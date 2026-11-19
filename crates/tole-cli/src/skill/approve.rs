@@ -271,7 +271,8 @@ pub enum SkillsAction {
     /// directory, after checking its bytes against the pinned package hash
     /// and the hash the uteke library recorded for the registry id (#878).
     /// Fetches nothing: see `docs/skills-registry-design.md`. Owner only,
-    /// at a terminal.
+    /// at a terminal. The pin must come from a source you trust apart from
+    /// the directory: uteke records its hash from that same directory.
     Fetch(crate::skill::fetch::FetchArgs),
     /// Skill drafts the agent proposed with `skill_propose` (#592): list,
     /// show, reject, record a reviewer's verdict. A draft never loads.
@@ -439,12 +440,36 @@ pub fn consent(
 
 /// Print the package the owner is about to approve: directory, each file
 /// with its size, and the hash.
-fn show_package(pkg: &tole_core::skill_approval::SkillPackage) {
-    println!("skill {} in {}", pkg.name, pkg.dir.display());
-    for (f, bytes) in &pkg.files {
-        println!("  {f} ({} bytes)", bytes.len());
+pub(crate) fn show_package(pkg: &tole_core::skill_approval::SkillPackage) {
+    for l in package_listing(pkg) {
+        println!("{l}");
     }
-    println!("hash {}", pkg.hash);
+}
+
+/// A line of text from a file or directory name, safe to print to the owner's
+/// terminal: no escape, carriage return, newline or other control character
+/// survives, so a name cannot overwrite, hide or forge a line of the listing.
+pub(crate) fn safe_text(s: &str) -> String {
+    tole_core::plugin_lock::terminal_safe(s)
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// The lines shown before an approval: directory, each file with its size,
+/// the hash. Names are file-system text (a model can write them), so they go
+/// through [`safe_text`].
+pub(crate) fn package_listing(pkg: &tole_core::skill_approval::SkillPackage) -> Vec<String> {
+    let mut out = vec![format!(
+        "skill {} in {}",
+        safe_text(&pkg.name),
+        safe_text(&pkg.dir.display().to_string())
+    )];
+    for (f, bytes) in &pkg.files {
+        out.push(format!("  {} ({} bytes)", safe_text(f), bytes.len()));
+    }
+    out.push(format!("hash {}", pkg.hash));
+    out
 }
 
 /// Approve `name` in `approvals` (not saved). Refuses when `expect` is

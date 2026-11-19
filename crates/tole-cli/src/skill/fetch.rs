@@ -22,6 +22,11 @@
 //!
 //! # Trust
 //!
+//! Caveat: uteke computes the hash it records from the same directory
+//! (`uteke skill index`), so equality with the pin adds almost nothing when
+//! the pin was copied from `uteke skill show`: the pin must come from a
+//! source the owner trusts independently of the directory.
+//!
 //! The uteke answer is stated data: it can only make this command refuse. It
 //! cannot approve anything, cannot put a byte into a prompt (`show` keeps a
 //! name and a hash and drops the rest) and is never consulted at load time;
@@ -127,74 +132,107 @@ pub fn source_for(id: &str, pinned_hex: &str, url: Option<String>) -> Source {
     }
 }
 
-fn clean(s: &str) -> String {
-    tole_core::plugin_lock::terminal_safe(s).replace(['\n', '\t'], " ")
-}
+use crate::skill_approve::safe_text as clean;
 
-pub fn cli(a: FetchArgs) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    crate::owner_only::refuse_under_session("tole skills fetch").map_err(anyhow::Error::msg)?;
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
+/// The flow after the owner-only guards, with its inputs injected so the
+/// ordering is testable: the terminal check, then uteke, then the local
+/// read, then the listing and the question, and only an explicit yes writes
+/// the ledger line and the approval. `ask` returns the owner's answer.
+pub fn run(
+    a: FetchArgs,
+    interactive: bool,
+    index: &UtekeSkillIndex,
+    approvals_path: &Path,
+    ws: &Path,
+    ask: impl FnOnce() -> Option<String>,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if !interactive {
+        return Err(
             "`tole skills fetch` needs a terminal: a registry approval is confirmed by a person \
              and has no --hash bypass (run it yourself; issue #878)"
+                .into(),
         );
     }
-    let pinned = pinned_package_hash(&a.pinned_sha).map_err(anyhow::Error::msg)?;
-    if !crate::tool_roster::binary_available("uteke") {
-        anyhow::bail!("the uteke binary is not on PATH; fetch resolves the id through it");
-    }
-    let index = UtekeSkillIndex::default();
+    let pinned = pinned_package_hash(&a.pinned_sha)?;
     if !index.supported() {
-        anyhow::bail!("uteke has no `skill` subcommand (needs >= 0.24.1)");
+        return Err("uteke has no `skill` subcommand (needs >= 0.24.1)".into());
     }
-    let ws = match a.workspace {
-        Some(p) => p,
-        None => std::env::current_dir().context("reading the current directory")?,
-    };
-    let path = Approvals::default_path()
-        .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
-    let loaded = crate::skill_approve::load_verified(&path).map_err(anyhow::Error::msg)?;
+    let loaded = crate::skill_approve::load_verified(approvals_path).map_err(|e| clean(&e))?;
     if let Some(fault) = &loaded.ledger_fault {
-        anyhow::bail!("{fault}");
-    }
-    for n in &loaded.notes {
-        eprintln!("tole: {n}");
+        return Err(clean(fault));
     }
     let mut approvals = loaded.approvals;
     let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
-    let shown = verify(&ws, &a.registry_id, &pinned, &index)
-        .map_err(|e| anyhow::Error::msg(clean(&secrets.redact(&e))))?;
-    println!(
-        "skill {} in {}  (registry id {}, hash matches the pin and uteke's record)",
-        shown.name,
-        shown.dir.display(),
-        clean(&a.registry_id)
-    );
-    for (f, bytes) in &shown.files {
-        println!("  {f} ({} bytes)", bytes.len());
+    let shown =
+        verify(ws, &a.registry_id, &pinned, index).map_err(|e| clean(&secrets.redact(&e)))?;
+    let w = |out: &mut dyn std::io::Write, l: String| {
+        let _ = writeln!(out, "{l}");
+    };
+    for l in crate::skill_approve::package_listing(&shown) {
+        w(out, l);
     }
-    println!("hash {}", shown.hash);
-    print!("approve these exact bytes? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).ok();
-    if !matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-        anyhow::bail!("not approved");
+    w(
+        out,
+        format!(
+            "registry id {}: the hash equals the pin and uteke's record (neither is independent \
+             of the directory unless you took the pin from a trusted source)",
+            clean(&a.registry_id)
+        ),
+    );
+    if !matches!(
+        ask().as_deref().map(str::trim),
+        Some("y" | "Y" | "yes" | "YES" | "Yes")
+    ) {
+        return Err("not approved".into());
     }
     let hex = pinned.trim_start_matches("sha256:");
     let pkg = crate::skill_approve::approve_and_record(
-        &path,
+        approvals_path,
         &mut approvals,
-        Some(&ws),
+        Some(ws),
         &a.registry_id,
         &shown.hash,
         Some(source_for(&a.registry_id, hex, a.source_url)),
         crate::skill_approve::now(),
     )
-    .map_err(anyhow::Error::msg)?;
-    println!("approved {} ({})", a.registry_id, pkg.hash);
+    .map_err(|e| clean(&e))?;
+    w(
+        out,
+        format!("approved {} ({})", clean(&a.registry_id), pkg.hash),
+    );
     Ok(())
+}
+
+pub fn cli(a: FetchArgs) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    crate::owner_only::refuse_under_session("tole skills fetch").map_err(anyhow::Error::msg)?;
+    let interactive = std::io::stdin().is_terminal();
+    if interactive && !crate::tool_roster::binary_available("uteke") {
+        anyhow::bail!("the uteke binary is not on PATH; fetch resolves the id through it");
+    }
+    let ws = match a.workspace.clone() {
+        Some(p) => p,
+        None => std::env::current_dir().context("reading the current directory")?,
+    };
+    let path = Approvals::default_path()
+        .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
+    run(
+        a,
+        interactive,
+        &UtekeSkillIndex::default(),
+        &path,
+        &ws,
+        || {
+            print!("approve these exact bytes? [y/N] ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line).ok()?;
+            Some(line)
+        },
+        &mut std::io::stdout(),
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 #[cfg(all(test, unix))]
@@ -362,5 +400,118 @@ mod tests {
         let (d, idx, hash) = setup("link", show_with);
         std::os::unix::fs::symlink("/etc/passwd", d.join("skills/demo/leak.md")).unwrap();
         assert!(verify(&d, "demo", &hash, &idx).is_err());
+    }
+
+    fn args(hash: &str) -> FetchArgs {
+        FetchArgs {
+            registry_id: "demo".into(),
+            pinned_sha: hash.into(),
+            source_url: None,
+            workspace: None,
+        }
+    }
+
+    fn no_store(d: &TestDir) {
+        assert!(!d.join("approvals.json").exists(), "approvals written");
+        assert!(
+            !tole_core::skill_approval::ledger_path(&d.join("approvals.json")).exists(),
+            "ledger written"
+        );
+    }
+
+    #[test]
+    fn a_file_name_with_escape_and_newline_cannot_forge_the_listing() {
+        let (d, _idx, _) = setup("names", show_with);
+        let evil = "a\u{1b}[2K\rhash sha256:forged\nscripts-x.sh";
+        std::fs::write(d.join("skills/demo").join(evil), "x").unwrap();
+        let pkg = tole_core::skill_approval::read_package(Some(&d), "demo").unwrap();
+        let lines = crate::skill_approve::package_listing(&pkg);
+        let all = lines.join("\n");
+        assert!(!all.contains('\u{1b}') && !all.contains('\r'), "{all:?}");
+        assert_eq!(
+            lines.len(),
+            pkg.files.len() + 2,
+            "one line per file: {lines:?}"
+        );
+        assert_eq!(lines.iter().filter(|l| l.starts_with("hash ")).count(), 1);
+    }
+
+    #[test]
+    fn a_stale_expected_hash_refuses_and_writes_nothing() {
+        let (d, _idx, hash) = setup("stale", show_with);
+        std::fs::write(d.join("skills/demo/late.md"), "changed after verify").unwrap();
+        let mut a = Approvals::default();
+        let e = crate::skill_approve::approve_and_record(
+            &d.join("approvals.json"),
+            &mut a,
+            Some(&d),
+            "demo",
+            &hash,
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(e.contains("review it again"), "{e}");
+        assert!(a.skills.is_empty());
+        no_store(&d);
+    }
+
+    #[test]
+    fn answering_no_writes_nothing_and_yes_writes_the_manual_line() {
+        let (d, idx, hash) = setup("flow", show_with);
+        let path = d.join("approvals.json");
+        let mut out = Vec::new();
+        let e = run(
+            args(&hash),
+            true,
+            &idx,
+            &path,
+            &d,
+            || Some("n\n".into()),
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(e, "not approved");
+        no_store(&d);
+        let shown = String::from_utf8(out).unwrap();
+        assert!(shown.contains(&format!("hash {hash}")), "{shown}");
+        // EOF at the prompt is a no as well.
+        assert!(run(args(&hash), true, &idx, &path, &d, || None, &mut Vec::new()).is_err());
+        no_store(&d);
+        run(
+            args(&hash),
+            true,
+            &idx,
+            &path,
+            &d,
+            || Some("y\n".into()),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let ledger =
+            std::fs::read_to_string(tole_core::skill_approval::ledger_path(&path)).unwrap();
+        assert_eq!(ledger.lines().count(), 1, "{ledger}");
+        assert!(
+            ledger.contains("\"event\":\"approve\"") || ledger.contains("approve"),
+            "{ledger}"
+        );
+    }
+
+    #[test]
+    fn without_a_terminal_uteke_is_never_called() {
+        let (d, idx, hash) = setup("notty", show_with);
+        let e = run(
+            args(&hash),
+            false,
+            &idx,
+            &d.join("approvals.json"),
+            &d,
+            || panic!("asked without a terminal"),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(e.contains("needs a terminal"), "{e}");
+        assert!(!d.join("argv.log").exists(), "uteke was called");
+        no_store(&d);
     }
 }

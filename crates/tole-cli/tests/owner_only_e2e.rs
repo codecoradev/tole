@@ -301,3 +301,36 @@ fn skills_fetch_without_a_terminal_is_refused_and_writes_nothing() {
     assert!(text(&o).contains("needs a terminal"), "{}", text(&o));
     assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
 }
+
+/// #878: the session guard and the terminal check run BEFORE uteke is
+/// looked up or called: a fake `uteke` on PATH logs every call.
+#[cfg(unix)]
+#[test]
+fn skills_fetch_refuses_before_it_calls_uteke() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let bin = tmpdir();
+    let log = bin.join("calls.log");
+    common::write_executable(
+        bin.join("uteke"),
+        format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let pin = "0000000000000000000000000000000000000000000000000000000000000000";
+    let args = ["skills", "fetch", "evil", "--pinned-sha", pin];
+    for env in [SESSION, CHILD, &[]] {
+        let mut e: Vec<(&str, &str)> = env.to_vec();
+        e.push(("PATH", &path));
+        let o = tole(&real(), &bare, &home, &e, &args);
+        assert!(!o.status.success(), "{env:?}: {}", text(&o));
+    }
+    assert!(
+        !log.exists(),
+        "uteke was called: {:?}",
+        std::fs::read_to_string(&log)
+    );
+}

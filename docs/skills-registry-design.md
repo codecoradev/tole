@@ -371,3 +371,14 @@ the owner: a real download transport (with size, path and symlink bounds and
 redacted logs) if uteke ever serves bodies; signatures for third-party skills
 (the pin is a plain hash, as stated data); and whether a git commit id should
 also be accepted as the pin (it cannot be checked against the bytes).
+
+Honest limits of that check: uteke records its hash from the same directory
+(`uteke skill index`), so when the pin is copied from `uteke skill show` the
+equality adds almost nothing; the pin must come from a source the owner trusts
+independently of the directory. The owner-only gate is advisory like the other
+owner commands (#601: a shell-capable model can drive a pty and answer y); the
+approvals file is loaded before the prompt and saved after it, so a concurrent
+revoke can be overwritten (as with `approve`); `uteke` is found by plain PATH
+lookup like the existing adapter. The positive terminal path (a real tty
+answering y) is exercised only through the injected `run` seam in unit tests,
+not end to end.
