@@ -325,9 +325,6 @@ pub fn run_mission(
 /// printing and exiting, so a face other than the CLI (`tole serve`) can
 /// report it. `summary` is the `fact/mission` register that was written.
 #[derive(Debug, Clone)]
-// `tokens` and `summary` are for the faces that report a mission (`tole
-// serve`); the CLI prints only the console line.
-#[allow(dead_code)]
 pub struct MissionOutcome {
     pub session_id: String,
     pub status: &'static str,
