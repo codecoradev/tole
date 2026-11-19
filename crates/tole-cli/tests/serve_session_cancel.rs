@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ struct ServeProcess {
     token: String,
     /// Dropped after `Drop::drop` has killed `child`.
     _cwd: common::TestDir,
+    /// Hermetic HOME (#993), dropped after `Drop::drop` has killed `child`.
+    _home: common::TestDir,
 }
 
 impl ServeProcess {
@@ -33,9 +35,10 @@ impl ServeProcess {
 
     fn spawn_with(base_url: &str, env: &[(&str, &str)]) -> Arc<Self> {
         let cwd = common::TestDir::new("tole-serve-cancel");
+        let home = common::TestDir::new("tole-serve-cancel-home");
         let token = "test-token-123".to_string();
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args([
                 "serve",
                 "--port",
@@ -62,6 +65,7 @@ impl ServeProcess {
             addr: format!("127.0.0.1:{port}"),
             token,
             _cwd: cwd,
+            _home: home,
         });
         // The listener is up; also confirm the HTTP face answers.
         common::wait_until(common::WAIT, "serve to become healthy", || {
@@ -453,7 +457,8 @@ fn serve_status_fields_equal_tole_status() {
     assert_eq!(st["stale"], json!(false), "{st}");
 
     // The same session through `tole status`.
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let home = common::TestDir::new("tole-serve-cancel-status-home");
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["status", "-s"])
         .arg(serve.dir().join(".tole/sessions"))
         .arg(&sid)
