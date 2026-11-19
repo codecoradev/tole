@@ -1035,7 +1035,13 @@ mod uteke_skill {
                 return Ok(Vec::new());
             }
             let fetch = (k * 3).clamp(SEARCH_LIMIT.0, SEARCH_LIMIT.1).to_string();
-            let v = self.run(&["skill", "search", &q, "--limit", &fetch, "--json"])?;
+            // `--mode semantic`: its score is a cosine similarity, the scale
+            // `TOLE_SKILL_FLOOR` (default 0.35) is stated in. uteke's default
+            // `hybrid` mode scores by rank fusion (about 0.03 at the top, run
+            // against a real 0.24.1 binary), which the floor would drop.
+            let v = self.run(&[
+                "skill", "search", &q, "--limit", &fetch, "--mode", "semantic", "--json",
+            ])?;
             let hits = hits_of(&v).ok_or("uteke skill search: unexpected JSON shape")?;
             let mut out: Vec<Candidate> = Vec::new();
             for (i, h) in hits.iter().enumerate() {
@@ -1158,7 +1164,10 @@ mod uteke_skill {
             assert_eq!(idx.search("ship it", &f, 5).unwrap().len(), 4);
             assert_eq!(idx.search("ship it", &f, 1).unwrap().len(), 1);
             let l = log(&dir);
-            assert!(l.contains("skill search ship it --limit 15 --json"), "{l}");
+            assert!(
+                l.contains("skill search ship it --limit 15 --mode semantic --json"),
+                "{l}"
+            );
             assert!(!l.contains("doc "), "{l}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -1179,15 +1188,18 @@ mod uteke_skill {
             assert_eq!(
                 q,
                 format!(
-                    "skill search {} --limit 50 --json",
+                    "skill search {} --limit 50 --mode semantic --json",
                     "a".repeat(MAX_QUERY_CHARS)
                 )
             );
             assert!(
-                q.ends_with("--limit 50 --json"),
+                q.ends_with("--limit 50 --mode semantic --json"),
                 "search limit clamps to 50: {q}"
             );
-            assert!(l.contains("skill search q --limit 3 --json"), "{l}");
+            assert!(
+                l.contains("skill search q --limit 3 --mode semantic --json"),
+                "{l}"
+            );
             assert!(l.contains("skill list --limit 1 --json"), "{l}");
             assert!(l.contains("skill list --limit 200 --json"), "{l}");
             let _ = std::fs::remove_dir_all(&dir);
