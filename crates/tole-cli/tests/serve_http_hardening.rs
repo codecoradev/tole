@@ -17,18 +17,25 @@ mod common;
 struct Serve {
     child: Child,
     port: u16,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: common::TestDir,
 }
 
 impl Serve {
     fn spawn() -> Self {
+        let home = common::TestDir::new("tole-serve-http-home");
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null());
             cmd
         });
-        Self { child, port }
+        Self {
+            child,
+            port,
+            _home: home,
+        }
     }
 
     fn connect(&self) -> std::io::Result<TcpStream> {

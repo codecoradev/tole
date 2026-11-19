@@ -9,7 +9,7 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tole_core::register::RegisterWrite;
 use tole_core::storage::{Commit, JsonlStorage, Storage};
@@ -76,7 +76,13 @@ fn spawn_mock() -> String {
 }
 
 fn tole(url: &str, args: &[&str], stdin: &str) -> (String, String, i32) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let home = TestDir::new("tole-session-model-home");
+    let path = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
+    let mut cmd = common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        &home,
+        &[("PATH", path.to_str().unwrap())],
+    );
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -85,7 +91,6 @@ fn tole(url: &str, args: &[&str], stdin: &str) -> (String, String, i32) {
         .env("TOLE_MODEL", "env-model")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_FALLBACK_BASE_URL")
         .env_remove("TOLE_MEMORY")
         .env_remove("TOLE_MEMORY_NAMESPACE")

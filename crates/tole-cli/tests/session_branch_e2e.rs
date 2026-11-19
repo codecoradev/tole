@@ -4,7 +4,7 @@
 mod common;
 use common::TestDir;
 use serde_json::json;
-use std::process::{Command, Output};
+use std::process::Output;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage};
@@ -14,7 +14,8 @@ fn tmpdir(tag: &str) -> TestDir {
 }
 
 fn tole(dir: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    let home = tmpdir("home");
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .arg("--sessions-dir")
         .arg(dir)
         .args(args)

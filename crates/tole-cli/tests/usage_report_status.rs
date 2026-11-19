@@ -6,7 +6,7 @@
 mod common;
 use common::TestDir;
 use serde_json::{json, Value};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use tole_core::entry::Entry;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
@@ -56,7 +56,8 @@ fn tmp(tag: &str) -> TestDir {
 
 fn status(dir: &std::path::Path, id: &str) -> String {
     let _g = serial();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let home = tmp("status-home");
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["status", "-s", dir.to_str().unwrap(), id])
         .stdin(Stdio::null())
         .output()
@@ -162,7 +163,8 @@ fn status_and_sessions_count_turns_by_the_transcript_rule() {
     assert!(out.contains("turns:   2 (user messages)"), "{out}");
 
     let g = serial();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let home = tmp("sessions-home");
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["sessions", "-s", dir.to_str().unwrap()])
         .stdin(Stdio::null())
         .output()
