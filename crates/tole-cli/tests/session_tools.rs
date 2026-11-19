@@ -13,6 +13,7 @@ fn ws(tag: &str) -> TestDir {
     tole_cli::session_host::set_server_skills(
         tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
     );
+    tole_cli::session::owner_mcp::set(vec![]).unwrap();
     let d = TestDir::new(&format!("tole-sess-tools-{tag}"));
     std::fs::create_dir_all(d.join("a")).unwrap();
     std::fs::create_dir_all(d.join("b")).unwrap();

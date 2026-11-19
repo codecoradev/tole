@@ -836,7 +836,7 @@ fn serve_refuses_config_hooks_like_the_flag() {
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
         &serve,
-        "--mcp-server is not supported by `tole serve`",
+        "an MCP server specification from the project config is not supported by `tole serve`",
     );
 }
 
@@ -857,7 +857,7 @@ fn acp_refuses_config_hooks_skills_and_mcp_servers_like_the_flag() {
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
         &["acp"],
-        "--mcp-server is not supported by `tole acp`",
+        "an MCP server specification from the project config is not supported by `tole acp`",
     );
 }
 

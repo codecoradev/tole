@@ -123,6 +123,7 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     tole_cli::session_host::set_server_skills(
         tole_cli::session::assemble::ServerSkills::new(vec![], false).unwrap(),
     );
+    tole_cli::session::owner_mcp::set(vec![]).unwrap();
     let session = tole_cli::session_host::open_session(
         "face-parity",
         w.to_str().unwrap(),
