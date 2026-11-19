@@ -108,12 +108,19 @@ nginjen-lite and its `scraper` HTML stack
 A slim build turns it off with `--no-default-features --features
 shell-tools,mcp,mcp-http,tui`.
 
-Re-measured on 2026-11-19 at 70cffd7 with the exact release command (`cargo build
---release -p tole-cli`, profile `strip = true`, thin LTO, 1 codegen unit, 4
-cores): 23,776,128 bytes stripped (34,482,104 unstripped; the `strip` step in
-`release.yml` is a no-op after cargo's own), 9.8 MB as tar.gz (the published
-v0.11.0 Linux x86_64 asset is 8.4 MB). `--no-default-features`: 10,180,024
-bytes. Variants tried: `lto = "fat"` 21,543,544 (-9.4%, build 3m52s to 8m32s);
-`opt-level = "s"` 18,276,776 (-23%, slower hot paths). Largest crates by
-`.text` (`cargo bloat --crates`): std 2.9 MiB, tole_cli 2.6, rmcp 2.2,
+Re-measured on 2026-11-19 at 70cffd7 with the exact release command (`cargo
+build --release -p tole-cli`, profile `strip = true`, thin LTO, 1 codegen
+unit), on one machine (x86_64 Linux, 4 cores): 23,776,128 bytes stripped
+(34,482,104 unstripped; the `strip` step in `release.yml` is a no-op after
+cargo's own). The table above lists 19,482,712 bytes for the same command six
+days earlier, so the binary grew about 4.3 MB (+22%); the cause is not
+bisected. The old "~9 MB" in the `Cargo.toml` comment (#482) is stale.
+`--no-default-features`: 10,180,024 bytes. Compressed, the local default build
+is 9.8 MB as tar.gz, while the published v0.11.0 Linux x86_64 asset is
+8,398,403 bytes; the difference is not explained (version, toolchain, gzip
+level or strip step). Variants tried: `lto = "fat"` 21,543,544 bytes (-9.4%,
+build 3m52s to 8m32s); `opt-level = "s"` 18,276,776 bytes (-23%; not
+benchmarked here, expected to trade hot-path speed). `cargo bloat --crates`
+figures cover the `.text` section only (17.1 MiB of the 22.7 MiB binary; the
+rest is rodata and other sections): std 2.9 MiB, tole_cli 2.6, rmcp 2.2,
 tole_core 2.1, serde_core 1.0, tole 0.9, tokio 0.5, serde_json 0.4, rustls 0.4.
