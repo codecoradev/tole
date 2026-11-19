@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 import platform
-import resource
+import secrets
 import socket
 import statistics
 import subprocess
@@ -139,6 +139,10 @@ class Env:
         self.home = root / "home"
         self.home.mkdir()
         self.url = provider_url
+        # Dummy credentials, random per harness run and never written to disk or
+        # logs. The mock accepts any key; tole only needs the variables set.
+        self.api_key = "sk-" + secrets.token_hex(16)
+        self.serve_token = secrets.token_hex(16)
 
     def env(self) -> dict[str, str]:
         keep = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
@@ -148,7 +152,7 @@ class Env:
             XDG_DATA_HOME=str(self.home / "data"),
             TOLE_BASE_URL=self.url,
             TOLE_MODEL="bench",
-            TOLE_API_KEY="sk-bench-not-a-secret",
+            TOLE_API_KEY=self.api_key,
             TOLE_STREAM="0",
             TOLE_NO_UPDATE_CHECK="1",
         )
@@ -231,7 +235,7 @@ def idle_rss_mb(env: Env) -> tuple[float, list[float]]:
     for _ in range(IDLE_RUNS):
         port = _free_port()
         e = env.env()
-        e["TOLE_SERVE_TOKEN"] = "bench-token-not-a-secret"
+        e["TOLE_SERVE_TOKEN"] = env.serve_token
         p = subprocess.Popen(
             [env.bin, "--sessions-dir", str(env.root / "serve-sessions"), "serve", "--port", str(port)],
             cwd=env.work, env=e, stdin=subprocess.DEVNULL,

@@ -104,6 +104,19 @@ class ChildPeakRss(unittest.TestCase):
         self.assertLess(peak, 50.0, "a 150 MB parent must not leak into the child's peak")
 
 
+class DummyCredentials(unittest.TestCase):
+    def test_credentials_are_random_per_run_and_reach_the_environment(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            a = run.Env("/bin/true", Path(d1), "http://127.0.0.1:1/v1")
+            b = run.Env("/bin/true", Path(d2), "http://127.0.0.1:1/v1")
+        self.assertNotEqual((a.api_key, a.serve_token), (b.api_key, b.serve_token))
+        self.assertTrue(a.api_key.startswith("sk-") and len(a.api_key) >= 32)
+        self.assertEqual(a.env()["TOLE_API_KEY"], a.api_key)
+
+
 class NoBudgetOnCi(unittest.TestCase):
     def test_gate_reports_no_budget_and_main_fails_it_on_ci(self):
         import json

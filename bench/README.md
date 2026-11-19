@@ -16,8 +16,8 @@ ceiling in [`budget.toml`](budget.toml).
 
 The real `target/release/tole`, no test double of the binary. The only fake is
 the provider: an OpenAI-compatible endpoint on `127.0.0.1` inside the harness
-process. No network, no secrets (the API key and serve token are dummy
-strings). Every run uses a fresh `HOME`, workspace and sessions dir.
+process. No network, no secrets (the API key and serve token are random
+dummy values generated per run). Every run uses a fresh `HOME`, workspace and sessions dir.
 
 | Metric | How |
 |---|---|
