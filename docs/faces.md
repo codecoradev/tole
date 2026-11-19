@@ -62,7 +62,7 @@ true; the status column says where the work is.
 | Default system prompt (tool discipline, one context line naming the session's workspace; pinned in the header) | yes | yes (#945) | n/a | cron's own | one path |
 | Skill sections and `load_skill` (approved skills only, #591) | yes | no | no | no | drift #945, needs the owner's go |
 | Review guidance (named only when both review tools are present) | yes | wired (#945), but the cora review tools are MCP tools, so it appears only once server sessions get MCP clients (#946) | n/a | no | one path in code; inactive on server faces until #946 |
-| Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
+| Model routing for a new session (#586) | yes | yes (#945: routed once, at the session's first prompt, from the owner's `[router]` config; a session that already has a model, a resumed one included, is left alone; ACP and the MCP session tools share the path) | n/a | its own (cron routes by job) | one path |
 | MCP client servers (`--mcp-server`, the cora preset) | yes | no | no | no | drift #946 (a trust boundary; the owner's configured servers only, never the request) |
 | Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (`serve` only, #947; ACP keeps the process flag) | per process flag | per job (`read_only`) | one path for `serve` (a request can only turn it on) |
 | Fork, tree, compact, name a session | yes | yes (`serve` only, #947; ACP has none of these routes) | n/a | n/a | one path for `serve` |

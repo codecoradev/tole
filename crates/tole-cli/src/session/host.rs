@@ -461,6 +461,50 @@ pub fn open_session_with(
     })
 }
 
+/// Routes a server session at its first prompt, before any provider call: the
+/// CLI's semantics through the one shared step. Off unless the OWNER's config
+/// enables `[router]`; a session that already has a model (client-set through
+/// the model route, a profile, resume) is left alone; a broken router fails
+/// this prompt with its redacted remedy. A request cannot touch the router.
+fn route_first_prompt(
+    storage: &mut dyn Storage,
+    profile: Option<&str>,
+    prompt: &str,
+    registry: &tole_core::tool::ToolRegistry,
+) -> Result<(), String> {
+    // A config that no longer loads fails the prompt too, redacted like a
+    // router error (its text can echo a value the owner wrote).
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    let cfg = match crate::config::user_config_path() {
+        Some(p) => crate::config::user_config_present(&p)
+            .and_then(|present| {
+                if present {
+                    crate::config::load(&p).map(Some).map_err(|e| e.to_string())
+                } else {
+                    Ok(None)
+                }
+            })
+            .map_err(|e| secrets.redact(&e).into_owned())?,
+        None => None,
+    }
+    .unwrap_or_default();
+    let setup = crate::delegate::Setup {
+        cfg,
+        ..Default::default()
+    };
+    crate::session::assemble::route_session(
+        storage,
+        &setup,
+        profile,
+        tole_core::router::TaskKind::Chat,
+        prompt,
+        registry,
+        false,
+        None,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// The provider config of one turn: the process-wide one, with the session's
 /// pinned model (#740) when it has one.
 fn session_provider_config(model: Option<&str>) -> Result<tole_core::openai::OpenAiConfig, String> {
@@ -564,6 +608,7 @@ pub fn run_session_turn_detailed(
         first_prompt_done,
         cancel,
         model,
+        profile,
         ..
     } = state;
     let mut final_text: Option<String> = None;
@@ -582,6 +627,10 @@ pub fn run_session_turn_detailed(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    // Model routing (#586, #945): once, at the first prompt of a NEW session.
+    if !*first_prompt_done.lock().expect("fpd lock") && model.is_none() {
+        route_first_prompt(&mut *storage, profile.as_deref(), prompt, &registry)?;
+    }
     // Live-token sinks (issue #196 phase 3): when an observer is wired
     // (ACP, serve with an open event stream), streamed reasoning/content
     // deltas flow to it DURING the provider call; the decisive output
