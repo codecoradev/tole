@@ -221,12 +221,17 @@ struct RedactCache {
 }
 
 impl RedactCache {
-    fn sync(&mut self, generation: u64) {
-        if self.generation != generation {
+    /// Moves the cache to `generation` and reports whether it is usable by a
+    /// reader at that generation. The generation only advances: a reader
+    /// that read an older one (it raced an allowlist install) neither
+    /// regresses the cache nor uses it.
+    fn sync(&mut self, generation: u64) -> bool {
+        if generation > self.generation {
             self.map.clear();
             self.bytes = 0;
             self.generation = generation;
         }
+        self.generation == generation
     }
 }
 
@@ -348,15 +353,18 @@ impl SecretSet {
         // generation no newer than the allowlist it was computed with.
         let generation = shape::generation();
         if let Ok(mut c) = self.inner.cache.lock() {
-            c.sync(generation);
-            if let Some(hit) = c.map.get(text) {
-                return match hit {
-                    Some(out) => Cow::Owned(out.to_string()),
-                    None => Cow::Borrowed(text),
-                };
+            if c.sync(generation) {
+                if let Some(hit) = c.map.get(text) {
+                    return match hit {
+                        Some(out) => Cow::Owned(out.to_string()),
+                        None => Cow::Borrowed(text),
+                    };
+                }
             }
         }
         let out = self.redact_uncached(text);
+        #[cfg(test)]
+        cache_tests::before_store();
         let cost = text.len() + out.len();
         if cost <= CACHE_MAX_BYTES {
             if let Ok(mut c) = self.inner.cache.lock() {
@@ -367,12 +375,19 @@ impl SecretSet {
                         c.map.clear();
                         c.bytes = 0;
                     }
-                    let value = match &out {
+                    let value: Option<Box<str>> = match &out {
                         Cow::Borrowed(_) => None,
                         Cow::Owned(o) => Some(o.as_str().into()),
                     };
-                    c.bytes += cost;
-                    c.map.insert(text.into(), value);
+                    let new_len = value.as_ref().map_or(0, |v| v.len());
+                    match c.map.insert(text.into(), value) {
+                        None => c.bytes += text.len() + new_len,
+                        // Same key: only the value's size changes.
+                        Some(old) => {
+                            let old_len = old.map_or(0, |v| v.len());
+                            c.bytes = (c.bytes + new_len).saturating_sub(old_len);
+                        }
+                    }
                 }
             }
         }
@@ -380,8 +395,7 @@ impl SecretSet {
     }
 
     /// [`SecretSet::redact`] without the memo: the reference behaviour.
-    #[doc(hidden)]
-    pub fn redact_uncached<'a>(&self, text: &'a str) -> Cow<'a, str> {
+    pub(crate) fn redact_uncached<'a>(&self, text: &'a str) -> Cow<'a, str> {
         match self.redact_known(text) {
             // Known values first (their `«NAME»` marker wins), then the
             // shared shape detector for secrets nobody told us about (#597).
@@ -790,6 +804,9 @@ fn url_password(url: &str) -> Option<&str> {
     let pw = &userinfo[userinfo.find(':')? + 1..];
     (!pw.is_empty()).then_some(pw)
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod tests {
