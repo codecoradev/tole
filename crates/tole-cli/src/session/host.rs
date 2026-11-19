@@ -582,6 +582,8 @@ fn route_first_prompt(
         false,
         None,
     )
+    // `route_session` redacts its own error with the process secrets
+    // (assemble.rs), so this text is already safe to return.
     .map_err(|e| e.to_string())
 }
 
