@@ -187,7 +187,7 @@ Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
 The fourth event, `turn_finished` (a serve turn ended, ids and a status word
 only), is specified in [turn-finished-event.md](turn-finished-event.md) (#962)
 and implemented with provisional defaults for the note's open decisions D1-D9
-(`webhook_out/turn.rs` names each one). It rides the volatile queue of section
+and D10, the settle counter in the id (`webhook_out/turn.rs` names each one). It rides the volatile queue of section
 8 with a 15 minute horizon (2 s, 10 s, 30 s, 2 min, then every 5 min), and a
 full queue replaces the oldest event of the same session.
 

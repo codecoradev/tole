@@ -528,6 +528,7 @@ fn done(session: &str, seq: u64) -> crate::webhook_out::turn::TurnSignal {
             status: TurnStatus::Completed,
             code: None,
             last_seq: seq,
+            settle: 1,
         },
         approval_id: None,
     }

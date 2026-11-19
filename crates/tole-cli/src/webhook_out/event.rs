@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use tole_core::ledger::RunStatus;
 
-use super::turn::{TurnEnd, MAX_TURN_BODY};
+use super::turn::{TurnEnd, ID_INCLUDES_SETTLE_COUNTER, MAX_TURN_BODY};
 use super::Event;
 
 /// The envelope after serialization, at most.
@@ -71,13 +71,23 @@ pub fn cron_event_id(fire_id: &str) -> String {
     format!("cron:{}", readable_and_digest(fire_id))
 }
 
-/// `turn:<readable>:<hash16>:<last_seq>` (#962): a pure function of durable
-/// state (the session id and the log position when the turn settled), so the
-/// same across retries and a restart; every settle of a session has a larger
-/// `last_seq` (the log is append-only), so a resumed leg never collides with an
-/// earlier one. At most 5 + 64 + 1 + 16 + 1 + 20 = 107 characters.
-pub fn turn_event_id(session_id: &str, last_seq: u64) -> String {
-    format!("turn:{}:{last_seq}", readable_and_digest(session_id))
+/// `turn:<readable>:<hash16>:<last_seq>:<settle>` (#962): a pure function of the
+/// session id, the log position when the turn settled and the session's settle
+/// counter, so the same across retries (it is computed once, when the event is
+/// built) and different for every settle of a session within one process. The
+/// log is append-only, so a settle that appended something has a larger
+/// `last_seq`; a turn that fails before appending anything does NOT, which is
+/// why the counter is there (provisional D10, `turn::ID_INCLUDES_SETTLE_COUNTER`).
+/// The counter is in memory and restarts with the process, so across a restart
+/// uniqueness rests on `last_seq` alone and a receiver also compares it. At most
+/// 5 + 64 + 1 + 16 + 1 + 20 + 1 + 20 = 128 characters, the delivery-id cap.
+pub fn turn_event_id(session_id: &str, last_seq: u64, settle: u64) -> String {
+    let base = format!("turn:{}:{last_seq}", readable_and_digest(session_id));
+    if ID_INCLUDES_SETTLE_COUNTER {
+        format!("{base}:{settle}")
+    } else {
+        base
+    }
 }
 
 /// `approval:<approval_id>:requested` or `:resolved`; `None` when the approval
@@ -318,7 +328,7 @@ pub fn turn_finished(
     if !tole_core::storage::is_valid_session_id(session_id) {
         return Err(BuildError::BadId);
     }
-    let id = turn_event_id(session_id, end.last_seq);
+    let id = turn_event_id(session_id, end.last_seq, end.settle);
     if !tole_core::webhook::valid_delivery(&id) {
         return Err(BuildError::BadId);
     }

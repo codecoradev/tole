@@ -18,6 +18,7 @@
 //! | D7 | no `profile` in the body | `event::turn_finished` |
 //! | D8 | on overflow replace the oldest event of the session | [`OVERFLOW_REPLACES_OLDEST_PER_SESSION`] |
 //! | D9 | a 15 minute retry horizon | [`RETRY_HORIZON_SECS`] |
+//! | D10 | the event id carries a per-session settle counter | [`ID_INCLUDES_SETTLE_COUNTER`] |
 //!
 //! # What may leave
 //!
@@ -52,6 +53,15 @@ pub const RETRY_BACKOFF_SECS: [i64; 4] = [2, 10, 30, 120];
 
 /// D1: the wait between later attempts.
 pub const RETRY_TAIL_SECS: i64 = 300;
+
+/// D10: the event id ends in `:<settle>`, a per-session in-memory counter of
+/// settled turns, besides `last_seq`. A turn that fails before it appends
+/// anything (a router or provider-config error, a cancel on resume) settles at
+/// the SAME `last_seq` as the turn before it, so without the counter its event
+/// would repeat the earlier event's id and a receiver deduping on the id would
+/// drop it. The counter restarts with the process; across a restart receivers
+/// also compare `last_seq`. `false` gives the note's original `...:<last_seq>`.
+pub const ID_INCLUDES_SETTLE_COUNTER: bool = true;
 
 /// The serialized `turn_finished` envelope, at most. It is a few hundred bytes
 /// by construction; a body over this is refused, never cut.
@@ -118,9 +128,17 @@ pub struct TurnEnd {
     /// D2: the `seq` of the newest log entry when the turn settled, the number
     /// `GET /sessions/{id}/entries?after=` pages by (`lastSeq` / `nextAfter`).
     pub last_seq: u64,
+    /// D10: this process's settle count for the session (1 for the first turn
+    /// it settled). Part of the event id only; never in the body.
+    pub settle: u64,
 }
 
 impl TurnEnd {
+    /// The same end with its per-session settle number.
+    pub fn with_settle(self, settle: u64) -> TurnEnd {
+        TurnEnd { settle, ..self }
+    }
+
     /// The one mapping from a `TurnOutcome`. Exhaustive, no wildcard arm: a new
     /// variant does not compile until it is placed here. `None` is a silent end
     /// (D3 off). Nothing inside the outcome is read except its variant.
@@ -145,6 +163,7 @@ impl TurnEnd {
             status,
             code,
             last_seq,
+            settle: 0,
         })
     }
 
@@ -154,6 +173,7 @@ impl TurnEnd {
             status: TurnStatus::Failed,
             code: Some(code),
             last_seq,
+            settle: 0,
         }
     }
 

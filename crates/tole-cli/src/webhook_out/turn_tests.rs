@@ -159,7 +159,7 @@ fn a_failed_end_carries_a_code_and_no_text() {
 
 fn body(end: &TurnEnd, approval: Option<&str>) -> Value {
     let b = turn_finished("gateway", 1_795_000_123, "s-1f2e3d", end, approval, &keep).unwrap();
-    assert_eq!(b.id, turn_event_id("s-1f2e3d", end.last_seq));
+    assert_eq!(b.id, turn_event_id("s-1f2e3d", end.last_seq, end.settle));
     serde_json::from_slice(&b.body).unwrap()
 }
 
@@ -233,6 +233,7 @@ fn the_largest_body_is_far_below_the_cap() {
         status: TurnStatus::ApprovalPending,
         code: Some(TurnCode::UnknownTool),
         last_seq: u64::MAX,
+        settle: u64::MAX,
     };
     let dest = "d".repeat(32);
     let b = turn_finished(&dest, i64::MAX, &session, &end, Some(&approval), &keep).unwrap();
@@ -242,13 +243,49 @@ fn the_largest_body_is_far_below_the_cap() {
 
 #[test]
 fn the_id_is_valid_deterministic_and_changes_with_the_log_position() {
-    let a = turn_event_id("s-1f2e3d", 14);
-    assert_eq!(a, turn_event_id("s-1f2e3d", 14));
-    assert!(a.starts_with("turn:s-1f2e3d:") && a.ends_with(":14"), "{a}");
-    assert_ne!(a, turn_event_id("s-1f2e3d", 15), "a resumed leg differs");
-    assert_ne!(turn_event_id("a_b", 1), turn_event_id("a-b", 1));
-    let long = turn_event_id(&"j".repeat(64), u64::MAX);
-    assert!(long.len() <= 107 && tole_core::webhook::valid_delivery(&long));
+    let a = turn_event_id("s-1f2e3d", 14, 3);
+    assert_eq!(a, turn_event_id("s-1f2e3d", 14, 3));
+    assert!(
+        a.starts_with("turn:s-1f2e3d:") && a.ends_with(":14:3"),
+        "{a}"
+    );
+    assert_ne!(a, turn_event_id("s-1f2e3d", 15, 3), "a resumed leg differs");
+    assert_ne!(turn_event_id("a_b", 1, 1), turn_event_id("a-b", 1, 1));
+    let long = turn_event_id(&"j".repeat(64), u64::MAX, u64::MAX);
+    assert!(
+        long.len() <= 128 && tole_core::webhook::valid_delivery(&long),
+        "{}",
+        long.len()
+    );
+}
+
+/// D10: a turn that fails before it appends anything settles at the same
+/// `last_seq` as the turn before it; its id must still differ, and a retry of
+/// one settle (the same built event) must keep its id.
+#[test]
+fn a_failed_before_append_turn_gets_a_different_id_and_a_retry_keeps_its_own() {
+    let done = TurnEnd::from_outcome(
+        &TurnOutcome::Final {
+            text: String::new(),
+            wrote: false,
+        },
+        14,
+    )
+    .unwrap()
+    .with_settle(1);
+    let failed = TurnEnd::failed(TurnCode::Provider, 14).with_settle(2);
+    assert_eq!(done.last_seq, failed.last_seq, "nothing was appended");
+    let a = turn_finished("g", 1, "s-1", &done, None, &keep).unwrap();
+    let b = turn_finished("g", 1, "s-1", &failed, None, &keep).unwrap();
+    assert_ne!(
+        a.id, b.id,
+        "a receiver deduping on the id must see two events"
+    );
+    // The same settle built again (a different `at`, as a retry would not be,
+    // but the id never depends on it) has the same id; a stored body is resent
+    // as is, so the id is unchanged across retries.
+    let again = turn_finished("g", 99, "s-1", &failed, None, &keep).unwrap();
+    assert_eq!(b.id, again.id);
 }
 
 #[test]
@@ -309,7 +346,9 @@ fn the_event_is_a_known_name_and_not_a_default() {
 /// `hmac`) over the exact bytes below, not with this code.
 #[test]
 fn a_turn_finished_body_has_a_pinned_signature() {
-    let end = TurnEnd::from_outcome(&TurnOutcome::Cancelled, 14).unwrap();
+    let end = TurnEnd::from_outcome(&TurnOutcome::Cancelled, 14)
+        .unwrap()
+        .with_settle(1);
     let end = TurnEnd {
         status: TurnStatus::Completed,
         ..end
@@ -318,7 +357,7 @@ fn a_turn_finished_body_has_a_pinned_signature() {
     let text = String::from_utf8(b.body.clone()).unwrap();
     assert_eq!(
         text,
-        r#"{"at":1795000000,"data":{"last_seq":14,"session_id":"s-1f2e3d","status":"completed"},"destination":"gateway","id":"turn:s-1f2e3d:357319c7c674b505:14","type":"turn_finished","v":1}"#
+        r#"{"at":1795000000,"data":{"last_seq":14,"session_id":"s-1f2e3d","status":"completed"},"destination":"gateway","id":"turn:s-1f2e3d:357319c7c674b505:14:1","type":"turn_finished","v":1}"#
     );
     let h = crate::webhook_out::sign::request_headers(
         b"tole-test-key-0123456789abcdef",
@@ -332,4 +371,4 @@ fn a_turn_finished_body_has_a_pinned_signature() {
 }
 
 const PINNED_SIGNATURE: &str =
-    "v2=3c4c324fcd6469c9239835520b4045e1f4e378da7ce6587d2546508f2a3d7b28";
+    "v2=40b6e20fcf55ad9521b43149ff2314ff1c852b65d8e1463d3b1d23c84270c168";

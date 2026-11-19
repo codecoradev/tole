@@ -337,6 +337,7 @@ fn signal(session: &str, status: TurnStatus, seq: u64) -> TurnSignal {
             status,
             code: None,
             last_seq: seq,
+            settle: 1,
         },
         approval_id: None,
     }

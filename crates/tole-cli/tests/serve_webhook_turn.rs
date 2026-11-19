@@ -397,7 +397,14 @@ impl World {
     }
 
     /// The lines the notifier and sender print never carry the marker, the
-    /// key or the URL token.
+    /// key or the URL token. ONLY lines containing "webhook" are asserted for
+    /// the marker: the pre-existing `log_outcome` lines (`tole: provider failed:
+    /// ...`, `tole: unknown tool '...'`) print the provider message and the tool
+    /// name by design (a named older sink, see the design note), so asserting
+    /// on them would fail for a reason this change does not own. The tests below
+    /// PROVE the marker reached those lines (`assert_marker_reached_log_outcome`),
+    /// so the clean-body assertions are not vacuous. The key is asserted absent
+    /// from the whole of stderr.
     fn assert_stderr_clean(&self, s: &Serve) {
         let log = s.stderr();
         for line in log.lines().filter(|l| l.contains("webhook")) {
@@ -406,6 +413,32 @@ impl World {
             assert!(!line.contains("/hook"), "{line}");
         }
         assert!(!log.contains(&self.key), "the key is in stderr");
+    }
+}
+
+impl World {
+    /// Proves the marker went through the real code path to the pre-existing
+    /// `log_outcome` stderr line `needle` (so a body built from the same text
+    /// would have carried it), then that no "webhook" line has it.
+    fn assert_marker_reached_log_outcome(&self, s: &Serve, needle: &str) {
+        let start = Instant::now();
+        loop {
+            let log = s.stderr();
+            if log
+                .lines()
+                .any(|l| l.contains(needle) && l.contains(&self.marker))
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the marker never reached the `{needle}` line, so the check would be vacuous: {log}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for line in s.stderr().lines().filter(|l| l.contains("webhook")) {
+            assert!(!line.contains(&self.marker), "{line}");
+        }
     }
 }
 
@@ -503,7 +536,7 @@ fn a_completed_turn_is_announced_once_to_the_destination_that_listed_it_and_leak
     assert!(ev["id"]
         .as_str()
         .unwrap()
-        .ends_with(&format!(":{last_seq}")));
+        .ends_with(&format!(":{last_seq}:1")));
     // Not vacuous: the marker was in the prompt, the tool result and the answer.
     assert!(log.matches(&w.marker).count() >= 3, "{log}");
     // One event, and none for the destination that did not list it.
@@ -595,6 +628,7 @@ fn failed_blocked_and_cancelled_turns_carry_a_status_and_a_code_never_text() {
     let ev = got.json();
     assert_eq!(ev["data"]["status"], "failed");
     assert_eq!(ev["data"]["code"], "provider");
+    w.assert_marker_reached_log_outcome(&s, "provider failed");
     assert_eq!(data_keys(&ev), ["code", "last_seq", "session_id", "status"]);
 
     // A tool the model made up, named after the marker.
@@ -606,6 +640,7 @@ fn failed_blocked_and_cancelled_turns_carry_a_status_and_a_code_never_text() {
     let ev = got.json();
     assert_eq!(ev["data"]["status"], "blocked");
     assert_eq!(ev["data"]["code"], "unknown_tool");
+    w.assert_marker_reached_log_outcome(&s, "unknown tool");
     assert_eq!(ev["data"]["session_id"], sid2.as_str());
 
     // The owner cancels a turn held at the provider.
