@@ -9,6 +9,7 @@
 use serde_json::{json, Value};
 use tole_core::ledger::RunStatus;
 
+use super::turn::{TurnEnd, ID_INCLUDES_SETTLE_COUNTER, MAX_TURN_BODY};
 use super::Event;
 
 /// The envelope after serialization, at most.
@@ -27,7 +28,8 @@ const READABLE_LEN: usize = 64;
 pub enum BuildError {
     /// An approval id outside `[A-Za-z0-9._:-]` or longer than 128.
     BadId,
-    /// Still over [`MAX_BODY`] with the summary dropped.
+    /// Still over [`MAX_BODY`] with the summary dropped (or, for a turn event,
+    /// over [`MAX_TURN_BODY`]: it is refused, never cut).
     TooLarge,
     /// The value could not be serialized.
     Serialize,
@@ -40,14 +42,12 @@ pub struct Built {
     pub body: Vec<u8>,
 }
 
-/// `cron:<readable>:<hash16>`: a pure function of the fire id, so the same in
-/// `tole serve` and `tole cron tick`, on every attempt and after a restart.
-/// `<hash16>` (the first 16 hex digits of SHA-256 over the whole fire id) makes
-/// it unique; `<readable>` is the fire id with every byte outside
-/// `[A-Za-z0-9._-]` replaced by `-`, cut to 64, for humans. At most 86
-/// characters and always a valid delivery id.
-pub fn cron_event_id(fire_id: &str) -> String {
-    let readable: String = fire_id
+/// `<readable>:<hash16>` of `key`: the part cron and turn ids share. `<hash16>`
+/// (the first 16 hex digits of SHA-256 over the whole key) makes it unique;
+/// `<readable>` is the key with every byte outside `[A-Za-z0-9._-]` replaced by
+/// `-`, cut to 64, for humans.
+fn readable_and_digest(key: &str) -> String {
+    let readable: String = key
         .bytes()
         .take(READABLE_LEN)
         .map(|b| {
@@ -59,9 +59,35 @@ pub fn cron_event_id(fire_id: &str) -> String {
         })
         .collect();
     format!(
-        "cron:{readable}:{}",
-        tole_core::webhook::short_digest(fire_id.as_bytes())
+        "{readable}:{}",
+        tole_core::webhook::short_digest(key.as_bytes())
     )
+}
+
+/// `cron:<readable>:<hash16>`: a pure function of the fire id, so the same in
+/// `tole serve` and `tole cron tick`, on every attempt and after a restart. At
+/// most 86 characters and always a valid delivery id.
+pub fn cron_event_id(fire_id: &str) -> String {
+    format!("cron:{}", readable_and_digest(fire_id))
+}
+
+/// `turn:<readable>:<hash16>:<last_seq>:<settle>` (#962): a pure function of the
+/// session id, the log position when the turn settled and the session's settle
+/// counter, so the same across retries (it is computed once, when the event is
+/// built) and different for every settle of a session within one process. The
+/// log is append-only, so a settle that appended something has a larger
+/// `last_seq`; a turn that fails before appending anything does NOT, which is
+/// why the counter is there (provisional D10, `turn::ID_INCLUDES_SETTLE_COUNTER`).
+/// The counter is in memory and restarts with the process, so across a restart
+/// uniqueness rests on `last_seq` alone and a receiver also compares it. At most
+/// 5 + 64 + 1 + 16 + 1 + 20 + 1 + 20 = 128 characters, the delivery-id cap.
+pub fn turn_event_id(session_id: &str, last_seq: u64, settle: u64) -> String {
+    let base = format!("turn:{}:{last_seq}", readable_and_digest(session_id));
+    if ID_INCLUDES_SETTLE_COUNTER {
+        format!("{base}:{settle}")
+    } else {
+        base
+    }
 }
 
 /// `approval:<approval_id>:requested` or `:resolved`; `None` when the approval
@@ -281,6 +307,66 @@ pub fn approval_resolved(
         data,
     ))?;
     Ok(Built { id, body })
+}
+
+/// The `turn_finished` event (#962). `data` holds ids and closed words only:
+/// `session_id`, `status`, `last_seq` (D2), and `approval_id` or `code` when
+/// they apply. There is no free-text field, no `profile` (D7), no `entries`
+/// count and no `truncated`: the body is a few hundred bytes by construction.
+///
+/// `approval_id` is the Pending queue entry of an `approval_pending` end. An id
+/// outside its charset, or one the redactor would change (a secret-shaped id),
+/// is refused as [`BuildError::BadId`]: it cannot be sent, so nothing is sent.
+pub fn turn_finished(
+    destination: &str,
+    at: i64,
+    session_id: &str,
+    end: &TurnEnd,
+    approval_id: Option<&str>,
+    redact: &dyn Fn(&str) -> String,
+) -> Result<Built, BuildError> {
+    if !tole_core::storage::is_valid_session_id(session_id) {
+        return Err(BuildError::BadId);
+    }
+    let id = turn_event_id(session_id, end.last_seq, end.settle);
+    if !tole_core::webhook::valid_delivery(&id) {
+        return Err(BuildError::BadId);
+    }
+    let mut data = serde_json::Map::new();
+    data.insert("session_id".into(), json!(session_id));
+    data.insert("status".into(), json!(end.status.as_str()));
+    data.insert("last_seq".into(), json!(end.last_seq));
+    if let Some(a) = approval_id {
+        if !tole_core::webhook::valid_delivery(a) {
+            return Err(BuildError::BadId);
+        }
+        data.insert("approval_id".into(), json!(a));
+    }
+    if let Some(code) = end.code {
+        data.insert("code".into(), json!(code.as_str()));
+    }
+    let value = envelope(
+        &id,
+        Event::TurnFinished,
+        destination,
+        at,
+        Value::Object(data),
+    );
+    let body = serde_json::to_vec(&value).map_err(|_| BuildError::Serialize)?;
+    if body.len() > MAX_TURN_BODY {
+        return Err(BuildError::TooLarge);
+    }
+    // Redaction over the serialized envelope: every id is inside the delivery
+    // charset, so a change means a secret-shaped id (or a destination name the
+    // redactor knows). Nothing is sent rather than a redacted stand-in.
+    let text = String::from_utf8(body).map_err(|_| BuildError::Serialize)?;
+    if redact(&text) != text {
+        return Err(BuildError::BadId);
+    }
+    Ok(Built {
+        id,
+        body: text.into_bytes(),
+    })
 }
 
 #[cfg(test)]
