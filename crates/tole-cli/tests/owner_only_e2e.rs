@@ -90,6 +90,13 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
         vec!["skills", "drafts", "promote", "d-1", "--hash", "sha256:00"],
         vec!["skills", "drafts", "revoke", "s-1"],
         vec!["skills", "revoke", "evil"],
+        vec![
+            "skills",
+            "fetch",
+            "evil",
+            "--pinned-sha",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
         vec!["skills", "adopt", "--all"],
         vec!["skills", "adopt", "evil"],
         vec!["skills", "recheckpoint", "--sha256", "sha256:00"],
@@ -267,5 +274,30 @@ fn run_command_cannot_reach_the_owner_only_records() {
     let out = t.execute(json!({ "command": line })).unwrap();
     assert_ne!(out["status"], 0, "{out}");
     assert!(out["stderr"].as_str().unwrap().contains("#684"), "{out}");
+    assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
+}
+
+/// #878: `skills fetch` has no --hash bypass: without a terminal (a script,
+/// cron, serve, acp) it is refused even outside a session, writes nothing,
+/// and never reaches uteke.
+#[test]
+fn skills_fetch_without_a_terminal_is_refused_and_writes_nothing() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let o = tole(
+        &real(),
+        &bare,
+        &home,
+        &[],
+        &[
+            "skills",
+            "fetch",
+            "evil",
+            "--pinned-sha",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+    );
+    assert!(!o.status.success());
+    assert!(text(&o).contains("needs a terminal"), "{}", text(&o));
     assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
 }

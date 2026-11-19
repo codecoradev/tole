@@ -233,7 +233,7 @@ mod tests {
                 d.display()
             ),
         );
-        (d.clone_path(), UtekeSkillIndex::new(&bin), hash)
+        (d, UtekeSkillIndex::new(&bin), hash)
     }
 
     fn show_with(hash: &str) -> String {
@@ -260,14 +260,30 @@ mod tests {
         let mut a = Approvals::default();
         let hex = hash.trim_start_matches("sha256:");
         let src = source_for("demo", hex, Some("https://example.test/s.git".into()));
-        crate::skill_approve::approve_and_record(&path, &mut a, Some(&d), "demo", &hash, Some(src.clone()), 7)
-            .unwrap();
-        let ledger = std::fs::read_to_string(tole_core::skill_approval::ledger_path(&path)).unwrap();
-        let manual = tole_core::skill_approval::ledger_line("approve", "demo", &hash, Some(&src), 7);
+        crate::skill_approve::approve_and_record(
+            &path,
+            &mut a,
+            Some(&d),
+            "demo",
+            &hash,
+            Some(src.clone()),
+            7,
+        )
+        .unwrap();
+        let ledger =
+            std::fs::read_to_string(tole_core::skill_approval::ledger_path(&path)).unwrap();
+        let manual =
+            tole_core::skill_approval::ledger_line("approve", "demo", &hash, Some(&src), 7);
         assert_eq!(ledger, manual);
-        assert!(ledger.contains("\"registry_id\":\"demo\"") && ledger.contains(hex), "{ledger}");
+        assert!(
+            ledger.contains("\"registry_id\":\"demo\"") && ledger.contains(hex),
+            "{ledger}"
+        );
         assert!(ledger.contains("example.test"), "{ledger}");
-        assert!(!ledger.contains("IGNORE"), "no body text in the ledger: {ledger}");
+        assert!(
+            !ledger.contains("IGNORE"),
+            "no body text in the ledger: {ledger}"
+        );
         tole_core::skill_approval::verify_checkpoint_at(&path).unwrap();
         // The gate loads it, with the source on the approval.
         assert_eq!(a.skills["demo"].source.as_ref(), Some(&src));
@@ -292,22 +308,33 @@ mod tests {
     #[test]
     fn a_missing_or_malformed_record_is_refused() {
         let (d, idx, hash) = setup("none", |_| "{\"slug\":\"demo\"}".into());
-        assert!(verify(&d, "demo", &hash, &idx).unwrap_err().contains("records no package hash"));
+        assert!(verify(&d, "demo", &hash, &idx)
+            .unwrap_err()
+            .contains("records no package hash"));
         let (d, idx, hash) = setup("bad", |_| show_with("deadbeef"));
-        assert!(verify(&d, "demo", &hash, &idx).unwrap_err().contains("not a sha256"));
+        assert!(verify(&d, "demo", &hash, &idx)
+            .unwrap_err()
+            .contains("not a sha256"));
     }
 
     #[test]
     fn an_edited_local_file_no_longer_matches_the_pin() {
         let (d, idx, hash) = setup("edit", show_with);
         std::fs::write(d.join("skills/demo/extra.md"), "added after the pin").unwrap();
-        assert!(verify(&d, "demo", &hash, &idx).unwrap_err().contains("not the pinned"));
+        assert!(verify(&d, "demo", &hash, &idx)
+            .unwrap_err()
+            .contains("not the pinned"));
     }
 
     #[test]
     fn a_commit_sized_or_malformed_pin_is_refused_before_uteke_is_called() {
         let (d, idx, _) = setup("fmt", show_with);
-        for bad in ["c".repeat(40), "sha256:XYZ".into(), "".into(), "A".repeat(64)] {
+        for bad in [
+            "c".repeat(40),
+            "sha256:XYZ".into(),
+            "".into(),
+            "A".repeat(64),
+        ] {
             assert!(verify(&d, "demo", &bad, &idx).is_err(), "{bad}");
         }
         assert!(!d.join("argv.log").exists(), "uteke was called");
@@ -323,7 +350,11 @@ mod tests {
         // The bytes that would load are the local ones.
         assert!(!String::from_utf8_lossy(pkg.skill_md()).contains("IGNORE"));
         let log = std::fs::read_to_string(d.join("argv.log")).unwrap();
-        assert!(log.lines().all(|l| l.starts_with("skill show") || l.starts_with("skill --help")), "{log}");
+        assert!(
+            log.lines()
+                .all(|l| l.starts_with("skill show") || l.starts_with("skill --help")),
+            "{log}"
+        );
     }
 
     #[test]

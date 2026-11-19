@@ -208,6 +208,25 @@ the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
 but stops its recall. Skill approval is required by default, so only
 owner-approved content loads (below).
 
+**Registry approval (#878).** `tole skills fetch <id> --pinned-sha <sha256>`
+approves a third-party skill by registry id, and downloads nothing: uteke
+0.24.1 returns no skill body (`skill show` is a manifest, the package hash and
+a ledger), so the bytes are whatever the owner placed in a skills directory
+by a channel they chose. The command computes the package hash over that
+directory and refuses unless it equals both the owner's pinned hash and the
+hash uteke recorded for the id; the uteke answer is read as a name and a hash
+only (the adapter drops everything else) and can only make the command refuse,
+never approve or supply text. The ledger line and the approval are those of
+`tole skills approve`, with the stated source. Owner only: refused under a
+session or child agent (#684) and without a terminal on stdin, with no `--hash`
+bypass; no model tool exists for it and a project config cannot reach it.
+Residuals: the pin and uteke's record are not signatures, so a pin the owner
+copied from the same hostile page as the bytes proves only that the bytes did
+not change after pinning; whoever can write uteke's library and the skill
+directory and also drives the owner's terminal is the owner-equivalent
+attacker of every approval. Nothing is executed at approval, and an approval
+does not vet what a `scripts/` file does later (normal tool approvals apply).
+
 **Approved-hash loading (#591).** Required by default since 2026-11-11 (owner
 decision), so the trust is no longer "whatever is on disk": a discovered skill loads only when
 its package (SKILL.md plus every other file of its directory, paths and
