@@ -28,6 +28,10 @@ struct ServeProcess {
 
 impl ServeProcess {
     fn spawn(base_url: &str) -> Arc<Self> {
+        Self::spawn_with(base_url, &[])
+    }
+
+    fn spawn_with(base_url: &str, env: &[(&str, &str)]) -> Arc<Self> {
         let cwd = common::TestDir::new("tole-serve-cancel");
         let token = "test-token-123".to_string();
         let (child, port) = common::spawn_listening(|port| {
@@ -48,6 +52,9 @@ impl ServeProcess {
             cmd.env("TOLE_MODEL", "mock-model");
             cmd.env("TOLE_API_KEY", "sk-test");
             cmd.env("TOLE_SERVE_TOKEN", &token);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
             cmd
         });
         let proc = Arc::new(Self {
@@ -106,6 +113,13 @@ impl ServeProcess {
         };
         let v: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
         Some((code, v))
+    }
+}
+
+impl ServeProcess {
+    /// The server's workspace (its cwd), where its sessions are kept.
+    fn dir(&self) -> &std::path::Path {
+        &self._cwd
     }
 }
 
@@ -396,4 +410,137 @@ fn serve_status_json_has_additive_usage_report() {
     assert!(first["history_chars"].as_u64().unwrap() > 0, "{st}");
     assert!(first["prefix_chars"].as_u64().unwrap() > 0, "{st}");
     assert_eq!(r["wire"]["history_growth_per_step"], Value::Null, "{st}");
+}
+
+/// #573: `GET /sessions/{id}/status` carries model, effort, context window
+/// and name, and they are what `tole status` shows for the same session.
+#[test]
+fn serve_status_fields_equal_tole_status() {
+    let (base, _gate) = spawn_mock();
+    let serve = ServeProcess::spawn_with(&base, &[("TOLE_CONTEXT_WINDOW", "128000")]);
+    let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let path = |a: &str| format!("/sessions/{sid}/{a}");
+
+    // Idle and untouched: model known, everything else unknown (null).
+    let (code, st) = serve.request("GET", &path("status"), "").unwrap();
+    assert_eq!(code, 200, "{st}");
+    assert_eq!(st["model"], json!("mock-model"), "{st}");
+    assert_eq!(st["effort"], Value::Null, "{st}");
+    assert_eq!(st["name"], Value::Null, "{st}");
+    assert_eq!(st["stale"], json!(false), "{st}");
+    assert!(st["snapshotAt"].as_u64().is_some(), "{st}");
+
+    let (c, _) = serve
+        .request("POST", &path("effort"), r#"{"effort":"high"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+    let (c, _) = serve
+        .request("POST", &path("name"), r#"{"name":"nightly"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+    let (c, _) = serve
+        .request("POST", &path("prompt"), r#"{"text":"quick"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+
+    let (_, st) = serve.request("GET", &path("status"), "").unwrap();
+    assert_eq!(st["model"], json!("mock-model"), "{st}");
+    assert_eq!(st["effort"], json!("high"), "{st}");
+    assert_eq!(st["name"], json!("nightly"), "{st}");
+    assert_eq!(st["contextWindow"], json!(128000), "{st}");
+    assert_eq!(st["contextUsed"], json!(1), "{st}");
+    assert_eq!(st["stale"], json!(false), "{st}");
+
+    // The same session through `tole status`.
+    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        .args(["status", "-s"])
+        .arg(serve.dir().join(".tole/sessions"))
+        .arg(&sid)
+        .env("TOLE_BASE_URL", &base)
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", "sk-test")
+        .env("TOLE_CONTEXT_WINDOW", "128000")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{text}");
+    let snap = tole_cli::status::SessionStatus {
+        model: st["model"].as_str().map(str::to_string),
+        effort: st["effort"].as_str().map(str::to_string),
+        last_prompt_tokens: st["contextUsed"].as_u64().unwrap(),
+        window: st["contextWindow"].as_u64(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        compactions: 0,
+    };
+    for line in [
+        "model:   mock-model",
+        "effort:  high",
+        snap.context_line().as_str(),
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "`tole status` lacks {line:?}:\n{text}"
+        );
+    }
+}
+
+/// #573: while a turn is held at the provider, the status route answers
+/// promptly from the last-known snapshot and says so (`stale`), instead of
+/// going blank; once the turn settles it is live again.
+#[test]
+fn serve_status_answers_from_a_snapshot_while_a_turn_runs() {
+    let (base, gate) = spawn_mock();
+    let serve = ServeProcess::spawn_with(&base, &[("TOLE_CONTEXT_WINDOW", "64000")]);
+    let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let status = format!("/sessions/{sid}/status");
+    let (c, _) = serve
+        .request(
+            "POST",
+            &format!("/sessions/{sid}/effort"),
+            r#"{"effort":"low"}"#,
+        )
+        .unwrap();
+    assert_eq!(c, 200);
+
+    let thread_serve = Arc::clone(&serve);
+    let sid_clone = sid.clone();
+    let prompt = std::thread::spawn(move || {
+        thread_serve.request(
+            "POST",
+            &format!("/sessions/{sid_clone}/prompt"),
+            r#"{"text": "DELAYED mission"}"#,
+        )
+    });
+    gate.wait_entered();
+
+    // The turn is parked at the provider and holds the session. Every poll
+    // answers within a second (the gate stays shut for the whole loop).
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (code, st) = serve.request("GET", &status, "").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "status blocked on the turn"
+        );
+        assert_eq!(code, 200, "{st}");
+        assert_eq!(st["busy"], json!(true), "{st}");
+        assert_eq!(st["stale"], json!(true), "{st}");
+        assert_eq!(st["entries"], Value::Null, "{st}");
+        assert_eq!(st["model"], json!("mock-model"), "{st}");
+        assert_eq!(st["effort"], json!("low"), "{st}");
+        assert_eq!(st["contextWindow"], json!(64000), "{st}");
+        assert!(st["snapshotAt"].as_u64().is_some(), "{st}");
+    }
+    gate.open();
+    let (pcode, _) = prompt.join().unwrap().expect("prompt response");
+    assert_eq!(pcode, 200);
+
+    let (_, st) = serve.request("GET", &status, "").unwrap();
+    assert_eq!(st["stale"], json!(false), "{st}");
+    assert_eq!(st["busy"], json!(false), "{st}");
+    assert_eq!(st["contextUsed"], json!(1), "{st}");
 }

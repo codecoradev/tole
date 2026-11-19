@@ -1223,11 +1223,21 @@ fn open_serve_session(
             {
                 return Err((503, json!({"error": "all sessions busy — at capacity"})));
             }
+            warm_status(state, session_id);
             Ok(())
         }
         // Another process (a TUI, a second serve) holds the writer lock.
         Err(e) if e.contains("open for writing") => Err((409, json!({"error": e}))),
         Err(e) => Err((500, json!({"error": e}))),
+    }
+}
+
+/// Look up a session's context window off the request path (#573): the
+/// provider's `/models` may be slow and the status route never waits for it.
+fn warm_status(state: &State, id: &str) {
+    let st = lock_sessions(&state.sessions).get(id).cloned();
+    if let Some(st) = st {
+        std::thread::spawn(move || st.warm_status());
     }
 }
 
@@ -1828,9 +1838,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 let queue = Arc::clone(&state.approvals);
                 std::thread::spawn(move || {
                     if serve_session {
-                        if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid)
+                        if let Err(e) =
+                            tole_cli::session_host::resume_session_turn(Arc::clone(&sessions), &sid)
                         {
                             eprintln!("tole serve: approval resume failed: {e}");
+                        }
+                        let st = lock_sessions(&sessions).get(&sid).cloned();
+                        if let Some(st) = st {
+                            st.warm_status();
                         }
                         return;
                     }
@@ -1868,36 +1883,48 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // blocking status on it would pin the endpoint (and
                     // the map) for the entire turn (CodeCora scan
                     // 2026-09-28). try_lock keeps this non-blocking.
-                    let (busy, entries, report) = {
+                    let (busy, entries, report, snapshot, stale) = {
                         let sessions = lock_sessions(&state.sessions);
                         let Some(st) = sessions.get(id) else {
                             return (404, json!({"error": "unknown session"}));
                         };
                         let busy = *st.busy.lock().expect("busy lock");
-                        let (entries, report) = match st.storage.try_lock() {
+                        let row = match st.storage.try_lock() {
+                            // Idle: a live read, which also refreshes the
+                            // snapshot a later busy answer falls back to.
                             Ok(guard) => (
+                                busy,
                                 Some(guard.entries().len()),
                                 // Issue #211: additive usage report.
                                 tole_cli::usage_report::usage_json(guard.entries(), guard.usages()),
+                                Some(st.refresh_status(&*guard)),
+                                false,
                             ),
-                            // turn in flight — skip the count and report
-                            Err(_) => (None, json!(null)),
+                            // Turn in flight: skip the count and report and
+                            // answer from the last-known snapshot (#573),
+                            // which never needs the turn's lock.
+                            Err(_) => (busy, None, json!(null), st.last_status(), true),
                         };
-                        (busy, entries, report)
+                        row
                     };
                     let entries = match entries {
                         Some(n) => json!(n),
                         None => json!(null),
                     };
-                    (
-                        200,
-                        json!({
-                            "id": id,
-                            "entries": entries,
-                            "busy": busy,
-                            "usage_report": report,
-                        }),
-                    )
+                    let mut out = json!({
+                        "id": id,
+                        "entries": entries,
+                        "busy": busy,
+                        "usage_report": report,
+                    });
+                    if let (Some(o), Some(f)) = (
+                        out.as_object_mut(),
+                        tole_cli::status::StatusSnapshot::json_fields(snapshot.as_ref(), stale)
+                            .as_object(),
+                    ) {
+                        o.extend(f.clone());
+                    }
+                    (200, out)
                 }
                 ("GET", id, Some("entries")) => {
                     // Paginated transcript read (#524). Replays the
@@ -1967,7 +1994,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    match run_session_turn_detailed(
+                    let turn = run_session_turn_detailed(
                         Arc::clone(&state.sessions),
                         id,
                         text,
@@ -1979,7 +2006,11 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         // an entry of this session newer than the snapshot
                         // was queued by THIS turn.
                         Some(&state.approvals),
-                    ) {
+                    );
+                    // The first turn gives the session a prompt to measure:
+                    // learn the context window off this request path (#573).
+                    warm_status(state, id);
+                    match turn {
                         // A turn waiting for an approval is not a refusal
                         // (#571). A stop that queued nothing (a pre-tool hook
                         // denial) is one: nothing waits for a decision.
@@ -2219,7 +2250,10 @@ fn with_idle_session(
     let Ok(mut guard) = st.storage.try_lock() else {
         return Err(busy());
     };
-    write(&mut guard).map_err(|(status, e)| (status, json!({"error": e})))
+    write(&mut guard).map_err(|(status, e)| (status, json!({"error": e})))?;
+    // A register changed: keep the last-known status snapshot current (#573).
+    st.refresh_status(&*guard);
+    Ok(())
 }
 
 /// `POST /sessions/{id}/compact` (#947): the TUI `/compact`, i.e.

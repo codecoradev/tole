@@ -2096,6 +2096,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(not(feature = "mcp-http"))]
                 anyhow::bail!("--transport mcp requires the mcp-http feature");
             }
+            // #573: the status snapshot resolves the window as `tole status`.
+            tole_cli::status::set_configured_window(
+                settings.context_window.as_ref().map(|w| w.value),
+            );
             crate::serve::run_serve(crate::serve::ServeConfig {
                 bind,
                 port,

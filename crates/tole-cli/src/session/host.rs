@@ -47,6 +47,69 @@ pub struct SessionState {
     /// The per-session profile's name (#740), fixed for this live session;
     /// `None` = opened without one.
     pub profile: Option<String>,
+    /// The last-known status snapshot (#573), refreshed whenever the session
+    /// is read idle, a turn settles or a register changes. A separate lock,
+    /// held only to copy or store, so the status route can read it while a
+    /// turn holds `storage`.
+    pub status: StdArc<Mutex<crate::session::status::StatusCell>>,
+}
+
+impl SessionState {
+    /// The configured model this session falls back to: its profile's, else
+    /// the provider configuration's (`None` when none resolves).
+    fn default_model(&self) -> Option<String> {
+        self.model
+            .clone()
+            .or_else(|| crate::turn_runner::provider_config().ok().map(|c| c.model))
+            .filter(|m| !m.trim().is_empty())
+    }
+
+    /// Re-read the status from `storage` (the caller holds its lock) and keep
+    /// it as the last-known snapshot. Pure: no network, no other lock than
+    /// the small status cell.
+    pub fn refresh_status(&self, storage: &impl Storage) -> crate::session::status::StatusSnapshot {
+        let default = self.default_model();
+        let mut cell = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = crate::session::status::take_snapshot(storage, default.as_deref(), &cell);
+        cell.store(snap.clone());
+        snap
+    }
+
+    /// The last-known snapshot, never touching `storage`.
+    pub fn last_status(&self) -> Option<crate::session::status::StatusSnapshot> {
+        self.status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
+            .cloned()
+    }
+
+    /// Ask the provider for the context window once the session has a prompt
+    /// to measure and none is known (a resumed session, or the first turn
+    /// just settled), then refresh the snapshot. Blocks on the network, so
+    /// callers run it off the request path. Never waits for a running turn.
+    pub fn warm_status(&self) {
+        let Ok(mut cfg) = crate::turn_runner::provider_config() else {
+            return;
+        };
+        if let Some(m) = self.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            cfg.model = m.to_string();
+        }
+        let model = {
+            let Ok(g) = self.storage.try_lock() else {
+                return;
+            };
+            if tole_core::compaction::last_prompt_tokens(&*g).is_none() {
+                return;
+            }
+            crate::turn_runner::session_model(&*g, &cfg.model)
+        };
+        if crate::session::status::detect_window(&self.status, &cfg, &model) {
+            if let Ok(g) = self.storage.try_lock() {
+                self.refresh_status(&*g);
+            }
+        }
+    }
 }
 
 /// What a host may fix for ONE session instead of taking the process-wide
@@ -526,7 +589,8 @@ fn open_session_inner(
     crate::tool_roster::register_todo(&mut reg, storage.entries(), plan_mode)
         .map_err(|e| e.to_string())?;
 
-    Ok(SessionState {
+    let state = SessionState {
+        status: StdArc::default(),
         storage: StdArc::new(Mutex::new(storage)),
         path: dir.join(format!("{session_id}.jsonl")),
         registry: StdArc::new(reg),
@@ -538,7 +602,9 @@ fn open_session_inner(
         tool_ids: StdArc::new(Mutex::new(0)),
         model: overrides.model,
         profile: overrides.profile,
-    })
+    };
+    state.refresh_status(&*state.storage.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(state)
 }
 
 /// The provider config of one turn: the process-wide one, with the session's
@@ -636,6 +702,7 @@ pub fn run_session_turn_detailed(
     // the transport loop stays live (CodeCora deadlock finding).
     let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
     let queue_mark = approvals.map(|q| q.mark());
+    let refresher = state.clone();
     let SessionState {
         storage,
         registry,
@@ -685,6 +752,8 @@ pub fn run_session_turn_detailed(
         crate::turn_runner::remember(memory.as_ref(), session_id, prompt, text, *wrote);
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
+    // The turn is over: the footer's last-known values are these (#573).
+    refresher.refresh_status(&*storage);
 
     if let tole_core::turn::TurnOutcome::Final { text, .. } = &outcome {
         final_text = Some(text.clone());
@@ -714,6 +783,7 @@ pub fn resume_session_turn(
     session_id: &str,
 ) -> Result<(String, Option<String>), String> {
     let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let refresher = state.clone();
     let SessionState {
         storage,
         registry,
@@ -740,6 +810,7 @@ pub fn resume_session_turn(
     };
     let outcome =
         crate::turn_runner::resume_turn_on(&mut *storage, &plan).map_err(|e| e.into_message())?;
+    refresher.refresh_status(&*storage);
     let final_text = match &outcome {
         tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
         _ => None,
@@ -809,6 +880,7 @@ mod eviction_tests {
             tool_ids: StdArc::new(Mutex::new(0)),
             model: None,
             profile: None,
+            status: StdArc::default(),
         }
     }
 
