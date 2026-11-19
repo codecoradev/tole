@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 mod common;
@@ -18,12 +18,15 @@ const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"p
 struct Server {
     child: Child,
     port: u16,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: common::TestDir,
 }
 
 impl Server {
     fn spawn() -> Self {
+        let home = common::TestDir::new("tole-mcp-http-home");
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args([
                 "serve",
                 "--transport",
@@ -37,7 +40,11 @@ impl Server {
             .stdout(Stdio::null());
             cmd
         });
-        Self { child, port }
+        Self {
+            child,
+            port,
+            _home: home,
+        }
     }
 
     fn connect(&self) -> TcpStream {

@@ -277,8 +277,9 @@ fn run_bounded_never_exceeds_the_limit() {
 #[test]
 fn cli_create_list_tick_round_trip() {
     let dir = tmp("bin");
+    let home = tmp("bin-home");
     let tole = |args: &[&str]| {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tole"))
+        let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .args(args)
             .env("TOLE_CRON_DIR", &dir)
             .current_dir(&dir)

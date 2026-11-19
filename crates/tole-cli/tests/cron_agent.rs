@@ -136,6 +136,21 @@ fn provider() {
                 });
             }
         });
+        // The agent runs in this process, so the hermetic env (#993) is
+        // set on the process itself: HOME and CODECORA_HOME in a test home,
+        // PATH without `cora`/`uteke` directories, no XDG overrides.
+        let home = TestDir::new("tole-cron-agent-home").keep();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CODECORA_HOME", &home);
+        std::env::set_var("PATH", common::path_without_sibling_binaries());
+        for var in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            std::env::remove_var(var);
+        }
         std::env::set_var("TOLE_BASE_URL", format!("http://{addr}/v1"));
         std::env::set_var("TOLE_MODEL", "mock-model");
         std::env::set_var("TOLE_API_KEY", "sk-test-cron-agent");
