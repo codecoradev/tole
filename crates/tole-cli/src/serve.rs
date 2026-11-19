@@ -1127,6 +1127,7 @@ fn open_serve_session(
     loading: bool,
     profile: Option<&SessionProfile>,
     record_profile: bool,
+    plan_mode: bool,
 ) -> Result<(), (u16, serde_json::Value)> {
     // Issue #200: non-preauthorized Writes queue for a remote
     // decision (deny now, resumable; allow = one-shot replay).
@@ -1159,7 +1160,9 @@ fn open_serve_session(
         session_id,
         cwd,
         loading,
-        state.plan_mode,
+        // A request can only turn plan mode ON for its session; a
+        // process-level plan mode (`--plan-mode`) is never switched off.
+        state.plan_mode || plan_mode,
         approver,
         memory,
         state.sessions_dir.as_deref(),
@@ -1318,7 +1321,7 @@ fn resume_session(
     let record = profile
         .as_ref()
         .is_some_and(|p| recorded != Ok(profiles::Recorded::Name(p.name.clone())));
-    match open_serve_session(state, id, cwd, true, profile.as_ref(), record) {
+    match open_serve_session(state, id, cwd, true, profile.as_ref(), record, false) {
         Ok(()) => {
             let mut out = json!({
                 "sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false
@@ -1542,6 +1545,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     )
                 }
             };
+            // Plan mode (#947): the same registry filter as `--plan-mode`
+            // (mutation tools absent). A request may turn it on for this
+            // session; there is no way to turn a process-level one off.
+            let plan_mode = match req.get("plan_mode") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return (400, json!({"error": "plan_mode must be a boolean"})),
+            };
             let requested = match req.get("cwd").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
                 None => state.workspace_root.to_string_lossy().into_owned(),
@@ -1562,7 +1573,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             match req.get("resume") {
                 None | Some(serde_json::Value::Null) => {}
                 Some(serde_json::Value::String(id)) => {
-                    return resume_session(state, id, cwd, profile)
+                    if plan_mode {
+                        return (
+                            400,
+                            json!({"error": "plan_mode applies when a session is created, not \
+                                    when one is resumed"}),
+                        );
+                    }
+                    return resume_session(state, id, cwd, profile);
                 }
                 Some(_) => return (400, json!({"error": "resume must be a session id string"})),
             }
@@ -1574,9 +1592,20 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
-            match open_serve_session(state, &session_id, cwd, false, profile.as_ref(), true) {
+            match open_serve_session(
+                state,
+                &session_id,
+                cwd,
+                false,
+                profile.as_ref(),
+                true,
+                plan_mode,
+            ) {
                 Ok(()) => {
                     let mut out = json!({"sessionId": session_id, "workspace": cwd});
+                    if plan_mode || state.plan_mode {
+                        out["planMode"] = json!(true);
+                    }
                     if let Some(p) = &profile {
                         out["profile"] = json!(p.name);
                     }
@@ -2353,6 +2382,68 @@ mod tests {
         let (status, payload) = route(&state, "POST", "/sessions", "{}");
         assert_eq!(status, 200, "{payload}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #947: `plan_mode` on `POST /sessions` removes the mutation tools from
+    /// that session's registry (absence, not approval); off by default; a bad
+    /// type is a 400; and a process-level plan mode cannot be disabled.
+    #[test]
+    fn plan_mode_request_filters_the_registry_and_cannot_disable_the_process_flag() {
+        let base = crate::test_dir::TestDir::new("tole-serve-plan-mode");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut state = test_state(root.clone(), sessions);
+        let cwd = root.to_str().unwrap();
+        let open = |state: &State, body: serde_json::Value| {
+            let (s, v) = route(state, "POST", "/sessions", &body.to_string());
+            (s, v)
+        };
+        let reg = |state: &State, v: &serde_json::Value| {
+            let id = v["sessionId"].as_str().unwrap().to_string();
+            let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+            st.registry.clone()
+        };
+
+        // Default: write tools present, no planMode on the wire.
+        let (s, v) = open(&state, json!({"cwd": cwd}));
+        assert_eq!(s, 200, "{v}");
+        assert!(v.get("planMode").is_none());
+        assert!(reg(&state, &v).get("write_file").is_some());
+
+        // Explicit false is the default too.
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": false}));
+        assert_eq!(s, 200, "{v}");
+        assert!(reg(&state, &v).get("write_file").is_some());
+
+        // On: mutation tools are absent, read tools stay.
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": true}));
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["planMode"], true);
+        let r = reg(&state, &v);
+        assert!(r.get("read_file").is_some());
+        for name in ["write_file", "run_command", "agent_start", "todo_write"] {
+            assert!(r.get(name).is_none(), "{name} in plan mode");
+        }
+
+        // Bad type, and the resume combination, are 400s.
+        for bad in [json!("yes"), json!(1), json!([true])] {
+            let (s, _) = open(&state, json!({"cwd": cwd, "plan_mode": bad}));
+            assert_eq!(s, 400);
+        }
+        let (s, _) = open(&state, json!({"resume": "x", "plan_mode": true}));
+        assert_eq!(s, 400);
+
+        // A process-level plan mode cannot be disabled by the request.
+        state.plan_mode = true;
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": false}));
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["planMode"], true);
+        assert!(reg(&state, &v).get("write_file").is_none());
+        let (s, v) = open(&state, json!({"cwd": cwd}));
+        assert_eq!(s, 200, "{v}");
+        assert!(reg(&state, &v).get("write_file").is_none());
     }
 
     /// Open a serve session in-process and settle one turn in its log, so
