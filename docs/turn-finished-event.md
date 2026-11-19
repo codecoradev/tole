@@ -259,7 +259,10 @@ gateway and any other receiver):
     when a destination lists an approval event. Option A therefore changes
     (a) the sender start condition to include `turn_finished`, (b) the per-event
     deadline and backoff tail, (c) the overflow rule of D8, plus a new doctor
-    counter. These are changes to a reviewed path.
+    counter. These are changes to a reviewed path. (Implemented; since #980 the
+    queue is drained by one worker thread per destination, so a hung receiver
+    delays neither another destination's `turn_finished` nor the approval
+    expiry timer: `webhook-delivery-design.md` section 4.)
   - Option B: the durable cron outbox. Survives a serve restart and gives the 6 h
     horizon, but the outbox, its validation rules, its reconcile pass and its
     ledger rows are keyed to a cron `fire_id`; a turn event has none, so this is
