@@ -1286,3 +1286,34 @@ another tool executes, an oversized or truncated request. `Destructive` stays
 unreachable (a delegated child is not interactive, so those tools are not
 registered). A discussion participant (#704) never asks and never decides: it
 stays read-only.
+
+### Approval auto mode (#995, proposed, design only)
+
+Design: [approval-auto-mode.md](approval-auto-mode.md). Nothing here is
+implemented; the rows record what the implementation must hold. With the
+feature off (the default) every row of "Remote approver trust boundary (#200)"
+stands unchanged: an unanswered approval expires to denied. With it on for a
+profile, "no answer" can become an allow, so the boundary moves from "a person
+holding the serve token" to "a person, or a judge call after a silence". It is
+opt-in per profile in the **user** config (a project config cannot enable it),
+and it reaches only a positive allow-list of classes computed by code before
+any model runs.
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| **Silence turned into consent** (an attacker floods or waits for the owner to be away, so no answer becomes an allow) | Default off; user config only; only the `workspace_edit` and `todo` classes can be candidates; the judge runs once, after `after_secs` (default 600), and the human can still decide until the 900 s hard expiry; per-session and per-hour caps; one auto verdict per (session, fingerprint) | An approved edit to an ordinary source file runs with nobody having read it. Reviewable afterwards in version control and the audit register, not preventable. This is the accepted cost of the feature |
+| **Prompt injection of the judge** (a crafted path or argument says "answer allow") | The judge is a separate call with a compiled policy prompt, no tools, no transcript, and a closed input struct (tool, risk, class, workspace-relative target, redacted capped summary); strict JSON answer; only `allow` with `high` confidence approves; eligibility is decided by code, so a fooled judge cannot approve an ineligible call | A fooled judge can approve a call in the eligible class. The class limit is the control, the judge is not |
+| **The asker judging itself** | The judge call shares no context with the turn that asked and sees none of its text beyond the capped summary; a dedicated judge model is recommended | A judge on the session's own model shares its weaknesses (decision A3) |
+| **A class widened by mistake** (a new tool, an MCP tool, a relaxed sandbox) | Positive allow-list: a tool is `Never` until a code change lists it; a table test pins the set; MCP tools (always `Write`), `run_command`, `job_start`, egress, secrets, trust, skills, plugins, sandbox relaxation, config and data dirs, writes outside the workspace guard, `target = None`, spawned work and `Destructive` are never eligible; a config may only narrow | A future PR that adds a class is a trust decision and must say so in its title |
+| **Race between a human and the judge** (a human decides as the judge answers; a late deny after an allow) | One transition out of `Pending` under the queue lock, shared by the human route, the hard expiry and the judge; the loser is discarded and not audited as a decision; the judge claim makes it run once; a human decision after an auto decision is 409 | A call already resumed by an auto allow cannot be recalled by a later human deny |
+| **Fail-open by error** (provider down, timeout, malformed or partial answer, panic, audit write failure, budget refusal, restart) | Every path leaves the entry denied or expired and no one-shot; an allow is audited before the resume starts and a failed audit turns it into a deny | None for correctness; availability of auto mode is best effort |
+| **A decision indistinguishable from a human one** | `decidedBy` / `source` (`human`, `auto`, `timeout`) in the session register, `GET /approvals`, the event stream and `approval_resolved`; the register holds the model name, class, confidence, redacted reason and an input hash | A receiver that ignores the field treats it like a human decision (documented duty: information, not authority) |
+| **Leak through the judge or its audit** (a secret in an argument reaches the provider, the register or a webhook) | Input and reason go through the same process secret redaction as every egress, are capped, and the reason text never leaves the session register (events and listings carry a reason code only); the judge goes to the provider the session already uses | A secret not in the redaction set is sent as the call's own summary, as it would be to the session's provider anyway |
+| **Cost and loop abuse** (a looping agent re-asks until the judge says allow; token spend) | One verdict per fingerprint, per-session and hourly caps, small `max_tokens`, usage recorded on the session, a budget refusal is a deny | The exact budget counter is open (design decision A10) |
+| **Unattended callers** (parked cron runs, missions) | Not eligible in v1 (`unattended_scope`) | Revisit after use (decision A6) |
+
+Never auto-approved, and why: anything that executes attacker-influenced code,
+leaves the host, changes what is trusted, handles a secret, or cannot be judged
+from a one-line redacted summary. An editor's changes to a source file are the
+only class left, because they are the one kind of change that can be reviewed
+and reverted after the fact.
