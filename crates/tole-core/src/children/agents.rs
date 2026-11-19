@@ -485,9 +485,18 @@ fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
 /// Soft failure — cleanup is an optimization; the durable child JSONL is
 /// the real archive.
 fn clean_mailbox(ns: &str) {
+    clean_mailbox_with("uteke", ns);
+}
+
+/// [`clean_mailbox`] with an explicit uteke binary, so a test can aim it at
+/// a stand-in without touching the process-wide `PATH`.
+fn clean_mailbox_with(bin: &str, ns: &str) {
     // Deleting a room only unlinks its memories, so forget them first.
-    forget_listed(&["room", "recall", "--limit", "1000", "--json", "--", ns]);
-    let mut drop_room = Command::new("uteke");
+    forget_listed(
+        bin,
+        &["room", "recall", "--limit", "1000", "--json", "--", ns],
+    );
+    let mut drop_room = Command::new(bin);
     crate::subprocess::scrub_env_for(&mut drop_room, "uteke");
     if crate::subprocess::point_uteke_at_data_dir(&mut drop_room).is_err() {
         return;
@@ -497,13 +506,16 @@ fn clean_mailbox(ns: &str) {
         .stdin(Stdio::null());
     let _ =
         crate::subprocess::run_with_timeout(&mut drop_room, crate::subprocess::SUBPROCESS_TIMEOUT);
-    forget_listed(&["list", "--namespace", ns, "--limit", "1000", "--json"]);
+    forget_listed(
+        bin,
+        &["list", "--namespace", ns, "--limit", "1000", "--json"],
+    );
 }
 
 /// `uteke forget --confirm <id>` for every memory a listing returns (flat
 /// `{"id"}` or nested `{"memory": {"id"}}` items).
-fn forget_listed(list_args: &[&str]) {
-    let mut list = Command::new("uteke");
+fn forget_listed(bin: &str, list_args: &[&str]) {
+    let mut list = Command::new(bin);
     crate::subprocess::scrub_env_for(&mut list, "uteke");
     if crate::subprocess::point_uteke_at_data_dir(&mut list).is_err() {
         return;
@@ -528,7 +540,7 @@ fn forget_listed(list_args: &[&str]) {
             .get("id")
             .and_then(Value::as_str)
     }) {
-        let mut cmd = Command::new("uteke");
+        let mut cmd = Command::new(bin);
         crate::subprocess::scrub_env_for(&mut cmd, "uteke");
         if crate::subprocess::point_uteke_at_data_dir(&mut cmd).is_err() {
             return;
@@ -1235,7 +1247,8 @@ mod tests {
     use super::*;
 
     /// #992: the mailbox cleanup uses `<CODECORA_HOME>/uteke`, never the
-    /// store under the real HOME, and does not run at all on a relative one.
+    /// store under the real HOME (the relative-`CODECORA_HOME` case is in
+    /// `tests/uteke_store_home.rs`, whose process owns its environment).
     #[cfg(unix)]
     #[test]
     fn mailbox_cleanup_uses_the_codecora_home_store() {
@@ -1252,24 +1265,21 @@ mod tests {
              case \"$1\" in room) [ \"$2\" = recall ] && echo '[{\"id\":\"m1\"}]';; \
              list) echo '[{\"id\":\"m2\"}]';; esac\nexit 0\n",
         );
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        // The stand-in is passed by path: the process-wide PATH is never
+        // touched, so no concurrent test can reach it.
+        let fake = bin.join("uteke").display().to_string();
         let (d, c) = (decoy.to_str().unwrap(), cc.to_str().unwrap());
         // Built at run time: a secret-shaped variable the child must not see.
         let secret = format!("{}-{}", "mailbox", "scrub-992-0123456789");
         crate::paths::with_env(
             &[
-                ("PATH", Some(&path)),
                 ("HOME", Some(d)),
                 ("CODECORA_HOME", Some(c)),
                 ("UTEKE_HOME", None),
                 ("TOLE_T992_API_KEY", Some(&secret)),
             ],
             || {
-                clean_mailbox("mbox");
+                clean_mailbox_with(&fake, "mbox");
                 let log = std::fs::read_to_string(cc.join("uteke/calls.log")).unwrap();
                 let lines: Vec<&str> = log.lines().collect();
                 assert_eq!(
@@ -1289,12 +1299,6 @@ mod tests {
                 let env_log = std::fs::read_to_string(cc.join("uteke/env.log")).unwrap();
                 assert_eq!(env_log.lines().count(), 5);
                 assert!(env_log.lines().all(|l| l == "stripped"), "{env_log}");
-                // Relative: nothing runs.
-                std::env::set_var("CODECORA_HOME", "rel-home");
-                std::fs::remove_file(cc.join("uteke/calls.log")).unwrap();
-                clean_mailbox("mbox");
-                assert!(!cc.join("uteke/calls.log").exists());
-                assert!(!decoy.join(".codecora").exists());
             },
         );
     }
