@@ -53,7 +53,8 @@ Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), `tole serve` (REST + multi-session
 MCP-over-HTTP daemon), and the inline terminal UI (`tole-tui`, bare
-`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)). Identity (owner-approved): a chat-first
+`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)); what the faces share and the
+few differences that are deliberate are in [docs/faces.md](docs/faces.md). Identity (owner-approved): a chat-first
 personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
