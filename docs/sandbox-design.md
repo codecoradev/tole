@@ -67,8 +67,8 @@ the owner's user.
 - **Anything tole does in-process:** file tools, `web_fetch`, the `gh`
   and `git` tools, HTTP MCP servers. They are governed by the approver,
   the workspace jail and the redactor, not by this sandbox.
-- **Resource exhaustion** beyond simple rlimits (§12): no cgroup limits in
-  the first phases.
+- **Resource exhaustion** beyond simple rlimits (§12): no cgroup limits;
+  evaluated and deferred in §12.1.
 - **Other platforms** (§13).
 
 ## 3. Feasibility (probed in this container, 2026-11-13)
@@ -1321,6 +1321,98 @@ Names only, never values or argument contents:
   `--size`. cgroup memory and PID limits need systemd or a delegated
   cgroup and are not in the first phases.
 
+### 12.1 cgroup limits: evaluated 2026-11-19 (#748), deferred
+
+Question: are cgroup limits cheap enough to add under `[sandbox.consumers]`?
+Verdict: **no, deferred.** Nothing in the code changes; this section records
+why and when to look again.
+
+**What the rlimits bound today** (`Limits` in `sandbox/command.rs`, set between
+fork and exec of `bwrap`, inherited, not raisable from inside): CPU time per
+process (`cpu_secs`, 3 600 s), address space per process (`memory_mb`,
+16 384 MiB), processes and threads (`processes`, 4 096, counted per user
+namespace so only the sandbox's own), and the largest file a process may write
+(`file_size_mb`, 4 096 MiB). A timeout or cancel kills the `bwrap` process and
+`--die-with-parent` takes the tree with it (§9.3, §9.5).
+
+**What they cannot bound, and cgroups could:**
+
+- Aggregate memory of the tree: `RLIMIT_AS` is per process and counts address
+  space, not resident memory, so N processes may use N x 16 GiB of address
+  space, and the `/tmp` tmpfs is not size-limited. A cgroup `memory.max`
+  bounds resident memory plus tmpfs of the whole tree and OOM-kills inside it.
+- Total CPU of the tree (`RLIMIT_CPU` is per process) and a wall-clock budget
+  inside the sandbox (only the caller's timeout exists, and it kills `bwrap`).
+- A fork bomb below the `processes` ceiling that is still harmful, and a
+  `pids.max` that does not depend on user-namespace accounting.
+- Reliable kill of the whole tree (`cgroup.kill`) instead of relying on
+  `--die-with-parent` and the PID namespace.
+
+**How an unprivileged tole could get a cgroup (cgroup v2):**
+
+1. `systemd-run --user --scope -p MemoryMax=.. -p TasksMax=..`: needs systemd
+   as PID 1, a user manager and a session bus (`DBUS_SESSION_BUS_ADDRESS` or
+   `XDG_RUNTIME_DIR`), and the memory and pids controllers delegated to the
+   user. Common on desktops and some hosted CI runners; absent in containers
+   and under `sudo`/`su` without a session.
+2. A delegated subtree: the manager (or a container runtime started with a
+   writable cgroup namespace) hands the user a subtree; tole creates a child,
+   writes `memory.max` and `pids.max`, moves the child into `cgroup.procs`.
+   Needs v2, writable delegation, and the "no internal process" rule
+   (controllers enabled in `cgroup.subtree_control` only on a group with no
+   processes of its own), so tole's own cgroup has to be moved aside first.
+
+**Where it is unavailable.** macOS and Windows (no cgroups; Windows Job objects
+are a different mechanism); Linux without v2 or without delegation; most
+containers and CI jobs (the cgroup tree is read-only or owned by the runtime);
+and the host this section was probed on (2026-11-19): a v1 hybrid hierarchy
+(`/sys/fs/cgroup/{memory,pids,...}` v1, a `cgroup2` mount at
+`/sys/fs/cgroup/unified` with root-owned, read-only `dr-xr-xr-x` and
+`cgroup.subtree_control` empty), `systemd-run` installed but no bus
+(`systemd-run --user --scope true`: "Failed to connect to bus: No medium
+found"), PID 1 not systemd. tole already READS cgroup v2 files, read-only, in
+`delegation/resource_guard.rs`; reading is not delegation.
+
+**Failure mode if it were built.** It would have to follow the three-state rule
+(§10): a new per-consumer key (for example `memory_limit = "cgroup"`) in
+`[sandbox.consumers]`; `required` refuses when no cgroup can be created, with
+the reason and remedy; `optional` runs with rlimits only and a once-per-process
+warning and ledger line naming that the cgroup limit is NOT applied, and in an
+unattended run counts as `required`; `off` is today. Never a silent downgrade,
+so the value cannot be an implicit default.
+
+**Cost.** Roughly 400 to 600 lines: a v2 and delegation probe (cached like the
+bwrap probe, with the transient-failure rule), a per-launch cgroup create,
+limit write, attach and cleanup that survives a killed tole (a leaked cgroup
+needs a sweeper), the two launch paths (systemd-run wrapper vs. direct), config
+keys and `tole config check`/`doctor` lines, and the `Limits` validation ranges.
+**Tests cannot run unprivileged in CI.** The GitHub-hosted `ubuntu` runner has
+no delegated user cgroup, and the `sandbox-bwrap` job (`ci.yml`) is built for
+bubblewrap only; a test of the real limit needs either root or a systemd user
+manager, so it would be a skip-on-absent test with `TOLE_REQUIRE_*` plumbing and
+a privileged job, the same cost the bwrap job already carries, for a second
+backend. Pure parsing and policy decisions are unit-testable; the enforcement
+(the point of the feature) is not.
+
+**Why deferred.** Not small (several hundred lines plus a privileged CI job and
+leak cleanup), not available where most users and every CI run are, and its
+failure mode is a new class of `optional` that quietly does less on the hosts
+that most need it. The rlimits plus the caller's timeout already bound a single
+runaway process and the whole tree's lifetime.
+
+**Revisit when** one of these holds: (a) a measured incident or report of
+tree-aggregate memory or fork exhaustion from a sandboxed consumer that the
+rlimits did not stop; (b) the Linux hosts tole targets mostly provide a
+delegated v2 user cgroup (systemd user manager) and a CI runner that does, so
+the enforcement is testable unprivileged; (c) a smaller way is found, such as a
+bubblewrap or `prlimit` option that bounds the tree without a cgroup.
+
+**What the sandbox still does not cover for resources.** Aggregate memory and
+CPU of the process tree, a tmpfs filled to memory, wall-clock inside the
+sandbox (the caller's timeout only), disk space outside file-size limits (many
+files under the writable workspace), and everything on macOS and Windows where
+there is no sandbox at all. See §2.2.
+
 ## 13. Platforms
 
 - **Linux:** the design above. Requires unprivileged user namespaces
@@ -1387,7 +1479,7 @@ entry.
 6. **Tool retrieval by meaning** (~900, may split): the search tool over
    third-party definitions through the skills index seam.
 7. **Not planned (owner decisions 3 and 4):** a macOS backend and an
-   inner Landlock layer. Cgroup limits remain later work.
+   inner Landlock layer. Cgroup limits are evaluated and deferred (§12.1).
 
 ## 16. Owner decisions
 
