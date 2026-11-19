@@ -58,7 +58,9 @@ pub const MAX_PARTICIPANTS: usize = 16;
 pub const RECOMMENDED_PARTICIPANTS: usize = 8;
 /// Most acceptance criteria.
 pub const MAX_CRITERIA: usize = 12;
-/// Longest question, criterion and contribution kept, in characters.
+/// Longest question, criterion and contribution, in characters. A question or
+/// criterion over its limit is refused, never cut; only a contribution (a
+/// model's output) is capped.
 pub const MAX_QUESTION_CHARS: usize = 2000;
 pub const MAX_CRITERION_CHARS: usize = 400;
 pub const MAX_CONTRIBUTION_CHARS: usize = 8000;
@@ -179,7 +181,18 @@ impl Contract {
                 "discussion id {id:?}: lowercase letters, digits and '-', up to 48"
             ));
         }
-        let question = sanitize(question, secrets, MAX_QUESTION_CHARS).text;
+        let q = sanitize(question, secrets, MAX_QUESTION_CHARS);
+        if q.truncated {
+            // Never cut the question silently: every participant and the
+            // ledger contract would see a partial payload and believe it whole.
+            return Err(format!(
+                "the question is {} characters, over the {MAX_QUESTION_CHARS}-character limit; \
+                 nothing was dropped and nothing started. Shorten it (put long data in a file \
+                 the participants can read) and try again",
+                question.chars().count()
+            ));
+        }
+        let question = q.text;
         if question.trim().is_empty() {
             return Err("the question is empty".into());
         }
@@ -192,12 +205,18 @@ impl Contract {
         let criteria: Vec<String> = criteria
             .iter()
             .map(|c| {
-                sanitize(c, secrets, MAX_CRITERION_CHARS)
-                    .text
-                    .trim()
-                    .to_string()
+                let s = sanitize(c, secrets, MAX_CRITERION_CHARS);
+                if s.truncated {
+                    return Err(format!(
+                        "an acceptance criterion is {} characters, over the \
+                         {MAX_CRITERION_CHARS}-character limit; nothing was dropped and nothing \
+                         started. Shorten it and try again",
+                        c.chars().count()
+                    ));
+                }
+                Ok(s.text.trim().to_string())
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         if criteria.iter().any(String::is_empty) {
             return Err("an acceptance criterion is empty".into());
         }
