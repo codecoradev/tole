@@ -33,6 +33,8 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Prompt with images | `POST /sessions/{id}/prompt` `{text, images: [<id>]}` (#558) | the turn records the references, never the blob |
 | Read an image | `GET /sessions/{id}/images/{fnv1a64}` (#558) | only images recorded in that session's log |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
+| Request a compaction | `POST /sessions/{id}/compact` (#947) | `200 {"id", "compaction": "requested"}`: the TUI `/compact` (the forced pass of #481). It records the request in the log; the session's NEXT prompt compacts first, when compaction is enabled. No model call runs in the route, and there are no instructions field. `404` unknown session, `409` while a turn runs |
+| Rename a session | `POST /sessions/{id}/name` `{"name": "<label>"}` (#947) | `200 {"id", "name"}` (the trimmed label): the TUI `/name` (the `fact/session_name` register). `400` for a missing, blank, control-character or over-120-character name, `404` unknown session, `409` while a turn runs |
 
 The round trip the app must support (the cross-repo acceptance):
 
