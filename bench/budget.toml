@@ -59,10 +59,10 @@ baseline = 11.8
 ceiling = 16
 
 [aarch64-linux.active_rss_mb]
-# Provisional: the first draft measured the harness's RSS here (see the
-# x86_64 note), so no valid baseline exists yet. Lowered from this PR's CI
-# numbers in a follow-up commit.
-ceiling = 33
+# Baseline from this PR's CI after the VmHWM fix (16.5 MB; the first draft
+# measured the harness's RSS here). Headroom x1.3.
+baseline = 16.5
+ceiling = 22
 
 [aarch64-linux.per_turn_ms]
 baseline = 3.3
