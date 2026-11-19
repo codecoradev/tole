@@ -122,6 +122,9 @@ pub struct SkillRecall {
     pub profile: Option<String>,
     /// The index for `uteke` mode; `None` = uteke unavailable.
     pub index: Option<Arc<dyn SkillIndex>>,
+    /// One startup note about which uteke surface `index` uses, when it
+    /// is not the skill surface (#973).
+    pub index_note: Option<String>,
     /// Redacted from every query before it reaches the index.
     pub secrets: SecretSet,
     /// What may load (#591): every listed, recalled, searched or loaded
@@ -173,18 +176,41 @@ impl SkillIndex for RedactingIndex {
     }
 }
 
+/// The uteke index to use: the 0.24 skill surfaces when the binary has the
+/// `skill` subcommand, else the `uteke doc` adapter, with one note (#973).
+#[cfg(feature = "shell-tools")]
+fn uteke_index() -> (Arc<dyn SkillIndex>, Option<String>) {
+    let skill = tole_core::skill_index::UtekeSkillIndex::default();
+    if skill.supported() {
+        (Arc::new(skill), None)
+    } else {
+        (
+            Arc::new(tole_core::skill_index::UtekeDocIndex::default()),
+            Some(
+                "uteke has no `skill` subcommand (needs >= 0.24.1): skill recall uses `uteke doc` instead"
+                    .into(),
+            ),
+        )
+    }
+}
+
 impl SkillRecall {
     /// From the environment, with the real `uteke` binary when it is on
     /// PATH.
     pub fn from_env(brief: Option<&str>) -> Result<Self, String> {
         let settings = RecallSettings::from_env(&crate::config_apply::real_env)?;
         #[cfg(feature = "shell-tools")]
-        let index: Option<Arc<dyn SkillIndex>> = (settings.mode == IndexMode::Uteke
-            && crate::tool_roster::binary_available("uteke"))
-        .then(|| Arc::new(tole_core::skill_index::UtekeDocIndex::default()) as _);
+        let (index, index_note) =
+            if settings.mode == IndexMode::Uteke && crate::tool_roster::binary_available("uteke") {
+                let (i, n) = uteke_index();
+                (Some(i), n)
+            } else {
+                (None, None)
+            };
         #[cfg(not(feature = "shell-tools"))]
-        let index: Option<Arc<dyn SkillIndex>> = None;
+        let (index, index_note): (Option<Arc<dyn SkillIndex>>, Option<String>) = (None, None);
         Ok(Self {
+            index_note,
             settings,
             brief: brief.map(str::to_string),
             profile: crate::config_apply::profile_name(),
@@ -207,7 +233,10 @@ pub fn skills_section(
     let mut notes = tole_core::skills::listing_notes(ws);
     notes.extend(crate::skill_approve::startup_note(ws, &recall.gate));
     let index = match (recall.settings.mode, &recall.index) {
-        (IndexMode::Uteke, Some(index)) => Some(index.clone()),
+        (IndexMode::Uteke, Some(index)) => {
+            notes.extend(recall.index_note.clone());
+            Some(index.clone())
+        }
         (IndexMode::Uteke, None) => {
             notes.push(format!(
                 "{INDEX_ENV}=uteke but the uteke binary is not available: listing every skill"
@@ -344,8 +373,12 @@ pub fn cli(action: IndexAction) -> anyhow::Result<()> {
     if !crate::tool_roster::binary_available("uteke") {
         anyhow::bail!("the uteke binary is not on PATH; the skill index needs it");
     }
+    let (inner, note) = uteke_index();
+    if let Some(n) = note {
+        eprintln!("tole: {n}");
+    }
     let index = RedactingIndex::new(
-        Arc::new(tole_core::skill_index::UtekeDocIndex::default()),
+        inner,
         crate::provider_chain::process_secrets(&crate::config_apply::real_env),
     );
     let root = |ws: Option<std::path::PathBuf>| -> anyhow::Result<std::path::PathBuf> {
@@ -515,6 +548,7 @@ mod tests {
                 ..RecallSettings::default()
             },
             brief: Some("ship the release".into()),
+            index_note: None,
             profile: None,
             index: Some(Arc::new(Fixed(vec!["beta", "gamma"]))),
             secrets: SecretSet::default(),
@@ -643,6 +677,7 @@ mod tests {
                 ..RecallSettings::default()
             },
             brief: Some(format!("deploy with key {secret} today")),
+            index_note: None,
             profile: Some("coder".into()),
             index: Some(seen.clone()),
             secrets: SecretSet::default().with("DEPLOY_TOKEN", secret),

@@ -106,11 +106,21 @@ semantic conflict, for example two PRs editing the same tests; #806). So:
 - After every merge, look at the push-to-`develop` CI run (it runs on every
   merge since #762). A red `develop` stops merging until it is fixed or
   reverted; do not stack more PRs on it.
-- Preferred, and an owner setting: require branches to be up to date before
-  merging on `develop` (strict required status checks), or a merge queue on
-  `develop` and `main`, so CI runs on the merge result and this rule is
-  enforced instead of remembered. A repository ruleset can only be changed
-  by the owner; until it is, the rules above apply.
+- Preferred, and an owner setting: a merge queue on `develop`, so CI runs on
+  the merge result and this rule is enforced instead of remembered. `CI`,
+  `Security` and the PR metadata workflows already run on `merge_group`
+  events with the same check names, so the queue can be switched on without
+  touching the workflows. `Cora Review`, `Message Standard`, `PR Description`
+  and `Conventional Commits` judge the PR itself and are skipped (they report
+  success) on a queue entry; they stay enforced on the PR head. Why a queue
+  and not "require branches to be up to date": a queue costs one CI run
+  (about 8 minutes) per PR, while strict mode makes every open PR re-run
+  after every merge, and the 12 to 30 minute Cora Review job with it.
+  Owner click-path: Settings, Rules, Rulesets, `develop protection`, tick
+  "Require merge queue" (merge method Squash, build concurrency 5, minimum
+  group size 1, status check timeout 60 minutes), keep the ten required
+  checks as they are. A repository ruleset can only be changed by the owner;
+  until it is, the rules above apply.
 
 ## Local review before a PR
 

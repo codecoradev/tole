@@ -5,6 +5,9 @@ on:
     branches: [develop, main]
   push:
     branches: [main, develop]
+  # Merge queue (#806): the same jobs run on the merge result a queue builds.
+  # Inert until the owner enables a merge queue; no job or check name changes.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
