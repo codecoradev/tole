@@ -60,6 +60,17 @@ pub struct SessionOverrides {
     pub profile: Option<String>,
 }
 
+static SERVER_SKILLS: std::sync::OnceLock<crate::session::assemble::ServerSkills> =
+    std::sync::OnceLock::new();
+
+/// Fix the process's skills choice for server sessions (#945), once at
+/// startup: the owner's `--skill` files and `--no-skills`. Unset means no
+/// explicit skills (approved workspace skills still load). The first call
+/// wins.
+pub fn set_server_skills(skills: crate::session::assemble::ServerSkills) {
+    let _ = SERVER_SKILLS.set(skills);
+}
+
 /// Why a soft interrupt was not queued (#377).
 #[derive(Debug, PartialEq, Eq)]
 pub enum InterruptRefusal {
@@ -360,6 +371,41 @@ pub fn open_session_with(
     plan_emitter: Option<PlanEmitter>,
     overrides: SessionOverrides,
 ) -> Result<SessionState, String> {
+    let skills = SERVER_SKILLS.get().cloned().unwrap_or_default();
+    open_session_inner(
+        session_id,
+        cwd,
+        loading,
+        plan_mode,
+        approver,
+        memory,
+        sessions_dir_override,
+        turnend,
+        parent_allows,
+        cancel,
+        plan_emitter,
+        overrides,
+        &skills,
+    )
+}
+
+/// [`open_session_with`] under an explicit skills choice (tests inject one).
+#[allow(clippy::too_many_arguments)]
+fn open_session_inner(
+    session_id: &str,
+    cwd: &str,
+    loading: bool,
+    plan_mode: bool,
+    approver: impl tole_core::approval::Approver + 'static,
+    memory: Option<MemoryConfig>,
+    sessions_dir_override: Option<&std::path::Path>,
+    turnend: Vec<String>,
+    parent_allows: Vec<String>,
+    cancel: tole_core::cancel::CancelToken,
+    plan_emitter: Option<PlanEmitter>,
+    overrides: SessionOverrides,
+    skills: &crate::session::assemble::ServerSkills,
+) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
         .canonicalize()
@@ -428,13 +474,33 @@ pub fn open_session_with(
         let st = tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?;
         let prompt = explicit_prompt.or_else(|| st.system_prompt().map(str::to_string));
+        // Append-only (#945): a resumed session keeps its pinned prompt and
+        // gains no skills section. When that prompt already lists skills,
+        // `load_skill` is registered again so the listing stays usable.
+        if prompt
+            .as_deref()
+            .is_some_and(crate::session::assemble::prompt_has_skills_index)
+        {
+            crate::session::assemble::server_session_skills(skills, &workspace_canon, &mut reg)
+                .map_err(|e| e.to_string())?;
+        }
         (st, prompt)
     } else {
-        let prompt = crate::session::assemble::server_session_prompt(
-            explicit_prompt,
-            plan_mode,
-            &workspace_canon,
-            &reg,
+        // Skills (#945): approved ones only, from the session workspace; the
+        // sections append to the pinned prompt, `load_skill` joins the
+        // registry. Before the session file exists, so a broken explicit
+        // skill leaves nothing behind.
+        let sections =
+            crate::session::assemble::server_session_skills(skills, &workspace_canon, &mut reg)
+                .map_err(|e| e.to_string())?;
+        let prompt = format!(
+            "{}{sections}",
+            crate::session::assemble::server_session_prompt(
+                explicit_prompt,
+                plan_mode,
+                &workspace_canon,
+                &reg,
+            )
         );
         let st = create_session(&dir, session_id, Some(&prompt), None, Some("server"))
             .map_err(|e| format!("creating session: {e}"))?;
@@ -1037,5 +1103,248 @@ mod roster_tests {
             assert_eq!(s.system_prompt.as_deref(), want, "{id}");
             assert_eq!(pinned(&s).as_deref(), want, "{id} header");
         }
+    }
+}
+
+/// #945 capability 3: server sessions load approved skills, discovered in the
+/// session workspace only.
+#[cfg(test)]
+mod server_skills_tests {
+    use super::*;
+    use crate::session::assemble::ServerSkills;
+    use std::sync::Arc;
+    use tole_core::approval::AllowlistApprover;
+    use tole_core::skill_approval::{read_package, Approvals, Gate};
+
+    fn write_skill(root: &std::path::Path, name: &str, body: &str) {
+        let d = root.join("skills").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: \"d {name}\"\n---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    fn approved(ws: &std::path::Path, names: &[&str]) -> Gate {
+        let mut a = Approvals::default();
+        for n in names {
+            a.approve(&read_package(Some(ws), n).unwrap(), 1);
+        }
+        Gate::Approved(Arc::new(a))
+    }
+
+    fn cfg(gate: Gate) -> ServerSkills {
+        ServerSkills {
+            gate_override: Some(gate),
+            ..Default::default()
+        }
+    }
+
+    fn open_with(
+        ws: &std::path::Path,
+        id: &str,
+        loading: bool,
+        skills: &ServerSkills,
+    ) -> SessionState {
+        open_session_inner(
+            id,
+            ws.to_str().unwrap(),
+            loading,
+            false,
+            AllowlistApprover::allow_only(vec![]),
+            None,
+            Some(&ws.join("sessions")),
+            Vec::new(),
+            Vec::new(),
+            tole_core::cancel::CancelToken::default(),
+            None,
+            SessionOverrides::default(),
+            skills,
+        )
+        .unwrap()
+    }
+
+    fn pinned(s: &SessionState) -> Option<String> {
+        s.storage
+            .lock()
+            .unwrap()
+            .system_prompt()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn approved_skill_loads_into_the_pinned_prompt_and_registers_load_skill() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-approved");
+        write_skill(&ws, "okskill", "do the ok thing");
+        let s = open_with(&ws, "s1", false, &cfg(approved(&ws, &["okskill"])));
+        let p = s.system_prompt.clone().unwrap();
+        assert!(p.contains("# Skills available"), "{p}");
+        assert!(p.contains("okskill"), "{p}");
+        assert!(!p.contains("unavailable"), "{p}");
+        assert_eq!(pinned(&s), Some(p));
+        let t = s.registry.get("load_skill").expect("load_skill registered");
+        assert_eq!(t.risk(), tole_core::tool::Risk::ReadOnly);
+        let out = t
+            .execute(serde_json::json!({"name": "okskill"}))
+            .expect("approved skill loads");
+        assert!(out.to_string().contains("do the ok thing"), "{out}");
+    }
+
+    #[test]
+    fn unapproved_and_revoked_skills_are_never_loaded() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-unapproved");
+        write_skill(&ws, "okskill", "ok body");
+        write_skill(&ws, "newskill", "SECRET-NEW-BODY");
+        write_skill(&ws, "oldskill", "SECRET-OLD-BODY");
+        // Approved then revoked: the ledger no longer names it.
+        let mut a = Approvals::default();
+        a.approve(&read_package(Some(&ws), "okskill").unwrap(), 1);
+        a.approve(&read_package(Some(&ws), "oldskill").unwrap(), 1);
+        assert!(a.revoke("oldskill"));
+        let s = open_with(&ws, "s2", false, &cfg(Gate::Approved(Arc::new(a))));
+        let p = s.system_prompt.clone().unwrap();
+        for name in ["newskill", "oldskill"] {
+            assert!(
+                p.contains(&format!("{name} {}", tole_core::skills::UNAPPROVED_MARK)),
+                "{name} is listed as unavailable only: {p}"
+            );
+            let err = s
+                .registry
+                .get("load_skill")
+                .unwrap()
+                .execute(serde_json::json!({"name": name}))
+                .unwrap_err();
+            assert!(err.contains("approv"), "{err}");
+        }
+        assert!(!p.contains("SECRET"), "{p}");
+    }
+
+    #[test]
+    fn a_changed_skill_needs_a_new_approval() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-changed");
+        write_skill(&ws, "okskill", "v1");
+        let gate = approved(&ws, &["okskill"]);
+        write_skill(&ws, "okskill", "v2 SECRET-CHANGED");
+        let s = open_with(&ws, "s3", false, &cfg(gate));
+        let p = s.system_prompt.unwrap();
+        assert!(!p.contains("SECRET-CHANGED"), "{p}");
+        assert!(p.contains("not approved"), "{p}");
+    }
+
+    #[test]
+    fn a_skill_outside_the_session_workspace_is_not_discovered() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-ws");
+        let other = crate::test_dir::TestDir::new("tole-sk-other");
+        write_skill(&other, "elsewhere", "ELSEWHERE-BODY");
+        let gate = approved(&other, &["elsewhere"]);
+        let s = open_with(&ws, "s4", false, &cfg(gate));
+        let p = s.system_prompt.unwrap();
+        assert!(!p.contains("elsewhere") && !p.contains("ELSEWHERE"), "{p}");
+    }
+
+    #[test]
+    fn no_skills_loads_nothing_and_registers_nothing() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-off");
+        write_skill(&ws, "okskill", "ok body");
+        let mut c = cfg(approved(&ws, &["okskill"]));
+        c.no_skills = true;
+        let s = open_with(&ws, "s5", false, &c);
+        let p = s.system_prompt.unwrap();
+        assert!(!p.contains("okskill"), "{p}");
+        assert!(s.registry.get("load_skill").is_none());
+    }
+
+    #[test]
+    fn explicit_process_skills_append_as_on_the_cli() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-explicit");
+        write_skill(&ws, "mine", "EXPLICIT-BODY");
+        let mut c = cfg(Gate::Approved(Arc::new(Approvals::default())));
+        c.explicit = vec![ws.join("skills").join("mine").join("SKILL.md")];
+        let s = open_with(&ws, "s6", false, &c);
+        assert!(
+            s.system_prompt
+                .unwrap()
+                .contains("# Skill: mine\nEXPLICIT-BODY"),
+            "an owner-named skill loads without an approval record"
+        );
+    }
+
+    /// Append-only: an old session, or one pinned without skills, gains no
+    /// skills section on resume; one pinned WITH the index gets `load_skill`
+    /// back.
+    #[test]
+    fn resume_adds_no_skills_section_to_an_old_session() {
+        let ws = crate::test_dir::TestDir::new("tole-sk-resume");
+        write_skill(&ws, "okskill", "ok body");
+        let dir = ws.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        tole_core::storage::JsonlStorage::create(&dir, "old", None).unwrap();
+        tole_core::storage::JsonlStorage::create_named(
+            &dir,
+            "pinned",
+            None,
+            Some("old pinned"),
+            None,
+        )
+        .unwrap();
+        let c = cfg(approved(&ws, &["okskill"]));
+        for (id, want) in [("old", None), ("pinned", Some("old pinned"))] {
+            let s = open_with(&ws, id, true, &c);
+            assert_eq!(s.system_prompt.as_deref(), want, "{id}");
+            assert_eq!(pinned(&s).as_deref(), want, "{id} header");
+            assert!(s.registry.get("load_skill").is_none(), "{id}");
+        }
+        // A session created with skills resumes with its prompt and the tool.
+        let made = open_with(&ws, "withskills", false, &c);
+        let prompt = made.system_prompt.clone().unwrap();
+        drop(made);
+        let again = open_with(&ws, "withskills", true, &c);
+        assert_eq!(again.system_prompt, Some(prompt));
+        assert!(again.registry.get("load_skill").is_some());
+    }
+
+    /// A request reaches a session only through `SessionOverrides` (and the
+    /// arguments of `open_session`): none of them names a skill, a skills
+    /// directory or an approval. Adding a field here must be a decision.
+    #[test]
+    fn session_overrides_carry_no_skill_input() {
+        let SessionOverrides {
+            system_prompt: _,
+            model: _,
+            profile: _,
+        } = SessionOverrides::default();
+        // The cwd a request names is the discovery root and the tool jail
+        // at once, so skills come from where the file tools already may go.
+        let ws = crate::test_dir::TestDir::new("tole-sk-body");
+        write_skill(&ws, "okskill", "ok body");
+        let sessions = ws.join("sessions");
+        let s = open_session_inner(
+            "s7",
+            ws.to_str().unwrap(),
+            false,
+            false,
+            AllowlistApprover::allow_only(vec![]),
+            None,
+            Some(&sessions),
+            Vec::new(),
+            Vec::new(),
+            tole_core::cancel::CancelToken::default(),
+            None,
+            SessionOverrides {
+                system_prompt: Some("# Skills available\n- okskill".into()),
+                ..Default::default()
+            },
+            &cfg(Gate::Approved(Arc::new(Approvals::default()))),
+        )
+        .unwrap();
+        // The prompt text is the caller's; the registry still obeys the gate.
+        let err = s
+            .registry
+            .get("load_skill")
+            .unwrap()
+            .execute(serde_json::json!({"name": "okskill"}))
+            .unwrap_err();
+        assert!(err.contains("approv"), "{err}");
     }
 }

@@ -187,7 +187,7 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
 }
 
 /// Skills wiring (issue #161), used by the CLI commands (run, chat, the TUI).
-/// Server faces do not call it yet (#945). Loads `--skill`
+/// Server faces call it through [`server_session_skills`] (#945). Loads `--skill`
 /// files (loud error on broken ones), and when the workspace exposes a
 /// non-empty skills dir, registers the ReadOnly load_skill tool and
 /// returns the index/section block to append to the system prompt.
@@ -263,6 +263,76 @@ pub fn apply_skills_in(
         sections.push_str(&block);
     }
     Ok(sections)
+}
+
+/// The owner's process-level skills choice for server sessions (#945):
+/// the `--skill` files and `--no-skills` the `tole serve` / `tole acp`
+/// process was started with (flags, `TOLE_SKILL`, config). It is fixed at
+/// startup: no request field, header or tool argument reaches it, so a
+/// client can name neither a skill file, a skills directory nor an approval.
+#[derive(Debug, Clone, Default)]
+pub struct ServerSkills {
+    pub explicit: Vec<PathBuf>,
+    pub no_skills: bool,
+    /// Tests only: the approval gate to use instead of the owner's
+    /// approvals file (which `gate_from_env` reads).
+    #[cfg(test)]
+    pub(crate) gate_override: Option<tole_core::skills::Gate>,
+}
+
+impl ServerSkills {
+    pub fn new(explicit: Vec<PathBuf>, no_skills: bool) -> Self {
+        Self {
+            explicit,
+            no_skills,
+            #[cfg(test)]
+            gate_override: None,
+        }
+    }
+}
+
+/// The skill sections of a server session (#945) and the `load_skill`
+/// registration, through the same [`apply_skills`] the CLI uses: only
+/// APPROVED skills load (#591), discovered in `workspace` (the session's
+/// jail root), plus the process's explicit `--skill` files. `--no-skills`
+/// short-circuits. Callers append the result to the pinned prompt of a NEW
+/// session only (append-only: a stored prompt is never extended).
+pub fn server_session_skills(
+    cfg: &ServerSkills,
+    workspace: &std::path::Path,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    if cfg.no_skills {
+        return Ok(String::new());
+    }
+    #[cfg(test)]
+    if let Some(gate) = &cfg.gate_override {
+        let recall = crate::skill_recall::SkillRecall {
+            gate: gate.clone(),
+            ..crate::skill_recall::SkillRecall::from_env(None).map_err(anyhow::Error::msg)?
+        };
+        return apply_skills_in(
+            &cfg.explicit,
+            Some(workspace.to_path_buf()),
+            false,
+            registry,
+            &recall,
+        );
+    }
+    apply_skills(
+        &cfg.explicit,
+        Some(&workspace.display().to_string()),
+        false,
+        registry,
+        None,
+    )
+}
+
+/// Whether a pinned prompt carries the skills index (the local listing or
+/// the recalled selection). A resumed session whose prompt has it needs
+/// `load_skill` back in its registry; one without it gains nothing.
+pub fn prompt_has_skills_index(prompt: &str) -> bool {
+    prompt.contains("\n# Skills available\n") || prompt.contains("\n# Skills\n")
 }
 
 /// Routes a NEW session once (#586), before its provider is built: off

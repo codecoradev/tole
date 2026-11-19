@@ -824,16 +824,9 @@ fn serve_refuses_config_hooks_like_the_flag() {
         &serve,
         "--on-pretool/--on-posttool are not supported by `tole serve`",
     );
-    assert_refused_with_hint(
-        "skill = [\"s/SKILL.md\"]\n",
-        &serve,
-        "--skill is not supported by `tole serve`",
-    );
-    assert_refused_with_hint(
-        "no_skills = true\n",
-        &serve,
-        "--no-skills is not supported by `tole serve`",
-    );
+    // `skill` / `no_skills` are no longer refused here: serve sessions load
+    // skills (#945), so the owner's choice applies to them. `tole mcp` and
+    // `tole mission` still refuse them (below).
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
@@ -850,11 +843,7 @@ fn acp_refuses_config_hooks_skills_and_mcp_servers_like_the_flag() {
         &["acp"],
         "--on-pretool/--on-posttool are not supported by `tole acp`",
     );
-    assert_refused_with_hint(
-        "skill = [\"s\"]\n",
-        &["acp"],
-        "--skill is not supported by `tole acp`",
-    );
+    // `skill` / `no_skills` apply to acp sessions now (#945); not refused.
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
@@ -1081,21 +1070,23 @@ fn tole_skill_env_loads_skills_and_the_flag_replaces_it() {
     );
 }
 
-/// An exported TOLE_SKILL on a server face is refused like `--skill`, and
-/// the message names the variable instead of a flag nobody typed.
-#[cfg(feature = "shell-tools")]
+/// An exported TOLE_SKILL on a face that hosts no skill-loading session
+/// (`tole mcp`; `serve` and `acp` load skills since #945) is refused like
+/// `--skill`, and the message names the variable instead of a flag nobody
+/// typed.
+#[cfg(all(feature = "shell-tools", feature = "mcp"))]
 #[test]
 fn server_faces_name_tole_skill_in_the_refusal() {
     let (d, home) = skill_project("");
     let o = finish(with_env(
-        base_cmd(&d, &home, &["acp"]),
+        base_cmd(&d, &home, &["mcp"]),
         "TOLE_SKILL",
         d.join("skills/demo/SKILL.md").to_str().unwrap(),
     ));
     let err = text(&o.stderr);
     assert!(!o.status.success(), "{err}");
     assert!(
-        err.contains("--skill is not supported by `tole acp`"),
+        err.contains("--skill is not supported by `tole mcp`"),
         "{err}"
     );
     assert!(err.contains("the value comes from TOLE_SKILL"), "{err}");
