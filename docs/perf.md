@@ -101,9 +101,7 @@ nginjen-lite and its `scraper` HTML stack
 A slim build turns it off with `--no-default-features --features
 shell-tools,mcp,mcp-http,tui`.
 
-The table above is a bigger build than the 9 MB quoted for #482; the
-`web-builtin` row is the unstripped-before-strip figure of that day. Measured
-on 2026-11-19 at 70cffd7 with the exact release command (`cargo build
+Re-measured on 2026-11-19 at 70cffd7 with the exact release command (`cargo build
 --release -p tole-cli`, profile `strip = true`, thin LTO, 1 codegen unit, 4
 cores): 23,776,128 bytes stripped (34,482,104 unstripped; the `strip` step in
 `release.yml` is a no-op after cargo's own), 9.8 MB as tar.gz (the published
