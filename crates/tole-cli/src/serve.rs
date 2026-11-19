@@ -51,6 +51,7 @@ use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
 pub mod missions;
+pub mod past_sessions;
 
 pub struct ServeConfig {
     pub bind: String,
@@ -1529,6 +1530,28 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 })
                 .collect();
             (200, json!({"sessions": list}))
+        }
+        ("GET", p) if p == "/sessions/index" || p.starts_with("/sessions/index?") => {
+            // Past sessions of this workspace (#572); the route is before
+            // `/sessions/{id}` so `index` is never read as an id.
+            let query = p.split_once('?').map_or("", |(_, q)| q);
+            let dir = match &state.sessions_dir {
+                Some(d) => d.clone(),
+                None => state.workspace_root.join(".tole/sessions"),
+            };
+            let live = |id: &str| {
+                lock_sessions(&state.sessions)
+                    .get(id)
+                    .map(|st| *st.busy.lock().expect("busy lock"))
+            };
+            past_sessions::list(
+                &state.workspace_root,
+                &dir,
+                state.sessions_dir.is_none(),
+                query,
+                past_sessions::LIMITS,
+                &live,
+            )
         }
         ("POST", "/sessions") => {
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
