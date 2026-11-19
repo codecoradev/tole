@@ -8,11 +8,11 @@ use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 // The binary probe backs the uteke memory loop and the cora MCP preset.
 use tole_cli::session::assemble::{
     apply_skills, build_default_prompt, civil_from_days, default_prompt_for, resolve_system_prompt,
-    resolve_workspace_root, review_section,
+    resolve_workspace_root, review_section, roster_for, FacePolicy, RosterInputs,
 };
+use tole_cli::tool_roster;
 #[cfg(any(feature = "shell-tools", feature = "mcp"))]
 use tole_cli::tool_roster::binary_available;
-use tole_cli::tool_roster::{self, AgentTools, Roster};
 use tole_cli::trust::expand_trust;
 #[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use tole_core::approval::AllowlistApprover;
@@ -2854,25 +2854,20 @@ fn build_registry(
              (this build lacks it); rebuild with default features"
         );
     }
-    let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
-    // CLI faces run shell tools in the process cwd; files stay jailed to
-    // the workspace.
-    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
-    roster.plan_mode = host.plan_mode;
-    roster.agents = Some(AgentTools {
-        worktrees: host.agents_worktree,
-        parent_allows: allow_patterns.to_vec(),
-        delegation: Some(host.delegation.clone()),
-    });
-    #[cfg(feature = "mcp")]
-    {
-        roster.mcp_servers = host
-            .mcp_server
-            .iter()
-            .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(anyhow::Error::msg)?;
-    }
+    let roster = roster_for(
+        &FacePolicy::CLI,
+        RosterInputs {
+            workspace: resolve_workspace_root(host.workspace.as_ref())?,
+            plan_mode: host.plan_mode,
+            allow_patterns,
+            agents_worktree: host.agents_worktree,
+            delegation: Some(&host.delegation),
+            #[cfg(feature = "mcp")]
+            mcp_specs: &host.mcp_server,
+            #[cfg(not(feature = "mcp"))]
+            mcp_specs: &[],
+        },
+    )?;
     tool_roster::build(approver, roster)
 }
 
@@ -2887,9 +2882,17 @@ fn build_server_registry(
     allow_patterns: &[String],
     plan_mode: bool,
 ) -> Result<ToolRegistry> {
-    let mut roster = Roster::new(resolve_workspace_root(workspace)?);
-    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
-    roster.plan_mode = plan_mode;
+    let roster = roster_for(
+        &FacePolicy::MCP_SERVER,
+        RosterInputs {
+            workspace: resolve_workspace_root(workspace)?,
+            plan_mode,
+            allow_patterns,
+            agents_worktree: false,
+            delegation: None,
+            mcp_specs: &[],
+        },
+    )?;
     // No child agents and no MCP client tools behind an MCP server face;
     // delete_file (Destructive) is absent behind the allowlist approver.
     let reg = tool_roster::build(
@@ -4259,7 +4262,7 @@ mod gh_repo_tests {
         let dir = crate::test_dir::TestDir::new("tole-gh-none");
         let reg = tool_roster::build(
             tole_core::approval::AllowlistApprover::allow_only(vec![]),
-            Roster::new(dir.to_path_buf()),
+            tool_roster::Roster::new(dir.to_path_buf()),
         )
         .unwrap();
         assert!(reg.get("gh").is_none());

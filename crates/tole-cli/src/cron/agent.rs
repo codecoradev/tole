@@ -297,8 +297,20 @@ pub fn run_agent(
     // A cron run has no human: an `optional` sandbox counts as `required`
     // (#601).
     tole_core::sandbox::mark_unattended();
-    let mut roster = crate::tool_roster::Roster::new(canon.clone());
-    roster.plan_mode = trigger.is_some_and(|t| t.read_only);
+    let roster = match crate::session::assemble::roster_for(
+        &crate::session::assemble::FacePolicy::CRON,
+        crate::session::assemble::RosterInputs {
+            workspace: canon.clone(),
+            plan_mode: trigger.is_some_and(|t| t.read_only),
+            allow_patterns: &[],
+            agents_worktree: false,
+            delegation: None,
+            mcp_specs: &[],
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => return fail(None, e.to_string()),
+    };
     let mut reg = match crate::tool_roster::build(approver, roster) {
         Ok(r) => r,
         Err(e) => return fail(None, e.to_string()),
