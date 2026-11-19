@@ -1,0 +1,197 @@
+//! The `turn_finished` event's closed types and its provisional policy knobs
+//! (#962, design `docs/turn-finished-event.md`).
+//!
+//! # Provisional owner decisions
+//!
+//! The design note leaves nine decisions (D1-D9) to the owner. This change
+//! implements the note's recommendations as DEFAULTS, and each one is a named
+//! constant or one small seam below, so flipping it is a one-line change:
+//!
+//! | | decision | where |
+//! |---|---|---|
+//! | D1 | volatile in-memory queue, longer retry horizon | `volatile.rs` queue, [`RETRY_BACKOFF_SECS`], [`RETRY_TAIL_SECS`] |
+//! | D2 | the log position is `last_seq`, the `seq` of the newest entry | [`TurnEnd::last_seq`], `event::turn_finished` |
+//! | D3 | emit `turn_finished(approval_pending)` | [`EMIT_APPROVAL_PENDING`] |
+//! | D4 | `detached` is folded into `cancelled` | [`FOLD_DETACHED_INTO_CANCELLED`] |
+//! | D5 | serve sessions only (no mission, no cron) | the call sites in `serve.rs` |
+//! | D6 | the status and code words of [`TurnStatus`] and [`TurnCode`] | those enums |
+//! | D7 | no `profile` in the body | `event::turn_finished` |
+//! | D8 | on overflow replace the oldest event of the session | [`OVERFLOW_REPLACES_OLDEST_PER_SESSION`] |
+//! | D9 | a 15 minute retry horizon | [`RETRY_HORIZON_SECS`] |
+//!
+//! # What may leave
+//!
+//! A turn end is a typed value with no free text: an enum, an integer and an id.
+//! [`TurnEnd::from_outcome`] is the ONLY place a `TurnOutcome` becomes one, it is
+//! an exhaustive match with no wildcard arm, and it drops every payload string
+//! (a provider message, a tool name, a stop-gate reason, a storage error).
+
+use std::sync::Arc;
+
+use tole_core::turn::TurnOutcome;
+
+/// D3: a turn that stops on an approval emits `turn_finished(approval_pending)`.
+/// `false` leaves that stop silent, `approval_requested` having already fired.
+pub const EMIT_APPROVAL_PENDING: bool = true;
+
+/// D4: an owner detach (`POST /sessions/{id}/detach`) is reported as
+/// `cancelled`. `false` reports the separate word `detached`.
+pub const FOLD_DETACHED_INTO_CANCELLED: bool = true;
+
+/// D8: when a destination's queue is full, a new `turn_finished` replaces the
+/// oldest queued one of the SAME session (only the latest settle matters to a
+/// receiver). `false` drops the new event, as the approval events do.
+pub const OVERFLOW_REPLACES_OLDEST_PER_SESSION: bool = true;
+
+/// D9: how long a `turn_finished` stays worth sending. A guess; one constant.
+pub const RETRY_HORIZON_SECS: i64 = 15 * 60;
+
+/// D1: the waits after the first failed attempts, then [`RETRY_TAIL_SECS`]
+/// until [`RETRY_HORIZON_SECS`] passes.
+pub const RETRY_BACKOFF_SECS: [i64; 4] = [2, 10, 30, 120];
+
+/// D1: the wait between later attempts.
+pub const RETRY_TAIL_SECS: i64 = 300;
+
+/// The serialized `turn_finished` envelope, at most. It is a few hundred bytes
+/// by construction; a body over this is refused, never cut.
+pub const MAX_TURN_BODY: usize = 1024;
+
+/// How a turn ended (D6). The names are the wire `status` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    /// Only produced when [`FOLD_DETACHED_INTO_CANCELLED`] is `false`.
+    Detached,
+    BudgetExhausted,
+    Blocked,
+    ApprovalPending,
+}
+
+impl TurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnStatus::Completed => "completed",
+            TurnStatus::Failed => "failed",
+            TurnStatus::Cancelled => "cancelled",
+            TurnStatus::Detached => "detached",
+            TurnStatus::BudgetExhausted => "budget_exhausted",
+            TurnStatus::Blocked => "blocked",
+            TurnStatus::ApprovalPending => "approval_pending",
+        }
+    }
+}
+
+/// A fixed reason for `failed` or `blocked` (D6). Never a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnCode {
+    Provider,
+    Storage,
+    Loop,
+    UnknownTool,
+    StopGate,
+    Internal,
+    Approval,
+}
+
+impl TurnCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnCode::Provider => "provider",
+            TurnCode::Storage => "storage",
+            TurnCode::Loop => "loop",
+            TurnCode::UnknownTool => "unknown_tool",
+            TurnCode::StopGate => "stop_gate",
+            TurnCode::Internal => "internal",
+            TurnCode::Approval => "approval",
+        }
+    }
+}
+
+/// A settled turn, with every payload string already dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnEnd {
+    pub status: TurnStatus,
+    pub code: Option<TurnCode>,
+    /// D2: the `seq` of the newest log entry when the turn settled, the number
+    /// `GET /sessions/{id}/entries?after=` pages by (`lastSeq` / `nextAfter`).
+    pub last_seq: u64,
+}
+
+impl TurnEnd {
+    /// The one mapping from a `TurnOutcome`. Exhaustive, no wildcard arm: a new
+    /// variant does not compile until it is placed here. `None` is a silent end
+    /// (D3 off). Nothing inside the outcome is read except its variant.
+    pub fn from_outcome(outcome: &TurnOutcome, last_seq: u64) -> Option<TurnEnd> {
+        let (status, code) = match outcome {
+            TurnOutcome::Final { .. } => (TurnStatus::Completed, None),
+            TurnOutcome::ProviderFailed { .. } => (TurnStatus::Failed, Some(TurnCode::Provider)),
+            TurnOutcome::Storage(_) => (TurnStatus::Failed, Some(TurnCode::Storage)),
+            TurnOutcome::Cancelled => (TurnStatus::Cancelled, None),
+            TurnOutcome::Detached if FOLD_DETACHED_INTO_CANCELLED => (TurnStatus::Cancelled, None),
+            TurnOutcome::Detached => (TurnStatus::Detached, None),
+            TurnOutcome::BudgetExhausted => (TurnStatus::BudgetExhausted, None),
+            TurnOutcome::LoopDetected { .. } => (TurnStatus::Blocked, Some(TurnCode::Loop)),
+            TurnOutcome::UnknownTool { .. } => (TurnStatus::Blocked, Some(TurnCode::UnknownTool)),
+            TurnOutcome::StopGateBlocked { .. } => (TurnStatus::Blocked, Some(TurnCode::StopGate)),
+            TurnOutcome::ApprovalRequired { .. } if EMIT_APPROVAL_PENDING => {
+                (TurnStatus::ApprovalPending, None)
+            }
+            TurnOutcome::ApprovalRequired { .. } => return None,
+        };
+        Some(TurnEnd {
+            status,
+            code,
+            last_seq,
+        })
+    }
+
+    /// A turn that failed without an outcome: the runner returned an error.
+    pub fn failed(code: TurnCode, last_seq: u64) -> TurnEnd {
+        TurnEnd {
+            status: TurnStatus::Failed,
+            code: Some(code),
+            last_seq,
+        }
+    }
+
+    /// Settles an approval stop against the queue: `approval_pending` needs the
+    /// id of a Pending entry; without one the stop is `blocked` with code
+    /// `approval` (a denied or hook-refused call queued nothing to decide).
+    /// Any other status passes through, and its `approval_id` is dropped.
+    pub fn with_approval(self, approval_id: Option<String>) -> (TurnEnd, Option<String>) {
+        if self.status != TurnStatus::ApprovalPending {
+            return (self, None);
+        }
+        match approval_id {
+            Some(id) => (self, Some(id)),
+            None => (
+                TurnEnd {
+                    status: TurnStatus::Blocked,
+                    code: Some(TurnCode::Approval),
+                    ..self
+                },
+                None,
+            ),
+        }
+    }
+}
+
+/// What the serve turn path hands the notifier: ids and a typed end. The
+/// approval id comes from the approval queue entry, never from the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSignal {
+    pub session_id: String,
+    pub end: TurnEnd,
+    /// The Pending queue entry the turn stopped on, if any.
+    pub approval_id: Option<String>,
+}
+
+/// The callback `tole serve` calls once per settled turn. It does no I/O.
+pub type TurnNotifier = Arc<dyn Fn(TurnSignal) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "turn_tests.rs"]
+mod tests;

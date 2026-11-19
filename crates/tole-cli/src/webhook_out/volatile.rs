@@ -5,7 +5,14 @@
 //! empty after a restart, so replaying `approval_requested` would announce
 //! something that can no longer be decided. A gateway reconciles with
 //! `GET /approvals` when it starts. The queue holds at most 256 events per
-//! destination; a new one is dropped (and counted) when it is full.
+//! destination; a new one is dropped (and counted) when it is full, except that
+//! a full queue makes room for a `turn_finished` by replacing the oldest queued
+//! one of the same session (#962, provisional D8: `turn::OVERFLOW_REPLACES_OLDEST_PER_SESSION`).
+//!
+//! `turn_finished` (#962, provisional D1) rides the same volatile queue with its
+//! own, longer retry horizon (`turn`): the session and its answer are durable,
+//! so a receiver that misses an event reconciles through the authenticated
+//! session routes.
 //!
 //! Nothing here does I/O. [`notifier`] returns the callback the approval queue
 //! calls, after its own locks are released, on the thread that caused the
@@ -22,6 +29,7 @@ use tole_core::secrets::SecretSet;
 use crate::approvals::{ApprovalEvent, ApprovalNotifier, ApprovalStatus};
 
 use super::event::{self, ApprovalOutcome, ApprovalRequest, Resolution};
+use super::turn::{self, TurnNotifier, TurnSignal};
 use super::{Destinations, Event};
 
 /// Events held per destination.
@@ -44,6 +52,9 @@ pub struct Queued {
     pub attempts: u32,
     /// Not before this time.
     pub next_at: i64,
+    /// The session a `turn_finished` is about (`None` for every other event):
+    /// the key of the overflow rule.
+    pub session: Option<String>,
 }
 
 // The body is redacted but private: `Debug` shows the shape only.
@@ -83,6 +94,17 @@ impl VolatileQueue {
         let mut m = self.by_dest.lock().unwrap_or_else(|p| p.into_inner());
         let q = m.entry(event.dest.clone()).or_default();
         if q.len() >= MAX_PER_DESTINATION {
+            // A turn end replaces an older one of its session instead of being
+            // lost: only the latest settle of a session matters to a receiver.
+            if turn::OVERFLOW_REPLACES_OLDEST_PER_SESSION
+                && event.event == Event::TurnFinished
+                && replace_oldest_of_session(q, event.session.as_deref())
+            {
+                q.push_back(event);
+                drop(m);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             drop(m);
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return Err(Refused::Full);
@@ -142,6 +164,40 @@ impl VolatileQueue {
     /// `next_at` holds it, and it still counts against the bound.
     pub fn requeue(&self, event: Queued) -> Result<(), Refused> {
         self.push(event)
+    }
+}
+
+/// Removes the oldest queued `turn_finished` of `session`; failing that, the
+/// oldest of any session that has two queued (its newer one still stands). True
+/// when a slot was freed.
+fn replace_oldest_of_session(q: &mut VecDeque<Queued>, session: Option<&str>) -> bool {
+    fn turn_of(e: &Queued) -> Option<Option<&str>> {
+        (e.event == Event::TurnFinished).then_some(e.session.as_deref())
+    }
+    if let Some(pos) = session.and_then(|s| q.iter().position(|e| turn_of(e) == Some(Some(s)))) {
+        q.remove(pos);
+        return true;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let newer_exists: Vec<bool> = q
+        .iter()
+        .rev()
+        .map(|e| match turn_of(e) {
+            Some(s) => !seen.insert(s),
+            None => false,
+        })
+        .collect();
+    // `newer_exists` is in reverse order: index i here is q[len - 1 - i].
+    let pos = newer_exists
+        .iter()
+        .rposition(|&dup| dup)
+        .map(|i| q.len() - 1 - i);
+    match pos {
+        Some(p) => {
+            q.remove(p);
+            true
+        }
+        None => false,
     }
 }
 
@@ -237,9 +293,90 @@ pub fn build(
             },
             attempts: 0,
             next_at: 0,
+            session: None,
         });
     }
     out
+}
+
+/// Why a `turn_finished` was not queued for a destination, as a closed code for
+/// the one stderr line (never a message).
+pub const BAD_ID: &str = "bad_id";
+
+/// Builds the `turn_finished` event for each destination that lists it. A
+/// destination that does not list it gets nothing. `refused` is called with the
+/// destination NAME and a closed code for an event that could not be built.
+pub fn build_turn(
+    dests: &Destinations,
+    signal: &TurnSignal,
+    now: i64,
+    redact: &dyn Fn(&str) -> String,
+    refused: &mut dyn FnMut(&str, &str),
+) -> Vec<Queued> {
+    let (end, approval_id) = signal.end.with_approval(signal.approval_id.clone());
+    let mut out = Vec::new();
+    for name in dests.names() {
+        let Some(d) = dests.get(name) else { continue };
+        if !d.events.contains(&Event::TurnFinished) {
+            continue;
+        }
+        let built = match event::turn_finished(
+            name,
+            now,
+            &signal.session_id,
+            &end,
+            approval_id.as_deref(),
+            redact,
+        ) {
+            Ok(b) => b,
+            Err(_) => {
+                refused(name, BAD_ID);
+                continue;
+            }
+        };
+        let Ok(body) = String::from_utf8(built.body) else {
+            continue;
+        };
+        out.push(Queued {
+            dest: name.to_string(),
+            id: built.id,
+            event: Event::TurnFinished,
+            body,
+            deadline: now.saturating_add(turn::RETRY_HORIZON_SECS),
+            attempts: 0,
+            next_at: 0,
+            session: Some(signal.session_id.clone()),
+        });
+    }
+    out
+}
+
+/// The callback `tole serve` calls once per settled turn (#962): builds the
+/// event for the destinations that list it and pushes it onto `queue`. No I/O;
+/// it holds the queue's mutex for the push alone, so a turn is never delayed by
+/// a slow receiver, and a full queue never changes its outcome. A refusal is one
+/// stderr line with the destination NAME and a closed code.
+pub fn turn_notifier(
+    dests: Arc<Destinations>,
+    queue: Arc<VolatileQueue>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    secrets: Arc<dyn Fn() -> SecretSet + Send + Sync>,
+) -> TurnNotifier {
+    Arc::new(move |signal| {
+        let set = secrets();
+        let redact = |s: &str| set.redact(s).into_owned();
+        let mut refused = |dest: &str, code: &str| {
+            eprintln!("tole serve: webhook turn_finished event for `{dest}` not sent: {code}");
+        };
+        for q in build_turn(&dests, &signal, clock(), &redact, &mut refused) {
+            let dest = q.dest.clone();
+            if queue.push(q).is_err() {
+                eprintln!(
+                    "tole serve: webhook turn_finished event for `{dest}` not sent: queue_full"
+                );
+            }
+        }
+    })
 }
 
 /// The callback to install with `ApprovalQueue::set_notifier`: builds the events

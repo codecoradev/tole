@@ -1,7 +1,11 @@
 # `turn_finished` outbound webhook event: design note
 
-Status: **proposed, design only** (issue #962, step 1 of the work; no code in
-this change). Extends [webhook-delivery-design.md](webhook-delivery-design.md)
+Status: **implemented with provisional defaults** (issue #962). Step 1 (this note)
+was design only; step 2 implements the recommendations below as DEFAULTS while
+D1-D9 are still open. Each is a named constant or one seam in
+`crates/tole-cli/src/webhook_out/turn.rs`. The one deviation from the text: the
+log position field is `last_seq`, not `entries` (D2, verified: receivers page by
+`Entry.seq`, and `GET /sessions/{id}/entries` returns `lastSeq`/`nextAfter`). Extends [webhook-delivery-design.md](webhook-delivery-design.md)
 (#911, implemented) and reads against [threat-model.md](threat-model.md).
 Consumer: the chat gateway of epic #910 (`codecoradev/tole-gateway#16`, and the
 mention-to-persona routing of #969).

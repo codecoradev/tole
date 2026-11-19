@@ -506,3 +506,142 @@ fn any_lists_says_whether_a_destination_wants_approval_events() {
     assert!(one.any_lists(&[Event::ApprovalRequested, Event::ApprovalResolved]));
     assert!(!one.any_lists(&[Event::ApprovalRequested]));
 }
+
+// ---- turn_finished (#962) ----
+
+fn turn_rig(dests: Arc<Destinations>) -> (Rig, crate::webhook_out::turn::TurnNotifier) {
+    let r = rig(Arc::clone(&dests));
+    let n = crate::webhook_out::volatile::turn_notifier(
+        dests,
+        Arc::clone(&r.queue),
+        Arc::new(|| NOW),
+        Arc::new(tole_core::secrets::process_secrets),
+    );
+    (r, n)
+}
+
+fn done(session: &str, seq: u64) -> crate::webhook_out::turn::TurnSignal {
+    use crate::webhook_out::turn::*;
+    TurnSignal {
+        session_id: session.into(),
+        end: TurnEnd {
+            status: TurnStatus::Completed,
+            code: None,
+            last_seq: seq,
+        },
+        approval_id: None,
+    }
+}
+
+#[test]
+fn a_turn_event_is_sent_signed_with_its_own_event_header() {
+    let (mut r, n) = turn_rig(dests(&[("g", &[Event::TurnFinished])]));
+    n(done("s-1", 14));
+    let fake = Fake::new(vec![]);
+    let (l, failed) = r.look(NOW, &fake, Some(KEY));
+    assert_eq!((l.sent, l.retried, l.gave_up), (1, 0, 0));
+    assert!(failed.is_empty());
+    let seen = fake.seen.borrow();
+    let q = &seen[0];
+    assert_eq!(header(&q.headers, "X-Tole-Event"), "turn_finished");
+    let id = header(&q.headers, "X-Tole-Delivery");
+    let body: serde_json::Value = serde_json::from_slice(&q.body).unwrap();
+    assert_eq!(body["id"], id);
+    assert_eq!(
+        header(&q.headers, "X-Tole-Signature"),
+        tole_core::webhook::sign(
+            KEY,
+            header(&q.headers, "X-Tole-Timestamp"),
+            id,
+            Some("turn_finished"),
+            &q.body
+        )
+    );
+}
+
+#[test]
+fn a_turn_event_keeps_retrying_every_five_minutes_until_its_horizon() {
+    let (mut r, n) = turn_rig(dests(&[("g", &[Event::TurnFinished])]));
+    n(done("s-1", 14));
+    let fake = Fake::new(vec![status(500); 20]);
+    let horizon = crate::webhook_out::turn::RETRY_HORIZON_SECS;
+    let mut at = NOW;
+    let mut times = vec![at];
+    let mut lost = vec![];
+    // 2, 10, 30, 120, then every 300 s.
+    r.look(at, &fake, Some(KEY));
+    for wait in [2, 10, 30, 120, 300, 300, 300, 300] {
+        at += wait;
+        if at >= NOW + horizon {
+            break;
+        }
+        let (l, failed) = r.look(at, &fake, Some(KEY));
+        assert_eq!(
+            l.retried + l.gave_up + l.expired_unsent,
+            1,
+            "at +{}",
+            at - NOW
+        );
+        times.push(at);
+        lost.extend(failed);
+    }
+    // The 0, 2, 12, 42, 162, 462, 762 schedule; the next would be 1062 > 900.
+    assert_eq!(
+        times.iter().map(|t| t - NOW).collect::<Vec<_>>(),
+        [0, 2, 12, 42, 162, 462, 762]
+    );
+    assert_eq!(fake.seen.borrow().len(), 7);
+    // The last attempt finds no time left: it is reported, once, with the
+    // destination NAME and the last closed code, and nothing stays queued.
+    assert_eq!(lost, vec![("g".to_string(), "http_500".to_string())]);
+    assert!(r.queue.is_empty());
+    // Every attempt carries the same id and body.
+    let seen = fake.seen.borrow();
+    assert!(seen.iter().all(|s| s.body == seen[0].body));
+}
+
+#[test]
+fn a_turn_event_survives_a_receiver_that_comes_back() {
+    let (mut r, n) = turn_rig(dests(&[("g", &[Event::TurnFinished])]));
+    n(done("s-1", 14));
+    let fake = Fake::new(vec![status(500), status(200)]);
+    r.look(NOW, &fake, Some(KEY));
+    let (l, _) = r.look(NOW + 2, &fake, Some(KEY));
+    assert_eq!(l.sent, 1);
+    assert!(r.queue.is_empty());
+}
+
+#[test]
+fn a_400_is_final_for_a_turn_event_too() {
+    let (mut r, n) = turn_rig(dests(&[("g", &[Event::TurnFinished])]));
+    n(done("s-1", 14));
+    let fake = Fake::new(vec![status(400)]);
+    let (l, failed) = r.look(NOW, &fake, Some(KEY));
+    assert_eq!(l.gave_up, 1);
+    assert_eq!(failed, vec![("g".to_string(), "http_400".to_string())]);
+    r.look(NOW + 500, &fake, Some(KEY));
+    assert_eq!(fake.seen.borrow().len(), 1);
+}
+
+#[test]
+fn an_approval_only_destination_is_never_sent_a_turn_event() {
+    let (mut r, n) = turn_rig(dests(&[("g", BOTH)]));
+    n(done("s-1", 14));
+    assert!(r.queue.is_empty());
+    let fake = Fake::new(vec![]);
+    let (l, _) = r.look(NOW, &fake, Some(KEY));
+    assert_eq!(l.sent, 0);
+}
+
+#[test]
+fn the_sender_starts_for_a_turn_event_alone() {
+    let one = dests(&[("g", &[Event::TurnFinished])]);
+    assert!(one.any_lists(&[Event::TurnFinished]));
+    let none = dests(&[("g", &[Event::CronRunFinished])]);
+    assert!(!none.any_lists(&[Event::TurnFinished]));
+    let spawned = spawn(none, Arc::new(ApprovalQueue::default()));
+    assert!(
+        spawned.turns.is_none(),
+        "no destination, no notifier, no thread"
+    );
+}
