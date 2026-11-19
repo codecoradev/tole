@@ -65,8 +65,8 @@ headroom.
 
 ## Adding a platform
 
-Run the harness on that platform (the job already does, report-only until it
-has a budget), copy the medians from the uploaded `perf-report-<arch>` into a
+Run the harness on that platform (a job for it measures and uploads a report
+even before it has a budget), copy the medians from the uploaded `perf-report-<arch>` into a
 new `[<platform>.<metric>]` set of tables as `baseline`, and set each
 `ceiling` with the same headroom. Until then the job prints a warning and
 passes: a platform with no budget is measured, not gated.

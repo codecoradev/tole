@@ -44,6 +44,22 @@ ceiling = 37
 baseline = 4.4
 ceiling = 18
 
-# aarch64: no baseline yet. The aarch64 job (ubuntu-24.04-arm) measures and
-# uploads its report but is not gated until a [aarch64-linux.*] section is
-# added here from its first run (see README.md, "Adding a platform").
+# --- aarch64 Linux (baseline: run 1 of this gate on the hosted ubuntu-24.04-arm
+# --- runner, 4 vCPU, PR #983; same headroom factors as x86_64, same metric
+# --- definitions and comments as above)
+
+[aarch64-linux.cold_start_ms]
+baseline = 2.6
+ceiling = 11
+
+[aarch64-linux.idle_rss_mb]
+baseline = 11.8
+ceiling = 16
+
+[aarch64-linux.active_rss_mb]
+baseline = 25.2
+ceiling = 33
+
+[aarch64-linux.per_turn_ms]
+baseline = 3.3
+ceiling = 14
