@@ -62,6 +62,7 @@ fn queued(dest: &str, id: &str, next_at: i64, deadline: i64) -> Queued {
         deadline,
         attempts: 0,
         next_at,
+        session: None,
     }
 }
 
@@ -315,4 +316,220 @@ fn the_notifier_never_blocks_on_a_full_queue_and_never_fails_an_approval() {
     assert_eq!(q.dropped(), 50);
     // Every approval is still there and decidable.
     assert_eq!(approvals.list(None).len(), MAX_PER_DESTINATION + 50);
+}
+
+// ---- turn_finished (#962) ----
+
+use crate::webhook_out::turn::{TurnCode, TurnEnd, TurnSignal, TurnStatus};
+
+fn turn_queued(dest: &str, session: &str, n: u64) -> Queued {
+    Queued {
+        event: Event::TurnFinished,
+        session: Some(session.into()),
+        ..queued(dest, &format!("turn:{session}:{n}"), 0, NOW + 900)
+    }
+}
+
+fn signal(session: &str, status: TurnStatus, seq: u64) -> TurnSignal {
+    TurnSignal {
+        session_id: session.into(),
+        end: TurnEnd {
+            status,
+            code: None,
+            last_seq: seq,
+            settle: 1,
+        },
+        approval_id: None,
+    }
+}
+
+fn ids(q: &VolatileQueue, dest: &str) -> Vec<String> {
+    let m = q.by_dest.lock().unwrap();
+    m.get(dest)
+        .map(|v| v.iter().map(|e| e.id.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_full_queue_replaces_the_oldest_event_of_the_same_session() {
+    let q = VolatileQueue::new();
+    // 256 events, one per session; the 17th session is the one that comes back.
+    for n in 0..MAX_PER_DESTINATION as u64 {
+        q.push(turn_queued("g", &format!("s{n}"), 1)).unwrap();
+    }
+    q.push(turn_queued("g", "s17", 2)).unwrap();
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION, "still bounded");
+    assert_eq!(q.dropped(), 1, "the replaced one is counted");
+    let all = ids(&q, "g");
+    assert!(
+        !all.contains(&"turn:s17:1".to_string()),
+        "oldest of s17 gone"
+    );
+    assert_eq!(all.last().unwrap(), "turn:s17:2", "the newest stands");
+    assert!(all.contains(&"turn:s16:1".to_string()), "others untouched");
+}
+
+#[test]
+fn a_full_queue_of_distinct_sessions_drops_the_new_event_and_counts_it() {
+    let q = VolatileQueue::new();
+    for n in 0..MAX_PER_DESTINATION as u64 {
+        q.push(turn_queued("g", &format!("s{n}"), 1)).unwrap();
+    }
+    assert_eq!(q.push(turn_queued("g", "fresh", 1)), Err(Refused::Full));
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.dropped(), 1);
+    assert!(!ids(&q, "g").contains(&"turn:fresh:1".to_string()));
+}
+
+#[test]
+fn a_full_queue_drops_a_superseded_event_of_another_session_first() {
+    let q = VolatileQueue::new();
+    q.push(turn_queued("g", "busy", 1)).unwrap();
+    q.push(turn_queued("g", "busy", 2)).unwrap(); // busy:1 is superseded
+    for n in 2..MAX_PER_DESTINATION as u64 {
+        q.push(turn_queued("g", &format!("s{n}"), 1)).unwrap();
+    }
+    q.push(turn_queued("g", "fresh", 1)).unwrap();
+    let all = ids(&q, "g");
+    assert!(!all.contains(&"turn:busy:1".to_string()));
+    assert!(
+        all.contains(&"turn:busy:2".to_string()),
+        "its latest stands"
+    );
+    assert!(all.contains(&"turn:fresh:1".to_string()));
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+}
+
+#[test]
+fn an_approval_event_on_a_full_queue_is_still_dropped_not_swapped() {
+    let q = VolatileQueue::new();
+    for n in 0..MAX_PER_DESTINATION as u64 {
+        q.push(turn_queued("g", &format!("s{n}"), 1)).unwrap();
+    }
+    assert_eq!(
+        q.push(queued("g", "approval:x:requested", 0, NOW + 900)),
+        Err(Refused::Full)
+    );
+}
+
+#[test]
+fn a_turn_event_is_built_only_for_the_destinations_that_list_it() {
+    let d = dests(&[
+        ("both", &[Event::TurnFinished, Event::ApprovalRequested]),
+        ("cron", &[Event::CronRunFinished]),
+        (
+            "approvals",
+            &[Event::ApprovalRequested, Event::ApprovalResolved],
+        ),
+    ]);
+    let mut refused = Vec::new();
+    let out = build_turn(
+        &d,
+        &signal("s-1", TurnStatus::Completed, 14),
+        NOW,
+        &identity,
+        &mut |n, c| refused.push((n.to_string(), c.to_string())),
+    );
+    assert!(refused.is_empty());
+    assert_eq!(out.len(), 1);
+    let q = &out[0];
+    assert_eq!((q.dest.as_str(), q.event), ("both", Event::TurnFinished));
+    assert_eq!(q.session.as_deref(), Some("s-1"));
+    assert_eq!(
+        q.deadline,
+        NOW + crate::webhook_out::turn::RETRY_HORIZON_SECS
+    );
+    let v: serde_json::Value = serde_json::from_str(&q.body).unwrap();
+    assert_eq!(v["type"], "turn_finished");
+    assert_eq!(v["data"]["last_seq"], 14);
+    assert_eq!(v["id"], q.id.as_str());
+    // Nobody lists it: no event at all.
+    let none = dests(&[("cron", &[Event::CronRunFinished])]);
+    assert!(build_turn(
+        &none,
+        &signal("s-1", TurnStatus::Completed, 1),
+        NOW,
+        &identity,
+        &mut |_, _| {}
+    )
+    .is_empty());
+}
+
+#[test]
+fn an_unsendable_id_is_refused_with_a_closed_code_and_no_text() {
+    let d = dests(&[("g", &[Event::TurnFinished])]);
+    let mut refused = Vec::new();
+    let out = build_turn(
+        &d,
+        &signal("a b", TurnStatus::Completed, 1),
+        NOW,
+        &identity,
+        &mut |n, c| refused.push((n.to_string(), c.to_string())),
+    );
+    assert!(out.is_empty());
+    assert_eq!(refused, vec![("g".to_string(), "bad_id".to_string())]);
+}
+
+#[test]
+fn an_approval_stop_without_a_pending_entry_is_blocked_with_code_approval() {
+    let d = dests(&[("g", &[Event::TurnFinished])]);
+    let out = build_turn(
+        &d,
+        &signal("s-1", TurnStatus::ApprovalPending, 5),
+        NOW,
+        &identity,
+        &mut |_, _| {},
+    );
+    let v: serde_json::Value = serde_json::from_str(&out[0].body).unwrap();
+    assert_eq!(v["data"]["status"], "blocked");
+    assert_eq!(v["data"]["code"], TurnCode::Approval.as_str());
+    assert!(v["data"].get("approval_id").is_none());
+    let mut with = signal("s-1", TurnStatus::ApprovalPending, 5);
+    with.approval_id = Some("ap-1".into());
+    let out = build_turn(&d, &with, NOW, &identity, &mut |_, _| {});
+    let v: serde_json::Value = serde_json::from_str(&out[0].body).unwrap();
+    assert_eq!(v["data"]["status"], "approval_pending");
+    assert_eq!(v["data"]["approval_id"], "ap-1");
+}
+
+#[test]
+fn the_turn_notifier_pushes_without_io_and_survives_a_full_queue() {
+    let d = Arc::new(dests(&[("g", &[Event::TurnFinished])]));
+    let q = VolatileQueue::new();
+    let n = turn_notifier(
+        d,
+        Arc::clone(&q),
+        Arc::new(|| NOW),
+        Arc::new(tole_core::secrets::process_secrets),
+    );
+    for i in 0..(MAX_PER_DESTINATION + 20) {
+        n(signal(&format!("s{i}"), TurnStatus::Completed, 1));
+    }
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.dropped(), 20);
+}
+
+#[test]
+fn a_retried_turn_event_never_evicts_a_newer_one_of_its_session() {
+    // E0 (settle 1) is out for a failed delivery while E1 (settle 2) of the same
+    // session sits in a full queue: requeueing E0 must drop E0, not E1.
+    let q = VolatileQueue::new();
+    q.push(turn_queued("g", "s", 1)).unwrap();
+    let e0 = q.take_due(NOW).due.pop().unwrap();
+    q.push(turn_queued("g", "s", 2)).unwrap();
+    for n in 0..(MAX_PER_DESTINATION - 1) {
+        q.push(turn_queued("g", &format!("other{n}"), 1)).unwrap();
+    }
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.requeue(e0), Err(Refused::Full));
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.dropped(), 1);
+    let ids: Vec<String> = std::iter::from_fn(|| q.take_due(NOW).due.pop())
+        .map(|e| e.id)
+        .collect();
+    assert!(ids.contains(&"turn:s:2".to_string()), "newer event kept");
+    assert!(
+        !ids.contains(&"turn:s:1".to_string()),
+        "stale retry dropped"
+    );
 }

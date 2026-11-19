@@ -2,7 +2,9 @@
 //! volatile queue and runs the expiry timer.
 //!
 //! One thread, started by `tole serve` when a destination lists
-//! `approval_requested` or `approval_resolved`. Each look:
+//! `approval_requested`, `approval_resolved` or `turn_finished` (#962; the same
+//! queue and thread, a longer retry schedule for the turn event, see
+//! [`retry_wait`]). Each look:
 //!
 //! 1. every 30 s asks the approval queue to expire what is past its 900 s (an
 //!    idle serve would otherwise never announce an expiry), which pushes the
@@ -24,8 +26,9 @@ use std::time::Duration;
 
 use super::send::{classify, EnvFileKeys, Keys, NetPoster, Poster, Request, Verdict};
 use super::sign;
-use super::volatile::{notifier, Queued, VolatileQueue};
-use super::Destinations;
+use super::turn::{self, TurnNotifier};
+use super::volatile::{notifier, turn_notifier, Queued, VolatileQueue};
+use super::{Destinations, Event};
 use crate::approvals::ApprovalQueue;
 
 /// How often an idle serve expires unanswered approvals.
@@ -39,6 +42,23 @@ const MAX_RETRY_AFTER_SECS: i64 = 120;
 const MAX_SENDS_PER_LOOK: usize = 1000;
 /// How often the thread looks.
 const POLL: Duration = Duration::from_secs(1);
+
+/// The wait after the `attempt`th failed attempt (1-based) of `event`; `None`
+/// gives the event up. Approval events stop after [`BACKOFF_SECS`]; a
+/// `turn_finished` (provisional D1/D9) continues every `turn::RETRY_TAIL_SECS`
+/// until its deadline, which the caller enforces.
+fn retry_wait(event: Event, attempt: u32) -> Option<i64> {
+    let i = attempt as usize - 1;
+    match event {
+        Event::TurnFinished => Some(
+            turn::RETRY_BACKOFF_SECS
+                .get(i)
+                .copied()
+                .unwrap_or(turn::RETRY_TAIL_SECS),
+        ),
+        _ => BACKOFF_SECS.get(i).copied(),
+    }
+}
 
 /// What a look did, for tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,7 +160,7 @@ impl ApprovalSender {
             }
             Verdict::Retry { code, retry_after } => {
                 ev.attempts += 1;
-                let Some(wait) = BACKOFF_SECS.get(ev.attempts as usize - 1).copied() else {
+                let Some(wait) = retry_wait(ev.event, ev.attempts) else {
                     out.gave_up += 1;
                     failed(&ev.dest, &code);
                     return;
@@ -148,8 +168,13 @@ impl ApprovalSender {
                 let wait = wait.max(retry_after.unwrap_or(0).min(MAX_RETRY_AFTER_SECS));
                 ev.next_at = now.saturating_add(wait);
                 if ev.next_at >= ev.deadline {
-                    // It would be stale by then: not worth sending.
+                    // It would be stale by then: not worth sending. A lost turn
+                    // end leaves a user waiting, so it is reported (a name and
+                    // the last closed code); an approval event is not.
                     out.expired_unsent += 1;
+                    if ev.event == Event::TurnFinished {
+                        failed(&ev.dest, &code);
+                    }
                     return;
                 }
                 if self.queue.requeue(ev).is_ok() {
@@ -160,29 +185,49 @@ impl ApprovalSender {
     }
 }
 
-/// Installs the notifier on `approvals` and starts the sender thread (#911).
-/// Does nothing when no destination lists an approval event, so a serve without
-/// one is exactly as before. The thread is never joined: pending events are
-/// volatile and die with the process.
-pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) {
-    if !dests.any_lists(&[
-        super::Event::ApprovalRequested,
-        super::Event::ApprovalResolved,
-    ]) {
-        return;
+/// What [`spawn`] installed.
+pub struct Spawned {
+    /// For the serve turn path, when a destination lists `turn_finished`.
+    pub turns: Option<TurnNotifier>,
+}
+
+/// Installs the notifiers and starts the sender thread (#911, #962). Does
+/// nothing when no destination lists an approval or turn event, so a serve
+/// without one is exactly as before. The approval notifier and the expiry timer
+/// are only installed when an approval event is listed. The thread is never
+/// joined: pending events are volatile and die with the process.
+pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) -> Spawned {
+    let approval_events = dests.any_lists(&[Event::ApprovalRequested, Event::ApprovalResolved]);
+    let turn_events = dests.any_lists(&[Event::TurnFinished]);
+    if !approval_events && !turn_events {
+        return Spawned { turns: None };
     }
     let queue = VolatileQueue::new();
-    approvals.set_notifier(Some(notifier(
-        Arc::clone(&dests),
-        Arc::clone(&queue),
-        Arc::new(unix_now),
-        Arc::new(tole_core::secrets::process_secrets),
-    )));
+    if approval_events {
+        approvals.set_notifier(Some(notifier(
+            Arc::clone(&dests),
+            Arc::clone(&queue),
+            Arc::new(unix_now),
+            Arc::new(tole_core::secrets::process_secrets),
+        )));
+    }
+    let turns = turn_events.then(|| {
+        turn_notifier(
+            Arc::clone(&dests),
+            Arc::clone(&queue),
+            Arc::new(unix_now),
+            Arc::new(tole_core::secrets::process_secrets),
+        )
+    });
     let expire = Arc::clone(&approvals);
     let mut sender = ApprovalSender::new(
         Arc::clone(&queue),
         Box::new(move || {
-            expire.expire_due();
+            // Without an approval event no notifier is installed: leave the
+            // queue's own lazy pruning as it was.
+            if approval_events {
+                expire.expire_due();
+            }
         }),
     );
     std::thread::spawn(move || {
@@ -197,17 +242,17 @@ pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) {
                     &mut |dest, code| {
                         // A name and a closed code: never a URL, a header or text a
                         // receiver sent.
-                        eprintln!("tole serve: webhook approval event to `{dest}` failed: {code}");
+                        eprintln!("tole serve: webhook event to `{dest}` failed: {code}");
                     },
                 )
             }));
             if look.is_err() {
-                eprintln!("tole serve: the webhook approval sender hit an internal error");
+                eprintln!("tole serve: the webhook event sender hit an internal error");
             }
             let dropped = queue.dropped();
             if dropped != dropped_seen {
                 eprintln!(
-                    "tole serve: {} webhook approval event(s) dropped, a destination's queue is full",
+                    "tole serve: {} webhook event(s) dropped, a destination's queue is full",
                     dropped - dropped_seen
                 );
                 dropped_seen = dropped;
@@ -215,6 +260,7 @@ pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) {
             std::thread::sleep(POLL);
         }
     });
+    Spawned { turns }
 }
 
 fn unix_now() -> i64 {
