@@ -393,10 +393,21 @@ pub fn open_session_with(
             allow_patterns: &parent_allows,
             agents_worktree: false,
             delegation: None,
-            mcp_specs: &[],
+            // The owner's servers, read at startup (#946): never from the
+            // request or its overrides.
+            mcp_specs: crate::session::owner_mcp::specs(),
         },
     )
     .map_err(|e| e.to_string())?;
+    #[cfg(feature = "mcp")]
+    let mcp_notices = {
+        let sink = crate::tool_roster::McpNoticeSink::default();
+        roster.mcp_notices = Some(sink.clone());
+        // Every MCP tool on a server face is Write behind the approval gate:
+        // no ReadOnly `mcp_read` (#946).
+        roster.mcp_resources = false;
+        sink
+    };
     roster.plan_emitter = plan_emitter;
     roster.session = Some(session_id.to_string());
     // #217: a job that exits nudges this session at its next safe point.
@@ -440,6 +451,18 @@ pub fn open_session_with(
             .map_err(|e| format!("creating session: {e}"))?;
         (st, Some(prompt))
     };
+    // A server the lock refused (or that did not start) is reported once in
+    // the session log, where a client reads it with the entries (#946).
+    #[cfg(feature = "mcp")]
+    let storage = {
+        let mut storage = storage;
+        let notices = mcp_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        record_mcp_notices(&mut storage, &notices)?;
+        storage
+    };
     // Task-list tools (issue #198): registered after the storage open —
     // the state is seeded from the replayed transcript, so crash-resume
     // restores the last list; todo_write is absent under --plan-mode.
@@ -459,6 +482,38 @@ pub fn open_session_with(
         model: overrides.model,
         profile: overrides.profile,
     })
+}
+
+/// Appends one `error` entry per MCP server that did not start (#946): the
+/// server's name and the reason, no secret (the reason is the lock's own
+/// text). A root entry the model wire drops, so it never reaches the model.
+#[cfg(feature = "mcp")]
+fn record_mcp_notices(
+    storage: &mut tole_core::storage::JsonlStorage,
+    notices: &[crate::tool_roster::McpNotice],
+) -> Result<(), String> {
+    use tole_core::entry::{EntryType, NewEntry};
+    for n in notices {
+        let text = format!(
+            "MCP server `{}` was not started for this session: {}",
+            n.server, n.reason
+        );
+        // Redacted with the process secrets, as every egress of the log.
+        let text = crate::provider_chain::process_secrets(&crate::config_apply::real_env)
+            .redact(&text)
+            .into_owned();
+        storage
+            .commit(tole_core::storage::Commit::new().entry(NewEntry::root(
+                EntryType::new(EntryType::ERROR),
+                serde_json::json!({
+                    "error": text,
+                    "notice": "mcp_server_not_started",
+                    "server": n.server,
+                }),
+            )))
+            .map_err(|e| format!("recording the MCP notice: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The provider config of one turn: the process-wide one, with the session's
