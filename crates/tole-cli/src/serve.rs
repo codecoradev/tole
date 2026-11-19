@@ -1887,7 +1887,12 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // Neither live here nor parked in the cron ledger: nothing
                 // can run the approved call (the session was evicted or its
                 // process restarted). Say so instead of promising a resume.
-                if !serve_session && !tole_cli::cron::has_parked_run(&sid) {
+                // An error reading the ledger is not a "no": the resume below
+                // surfaces it in the log, as before.
+                if !serve_session && matches!(tole_cli::cron::has_parked_run(&sid), Ok(false)) {
+                    // The grant must not outlive the refusal: a session
+                    // reopened later would consume it silently.
+                    state.approvals.revoke_one_shot(&id);
                     return (
                         409,
                         json!({
@@ -2576,6 +2581,8 @@ mod tests {
         assert_eq!(status, 409, "{body}");
         assert_eq!(body["resuming"], false);
         assert!(body["error"].as_str().unwrap().contains("not live"));
+        // The refused allow left no one-shot behind (F2).
+        assert!(!state.approvals.has_pending("srv-gone"));
         let id = queue(2);
         let (status, body) = route(
             &state,

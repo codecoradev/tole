@@ -238,7 +238,10 @@ pub const AMBIGUOUS_SESSION: &str =
 impl Sessions {
     /// Install the rule for sessions that must not be evicted while it
     /// answers true (`tole serve`: a pending approval). The rule runs under
-    /// the map lock, so it must not take that lock.
+    /// the map lock, so it must not take that lock. For `tole serve` the
+    /// rule takes the approval queue's locks while the map lock is held; that
+    /// is deadlock free only because the approval notifier contract (it
+    /// enqueues, and never takes the sessions lock) holds.
     pub fn set_keep(&mut self, keep: KeepFn) {
         self.keep = Some(keep);
     }
@@ -1322,8 +1325,19 @@ mod eviction_tests {
             .unwrap();
         assert_eq!(evicted, vec!["s1".to_string()]);
         assert!(s.get("s0").is_some(), "the parked session must stay live");
-        // Once decided, the session is an ordinary LRU candidate again.
+        // Allowed but the resume has not claimed the turn yet: still held, so
+        // an admission in that window cannot evict it.
         queue.decide(&id, true);
+        let evicted = s
+            .admit_capped("mid".into(), state(dir.path(), "mid", false), cap)
+            .unwrap();
+        assert_eq!(evicted, vec!["s2".to_string()]);
+        assert!(
+            s.get("s0").is_some(),
+            "an approved, not yet resumed session stays"
+        );
+        // The resume replays the call (consuming the grant): ordinary again.
+        assert!(queue.take_one_shot("s0", 1));
         let evicted = s
             .admit_capped("newer".into(), state(dir.path(), "newer", false), cap)
             .unwrap();

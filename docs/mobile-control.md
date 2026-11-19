@@ -183,7 +183,7 @@ session's JSONL is what survives).
   reconnects mid-turn gets its id back together with the `busy` flag.
 - `404` no such session in that directory; `400` bad id or a `resume` that is not a string;
   `409` another process (a TUI, a second `tole serve`) holds the session's writer lock;
-  `503` at the live-session cap with every session busy.
+  `503` at the live-session cap with every session busy or holding a pending approval.
 - Approvals: a resumed session queues non-preauthorized Writes exactly like a new one.
   Nothing about resuming grants authority; the token is the same.
 
