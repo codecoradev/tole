@@ -47,9 +47,10 @@ Two consumer needs follow:
 
 ## 3. Event name and body
 
-Event type (also `X-Tole-Event`): `turn_finished`. It fits
-`webhook::valid_event` and is added to the closed list the `events` allow-list
-accepts. Envelope is the unchanged schema v1 of #911 section 2
+Event type (also `X-Tole-Event`): `turn_finished`. It passes the shape check
+`webhook::valid_event`; the real closed list is the `Event` enum in
+`webhook_out/mod.rs` (`ALL`, `as_str`, `parse`), which gains a `TurnFinished`
+member (`ALL` goes from 3 to 4 entries; `WebhookTest` stays outside it). Envelope is the unchanged schema v1 of #911 section 2
 (`v`, `id`, `type`, `destination`, `at`, `data`); `v` stays 1 because adding an
 event type is additive.
 
@@ -74,7 +75,7 @@ event type is additive.
 |---|---|---|
 | `session_id` | string, id charset | the serve session whose turn ended |
 | `status` | closed word, section 4 | how the turn ended |
-| `entries` | integer | number of entries in the session log when the turn settled; the receiver reads entries after the cursor it already holds, and uses it to see that it has caught up |
+| `entries` | integer | the session log position when the turn settled (see D2: it must be the number `GET /sessions/{id}/entries?after=` pages by, i.e. `last_seq`, not a raw count unless the two are proven equal); the receiver reads entries after the cursor it already holds |
 | `approval_id` | string, id charset, only when `status = approval_pending` | the approval the turn stopped on |
 | `code` | closed word, only when `status = failed` or `blocked` | a fixed reason code, never a message (section 4) |
 
@@ -84,17 +85,33 @@ event type is additive.
   needed, and a name or count is one more field a test has to prove clean.
 - **RECOMMENDATION** There is no `truncated` field and no cap branch: the body
   is a few hundred bytes by construction (section 8).
-- `session_id` and `approval_id` are ids tole generates, as in the approval
-  events. If a session id can fall outside `[A-Za-z0-9._:-]`, the producer
-  refuses to emit (counted, one stderr line with the code `bad_id`), as the
-  loader does for approval ids.
+- `session_id` is validated by `validate_session_id` (`[A-Za-z0-9_-]`, at most
+  64), so it is always inside the delivery-id charset; it may be chosen by the
+  client on resume but is always validated. `approval_id` is already inside the
+  charset (#911 section 2). The producer keeps a defensive refusal (counted, one
+  stderr line with the code `bad_id`) that should be unreachable.
 
 ## 4. Which turn outcomes emit
 
-Source: `TurnOutcome` in `crates/tole-core/src/turn/mod.rs`, as observed at the
-serve turn runner. The mapping is a **closed set**; a new `TurnOutcome` variant
-must be mapped on purpose (the match has no wildcard arm), and the default for
-an unmapped variant is `failed` with `code = "internal"`.
+Source: `TurnOutcome` in `crates/tole-core/src/turn/mod.rs`. **Where it is
+observed matters.** The serve routes never see `TurnOutcome`:
+`run_session_turn_detailed` (`session/host.rs`) consumes it and returns a
+`TurnResult` with a collapsed `stop` string (`stop_reason` folds
+`StopGateBlocked`, `ApprovalRequired`, `UnknownTool`, `ProviderFailed` and
+`LoopDetected` into `"refusal"`); a `Storage` error or a runner error returns
+`Err(String)`; the resume path returns only `(String, Option<String>)`. So:
+
+- **RECOMMENDATION** The notifier hooks inside `host.rs`, next to `stop_reason`
+  and `log_outcome`, or `TurnResult` and the resume return gain a small typed
+  `TurnEnd` enum built from `&TurnOutcome` with every payload string discarded.
+  There is one exhaustive match (no wildcard arm); this is a new rule, since
+  `stop_reason` collapses today. Passing a `message`, `name`, `tool` or `reason`
+  string through to the event is the leak the typed enum exists to prevent.
+- An `Err` from the turn call maps to `failed` with `code = "storage"` or
+  `"internal"`, and the string is dropped. A busy 409, an invalid id and any
+  request rejected before a turn starts emit nothing.
+- The mapping below is a closed set; an unmapped variant would be `failed` with
+  `code = "internal"`.
 
 | `TurnOutcome` | `status` | `code` | note |
 |---|---|---|---|
@@ -107,11 +124,18 @@ an unmapped variant is `failed` with `code = "internal"`.
 | `LoopDetected` | `blocked` | `loop` | the repeated tool name and count are not sent |
 | `UnknownTool` | `blocked` | `unknown_tool` | the requested tool name is model output and is not sent |
 | `StopGateBlocked` | `blocked` | `stop_gate` | the gate reason is durable in the log but not sent |
-| `ApprovalRequired` | `approval_pending` | none | carries `approval_id`; see below |
+| `ApprovalRequired` | `approval_pending` | none | only when a Pending queue entry exists; see below |
 
 **Approval stop.** `approval_requested` already fires when the entry is queued.
 Whether the turn's end also emits `turn_finished(approval_pending)` is a choice:
 
+- `ApprovalRequired { name }` carries no approval id, and the same outcome also
+  covers a denied or hook-refused call. The id is read from the queue entry
+  (`queued_since` / `approval_required_body` in `serve.rs`), never from the
+  outcome. **RECOMMENDATION** emit `approval_pending` only when a Pending entry
+  exists, with its `approval_id`; when none exists emit `blocked` with
+  `code = "approval"` (added to D6). The resume path has no id plumbing today
+  and needs it (section 12).
 - **RECOMMENDATION** Emit it. Then every turn leg ends with exactly one
   terminal event, the gateway has a single rule ("stop waiting on this leg"),
   and a lost `approval_requested` can still be recovered from the later
@@ -122,8 +146,11 @@ Whether the turn's end also emits `turn_finished(approval_pending)` is a choice:
 **Which sessions.** **RECOMMENDATION** Only turns that run in a `tole serve`
 session started or resumed through the serve routes. Cron agent runs already
 have `cron_run_finished`; ACP and the TUI have no outbound webhook sink, so this
-is a serve-only item and needs a row in [faces.md](faces.md) with that reason
-(AGENTS.md section 6), with `face_parity` passing. (**DECISION NEEDED**, D5.)
+is a serve-only item and needs a row in the capability table of
+[faces.md](faces.md) (status `policy`, with the reason; AGENTS.md section 6),
+with `face_parity` passing. Mission turns (`POST /missions`) start outside
+`run_session_turn_detailed`; whether they emit is part of D5 (recommended: no in
+v1). ACP and MCP-HTTP share the host turn path, so the hook is gated to serve. (**DECISION NEEDED**, D5.)
 
 **Never emitted:** a turn that never started (a rejected request), a
 `webhook_test`, and any state that is not a turn end. A turn that continues after
@@ -207,13 +234,18 @@ gateway and any other receiver):
   announce something that cannot be decided. A turn end is different: the session
   and its answer are durable, and a lost `turn_finished` leaves a user waiting
   for a reply that already exists.
-  - Option A, **RECOMMENDED for v1**: volatile bounded in-memory queue like the
+  - Option A, **RECOMMENDED for v1**: the existing volatile bounded in-memory queue like the
     approval events (256 per destination, counted), with a longer retry
     horizon than approvals (2 s, 10 s, 30 s, 2 min, then every 5 min up to 15 min,
     then dead), and the gateway reconciles through
     `GET /sessions/{id}/status` at start and after a reconnect, which it
-    already does for approvals. Simple, no new outbox semantics, no ledger row,
-    no reconcile pass.
+    already does for approvals. No outbox, no ledger row, no reconcile pass. It is
+    not free: today's queue is drop-newest only, has a fixed 900 s deadline per
+    event and a fixed 2/10/30/120 s backoff, and the sender thread starts only
+    when a destination lists an approval event. Option A therefore changes
+    (a) the sender start condition to include `turn_finished`, (b) the per-event
+    deadline and backoff tail, (c) the overflow rule of D8, plus a new doctor
+    counter. These are changes to a reviewed path.
   - Option B: the durable cron outbox. Survives a serve restart and gives the 6 h
     horizon, but the outbox, its validation rules, its reconcile pass and its
     ledger rows are keyed to a cron `fire_id`; a turn event has none, so this is
@@ -269,7 +301,10 @@ the storage error, paths, model and provider names, the destination URL and key.
   failure injection as in #911 (500 then 200 with the same id and body and a new
   timestamp, 400 no retry, a hung receiver does not delay the turn, a killed
   receiver and a restarted serve).
-- *Leak check (#781 pattern):* a canary secret placed in the environment, the
+- *Leak check (#781 pattern), scoped to this event:* the existing `log_outcome`
+  stderr line already prints provider messages, tool names and gate reasons
+  (`host.rs`), so the stderr assertion covers the notifier's own lines only and
+  `log_outcome` is a named pre-existing sink (a separate item may redact it). a canary secret placed in the environment, the
   user prompt, a tool result, the assistant's final text, the provider error
   message, the stop-gate reason and an unknown tool name; neither the canary nor
   the destination key may appear in any received body, the outbox if used, the
@@ -311,11 +346,13 @@ Each has a recommendation; none is decided by this note.
 
 - **D1 Durability.** Volatile queue with a longer retry horizon (A,
   recommended) or the durable outbox (B)? Section 8.
-- **D2 `entries` cursor.** Is the log length the right idempotency suffix and
-  read cursor, or should serve expose an explicit turn counter? The log length is
-  recommended because it needs no new state; the cost is that it couples the
-  event to the log's entry numbering. Verify it against the serve status shape
-  when the code is written.
+- **D2 Cursor.** The receiver pages entries by `Entry.seq` (`last_seq` /
+  `next_after`), and `seq` is not obviously equal to the entry count (the
+  `entries` field of `GET /sessions/{id}` is a count and is `null` while a turn
+  runs). Recommended: name the field after what the receiver pages by
+  (`last_seq`) and use it as the idempotency suffix; verify against the log
+  before accepting section 6. A separate turn counter is the alternative and
+  needs new state.
 - **D3 Approval stop.** Emit `turn_finished(approval_pending)` (recommended) or
   stay silent because `approval_requested` covers it?
 - **D4 `detached`.** Keep it as its own word (recommended, it is a different owner
@@ -326,7 +363,7 @@ Each has a recommendation; none is decided by this note.
 - **D6 Status vocabulary.** Approve the closed set `completed`, `failed`,
   `cancelled`, `detached`, `budget_exhausted`, `blocked`, `approval_pending` and
   the `code` words `provider`, `storage`, `loop`, `unknown_tool`, `stop_gate`,
-  `internal`. Adding a word later is additive; renaming one is a `v` bump.
+  `internal`, `approval`. Adding a word later is additive; renaming one is a `v` bump.
 - **D7 Persona field.** Keep `profile` out of the body (recommended) or add the
   profile name so a receiver without a session map can route? It is
   config-derived and not agent text, so it is safe, but it is one more field.
@@ -337,10 +374,13 @@ Each has a recommendation; none is decided by this note.
 
 ## 12. Implementation plan (for the next step, not this PR)
 
-1. `feat(cli)`: event name in the `events` validator, `TurnFinished` payload type
+1. `feat(cli)`: `Event::TurnFinished` in `webhook_out/mod.rs` (`ALL`, `as_str`,
+   `parse`), `TurnFinished` payload type
    with the closed enums and the id function (shared with cron), the outcome
    mapping with no wildcard arm, schema and mapping unit tests.
-2. `feat(serve)`: notifier at the turn settle in the serve runner, queue policy
+2. `feat(serve)`: the typed `TurnEnd` through `host.rs` and the resume return,
+   approval id plumbing for the resume path, the sender start condition,
+   notifier at the turn settle in the serve runner, queue policy
    from D1 and D8, `faces.md` row, e2e with failure injection and the leak check,
    threat-model row, design-doc table, CHANGELOG, README status line,
    `docs/epics.md`. Needs an **independent review** (it touches the outbound data
