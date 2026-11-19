@@ -95,6 +95,37 @@ pub fn probe(s: &Sibling) -> Status {
     }
 }
 
+/// `tole doctor` WARN (#992): `CODECORA_HOME` moves uteke's whole home (the
+/// store, the embedding model under `models/`, `uteke.toml`, logs) to
+/// `<CODECORA_HOME>/uteke`. When the owner has a populated `~/.codecora/uteke`
+/// and the new location does not exist yet, the memory looks lost and the
+/// first recall would download the model again. `None` when there is nothing
+/// to say: no `CODECORA_HOME` (or a relative one), an owner `UTEKE_HOME`, no
+/// old home, or the new location already exists.
+pub fn store_move_warning(
+    codecora_home: Option<&str>,
+    uteke_home: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    let cc = std::path::Path::new(codecora_home.filter(|s| !s.is_empty())?);
+    if !cc.is_absolute() || uteke_home.is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    let old = home?.join(".codecora").join("uteke");
+    let new = cc.join("uteke");
+    if old == new || !old.is_dir() || new.exists() {
+        return None;
+    }
+    Some(format!(
+        "  ! uteke: CODECORA_HOME is set, so uteke now uses {} (store, embedding model, \
+         config), but {} exists and is not used; export UTEKE_HOME={} to keep it, or \
+         copy or symlink it (at least its models/ directory) to the new location",
+        new.display(),
+        old.display(),
+        old.display()
+    ))
+}
+
 fn fmt(v: (u64, u64, u64)) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
@@ -185,5 +216,32 @@ mod tests {
     fn only_cora_has_a_setup_shortcut() {
         assert!(line(&SIBLINGS[0], &Status::Missing).contains("tole setup cora"));
         assert!(!line(&SIBLINGS[1], &Status::Missing).contains("tole setup"));
+    }
+
+    #[test]
+    fn store_move_warns_only_when_the_old_home_would_be_orphaned() {
+        let root = std::env::temp_dir().join(format!("tole-eco-992-{}", std::process::id()));
+        let home = root.join("home");
+        let cc = root.join("cc");
+        std::fs::create_dir_all(home.join(".codecora/uteke")).unwrap();
+        std::fs::create_dir_all(&cc).unwrap();
+        let (h, c) = (Some(home.as_path()), cc.to_str());
+        let w = store_move_warning(c, None, h).expect("warns");
+        assert!(w.contains("UTEKE_HOME="), "{w}");
+        assert!(w.contains(&cc.join("uteke").display().to_string()), "{w}");
+        // An owner UTEKE_HOME, no CODECORA_HOME, a relative one: silent.
+        assert!(store_move_warning(c, Some("/x"), h).is_none());
+        assert!(store_move_warning(None, None, h).is_none());
+        assert!(store_move_warning(Some(""), None, h).is_none());
+        assert!(store_move_warning(Some("rel"), None, h).is_none());
+        // The new home exists: nothing is lost.
+        std::fs::create_dir_all(cc.join("uteke")).unwrap();
+        assert!(store_move_warning(c, None, h).is_none());
+        // No old home to lose.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::remove_dir_all(cc.join("uteke")).unwrap();
+        assert!(store_move_warning(c, None, Some(bare.as_path())).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

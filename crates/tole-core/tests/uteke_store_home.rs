@@ -12,7 +12,7 @@ use tole_core::memory::{recall, remember_session, MemoryConfig};
 use tole_core::secrets::SecretSet;
 use tole_core::skill_index::{SkillEntry, SkillFilter, SkillIndex, SkillStatus, UtekeDocIndex};
 use tole_core::tool::Tool;
-use tole_core::uteke::UtekeRecallTool;
+use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 
 /// Every file under `dir`, recursively (relative paths as text).
 fn files_under(dir: &std::path::Path) -> Vec<String> {
@@ -66,36 +66,94 @@ fn spawned_uteke_uses_the_codecora_home_store_not_the_real_home() {
 
     let bin = bin_dir.join("uteke").display().to_string();
     let cfg = MemoryConfig::for_cwd(&bin, &root.join("proj"));
-    let _ = recall(&cfg, "anything");
-    let _ = remember_session(&cfg, "s1", "prompt", "answer", false, &SecretSet::default());
-    let idx = UtekeDocIndex::new(&bin);
-    let _ = idx.search("q", &SkillFilter::default(), 3);
-    let _ = idx.upsert(&SkillEntry {
-        name: "demo".into(),
-        description: "d".into(),
-        profiles: vec![],
-        status: SkillStatus::Approved,
-        content_hash: "sha256:00".into(),
-    });
-    // The bare-`uteke` (PATH) spawn of the recall tool.
-    let _ = UtekeRecallTool::new().execute(json!({"query": "anything"}));
-
     let store = codecora_home.join("uteke");
-    let log = std::fs::read_to_string(store.join("calls.log")).unwrap_or_default();
-    assert!(
-        log.lines().count() >= 4,
-        "expected every spawn in <CODECORA_HOME>/uteke, saw: {log:?}"
-    );
+    let log_of = |store: &std::path::Path| -> Vec<String> {
+        std::fs::read_to_string(store.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let exercise = || {
+        let mut errs = Vec::new();
+        errs.extend(recall(&cfg, "anything").err());
+        errs.extend(
+            remember_session(&cfg, "s1", "prompt", "answer", false, &SecretSet::default()).err(),
+        );
+        let idx = UtekeDocIndex::new(&bin);
+        errs.extend(idx.search("q", &SkillFilter::default(), 3).err());
+        errs.extend(
+            idx.upsert(&SkillEntry {
+                name: "demo".into(),
+                description: "d".into(),
+                profiles: vec![],
+                status: SkillStatus::Approved,
+                content_hash: "sha256:00".into(),
+            })
+            .err(),
+        );
+        // The bare-`uteke` (PATH) spawns.
+        errs.extend(
+            UtekeRecallTool::new()
+                .execute(json!({"query": "anything", "room": "repo-proj"}))
+                .err(),
+        );
+        errs.extend(
+            UtekeDocumentTool::new(None)
+                .execute(json!({"slug": "demo-doc", "markdown": "# d", "room": "repo-proj"}))
+                .err(),
+        );
+        errs
+    };
+
+    let errs = exercise();
+    assert!(errs.is_empty(), "{errs:?}");
+    let log = log_of(&store);
+    let want = [
+        "room recall --limit 3 --json -- repo-proj anything",
+        "recall --namespace repo-proj --limit 3 --json -- anything",
+        "remember [tole session s1] prompt \u{2192} answer --room repo-proj --type context \
+         --tags tole,session --source tole-harness --source-type system",
+        "doc search q --mode semantic --limit 9 --json",
+        "doc create skill-demo --file - --tags skill",
+        "doc update skill-demo --metadata {\"content_hash\":\"sha256:00\",\"description\":\"d\",\
+         \"kind\":\"tole-skill\",\"name\":\"demo\",\"profiles\":[],\"status\":\"approved\"}",
+        "room recall repo-proj anything --limit 5 --json",
+        "doc create demo-doc --file -",
+        "room add-document repo-proj demo-doc",
+    ];
+    assert_eq!(log, want, "every spawn, with its exact argv, in the store");
     assert_eq!(
         files_under(&decoy_home),
         Vec::<String>::new(),
         "nothing may appear under the real HOME"
     );
 
-    // Without CODECORA_HOME uteke keeps its own default under HOME.
-    std::env::remove_var("CODECORA_HOME");
+    // A relative CODECORA_HOME fails closed: no spawn, an error each, and no
+    // file under HOME or the working directory.
+    std::fs::remove_file(store.join("calls.log")).unwrap();
+    std::env::set_var("CODECORA_HOME", "rel-home");
+    let errs = exercise();
+    assert_eq!(errs.len(), 6, "{errs:?}");
+    assert!(
+        errs.iter().all(|e| e.contains("not an absolute path")),
+        "{errs:?}"
+    );
+    assert!(log_of(&store).is_empty());
+    assert!(files_under(&decoy_home).is_empty());
+    assert!(!std::path::Path::new("rel-home").exists());
+
+    // An empty CODECORA_HOME is unset (tole's own rule): uteke keeps its own
+    // default under HOME, like tole's data does.
+    std::env::set_var("CODECORA_HOME", "");
     let _ = recall(&cfg, "anything");
     assert!(decoy_home.join(".codecora/uteke/calls.log").exists());
+
+    // Unset: the same.
+    std::env::remove_var("CODECORA_HOME");
+    std::fs::remove_file(decoy_home.join(".codecora/uteke/calls.log")).unwrap();
+    let _ = recall(&cfg, "anything");
+    assert_eq!(log_of(&decoy_home.join(".codecora/uteke")).len(), 2);
 
     // A UTEKE_HOME the user chose wins over CODECORA_HOME.
     let chosen = root.join("chosen");

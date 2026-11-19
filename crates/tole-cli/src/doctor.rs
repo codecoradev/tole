@@ -813,6 +813,16 @@ pub fn run_cli(
             crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
         );
     }
+    let home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(w) = crate::ecosystem::store_move_warning(
+        std::env::var("CODECORA_HOME").ok().as_deref(),
+        std::env::var("UTEKE_HOME").ok().as_deref(),
+        home_dir.as_deref(),
+    ) {
+        println!("{w}");
+    }
     // Review gate (#534): what a `git commit` needs while cora is attached.
     #[cfg(feature = "shell-tools")]
     println!(

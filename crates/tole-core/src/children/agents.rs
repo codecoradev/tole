@@ -488,7 +488,10 @@ fn clean_mailbox(ns: &str) {
     // Deleting a room only unlinks its memories, so forget them first.
     forget_listed(&["room", "recall", "--limit", "1000", "--json", "--", ns]);
     let mut drop_room = Command::new("uteke");
-    crate::subprocess::point_uteke_at_data_dir(&mut drop_room);
+    crate::subprocess::scrub_env_for(&mut drop_room, "uteke");
+    if crate::subprocess::point_uteke_at_data_dir(&mut drop_room).is_err() {
+        return;
+    }
     drop_room
         .args(["room", "delete", "--confirm", "--", ns])
         .stdin(Stdio::null());
@@ -501,7 +504,10 @@ fn clean_mailbox(ns: &str) {
 /// `{"id"}` or nested `{"memory": {"id"}}` items).
 fn forget_listed(list_args: &[&str]) {
     let mut list = Command::new("uteke");
-    crate::subprocess::point_uteke_at_data_dir(&mut list);
+    crate::subprocess::scrub_env_for(&mut list, "uteke");
+    if crate::subprocess::point_uteke_at_data_dir(&mut list).is_err() {
+        return;
+    }
     list.args(list_args).stdin(Stdio::null());
     let Ok(out) =
         crate::subprocess::run_with_timeout(&mut list, crate::subprocess::SUBPROCESS_TIMEOUT)
@@ -523,7 +529,10 @@ fn forget_listed(list_args: &[&str]) {
             .and_then(Value::as_str)
     }) {
         let mut cmd = Command::new("uteke");
-        crate::subprocess::point_uteke_at_data_dir(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "uteke");
+        if crate::subprocess::point_uteke_at_data_dir(&mut cmd).is_err() {
+            return;
+        }
         cmd.args(["forget", "--confirm", "--", id])
             .stdin(Stdio::null());
         let _ =
@@ -1224,6 +1233,71 @@ impl AgentPollTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #992: the mailbox cleanup uses `<CODECORA_HOME>/uteke`, never the
+    /// store under the real HOME, and does not run at all on a relative one.
+    #[cfg(unix)]
+    #[test]
+    fn mailbox_cleanup_uses_the_codecora_home_store() {
+        let dir = TestDir::new("tole-mbox-992");
+        let (bin, decoy, cc) = (dir.join("bin"), dir.join("home"), dir.join("cc"));
+        for d in [&bin, &decoy, &cc] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        crate::test_dir::write_executable(
+            bin.join("uteke"),
+            "#!/bin/sh\nstore=\"${UTEKE_HOME:-$HOME/.codecora/uteke}\"\nmkdir -p \"$store\"\n\
+             echo \"$*\" >> \"$store/calls.log\"\n\
+             echo \"${TOLE_T992_API_KEY:-stripped}\" >> \"$store/env.log\"\n\
+             case \"$1\" in room) [ \"$2\" = recall ] && echo '[{\"id\":\"m1\"}]';; \
+             list) echo '[{\"id\":\"m2\"}]';; esac\nexit 0\n",
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let (d, c) = (decoy.to_str().unwrap(), cc.to_str().unwrap());
+        // Built at run time: a secret-shaped variable the child must not see.
+        let secret = format!("{}-{}", "mailbox", "scrub-992-0123456789");
+        crate::paths::with_env(
+            &[
+                ("PATH", Some(&path)),
+                ("HOME", Some(d)),
+                ("CODECORA_HOME", Some(c)),
+                ("UTEKE_HOME", None),
+                ("TOLE_T992_API_KEY", Some(&secret)),
+            ],
+            || {
+                clean_mailbox("mbox");
+                let log = std::fs::read_to_string(cc.join("uteke/calls.log")).unwrap();
+                let lines: Vec<&str> = log.lines().collect();
+                assert_eq!(
+                    lines,
+                    [
+                        "room recall --limit 1000 --json -- mbox",
+                        "forget --confirm -- m1",
+                        "room delete --confirm -- mbox",
+                        "list --namespace mbox --limit 1000 --json",
+                        "forget --confirm -- m2",
+                    ]
+                );
+                assert!(!decoy.join(".codecora").exists());
+                // The scrub still ran (#682) while UTEKE_HOME got through: the
+                // calls landed in the CODECORA_HOME store above, and no child
+                // saw the secret.
+                let env_log = std::fs::read_to_string(cc.join("uteke/env.log")).unwrap();
+                assert_eq!(env_log.lines().count(), 5);
+                assert!(env_log.lines().all(|l| l == "stripped"), "{env_log}");
+                // Relative: nothing runs.
+                std::env::set_var("CODECORA_HOME", "rel-home");
+                std::fs::remove_file(cc.join("uteke/calls.log")).unwrap();
+                clean_mailbox("mbox");
+                assert!(!cc.join("uteke/calls.log").exists());
+                assert!(!decoy.join(".codecora").exists());
+            },
+        );
+    }
     use serde_json::json;
 
     fn fake_child(dir: &std::path::Path) -> PathBuf {
