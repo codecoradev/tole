@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [develop, main]
     types: [opened, synchronize, ready_for_review, reopened]
+  # Merge queue (#806): the review was done on the PR head; the job is skipped
+  # (reports success) on a queue entry so the required check still reports.
+  merge_group:
 
 concurrency:
   group: cora-review-${{ github.ref }}
@@ -18,6 +21,7 @@ permissions:
 jobs:
   cora-review:
     name: Cora Review
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     # PRs of 850+ lines need ~16 min of review; 10 min cancelled them
     # mid-review with no verdict.
