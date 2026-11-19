@@ -16,6 +16,8 @@ use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
+use crate::webhook_out::turn::{TurnCode, TurnEnd};
+
 #[derive(Clone)]
 pub struct SessionState {
     /// Per-session storage lock: a turn holds THIS (not the session-map
@@ -38,6 +40,10 @@ pub struct SessionState {
     /// hosts would correlate the completion onto the previous turn's
     /// stale card.
     pub tool_ids: StdArc<Mutex<u64>>,
+    /// Turns this process has settled in the session (#962, D10): the part of a
+    /// `turn_finished` id that keeps two settles at the same log position apart.
+    /// In memory: it restarts at 0 with the process.
+    pub settles: StdArc<std::sync::atomic::AtomicU64>,
     /// client cancel (ACP `session/cancel`); the turn loop checks it
     /// between steps. `serve` never sets it — REST behavior unchanged.
     pub cancel: tole_core::cancel::CancelToken,
@@ -640,6 +646,7 @@ fn open_session_inner(
         busy: StdArc::new(Mutex::new(false)),
         cancel,
         tool_ids: StdArc::new(Mutex::new(0)),
+        settles: StdArc::default(),
         model: overrides.model,
         profile: overrides.profile,
     };
@@ -810,6 +817,38 @@ pub struct TurnResult {
     /// claimed the session (`Some` when the caller passed a queue): an entry
     /// of this session newer than it was queued by this turn.
     pub queue_mark: Option<u64>,
+    /// The typed end of the turn for the `turn_finished` webhook (#962): every
+    /// payload string dropped. `None` when the end is not announced.
+    pub turn_end: Option<TurnEnd>,
+}
+
+/// A turn that returned an error. `message` is what the HTTP face reports.
+/// `end` is `Some` only when the turn had started (the session was claimed):
+/// a busy session or an unknown id never produce one, so nothing is announced.
+/// It carries no text; `message` must never be copied into an event.
+#[derive(Debug)]
+pub struct TurnError {
+    pub message: String,
+    pub end: Option<TurnEnd>,
+}
+
+impl TurnError {
+    fn before_turn(message: String) -> TurnError {
+        TurnError { message, end: None }
+    }
+
+    fn failed(message: String, code: TurnCode, storage: &dyn Storage, settle: u64) -> TurnError {
+        TurnError {
+            message,
+            end: Some(TurnEnd::failed(code, last_seq(storage)).with_settle(settle)),
+        }
+    }
+}
+
+/// The `seq` of the newest entry (0 when the log is empty): the position
+/// `GET /sessions/{id}/entries?after=` pages by.
+fn last_seq(storage: &dyn Storage) -> u64 {
+    storage.entries().last().map_or(0, |e| e.seq)
 }
 
 /// [`run_session_turn_with_images`] plus the approval tool of an
@@ -825,11 +864,31 @@ pub fn run_session_turn_detailed(
     observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
     approvals: Option<&crate::approvals::ApprovalQueue>,
 ) -> Result<TurnResult, String> {
+    run_session_turn_with_end(sessions, session_id, prompt, images, observer, approvals)
+        .map_err(|e| e.message)
+}
+
+/// [`run_session_turn_detailed`] with the typed end of a failed turn (#962),
+/// for the one face that announces turn ends (`tole serve`).
+pub fn run_session_turn_with_end(
+    sessions: SharedSessions,
+    session_id: &str,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+    observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
+    approvals: Option<&crate::approvals::ApprovalQueue>,
+) -> Result<TurnResult, TurnError> {
     // Brief map lock: claim the session for this turn. The MAP lock is
     // released here — a running turn holds only its OWN storage lock, so
     // the transport loop stays live (CodeCora deadlock finding).
-    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let (state, _busy_guard) = lock_sessions(&sessions)
+        .claim_turn(session_id)
+        .map_err(TurnError::before_turn)?;
     let queue_mark = approvals.map(|q| q.mark());
+    let settle = state
+        .settles
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let refresher = state.clone();
     let SessionState {
         storage,
@@ -860,7 +919,8 @@ pub fn run_session_turn_detailed(
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
     // Model routing (#586, #945): once, at the first prompt of a NEW session.
     if !*first_prompt_done.lock().expect("fpd lock") && model.is_none() {
-        route_first_prompt(&mut *storage, profile.as_deref(), prompt, &registry)?;
+        route_first_prompt(&mut *storage, profile.as_deref(), prompt, &registry)
+            .map_err(|e| TurnError::failed(e, TurnCode::Internal, &*storage, settle))?;
     }
     // Live-token sinks (issue #196 phase 3): when an observer is wired
     // (ACP, serve with an open event stream), streamed reasoning/content
@@ -868,7 +928,8 @@ pub fn run_session_turn_detailed(
     // semantics are unchanged. The same configuration applies to a reserve
     // provider (#209). The turn itself is the shared runner (#525).
     let plan = crate::turn_runner::TurnPlan {
-        cfg: session_provider_config(model.as_deref())?,
+        cfg: session_provider_config(model.as_deref())
+            .map_err(|e| TurnError::failed(e, TurnCode::Provider, &*storage, settle))?,
         registry: &registry,
         system_prompt: system_prompt.as_deref(),
         cancel: &cancel,
@@ -878,7 +939,7 @@ pub fn run_session_turn_detailed(
     };
     let outcome =
         crate::turn_runner::run_turn_on_with_images(&mut *storage, &plan, &effective, images)
-            .map_err(|e| e.into_message())?;
+            .map_err(|e| run_error(e, &*storage, settle))?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
@@ -892,7 +953,12 @@ pub fn run_session_turn_detailed(
         final_text = Some(text.clone());
     }
     log_outcome(&outcome);
-    let stop = stop_reason(&outcome)?;
+    let turn_end =
+        TurnEnd::from_outcome(&outcome, last_seq(&*storage)).map(|e| e.with_settle(settle));
+    let stop = stop_reason(&outcome).map_err(|message| TurnError {
+        message,
+        end: turn_end,
+    })?;
     let approval_tool = match &outcome {
         tole_core::turn::TurnOutcome::ApprovalRequired { name } => Some(name.clone()),
         _ => None,
@@ -902,6 +968,7 @@ pub fn run_session_turn_detailed(
         text: final_text,
         approval_tool,
         queue_mark,
+        turn_end,
     })
 }
 
@@ -915,7 +982,28 @@ pub fn resume_session_turn(
     sessions: SharedSessions,
     session_id: &str,
 ) -> Result<(String, Option<String>), String> {
-    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    resume_session_turn_with_end(sessions, session_id, None)
+        .map(|r| (r.stop, r.text))
+        .map_err(|e| e.message)
+}
+
+/// [`resume_session_turn`] with the typed end of the resumed turn (#962), and
+/// the approval queue snapshot (`TurnResult::queue_mark`, taken after the busy
+/// claim as in [`run_session_turn_detailed`]) so a second approval stop can name
+/// the entry it queued. Only `tole serve` calls it.
+pub fn resume_session_turn_with_end(
+    sessions: SharedSessions,
+    session_id: &str,
+    approvals: Option<&crate::approvals::ApprovalQueue>,
+) -> Result<TurnResult, TurnError> {
+    let (state, _busy_guard) = lock_sessions(&sessions)
+        .claim_turn(session_id)
+        .map_err(TurnError::before_turn)?;
+    let queue_mark = approvals.map(|q| q.mark());
+    let settle = state
+        .settles
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let refresher = state.clone();
     let SessionState {
         storage,
@@ -933,7 +1021,8 @@ pub fn resume_session_turn(
     // resume, while one that landed earlier had no in-flight turn to
     // target (cancel is unconditional) and must not kill it.
     let plan = crate::turn_runner::TurnPlan {
-        cfg: session_provider_config(model.as_deref())?,
+        cfg: session_provider_config(model.as_deref())
+            .map_err(|e| TurnError::failed(e, TurnCode::Provider, &*storage, settle))?,
         registry: &registry,
         system_prompt: system_prompt.as_deref(),
         cancel: &cancel,
@@ -941,15 +1030,42 @@ pub fn resume_session_turn(
         resolve_parked: false,
         compaction: None,
     };
-    let outcome =
-        crate::turn_runner::resume_turn_on(&mut *storage, &plan).map_err(|e| e.into_message())?;
+    let outcome = crate::turn_runner::resume_turn_on(&mut *storage, &plan)
+        .map_err(|e| run_error(e, &*storage, settle))?;
     refresher.refresh_status(&*storage);
     let final_text = match &outcome {
         tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
         _ => None,
     };
     log_outcome(&outcome);
-    Ok((stop_reason(&outcome)?, final_text))
+    let turn_end =
+        TurnEnd::from_outcome(&outcome, last_seq(&*storage)).map(|e| e.with_settle(settle));
+    let stop = stop_reason(&outcome).map_err(|message| TurnError {
+        message,
+        end: turn_end,
+    })?;
+    let approval_tool = match &outcome {
+        tole_core::turn::TurnOutcome::ApprovalRequired { name } => Some(name.clone()),
+        _ => None,
+    };
+    Ok(TurnResult {
+        stop,
+        text: final_text,
+        approval_tool,
+        queue_mark,
+        turn_end,
+    })
+}
+
+/// A runner error as a failed turn: the code says which part failed, the text
+/// stays in `message` only.
+fn run_error(e: crate::turn_runner::TurnRunError, storage: &dyn Storage, settle: u64) -> TurnError {
+    use crate::turn_runner::TurnRunError as E;
+    let code = match &e {
+        E::Provider(_) => TurnCode::Provider,
+        E::Storage(_) => TurnCode::Storage,
+    };
+    TurnError::failed(e.into_message(), code, storage, settle)
 }
 
 /// Single stop-reason mapping for `run_session_turn` and
@@ -1011,6 +1127,7 @@ mod eviction_tests {
             busy: StdArc::new(Mutex::new(busy)),
             cancel: tole_core::cancel::CancelToken::default(),
             tool_ids: StdArc::new(Mutex::new(0)),
+            settles: StdArc::default(),
             model: None,
             profile: None,
             status: StdArc::default(),

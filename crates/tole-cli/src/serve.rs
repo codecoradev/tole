@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::session_host::{
-    lock_sessions, open_session_with, run_session_turn_detailed, SessionOverrides, Sessions,
+    lock_sessions, open_session_with, run_session_turn_with_end, SessionOverrides, Sessions,
     SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
@@ -125,6 +125,38 @@ struct State {
     missions: Arc<missions::Missions>,
     /// What a client may pick for `GET /models` (#574): the owner's list.
     models: models::ModelCatalog,
+    /// The `turn_finished` webhook callback (#962), set once at start-up when a
+    /// destination lists the event. Empty, no turn path does anything extra.
+    turn_events: std::sync::OnceLock<tole_cli::webhook_out::turn::TurnNotifier>,
+}
+
+/// Announces a settled turn of a `tole serve` session to the destinations that
+/// list `turn_finished` (#962, provisional D5: serve sessions only). `end` is the
+/// typed end built in the session host, with no text in it. The approval id of an
+/// `approval_pending` end is read from the queue entry this turn queued, never
+/// from the outcome. Never blocks beyond a queue push and never fails the turn.
+fn announce_turn(
+    notifier: Option<&tole_cli::webhook_out::turn::TurnNotifier>,
+    approvals: &tole_cli::approvals::ApprovalQueue,
+    session_id: &str,
+    end: Option<tole_cli::webhook_out::turn::TurnEnd>,
+    approval_tool: Option<&str>,
+    queue_mark: Option<u64>,
+) {
+    let (Some(notify), Some(end)) = (notifier, end) else {
+        return;
+    };
+    let approval_id = approval_tool
+        .zip(queue_mark)
+        .and_then(|(tool, mark)| approvals.queued_since(session_id, tool, mark))
+        .filter(|e| e.status == tole_cli::approvals::ApprovalStatus::Pending)
+        .map(|e| e.id);
+    let signal = tole_cli::webhook_out::turn::TurnSignal {
+        session_id: session_id.to_string(),
+        end,
+        approval_id,
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify(signal)));
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -199,6 +231,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         mission: cfg.mission.clone(),
         missions: Arc::default(),
         models: models::ModelCatalog::from_env(),
+        turn_events: std::sync::OnceLock::new(),
     });
     if !state.hooks.is_empty() {
         let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
@@ -222,10 +255,16 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // Approval events (#911): when a destination lists them, the approval queue
     // tells a sender thread about each request and each resolution, and a timer
     // expires what nobody answers. Absent, the approval paths are unchanged.
-    tole_cli::webhook_out::approval_sender::spawn(
+    // The same sender also carries `turn_finished` (#962); its notifier is kept
+    // for the turn routes.
+    if let Some(turns) = tole_cli::webhook_out::approval_sender::spawn(
         Arc::clone(&webhook_out),
         Arc::clone(&state.approvals),
-    );
+    )
+    .turns
+    {
+        let _ = state.turn_events.set(turns);
+    }
     if cfg.cron {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!("tole serve: cron ticker on {}", dir.display());
@@ -1836,12 +1875,33 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // (#581): it resumes through the cron ledger instead.
                 let serve_session = lock_sessions(&state.sessions).get(&sid).is_some();
                 let queue = Arc::clone(&state.approvals);
+                let turn_notifier = state.turn_events.get().cloned();
                 std::thread::spawn(move || {
                     if serve_session {
-                        if let Err(e) =
-                            tole_cli::session_host::resume_session_turn(Arc::clone(&sessions), &sid)
-                        {
-                            eprintln!("tole serve: approval resume failed: {e}");
+                        match tole_cli::session_host::resume_session_turn_with_end(
+                            Arc::clone(&sessions),
+                            &sid,
+                            Some(&queue),
+                        ) {
+                            Ok(r) => announce_turn(
+                                turn_notifier.as_ref(),
+                                &queue,
+                                &sid,
+                                r.turn_end,
+                                r.approval_tool.as_deref(),
+                                r.queue_mark,
+                            ),
+                            Err(e) => {
+                                eprintln!("tole serve: approval resume failed: {}", e.message);
+                                announce_turn(
+                                    turn_notifier.as_ref(),
+                                    &queue,
+                                    &sid,
+                                    e.end,
+                                    None,
+                                    None,
+                                );
+                            }
                         }
                         let st = lock_sessions(&sessions).get(&sid).cloned();
                         if let Some(st) = st {
@@ -1994,7 +2054,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    let turn = run_session_turn_detailed(
+                    let turn = run_session_turn_with_end(
                         Arc::clone(&state.sessions),
                         id,
                         text,
@@ -2010,6 +2070,24 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // The first turn gives the session a prompt to measure:
                     // learn the context window off this request path (#573).
                     warm_status(state, id);
+                    match &turn {
+                        Ok(r) => announce_turn(
+                            state.turn_events.get(),
+                            &state.approvals,
+                            id,
+                            r.turn_end,
+                            r.approval_tool.as_deref(),
+                            r.queue_mark,
+                        ),
+                        Err(e) => announce_turn(
+                            state.turn_events.get(),
+                            &state.approvals,
+                            id,
+                            e.end,
+                            None,
+                            None,
+                        ),
+                    }
                     match turn {
                         // A turn waiting for an approval is not a refusal
                         // (#571). A stop that queued nothing (a pre-tool hook
@@ -2031,8 +2109,10 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                                 (None, None) => (200, json!({"stopReason": r.stop})),
                             }
                         }
-                        Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
-                        Err(e) => (500, json!({"error": e})),
+                        Err(e) if e.message.contains("session is busy") => {
+                            (409, json!({"error": e.message}))
+                        }
+                        Err(e) => (500, json!({"error": e.message})),
                     }
                 }
                 ("POST", id, Some("cancel")) => {
@@ -2373,6 +2453,7 @@ mod tests {
             mission: Default::default(),
             missions: Arc::default(),
             models: Default::default(),
+            turn_events: std::sync::OnceLock::new(),
         }
     }
 

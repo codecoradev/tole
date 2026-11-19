@@ -285,15 +285,16 @@ fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, 
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_tole");
-    let mut cmd = std::process::Command::new(bin);
+    // The hermetic environment (`common::hermetic_command`) gives the test its
+    // own home, never the machine's; a test that wants a decoy overrides it
+    // through `env_extra`. The home is outside the workspace: delegation keeps
+    // one machine-wide registry under the data dir, and the spawn interval
+    // would queue this child behind any other tole on the machine (a parallel
+    // test, another agent) so the mock never sees an agent id (#702). The same
+    // home also holds the user config and plugin lock.
+    let mut cmd = common::hermetic_command(bin, &dir.with_extension("home"), &[]);
     cmd.args(args)
         .current_dir(&dir)
-        // A home of its own, outside the workspace: delegation keeps one
-        // machine-wide registry under the data dir, and the spawn interval
-        // would queue this child behind any other tole on the machine (a
-        // parallel test, another agent) so the mock never sees an agent id
-        // (#702). The same home also holds the user config and plugin lock.
-        .env("CODECORA_HOME", dir.with_extension("home"))
         .env("TOLE_API_KEY", "test")
         .env("TOLE_MODEL", "mock")
         .env_remove("TOLE_MEMORY")

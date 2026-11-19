@@ -67,6 +67,7 @@ true; the status column says where the work is.
 | Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (`serve` only, #947; ACP keeps the process flag) | per process flag | per job (`read_only`) | one path for `serve` (a request can only turn it on) |
 | Fork, tree, compact, name a session | yes | yes (`serve` only, #947; ACP has none of these routes) | n/a | n/a | one path for `serve` |
 | Mission chaining with a budget | yes | yes (`serve` only, `POST /missions`, #947; a mission is its own session, one at a time, refused under `--plan-mode`) | n/a | n/a | one path for `serve` (the verify command, the budget ceilings and the workspace are owner configuration; a request may only lower a budget) |
+| The `turn_finished` outbound webhook event (#962; ids and a status word, opt-in per destination) | no | yes (`serve` only: the serve prompt route and the approval-resume thread; ACP and `tole mcp` have no webhook sink) | no | no (a cron run has `cron_run_finished`) | policy |
 | Every turn through `turn_runner` | yes (#944) | yes | n/a | yes | one path |
 | Tool roster built by `roster_for` and a `FacePolicy` (#943) | yes | yes | yes | yes | one path |
 | The approval gate (`gate::authorize`) | yes | yes | yes | yes | one path |

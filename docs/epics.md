@@ -419,7 +419,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | none open: #572, #573, #574 and #575 are done (#571 moved to the gateway track) |
-| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), G1 to G5 in the epic |
+| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, implemented with provisional owner decisions D1-D10, not merged until confirmed), G1 to G5 in the epic |
 | UI stack (epic #523) | #527, #528, #529, #561 (parked) |
 | Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
 | Docs and process | #807 (local Cora review), #808 (this page) |

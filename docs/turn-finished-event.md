@@ -1,7 +1,11 @@
 # `turn_finished` outbound webhook event: design note
 
-Status: **proposed, design only** (issue #962, step 1 of the work; no code in
-this change). Extends [webhook-delivery-design.md](webhook-delivery-design.md)
+Status: **implemented with provisional defaults** (issue #962). Step 1 (this note)
+was design only; step 2 implements the recommendations below as DEFAULTS while
+D1-D9 are still open (the implementation adds D10, below). Each is a named constant or one seam in
+`crates/tole-cli/src/webhook_out/turn.rs`. The one deviation from the text: the
+log position field is `last_seq`, not `entries` (D2, verified: receivers page by
+`Entry.seq`, and `GET /sessions/{id}/entries` returns `lastSeq`/`nextAfter`). Extends [webhook-delivery-design.md](webhook-delivery-design.md)
 (#911, implemented) and reads against [threat-model.md](threat-model.md).
 Consumer: the chat gateway of epic #910 (`codecoradev/tole-gateway#16`, and the
 mention-to-persona routing of #969).
@@ -188,6 +192,16 @@ event with a new id.
   retries and a restart; every settle of a session has a different `entries`
   (the log is append-only, [AGENTS.md](../AGENTS.md) section 6), so a resumed
   leg never collides with the first one; no turn counter has to be invented.
+  **Correction (D10, found in review of the implementation):** that last claim
+  is false. A turn that fails before it appends anything (a router or
+  provider-config error, a cancel on resume) settles at the same log position as
+  the turn before it, so its event would repeat the earlier id and a receiver
+  deduping on the id would drop it. The implementation therefore ends the id in a
+  per-session, in-memory settle counter: `turn:<readable>:<hash>:<last_seq>:<settle>`
+  (at most 128 characters). The id is the same across retries and different for
+  every settle within one process; the counter restarts with the process, so
+  across a restart a receiver also compares `last_seq`. Provisional; one constant,
+  `ID_INCLUDES_SETTLE_COUNTER`.
   At most 5 + 64 + 1 + 16 + 1 + 20 = 107 characters, inside the 128 cap. Reuse
   the cron helper rather than copy it (one small shared item, as #911 section 9
   PR 1 already plans for `sha2`).

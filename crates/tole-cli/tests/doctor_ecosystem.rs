@@ -106,3 +106,38 @@ fn doctor_reports_the_process_guard() {
     assert!(stdout.contains("process guard: ✓ non-dumpable"), "{stdout}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn doctor_warns_when_codecora_home_leaves_an_existing_uteke_home_behind() {
+    let bin = tmpdir("move-bin");
+    let real_home = tmpdir("move-home");
+    let cc = tmpdir("move-cc");
+    std::fs::create_dir_all(real_home.join(".codecora/uteke")).unwrap();
+    let run = |cc_home: &Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+            .args(["doctor", "--tier", "offline", "--no-ledger"])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", &*real_home)
+            .env("CODECORA_HOME", cc_home)
+            .env_remove("UTEKE_HOME")
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run tole doctor");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let warned = run(&cc);
+    assert!(
+        warned.contains("! uteke: CODECORA_HOME is set") && warned.contains("export UTEKE_HOME="),
+        "{warned}"
+    );
+    std::fs::create_dir_all(cc.join("uteke")).unwrap();
+    assert!(
+        !run(&cc).contains("! uteke: CODECORA_HOME"),
+        "new home exists: no warning"
+    );
+}

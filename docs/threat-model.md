@@ -74,6 +74,8 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Secret in an outbound webhook (payload, outbox, ledger, logs) | **control + documented residual (#911)** | The destination key, its URL and each long query value or path segment of the URL are role secrets, redacted on egress and scrubbed from children; the payload goes through `SecretSet::redact` before it is stored or signed; the outbox keeps the already-redacted body (0600); the ledger, doctor and stderr carry only the destination name and a fixed code, never a URL, header or response. An approval `description` is redacted too, including `${NAME}` header secrets, and an event carries no storage path or call fingerprint. A real-binary leak check (a key and a URL token printed by a job in halves) covers the receiver, the outbox, the ledger and stderr. Residual: a value added to the secret set after an event is queued is not re-redacted in a stored body. |
 | Forged or tampered outbox line (same account) | **control + documented residual (#911)** | The sender re-validates every line before signing: a destination the config does not name, a body naming another destination, an event type the destination does not list, an id that is not the body's, an unknown schema version, a time in the future or past the deadline, an oversized or malformed body is refused and marked dead. Residual: the same account can edit the user config, so a well-formed event for a configured destination can still be appended. |
 | A webhook mistaken for authority | **control (#911)** | A notification only says that a run finished or that an approval is pending. It carries no credential, token or link; the decision arrives only on `POST /approvals/{id}/decision` with serve's own credential. A receiver that applies the documented 300 s timestamp window rejects a replay, and a replay cannot grant anything. The notifier on the approval queue cannot change, delay by lock or fail an approval (called after every lock is released, panics caught, an event announced exactly once). |
+| Transcript, tool output or error text leaves through the `turn_finished` webhook (#962) | **control (#962, provisional defaults for D1-D10)** | The event is built from a typed `TurnEnd` (a status enum, a fixed code enum, an integer log position) made inside `session/host.rs` by one exhaustive match on `TurnOutcome` with no wildcard arm: every payload string (the final answer, a provider message, a tool name, a stop-gate reason, a storage error) is dropped there and no `String` field exists to hold free text, so adding a variant or a field fails to compile or fails the key-set test. The body is the session id, a status word, `last_seq` and, only when they apply, an approval id read from the approval queue entry (never from the outcome) or a fixed code; at most 1 KiB, refused rather than cut. An id outside its charset or one the redactor would change is not sent (counted, one stderr line with the destination name and `bad_id`). A destination receives it only when it lists `turn_finished` in `events` (user config only; the default is unchanged, so an existing destination gets nothing new); a serve session is the only producer. A real-binary leak check puts a marker in the environment, the prompt, a tool result, the final answer, a provider error message and an unknown tool name, and requires it in no delivered body and in none of the notifier's stderr lines, while a separate assertion shows the marker was in the session log. Residual: the pre-existing `log_outcome` stderr line still prints a provider message, a tool name and a gate reason (a named, older sink); a volatile queue loses queued events when `tole serve` restarts (the receiver reconciles through the authenticated reads); which `status` word appears can be influenced by an agent that causes a failure, a loop or a stop-gate trip (the same trust position as `approval_resolved.status`). |
+| A `turn_finished` webhook mistaken for authority or flooding a receiver (#962) | **control + documented residual (#962)** | It says only that a turn ended; it decides nothing (a decision stays `POST /approvals/{id}/decision` with serve's own credential) and selects no persona or session (the receiver's own map does). One event per settled turn, so the rate is the owner's own session activity; the queue is bounded (256 per destination), a full queue replaces the oldest event of the same session instead of growing, one request is in flight per destination, and the producer does no I/O (a push under the queue mutex, panics caught), so a slow or dead receiver never delays a turn or changes its outcome. Residual: delivery is at-least-once with no ordering, so a receiver dedupes on the id. The id (`turn:<session>:<hash>:<last_seq>:<settle>`) is the same across retries and different for every settle of a session within one process; the settle counter is in memory and restarts with the process, so across a restart a receiver also ignores an event whose `last_seq` is not larger than the cursor it holds (a failed turn that appended nothing keeps the previous `last_seq`). |
 
 ## Deliberate limitations (documented, not fixed)
 
@@ -207,6 +209,33 @@ body. Only entries tagged `skill`, with status `approved` and in scope for
 the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
 but stops its recall. Skill approval is required by default, so only
 owner-approved content loads (below).
+
+**uteke store location (#992).** uteke resolves its home, which holds the
+store, the embedding model (`models/`), `uteke.toml`, logs and the server
+routing config, from `--store`, then `UTEKE_HOME`, then `$HOME/.codecora/uteke`;
+it does not read `CODECORA_HOME`. Every uteke tole spawns (the memory loop,
+`uteke_recall`, `uteke_document`, `UtekeSkillIndex` and `UtekeDocIndex`, the
+child-agent mailbox cleanup) therefore gets `UTEKE_HOME=<CODECORA_HOME>/uteke`
+when `CODECORA_HOME` is set, so an isolated run never reads or writes the store
+under the real `HOME`. All of it moves, not only the store: the new directory
+holds no model and no config, so the first recall downloads the model (about
+188 MB) or fails offline or sandboxed, and an owner with a populated
+`~/.codecora/uteke` sees the memory as lost. `tole doctor` warns when
+`CODECORA_HOME` is set, `~/.codecora/uteke` exists and `<CODECORA_HOME>/uteke`
+does not; the remedies are `export UTEKE_HOME=~/.codecora/uteke`, or copying or
+symlinking the directory (at least `models/`). Fail closed: a `CODECORA_HOME`
+that is set, non-empty and relative is unresolvable for tole itself (its own
+data features skip or error; tole does not refuse to start), so no uteke is
+spawned and the caller gets the error `CODECORA_HOME is not an absolute path`
+(the mailbox cleanup, which has no caller to tell, just does not run). An empty
+`CODECORA_HOME` counts as unset, as everywhere in tole, and uteke keeps its own
+default under `HOME`. Residuals: a `UTEKE_HOME` the owner already exported
+wins, as a deliberate choice of store; a uteke an agent runs through
+`run_command` is not covered (it inherits the process environment, so it is
+covered only when the owner exported `UTEKE_HOME` themselves, and the sandbox,
+when on, has no `$HOME` anyway); a uteke tole did not spawn (a hook, a
+terminal) is outside this control; and the `--version` probe of
+`tole doctor` is not pointed at the store, because it opens none.
 
 **Registry approval (#878).** `tole skills fetch <id> --pinned-sha <sha256>`
 approves a third-party skill by registry id, and downloads nothing: uteke
@@ -1286,3 +1315,39 @@ another tool executes, an oversized or truncated request. `Destructive` stays
 unreachable (a delegated child is not interactive, so those tools are not
 registered). A discussion participant (#704) never asks and never decides: it
 stays read-only.
+
+### Approval auto mode (#995, proposed, design only)
+
+Design: [approval-auto-mode.md](approval-auto-mode.md). Nothing here is
+implemented; the rows record what the implementation must hold. With the
+feature off (the default) every row of "Remote approver trust boundary (#200)"
+stands unchanged: an unanswered approval expires to denied. With it on for a
+profile, "no answer" can become an allow, so the boundary moves from "a person
+holding the serve token" to "a person, or a judge call after a silence". It is
+opt-in per profile in the **user** config (a project config cannot enable it),
+and it reaches only a positive allow-list of classes computed by code before
+any model runs. In the recommended form the one class is `edit_file` on a
+workspace path the owner listed (default: none).
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| **Silence turned into consent** (an attacker floods or waits for the owner to be away, so no answer becomes an allow) | Default off; user config only; only `edit_file` on an owner-written path allow-list can be a candidate, and only when the whole edit fits 2 KiB; the judge runs once, after `after_secs` (floor 300, default 600), and the human can still decide until the 900 s hard expiry; a kill switch turns it off without a restart (proposed); per-session and per-hour caps; one auto verdict per (session, fingerprint) | **A workspace edit is delayed arbitrary code execution.** An approved edit to source, a test, a manifest or lock file, `conftest.py`, `sitecustomize.py`, a `*.pth`, `*.mk`, `*.cmake`, `*.nix` or a CI or tool config runs the next time anything builds, tests, imports or deploys; the guard's denylist ("not a sandbox") does not cover these, which is why the rule is an owner allow-list of paths, not the guard. Nobody read the edit. Reviewable afterwards in version control and the audit register, not preventable. This is the accepted cost of the feature |
+| **Prompt injection of the judge** (a crafted path or argument says "answer allow") | The judge is a separate call with a compiled policy prompt, no tools, no transcript, and a closed input struct (tool, risk, class, workspace-relative target, redacted capped summary); strict JSON answer; only `allow` with `high` confidence approves; eligibility is decided by code, so a fooled judge cannot approve an ineligible call | The judge has no transcript or user prompt, so it cannot tell an edit the owner wanted from one a hostile page asked for; it answers "plausibly benign" and nothing more. A fooled judge can approve a call in the eligible class. The class limit is the control, the judge is not |
+| **The asker judging itself** | The judge call shares no context with the turn that asked and sees none of its text beyond the capped summary; a dedicated judge model is recommended | A judge on the session's own model shares its weaknesses (decision A3) |
+| **A class widened by mistake** (a new tool, an MCP tool, a relaxed sandbox) | Positive allow-list: a tool is `Never` until a code change lists it; a table test pins the set; MCP tools (always `Write`), `run_command`, `job_start`, egress, secrets, trust, skills, plugins, sandbox relaxation, config and data dirs, writes outside the workspace guard, `target = None`, spawned work and `Destructive` are never eligible; a config may only narrow | A future PR that adds a class is a trust decision and must say so in its title |
+| **Race between a human and the judge** (a human decides as the judge answers; a late deny after an allow) | One transition out of `Pending` under the queue lock, shared by the human route, the hard expiry and the judge; the loser is discarded and not audited as a decision; the judge claim makes it run once; a human decision after an auto decision is 409 | A call already resumed by an auto allow cannot be recalled by a later human deny |
+| **Fail-open by error** (provider down, timeout, malformed or partial answer, panic, audit write failure, budget refusal, restart) | Every path leaves the entry denied or expired and no one-shot. An allow is audited first (`judge_verdict`), then transitioned and announced once, then an outcome record (`applied` or `lost`) is written; a failed audit denies and never announces approved; a non-announced claim blocks a human decision for one audit write only | A restart loses pending entries and one-shots, restarts the ten-minute clock, and can leave a verdict record with no effect; the per-fingerprint rule is per process unless persisted. Availability of auto mode is best effort |
+| **A decision indistinguishable from a human one** | `decidedBy` / `source` (`human`, `auto`, `timeout`) in the session register, `GET /approvals`, the event stream and `approval_resolved`; the register holds the model name, class, confidence, redacted reason and an input hash | A receiver that ignores the field treats it like a human decision (documented duty: information, not authority) |
+| **Leak through the judge or its audit** (a secret in an argument reaches the provider, the register or a webhook) | Input and reason go through the same process secret redaction as every egress, are capped, and the reason text never leaves the session register (events and listings carry a reason code only); the judge sees the full edit built from the raw input (not `describe`, which shows 80-character previews), is pinned to the session's provider by default, a deterministic secret-shape check makes an edit containing a token or key `Never`, and `tole doctor` names the judge's provider and model | The redaction set holds only process secrets (environment, webhook and serve-token secrets, `web_fetch` header secrets), so a secret pasted into `new_text` that the shape check misses reaches the provider. A judge on a different provider is a new egress party (decision A15) |
+| **Cost and loop abuse** (a looping agent re-asks until the judge says allow; token spend) | One verdict per fingerprint, per-session and hourly caps, small `max_tokens`, usage recorded on the session, a budget refusal is a deny | The exact budget counter is open (design decision A10) |
+| **Replay after a symlink swap** (the file or path changes between approval and replay) | `edit_file` refuses a stale `old_hash` (content anchor); the candidate stores its resolved target and the replay re-checks it before the one-shot is used | The fingerprint binds the raw `path` string, not the resolved target, so the target re-check is required, not optional |
+| **Unattended callers** (parked cron runs, missions) | Not eligible in v1 (`unattended_scope`) | Revisit after use (decision A6) |
+
+Never auto-approved, and why: anything that executes attacker-influenced code
+(`run_command`, `job_start`), leaves the host (egress), changes what is trusted
+or remembered (skills, plugins, MCP, config, `uteke_document`), handles a
+secret, spawns work (`consult_advisor`, agents), or cannot be judged from the
+full text the judge sees. Any tool not listed is never eligible. An edit to a
+file the owner listed is the only class left, because it can be reviewed and
+reverted afterwards, and even that is delayed code execution unless the listed
+paths are inert (documentation, for example).
