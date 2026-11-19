@@ -210,6 +210,36 @@ the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
 but stops its recall. Skill approval is required by default, so only
 owner-approved content loads (below).
 
+**Registry approval (#878).** `tole skills fetch <id> --pinned-sha <sha256>`
+approves a third-party skill by registry id, and downloads nothing: uteke
+0.24.1 returns no skill body (`skill show` is a manifest, the package hash and
+a ledger), so the bytes are whatever the owner placed in a skills directory
+by a channel they chose. The command computes the package hash over that
+directory and refuses unless it equals both the owner's pinned hash and the
+hash uteke recorded for the id; the uteke answer is read as a name and a hash
+only (the adapter drops everything else) and can only make the command refuse,
+never approve or supply text. The ledger line and the approval are those of
+`tole skills approve`, with the stated source. Owner only: refused under a
+session or child agent (#684) and without a terminal on stdin, with no `--hash`
+bypass; no model tool exists for it and a project config cannot reach it.
+uteke computes the hash it records from the same directory (`uteke skill
+index`), so equality with the pin adds almost nothing when the pin was copied
+from `uteke skill show`: the pin must come from a source the owner trusts
+independently of the directory, and the success message says only that the hash
+equals the pin and uteke's record. File names in the listing the owner reads
+before answering are sanitized (no escape, CR or newline survives), so a name
+cannot forge or hide a line. The owner-only gate is advisory like every other
+owner command (#601): a model with a shell can drive a pty (`script -qc 'tole
+skills fetch ...'`) and answer y; the approvals are loaded before the prompt
+and saved after it, so a revoke or approve made while the prompt is open can be
+overwritten (the same as `approve`); the uteke binary is found by a plain
+PATH lookup like the existing adapter. Residuals: the pin and uteke's record are not signatures, so a pin the owner
+copied from the same hostile page as the bytes proves only that the bytes did
+not change after pinning; whoever can write uteke's library and the skill
+directory and also drives the owner's terminal is the owner-equivalent
+attacker of every approval. Nothing is executed at approval, and an approval
+does not vet what a `scripts/` file does later (normal tool approvals apply).
+
 **Approved-hash loading (#591).** Required by default since 2026-11-11 (owner
 decision), so the trust is no longer "whatever is on disk": a discovered skill loads only when
 its package (SKILL.md plus every other file of its directory, paths and

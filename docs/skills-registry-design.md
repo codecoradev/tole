@@ -354,3 +354,31 @@ tag gets search for free, but a skill is more than one markdown document:
    - Reuses the document engine.
    - No pool, no GitHub ingest, no sharing: those stay in Cloud.
 
+
+## Registry fetch (#878): how bytes arrive
+
+Decision (step 3 of #973, verified against uteke 0.24.1 and its source): tole
+does not fetch skill code. The uteke skill library indexes directories that
+are already on a machine; no CLI or remote surface returns a body, and the
+remote answers omit the source path. A transport inside tole would be new
+network code that unpacks third-party bytes, which the issue allows only when
+unavoidable, and it is avoidable here. So the owner places the package (a
+`git clone` at the commit, a copy) and `tole skills fetch <id> --pinned-sha
+<sha256>` ties it to the registry id: the local package hash must equal the
+pin and uteke's recorded hash, then the owner confirms at a terminal and the
+usual approval and ledger line are written with the stated source. Open for
+the owner: a real download transport (with size, path and symlink bounds and
+redacted logs) if uteke ever serves bodies; signatures for third-party skills
+(the pin is a plain hash, as stated data); and whether a git commit id should
+also be accepted as the pin (it cannot be checked against the bytes).
+
+Honest limits of that check: uteke records its hash from the same directory
+(`uteke skill index`), so when the pin is copied from `uteke skill show` the
+equality adds almost nothing; the pin must come from a source the owner trusts
+independently of the directory. The owner-only gate is advisory like the other
+owner commands (#601: a shell-capable model can drive a pty and answer y); the
+approvals file is loaded before the prompt and saved after it, so a concurrent
+revoke can be overwritten (as with `approve`); `uteke` is found by plain PATH
+lookup like the existing adapter. The positive terminal path (a real tty
+answering y) is exercised only through the injected `run` seam in unit tests,
+not end to end.
