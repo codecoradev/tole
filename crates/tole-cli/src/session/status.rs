@@ -3,7 +3,7 @@
 //! vs. window, token totals, compactions. A pure function of storage, the
 //! resolved settings and an injected [`WindowSource`] (no network here).
 
-use crate::compaction_host::{CompactionSettings, WindowSource};
+use crate::compaction_host::{CompactionSettings, ModelsCatalog, WindowSource};
 use tole_core::compaction;
 use tole_core::storage::Storage;
 
@@ -105,6 +105,153 @@ pub fn session_status(
         output_tokens: u.completion_tokens,
         cached_tokens: u.cached_tokens,
         compactions: compaction::history(storage.entries()).len(),
+    }
+}
+
+/// The context window the owner configured (`TOLE_CONTEXT_WINDOW` / config
+/// `context_window`), fixed once for a server process so every session's
+/// snapshot resolves the window the way `tole status` does.
+static CONFIGURED_WINDOW: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+/// Fix the configured window for server sessions (first call wins).
+pub fn set_configured_window(window: Option<u64>) {
+    let _ = CONFIGURED_WINDOW.set(window);
+}
+
+fn configured_window() -> Option<u64> {
+    CONFIGURED_WINDOW.get().copied().flatten()
+}
+
+/// A session's status as it was at one moment (#573): the `tole status`
+/// snapshot plus the session name, stamped with the time it was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSnapshot {
+    pub status: SessionStatus,
+    /// `fact/session_name` register, else the header alias.
+    pub name: Option<String>,
+    /// Epoch milliseconds when the snapshot was taken.
+    pub at_ms: u64,
+}
+
+impl StatusSnapshot {
+    /// The additive fields of `GET /sessions/{id}/status`. Every unknown
+    /// value is `null`, never a made-up one. `stale` says the values come
+    /// from the last-known snapshot (a turn holds the session), not a live
+    /// read; `snapshotAt` is when they were read.
+    pub fn json_fields(snapshot: Option<&Self>, stale: bool) -> serde_json::Value {
+        use serde_json::json;
+        match snapshot {
+            Some(s) => json!({
+                "model": s.status.model,
+                "effort": s.status.effort,
+                "contextWindow": s.status.window,
+                "contextUsed": s.status.last_prompt_tokens,
+                "name": s.name,
+                "snapshotAt": s.at_ms,
+                "stale": stale,
+            }),
+            None => json!({
+                "model": null, "effort": null, "contextWindow": null,
+                "contextUsed": null, "name": null, "snapshotAt": null,
+                "stale": stale,
+            }),
+        }
+    }
+}
+
+/// What a live session remembers for the status route: the last snapshot
+/// and the window the provider's `/models` reported for a model (asked at
+/// most once per model, never from the route).
+#[derive(Debug, Default)]
+pub struct StatusCell {
+    snapshot: Option<StatusSnapshot>,
+    window: Option<(String, u64)>,
+}
+
+impl StatusCell {
+    /// The detected window, when it was detected for this very model.
+    pub fn window_for(&self, model: &str) -> Option<u64> {
+        self.window
+            .as_ref()
+            .filter(|(m, _)| m == model)
+            .map(|(_, w)| *w)
+    }
+
+    pub fn set_window(&mut self, model: &str, window: u64) {
+        self.window = Some((model.to_string(), window));
+    }
+
+    pub fn snapshot(&self) -> Option<&StatusSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    pub fn store(&mut self, s: StatusSnapshot) {
+        self.snapshot = Some(s);
+    }
+}
+
+/// Window source that never touches the network: the configured window, or
+/// what an earlier lookup cached.
+struct Known(Option<u64>);
+impl WindowSource for Known {
+    fn window(&mut self) -> Option<u64> {
+        self.0
+    }
+}
+
+/// Take a snapshot of `storage` without any network call: the window is the
+/// configured one or `cached`. `default_model` is the configured model.
+pub fn take_snapshot(
+    storage: &impl Storage,
+    default_model: Option<&str>,
+    cached: &StatusCell,
+) -> StatusSnapshot {
+    let model = crate::turn_runner::session_model(storage, default_model.unwrap_or(""));
+    let settings = CompactionSettings {
+        window: configured_window(),
+        ..CompactionSettings::default()
+    };
+    let status = session_status(
+        storage,
+        default_model,
+        &settings,
+        &mut Known(cached.window_for(&model)),
+    );
+    StatusSnapshot {
+        status,
+        name: storage.session_name().map(str::to_string),
+        at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }
+}
+
+/// Look up the model's window on the provider (network, bounded by the
+/// catalog timeout) when it is needed and not known yet; `true` = the cell
+/// gained a window. Call WITHOUT holding any session lock.
+pub fn detect_window(
+    cell: &std::sync::Mutex<StatusCell>,
+    cfg: &tole_core::openai::OpenAiConfig,
+    model: &str,
+) -> bool {
+    if configured_window().is_some()
+        || cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .window_for(model)
+            .is_some()
+    {
+        return false;
+    }
+    match ModelsCatalog::new(cfg, model).window() {
+        Some(w) => {
+            cell.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_window(model, w);
+            true
+        }
+        None => false,
     }
 }
 
@@ -238,5 +385,51 @@ mod tests {
         );
         assert_eq!(st.model.as_deref(), Some("pinned-m"));
         assert_eq!(st.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn snapshot_fields_are_null_when_unknown_and_flag_staleness() {
+        let none = StatusSnapshot::json_fields(None, true);
+        for k in [
+            "model",
+            "effort",
+            "contextWindow",
+            "contextUsed",
+            "name",
+            "snapshotAt",
+        ] {
+            assert_eq!(none[k], json!(null), "{k}");
+        }
+        assert_eq!(none["stale"], json!(true));
+        let snap = take_snapshot(&store("snap"), None, &StatusCell::default());
+        let f = StatusSnapshot::json_fields(Some(&snap), false);
+        assert_eq!(f["model"], json!(null));
+        assert_eq!(f["contextWindow"], json!(null), "no window detected");
+        assert_eq!(f["name"], json!(null));
+        assert_eq!(f["stale"], json!(false));
+        assert!(f["snapshotAt"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn snapshot_uses_the_cached_window_only_for_its_model() {
+        let mut s = store("cached");
+        turn(&mut s, 41_000, 1, 0);
+        s.commit(Commit::new().register(RegisterWrite::set("fact", "model", json!("m1"))))
+            .unwrap();
+        let mut cell = StatusCell::default();
+        cell.set_window("m1", 128_000);
+        let f = StatusSnapshot::json_fields(Some(&take_snapshot(&s, None, &cell)), false);
+        assert_eq!(
+            (f["contextWindow"].clone(), f["contextUsed"].clone()),
+            (json!(128_000), json!(41_000))
+        );
+        s.commit(Commit::new().register(RegisterWrite::set("fact", "model", json!("m2"))))
+            .unwrap();
+        let f = StatusSnapshot::json_fields(Some(&take_snapshot(&s, None, &cell)), false);
+        assert_eq!(
+            f["contextWindow"],
+            json!(null),
+            "another model's window is not reused"
+        );
     }
 }
