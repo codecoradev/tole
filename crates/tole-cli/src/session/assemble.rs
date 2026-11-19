@@ -78,15 +78,42 @@ until the session is started without --plan-mode."
 /// prompt is pinned in the session header, so within a session the
 /// wire body stays append-only (KV-cache prefix property untouched).
 pub fn build_default_prompt(plan_mode: bool) -> String {
-    let mut p = default_prompt_for(plan_mode);
     let cwd = std::env::current_dir()
         .map(|d| d.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    default_prompt_with_context(plan_mode, &cwd)
+}
+
+/// [`build_default_prompt`] for a session whose working directory is not the
+/// process cwd: a server session (`serve`, ACP, MCP over HTTP) jails its tools
+/// to its own workspace, so the context line names that (#945). The text is
+/// otherwise identical to the CLI's.
+pub fn build_default_prompt_in(plan_mode: bool, workspace: &std::path::Path) -> String {
+    default_prompt_with_context(plan_mode, &workspace.display().to_string())
+}
+
+fn default_prompt_with_context(plan_mode: bool, cwd: &str) -> String {
+    let mut p = default_prompt_for(plan_mode);
     p.push_str(&format!(
         "\nContext: working directory {cwd}; today is {} (UTC).",
         today_utc()
     ));
     p
+}
+
+/// The system prompt a NEW server session pins in its header (#945): an
+/// explicit prompt (profile persona, `TOLE_SYSTEM_PROMPT`, trusted config)
+/// wins, exactly as `--system` does on the CLI; otherwise the shared default
+/// for the session's mode and workspace. The cora review guidance follows
+/// either one, only when both review tools are in `registry`.
+pub fn server_session_prompt(
+    explicit: Option<String>,
+    plan_mode: bool,
+    workspace: &std::path::Path,
+    registry: &ToolRegistry,
+) -> String {
+    let base = explicit.unwrap_or_else(|| build_default_prompt_in(plan_mode, workspace));
+    format!("{base}{}", review_section(registry))
 }
 
 /// The cora agent-as-reviewer flow (#422, cora >= 0.19): the calling
@@ -480,6 +507,46 @@ mod default_prompt_tests {
         let section = super::review_section(&reg);
         assert!(section.contains("mcp_cora_cora_review_prepare"));
         assert!(section.contains("SAME diff"));
+    }
+
+    #[test]
+    fn server_session_prompt_composes_default_explicit_and_review() {
+        use tole_core::tool::{Risk, Tool};
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn execute(&self, _input: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        let ws = std::path::Path::new("/some/ws");
+        let mut reg = tole_core::tool::ToolRegistry::with_approver(
+            tole_core::approval::AllowlistApprover::allow_only(vec![]),
+        );
+        let d = super::server_session_prompt(None, false, ws, &reg);
+        assert!(d.starts_with(super::default_system_prompt()));
+        assert!(d.contains("Context: working directory /some/ws; today is "));
+        assert!(!d.contains("# Code review"));
+        let e = super::server_session_prompt(Some("mine".into()), false, ws, &reg);
+        assert_eq!(e, "mine");
+        // The plan-mode sentence, as on the CLI.
+        assert!(super::server_session_prompt(None, true, ws, &reg).contains("PLAN MODE"));
+        reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
+            .unwrap();
+        assert!(!super::server_session_prompt(None, false, ws, &reg).contains("# Code review"));
+        reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
+            .unwrap();
+        assert!(super::server_session_prompt(None, false, ws, &reg)
+            .ends_with(super::CORA_REVIEW_SECTION));
+        assert_eq!(
+            super::server_session_prompt(Some("mine".into()), false, ws, &reg),
+            format!("mine{}", super::CORA_REVIEW_SECTION)
+        );
     }
 
     #[test]

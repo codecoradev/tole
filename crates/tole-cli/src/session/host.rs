@@ -364,10 +364,11 @@ pub fn open_session_with(
     let workspace_canon = workspace
         .canonicalize()
         .map_err(|e| format!("session workspace {}: {e}", workspace.display()))?;
-    // The selected profile's persona (#584) > TOLE_SYSTEM_PROMPT env >
-    // project config (#208; absent unless a trusted config installed it) >
-    // none.
-    let system_prompt = overrides
+    // An explicit prompt: the selected profile's persona (#584) >
+    // TOLE_SYSTEM_PROMPT env > project config (#208; absent unless a trusted
+    // config installed it). With none, a NEW session gets the shared default
+    // prompt below (#945), as the CLI does.
+    let explicit_prompt = overrides
         .system_prompt
         .clone()
         .filter(|s| !s.trim().is_empty())
@@ -387,7 +388,7 @@ pub fn open_session_with(
     let mut roster = crate::session::assemble::roster_for(
         &crate::session::assemble::FacePolicy::SERVER_SESSION,
         crate::session::assemble::RosterInputs {
-            workspace: workspace_canon,
+            workspace: workspace_canon.clone(),
             plan_mode,
             allow_patterns: &parent_allows,
             agents_worktree: false,
@@ -419,18 +420,25 @@ pub fn open_session_with(
         }
         None => sessions_dir_for(cwd)?,
     };
-    let storage = if loading {
-        tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
-            .map_err(|e| format!("loading session: {e}"))?
+    // A new session pins its prompt in the header. A loaded one keeps the
+    // header's unless an explicit prompt applies (a profile persona chosen on
+    // resume, #584, still takes over as before). Append-only: a session
+    // created before #945 has no pinned prompt and does not gain the default.
+    let (storage, system_prompt) = if loading {
+        let st = tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
+            .map_err(|e| format!("loading session: {e}"))?;
+        let prompt = explicit_prompt.or_else(|| st.system_prompt().map(str::to_string));
+        (st, prompt)
     } else {
-        create_session(
-            &dir,
-            session_id,
-            system_prompt.as_deref(),
-            None,
-            Some("server"),
-        )
-        .map_err(|e| format!("creating session: {e}"))?
+        let prompt = crate::session::assemble::server_session_prompt(
+            explicit_prompt,
+            plan_mode,
+            &workspace_canon,
+            &reg,
+        );
+        let st = create_session(&dir, session_id, Some(&prompt), None, Some("server"))
+            .map_err(|e| format!("creating session: {e}"))?;
+        (st, Some(prompt))
     };
     // Task-list tools (issue #198): registered after the storage open —
     // the state is seeded from the replayed transcript, so crash-resume
@@ -915,5 +923,119 @@ mod roster_tests {
             .iter()
             .filter_map(|s| s["function"]["name"].as_str().or(s["name"].as_str()))
             .all(|n| p.registry.get(n).map(|t| t.risk()) == Some(Risk::ReadOnly)));
+    }
+
+    /// The prompt in the session file's header (the session holds the file lock).
+    fn pinned(s: &SessionState) -> Option<String> {
+        s.storage
+            .lock()
+            .unwrap()
+            .system_prompt()
+            .map(str::to_string)
+    }
+
+    fn without_context(p: &str) -> String {
+        p.lines()
+            .filter(|l| !l.starts_with("Context: working directory "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #945: a server session with no explicit prompt pins the CLI's default
+    /// prompt (modulo the context line, which names the SESSION workspace).
+    #[test]
+    fn server_session_pins_the_cli_default_prompt_with_its_own_workspace() {
+        let (s, ws) = open("prompt", false);
+        let p = s.system_prompt.clone().expect("a default prompt");
+        assert_eq!(
+            without_context(&p),
+            without_context(&crate::session::assemble::build_default_prompt(false))
+        );
+        let canon = ws.canonicalize().unwrap();
+        assert!(
+            p.contains(&format!("Context: working directory {};", canon.display())),
+            "{p}"
+        );
+        assert_ne!(
+            Some(canon),
+            std::env::current_dir().ok(),
+            "the test needs a workspace that is not the process cwd"
+        );
+        // Pinned in the header, byte for byte.
+        assert_eq!(pinned(&s), Some(p));
+    }
+
+    #[test]
+    fn server_session_plan_mode_prompt_carries_the_plan_sentence() {
+        let (s, _ws) = open("prompt-plan", true);
+        let p = s.system_prompt.unwrap();
+        assert!(p.contains("PLAN MODE"));
+        assert_eq!(
+            without_context(&p),
+            without_context(&crate::session::assemble::build_default_prompt(true))
+        );
+    }
+
+    #[test]
+    fn an_explicit_prompt_wins_over_the_default() {
+        let ws = crate::test_dir::TestDir::new("tole-sh-prompt-explicit");
+        let s = open_session_with(
+            "s-explicit",
+            ws.to_str().unwrap(),
+            false,
+            false,
+            AllowlistApprover::allow_only(vec![]),
+            None,
+            Some(&ws.join("sessions")),
+            Vec::new(),
+            Vec::new(),
+            tole_core::cancel::CancelToken::default(),
+            None,
+            SessionOverrides {
+                system_prompt: Some("You are a pirate.".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.system_prompt.as_deref(), Some("You are a pirate."));
+        assert_eq!(pinned(&s).as_deref(), Some("You are a pirate."));
+    }
+
+    /// Append-only (#945): a session created before the default prompt
+    /// existed has none pinned, and resuming it must not add one.
+    #[test]
+    fn resume_keeps_the_stored_prompt_and_adds_none_to_an_old_session() {
+        let ws = crate::test_dir::TestDir::new("tole-sh-prompt-resume");
+        let dir = ws.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Old style: no pinned prompt in the header.
+        tole_core::storage::JsonlStorage::create(&dir, "s-old", None).unwrap();
+        // And one with a prompt pinned by an earlier version.
+        tole_core::storage::JsonlStorage::create_named(
+            &dir,
+            "s-pinned",
+            None,
+            Some("old pinned"),
+            None,
+        )
+        .unwrap();
+        for (id, want) in [("s-old", None), ("s-pinned", Some("old pinned"))] {
+            let s = open_session(
+                id,
+                ws.to_str().unwrap(),
+                true,
+                false,
+                AllowlistApprover::allow_only(vec![]),
+                None,
+                Some(&dir),
+                Vec::new(),
+                Vec::new(),
+                tole_core::cancel::CancelToken::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(s.system_prompt.as_deref(), want, "{id}");
+            assert_eq!(pinned(&s).as_deref(), want, "{id} header");
+        }
     }
 }
