@@ -2114,6 +2114,20 @@ fn dispatch(cli: Cli) -> Result<()> {
                         .as_ref()
                         .is_some_and(|e| e.source == config_apply::Source::Flag),
                 },
+                // Missions over serve (#947): the owner's configuration, read
+                // here like `tole mission` reads it (user config, the same
+                // trusted tier); a request can only ask for less.
+                mission: crate::serve::missions::MissionSettings {
+                    verify: settings.verify.as_ref().map(|v| v.value.clone()),
+                    verify_timeout_secs: settings.verify_timeout.value,
+                    ceiling: mission::BudgetTier::resolve(
+                        trust_extra.iter().any(|p| p == "todo_write"),
+                        settings.max_steps.as_ref().map(|e| e.value),
+                        settings.max_minutes.as_ref().map(|e| e.value),
+                        settings.max_tokens.as_ref().map(|e| e.value),
+                    ),
+                    compaction: host.compaction,
+                },
             })
         }
         Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),
