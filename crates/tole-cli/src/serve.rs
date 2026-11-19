@@ -1998,6 +1998,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 }
                 ("POST", id, Some("fork")) => fork_route(state, id, body),
                 ("GET", id, Some("tree")) => tree_route(state, id),
+                ("POST", id, Some("compact")) => compact_route(state, id),
+                ("POST", id, Some("name")) => name_route(state, id, body),
                 _ => (404, json!({"error": "not found"})),
             }
         }
@@ -2113,6 +2115,71 @@ fn tree_route(state: &State, id: &str) -> (u16, serde_json::Value) {
             })
             .collect();
     (200, json!({"id": id, "tree": rows}))
+}
+
+/// Run `write` on session `id`'s storage under the turn lock, for the routes
+/// that write a `fact/*` register the TUI writes too (#947). 404 for an
+/// unknown session, 409 while a turn runs (the busy flag, then the turn
+/// lock itself: a turn that took it in between is the same 409).
+fn with_idle_session(
+    state: &State,
+    id: &str,
+    write: impl FnOnce(&mut tole_core::storage::JsonlStorage) -> Result<(), (u16, String)>,
+) -> Result<(), (u16, serde_json::Value)> {
+    let st = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).cloned()
+    };
+    let Some(st) = st else {
+        return Err((404, json!({"error": "unknown session"})));
+    };
+    let busy = || (409, json!({"error": "session is busy: a turn is running"}));
+    if *st.busy.lock().expect("busy lock") {
+        return Err(busy());
+    }
+    let Ok(mut guard) = st.storage.try_lock() else {
+        return Err(busy());
+    };
+    write(&mut guard).map_err(|(status, e)| (status, json!({"error": e})))
+}
+
+/// `POST /sessions/{id}/compact` (#947): the TUI `/compact`, i.e.
+/// `session_settings::request_compaction`. It records the forced pass of
+/// #481 and the session's NEXT prompt compacts first (when compaction is
+/// enabled); it is not a mid-turn compaction and runs no model call here.
+fn compact_route(state: &State, id: &str) -> (u16, serde_json::Value) {
+    match with_idle_session(state, id, |s| {
+        tole_cli::session_settings::request_compaction(s).map_err(|e| (500, e))
+    }) {
+        Ok(()) => {
+            eprintln!("tole: session/{id} compaction requested (serve)");
+            (200, json!({"id": id, "compaction": "requested"}))
+        }
+        Err(e) => e,
+    }
+}
+
+/// `POST /sessions/{id}/name {"name": "<label>"}` (#947): the TUI `/name`,
+/// i.e. `session_settings::set_name` (the `fact/session_name` register).
+fn name_route(state: &State, id: &str, body: &str) -> (u16, serde_json::Value) {
+    let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (400, json!({"error": "invalid JSON body"}));
+    };
+    let Some(name) = req.get("name").and_then(|v| v.as_str()) else {
+        return (400, json!({"error": "missing name"}));
+    };
+    // The same label rule as the TUI, checked before the session is looked
+    // at so a bad name is a 400 whatever the session's state.
+    let name = match tole_cli::session_settings::clean_label("name", name) {
+        Ok(n) => n,
+        Err(e) => return (400, json!({"error": e})),
+    };
+    match with_idle_session(state, id, |s| {
+        tole_cli::session_settings::set_name(s, &name).map_err(|e| (500, e))
+    }) {
+        Ok(()) => (200, json!({"id": id, "name": name})),
+        Err(e) => e,
+    }
 }
 
 #[cfg(test)]
@@ -2418,6 +2485,92 @@ mod tests {
         let (s, _) = route(&state, "GET", &format!("/sessions/{id}/tree"), "");
         assert_eq!(s, 200);
         *st.busy.lock().unwrap() = false;
+    }
+
+    /// Open a serve session in-process; returns its id.
+    fn open_session(state: &State, cwd: &std::path::Path) -> String {
+        let (status, v) = route(
+            state,
+            "POST",
+            "/sessions",
+            &json!({"cwd": cwd.to_str().unwrap()}).to_string(),
+        );
+        assert_eq!(status, 200, "{v}");
+        v["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// #947: compact and name over serve write what the TUI writes (read
+    /// back through the session's own readers), 404 an unknown session, 409
+    /// while a turn runs, and 400 a bad name.
+    #[test]
+    fn compact_and_name_routes_write_the_tui_registers_404_409_and_bad_name() {
+        let base = crate::test_dir::TestDir::new("tole-serve-compact-name");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions);
+        let id = open_session(&state, &root);
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        let compact = format!("/sessions/{id}/compact");
+        let name = format!("/sessions/{id}/name");
+        let named = json!({"name": "nightly"}).to_string();
+
+        for (path, body) in [
+            ("/sessions/nope/compact", ""),
+            ("/sessions/nope/name", named.as_str()),
+        ] {
+            let (s, _) = route(&state, "POST", path, body);
+            assert_eq!(s, 404, "{path}");
+        }
+
+        // 409 while a turn runs, and nothing is written.
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "POST", &compact, "");
+        assert_eq!(s, 409);
+        let (s, _) = route(&state, "POST", &name, &named);
+        assert_eq!(s, 409);
+        *st.busy.lock().unwrap() = false;
+        {
+            let g = st.storage.lock().unwrap();
+            assert_eq!(g.session_name(), None);
+            assert!(!tole_core::compaction::overflow_pending(&*g));
+        }
+        // The turn lock itself held (a turn between the check and the write).
+        {
+            let _held = st.storage.lock().unwrap();
+            let (s, _) = route(&state, "POST", &compact, "");
+            assert_eq!(s, 409);
+        }
+
+        // Bad names are a 400 and write nothing.
+        for bad in [
+            "not json".to_string(),
+            json!({}).to_string(),
+            json!({"name": 5}).to_string(),
+            json!({"name": "  "}).to_string(),
+            json!({"name": "a\u{1b}b"}).to_string(),
+            json!({"name": "x".repeat(121)}).to_string(),
+        ] {
+            let (s, v) = route(&state, "POST", &name, &bad);
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+
+        // Success: the response shape and what the TUI would have written.
+        let (s, v) = route(
+            &state,
+            "POST",
+            &name,
+            &json!({"name": " nightly "}).to_string(),
+        );
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "name": "nightly"}));
+        let (s, v) = route(&state, "POST", &compact, "");
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "compaction": "requested"}));
+        let g = st.storage.lock().unwrap();
+        assert_eq!(g.session_name(), Some("nightly"));
+        assert!(tole_core::compaction::overflow_pending(&*g));
     }
 
     #[test]
