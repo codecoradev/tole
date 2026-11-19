@@ -219,6 +219,25 @@ impl TurnRunError {
     }
 }
 
+impl<'a> TurnPlan<'a> {
+    /// The plan of a face that owns its provider and its compaction
+    /// (`run`, `resume`, `chat`, mission, the doctor probe): no live
+    /// observer, no parked-turn settling and no compaction here. Those faces
+    /// compact at their own call site, with a compactor they keep across
+    /// turns so its window lookup is cached.
+    pub fn new(cfg: OpenAiConfig, registry: &'a ToolRegistry, cancel: &'a CancelToken) -> Self {
+        TurnPlan {
+            cfg,
+            registry,
+            system_prompt: None,
+            cancel,
+            observer: None,
+            resolve_parked: false,
+            compaction: None,
+        }
+    }
+}
+
 impl TurnPlan<'_> {
     fn provider(&self, storage: &impl Storage) -> Result<Box<dyn Provider>, TurnRunError> {
         session_provider(

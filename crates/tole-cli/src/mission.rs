@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{run_turn_with_images, TurnOutcome};
+use tole_core::turn::TurnOutcome;
 
 /// The completion marker the mission system prompt pins: a final
 /// message containing this line declares the goal fully achieved.
@@ -371,6 +371,7 @@ pub fn run_mission(
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
         tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
+    let turn_cfg = provider_cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         provider_cfg,
         &storage,
@@ -457,20 +458,19 @@ pub fn run_mission(
         } else {
             &[]
         };
-        let outcome = match run_turn_with_images(
+        let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg.clone(), &registry, &cfg.cancel);
+        let outcome = match tole_cli::turn_runner::run_turn_with_images(
             &mut storage,
             &mut provider,
-            &registry,
+            &plan,
             &prompt,
             first_images,
-            &cfg.cancel,
-            None,
         ) {
             Ok(o) => o,
             Err(e) => {
                 // Storage-class failure: still summarize (the "either
                 // way" contract), then surface the error.
-                eprintln!("mission: turn storage error: {e}");
+                eprintln!("mission: turn storage error: {}", e.into_message());
                 status = "error";
                 break;
             }
