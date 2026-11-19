@@ -147,6 +147,24 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Whether `child` is serving: true only once its OWN log has the
+/// "listening on" line, false when it exited or the bound passed. A successful connect is NOT readiness: the
+/// port was chosen by bind-and-close, so another test's daemon may draw the
+/// same one, a connect then succeeds against that daemon while this child
+/// is still starting (and later exits with "in use"), and the test talks to
+/// a stranger's server (wrong credentials, a foreign limiter, and a status
+/// of 0 once the other test's `Drop` kills it; #915's sibling flake).
+fn wait_listening(child: &mut Child, log: &std::path::Path, bound: Duration) -> bool {
+    common::poll_until(bound, || {
+        if child.try_wait().ok().flatten().is_some() {
+            return Some(false);
+        }
+        std::fs::read_to_string(log)
+            .is_ok_and(|l| l.contains("listening on"))
+            .then_some(true)
+    }) == Some(true)
+}
+
 /// A serve daemon with Basic on by default (hash from a file), its stderr in
 /// a file the test reads.
 fn spawn(o: Opts) -> Daemon {
@@ -196,13 +214,8 @@ fn spawn(o: Opts) -> Daemon {
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
         let mut child = cmd.spawn().expect("spawn tole");
-        let up = common::poll_until(Duration::from_secs(20), || {
-            if child.try_wait().ok().flatten().is_some() {
-                return Some(false);
-            }
-            TcpStream::connect(("127.0.0.1", port)).ok().map(|_| true)
-        });
-        if up == Some(true) {
+        let up = wait_listening(&mut child, &log, Duration::from_secs(20));
+        if up {
             return Daemon {
                 child,
                 port,
@@ -800,4 +813,25 @@ fn a_refused_upload_counts_one_failure() {
     }
     let r = send_raw(d.port, "POST", "/sessions/s-1/images", &good(), b"xx");
     assert_eq!(r.status, 429, "ten failures, then limited: {}", r.body);
+}
+
+/// The readiness check must not take a connect to a port somebody else
+/// listens on for "this daemon is up" (the cross-talk behind a status 0 and a
+/// foreign 429 when two tests draw the same port).
+#[test]
+fn readiness_is_the_childs_own_listening_line_not_a_connect() {
+    // A listener that accepts connects stands for the other test's daemon.
+    let _stranger = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = TestDir::new("tole-basic-ready");
+    let log = dir.join("serve.log");
+    std::fs::write(&log, "").unwrap();
+    // A live child that never prints the line, on a port that accepts connects.
+    let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+    let up = wait_listening(&mut child, &log, Duration::from_millis(400));
+    assert!(!up, "a connectable port is not a listening child");
+    // Its own line is what counts.
+    std::fs::write(&log, "tole serve: listening on http://127.0.0.1:1 (0)\n").unwrap();
+    assert!(wait_listening(&mut child, &log, Duration::from_secs(5)));
+    let _ = child.kill();
+    let _ = child.wait();
 }
