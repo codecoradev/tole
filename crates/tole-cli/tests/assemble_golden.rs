@@ -85,9 +85,12 @@ fn observe(tag: &str, env: &[(&str, &str)], prep: impl Fn(&TestDir) -> Vec<Strin
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
     // `--no-auto-mcp`: a `cora` binary on PATH would otherwise attach the cora
     // MCP preset, which adds tools and (with both review tools) a review
-    // section to the prompt, so the result would depend on the machine.
-    cmd.arg("--no-auto-mcp")
-        .arg("run")
+    // section to the prompt, so the result would depend on the machine. The
+    // flag and the preset exist only with the `mcp` feature (the `no-mcp`
+    // CI profile has neither).
+    #[cfg(feature = "mcp")]
+    cmd.arg("--no-auto-mcp");
+    cmd.arg("run")
         .args(&extra)
         .arg("go")
         .current_dir(base.join("w"))
@@ -192,9 +195,17 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "web_search",
 ];
 
+/// `web_search` exists only with the `web-builtin` feature (the `no-mcp`
+/// CI profile builds without it); the pinned rosters list it, so drop it
+/// from the expectation when the feature is off.
 fn assert_case(o: &Observed, system: &str, tools: &[&str]) {
     assert_eq!(o.system, system);
-    assert_eq!(o.tools, tools);
+    let want: Vec<&str> = tools
+        .iter()
+        .copied()
+        .filter(|t| cfg!(feature = "web-builtin") || *t != "web_search")
+        .collect();
+    assert_eq!(o.tools, want);
 }
 
 /// A skill file in its own directory (the skill is named after the
