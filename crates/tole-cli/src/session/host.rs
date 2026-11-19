@@ -196,7 +196,18 @@ impl Drop for BusyGuard {
 #[derive(Default)]
 pub struct Sessions {
     map: HashMap<String, SessionState>,
+    /// Last use of each live session: a tick from `clock`, set when the
+    /// session is admitted and when a turn claims it. Eviction takes the
+    /// smallest tick, so the least recently used idle session goes first.
+    last_used: std::cell::RefCell<HashMap<String, u64>>,
+    clock: std::cell::Cell<u64>,
+    /// A session this says must stay (for `tole serve`: one with a pending
+    /// approval, whose Allow could not resume anything once evicted).
+    keep: Option<KeepFn>,
 }
+
+/// See [`Sessions::set_keep`].
+pub type KeepFn = Box<dyn Fn(&str) -> bool + Send>;
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
 
@@ -225,6 +236,19 @@ pub const AMBIGUOUS_SESSION: &str =
     "missing 'session_id': pass it explicitly (or keep exactly one session open)";
 
 impl Sessions {
+    /// Install the rule for sessions that must not be evicted while it
+    /// answers true (`tole serve`: a pending approval). The rule runs under
+    /// the map lock, so it must not take that lock.
+    pub fn set_keep(&mut self, keep: KeepFn) {
+        self.keep = Some(keep);
+    }
+
+    fn touch(&self, id: &str) {
+        let t = self.clock.get() + 1;
+        self.clock.set(t);
+        self.last_used.borrow_mut().insert(id.to_string(), t);
+    }
+
     /// The live session `id`, if any.
     pub fn get(&self, id: &str) -> Option<&SessionState> {
         self.map.get(id)
@@ -299,6 +323,7 @@ impl Sessions {
                 .evict_for_insert(max)
                 .map_err(|AllSessionsBusy| AdmitError::AtCapacity)?,
         };
+        self.touch(&id);
         self.map.insert(id, state);
         Ok(evicted)
     }
@@ -320,11 +345,13 @@ impl Sessions {
         *busy = true;
         state.cancel.reset();
         drop(busy);
+        self.touch(id);
         Ok((state.clone(), BusyGuard(StdArc::clone(&state.busy))))
     }
 
     /// Make room for one more session: while the map is at `max`, evict
-    /// one NON-busy session. A busy flag that is itself locked means a
+    /// the least recently used session that is NOT busy and is not kept by
+    /// [`Sessions::set_keep`]. A busy flag that is itself locked means a
     /// turn is mid-flight on that session, so it is skipped via
     /// `try_lock` without blocking the whole map (CodeCora scan
     /// round-2). Returns the evicted ids so callers can prune any side
@@ -333,15 +360,19 @@ impl Sessions {
     fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
         let mut evicted = Vec::new();
         while self.map.len() >= max {
-            let oldest = self
-                .map
-                .iter()
-                .filter(|(_, st)| matches!(st.busy.try_lock().as_deref().copied(), Ok(false)))
-                .map(|(id, _)| id.clone())
-                .next();
-            match oldest {
+            let victim = {
+                let used = self.last_used.borrow();
+                self.map
+                    .iter()
+                    .filter(|(_, st)| matches!(st.busy.try_lock().as_deref().copied(), Ok(false)))
+                    .filter(|(id, _)| !self.keep.as_ref().is_some_and(|keep| keep(id)))
+                    .min_by_key(|(id, _)| used.get(*id).copied().unwrap_or(0))
+                    .map(|(id, _)| id.clone())
+            };
+            match victim {
                 Some(id) => {
                     self.map.remove(&id);
+                    self.last_used.borrow_mut().remove(&id);
                     evicted.push(id);
                 }
                 None => return Err(AllSessionsBusy),
@@ -1230,6 +1261,73 @@ mod eviction_tests {
         s.map.insert("b".into(), state(dir.path(), "b", true));
         assert_eq!(s.evict_for_insert(2), Err(AllSessionsBusy));
         assert_eq!(s.map.len(), 2);
+    }
+
+    #[test]
+    fn eviction_takes_the_least_recently_used_idle_session() {
+        let dir = TmpDir::new("lru");
+        let mut s = Sessions::default();
+        for n in ["a", "b", "c"] {
+            s.admit(n.into(), state(dir.path(), n, false)).unwrap();
+        }
+        // `a` is the oldest admitted, but a turn claims it: `b` is now LRU.
+        drop(s.claim_turn("a").unwrap());
+        let evicted = s.admit_capped("d".into(), state(dir.path(), "d", false), 3);
+        assert_eq!(evicted, Ok(vec!["b".to_string()]));
+        let evicted = s.admit_capped("e".into(), state(dir.path(), "e", false), 3);
+        assert_eq!(evicted, Ok(vec!["c".to_string()]));
+    }
+
+    #[test]
+    fn a_kept_session_is_never_the_victim() {
+        let dir = TmpDir::new("keep");
+        let mut s = Sessions::default();
+        s.set_keep(Box::new(|id| id == "a"));
+        for n in ["a", "b"] {
+            s.admit(n.into(), state(dir.path(), n, false)).unwrap();
+        }
+        // `a` is the least recently used, yet kept: `b` goes.
+        assert_eq!(s.evict_for_insert(2), Ok(vec!["b".to_string()]));
+        assert!(s.map.contains_key("a"));
+        // Nothing left to evict: refused, `a` survives.
+        assert_eq!(s.evict_for_insert(1), Err(AllSessionsBusy));
+        assert!(s.map.contains_key("a"));
+    }
+
+    /// #979: a full map of idle sessions, an approval queued on the one
+    /// eviction would pick, a new session admitted: the parked session
+    /// survives (so its Allow can resume) and the next-oldest goes instead.
+    #[test]
+    fn a_session_with_a_pending_approval_survives_admission_at_the_cap() {
+        let dir = TmpDir::new("pending");
+        let queue = crate::approvals::ApprovalQueue::shared();
+        let mut s = Sessions::default();
+        let q = StdArc::clone(&queue);
+        s.set_keep(Box::new(move |id| q.has_pending(id)));
+        let cap = 4;
+        for n in ["s0", "s1", "s2", "s3"] {
+            s.admit_capped(n.into(), state(dir.path(), n, false), cap)
+                .unwrap();
+        }
+        // `s0` is the least recently used and is parked on an approval.
+        let id = queue.queue_entry(
+            "s0",
+            "write_file",
+            "write x",
+            1,
+            dir.path().join("s0.jsonl"),
+        );
+        let evicted = s
+            .admit_capped("new".into(), state(dir.path(), "new", false), cap)
+            .unwrap();
+        assert_eq!(evicted, vec!["s1".to_string()]);
+        assert!(s.get("s0").is_some(), "the parked session must stay live");
+        // Once decided, the session is an ordinary LRU candidate again.
+        queue.decide(&id, true);
+        let evicted = s
+            .admit_capped("newer".into(), state(dir.path(), "newer", false), cap)
+            .unwrap();
+        assert_eq!(evicted, vec!["s0".to_string()]);
     }
 
     #[test]

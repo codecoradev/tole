@@ -321,6 +321,17 @@ impl ApprovalQueue {
             .map(|e| e.storage_path.clone())
     }
 
+    /// True when `session_id` has a Pending entry: such a session must stay
+    /// live, because an Allow resumes the turn in memory.
+    pub fn has_pending(&self, session_id: &str) -> bool {
+        self.prune_expired();
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|e| e.session_id == session_id && e.status == ApprovalStatus::Pending)
+    }
+
     /// Validate an id WITHOUT mutating: (session_id, tool) when the
     /// entry is Pending. The decision route audits BEFORE deciding, so
     /// a failed audit leaves the queue untouched.

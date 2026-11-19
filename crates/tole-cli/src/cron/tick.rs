@@ -270,6 +270,18 @@ pub fn parked_pc(path: &Path) -> Result<tole_core::state::Pc, String> {
         .ok_or_else(|| "the session file has no state".to_string())
 }
 
+/// True when an unresumed parked run has `session_id` (read-only).
+pub fn has_parked(dir: &Path, session_id: &str) -> bool {
+    store::with_lock(dir, |l| {
+        Ok(l.state()
+            .dones()
+            .filter(|d| d.session_id.as_deref() == Some(session_id))
+            .filter(|d| d.status == RunStatus::AwaitingApproval)
+            .any(|d| l.state().resumed_by(&d.fire_id).is_none()))
+    })
+    .unwrap_or(false)
+}
+
 /// After an `/approvals` allow (#581): continues the parked agent run whose
 /// session is `session_id`, under a new `resume` claim (once per parked
 /// run), through the same execute / settle / deliver path as a tick. The
