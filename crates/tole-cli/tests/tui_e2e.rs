@@ -199,10 +199,10 @@ impl Pty {
         };
         assert_eq!(rc, 0, "openpty");
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(sl)) };
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd =
+            common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[]);
         cmd.args(args)
             .current_dir(cwd)
-            .env("CODECORA_HOME", cwd.with_extension("home"))
             .env("TOLE_BASE_URL", url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -386,13 +386,13 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
         .to_string_lossy()
         .trim_end_matches(".jsonl")
         .to_string();
-    let listed = Command::new(env!("CARGO_BIN_EXE_tole"))
-        .arg("sessions")
-        .current_dir(&dir)
-        .env("CODECORA_HOME", dir.with_extension("home"))
-        .env("TOLE_NO_UPDATE_CHECK", "1")
-        .output()
-        .unwrap();
+    let listed =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
+            .arg("sessions")
+            .current_dir(&dir)
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
     assert!(
         String::from_utf8_lossy(&listed.stdout).contains(&id),
         "sessions lists {id}: {}",
@@ -510,10 +510,9 @@ fn tui_model_picker_and_thinking_reach_the_next_request_and_survive_resume() {
         .trim_end_matches(".jsonl")
         .to_string();
     let tole = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
             .args(args)
             .current_dir(&dir)
-            .env("CODECORA_HOME", dir.with_extension("home"))
             .env("TOLE_BASE_URL", &url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -816,13 +815,13 @@ fn tui_fork_continues_in_the_new_session_and_tree_switches_back() {
     let (url, dir) = (spawn_mock_recording(bodies.clone()), workdir());
     let sessions = dir.join(".tole/sessions");
     let tole = |args: &[&str]| {
-        let o = Command::new(env!("CARGO_BIN_EXE_tole"))
-            .args(args)
-            .current_dir(&dir)
-            .env("CODECORA_HOME", dir.with_extension("home"))
-            .env("TOLE_NO_UPDATE_CHECK", "1")
-            .output()
-            .unwrap();
+        let o =
+            common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
+                .args(args)
+                .current_dir(&dir)
+                .env("TOLE_NO_UPDATE_CHECK", "1")
+                .output()
+                .unwrap();
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     let mut t = Pty::spawn(&dir, &url);

@@ -263,15 +263,13 @@ fn run_tole_with(
     let home = tmpdir("home");
     approve_fake_cora(&home);
     let sessions = home.join("sessions");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
     cmd.args(["run", "--yes", "-s", sessions.to_str().unwrap()])
         .args(extra)
         .arg("commit it")
         .current_dir(repo)
         .stdin(Stdio::null())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("HOME", &home)
-        .env("CODECORA_HOME", &home)
         .env("TOLE_BASE_URL", base)
         .env("TOLE_MODEL", "mock-model")
         .env("TOLE_API_KEY", "sk-test")
@@ -385,10 +383,9 @@ fn doctor_reports_the_gate() {
     let dir = tmpdir("doctor");
     let bin = fake_cora(&dir, 0);
     let home = tmpdir("home");
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["doctor", "--tier", "offline", "--no-ledger"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env_remove("TOLE_REVIEW_GATE")
         .output()

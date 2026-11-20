@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 /// Mock: answers every request with `SYSTEM::<the system message>`.
@@ -147,7 +146,7 @@ fn fixture_with(tag: &str, pre_024: bool) -> TestDir {
 }
 
 fn run(dir: &Path, url: &str, envs: &[(&str, &str)]) -> (String, String, i32) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.join("home"), &[]);
     cmd.args([
         "run",
         "--workspace",
@@ -160,7 +159,6 @@ fn run(dir: &Path, url: &str, envs: &[(&str, &str)]) -> (String, String, i32) {
     .env("TOLE_MODEL", "m")
     .env("TOLE_API_KEY", "k")
     .env("TOLE_NO_UPDATE_CHECK", "1")
-    .env("CODECORA_HOME", dir.join("home"))
     .env(
         "PATH",
         format!("{}:/usr/bin:/bin", dir.join("bin").display()),

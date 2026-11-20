@@ -49,15 +49,13 @@ struct Run {
 
 fn tole_setup(bin: &Path, cargo_home: &Path, args: &[&str]) -> Run {
     let home = tmpdir("home");
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .arg("setup")
         .args(args)
         .stdin(Stdio::null())
         .env("PATH", bin)
-        .env("HOME", &home)
         .env("CARGO_HOME", cargo_home)
         .env("FAKE_CORA_VERSION", "0.20.0")
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .output()
         .unwrap();
@@ -163,14 +161,12 @@ fn setup_fails_loudly_when_the_install_does_not_produce_a_usable_cora() {
     fake_cargo(&bin, &log);
     // The fake install drops a cora that is still too old.
     let home = tmpdir("home");
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["setup", "cora", "--yes"])
         .stdin(Stdio::null())
         .env("PATH", &bin)
-        .env("HOME", &home)
         .env("CARGO_HOME", &ch)
         .env("FAKE_CORA_VERSION", "0.18.9")
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .output()
         .unwrap();
