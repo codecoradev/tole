@@ -785,8 +785,18 @@ fn lazy_snapshot(
 /// the tool writes one capped file at the path the parent chose and the
 /// parent adds it to the child's allow list, so it is the only Write tool
 /// left and the only one a participant can call.
+///
+/// A participant whose owner allowed it some connected tools (#1039) keeps
+/// exactly those besides the ReadOnly ones: they stay `Write`, and every call
+/// still goes through its approver (`delegated_approver`), which asks the
+/// owner once per tool per discussion. The built-in ReadOnly tools (file
+/// reading, search, web search and fetch where configured) are kept either
+/// way, so a participant could already look things up before this.
 fn keep_read_only(reg: &mut ToolRegistry, env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
-    reg.retain_read_only();
+    match tole_core::child_env::discussion_scope(env) {
+        Some(scope) => reg.retain_read_only_and(&scope.tools),
+        None => reg.retain_read_only(),
+    }
     if let Some(path) = tole_core::child_env::delegation_report(env) {
         add(
             reg,
@@ -886,6 +896,56 @@ mod tests {
                 assert!(
                     risk == Risk::ReadOnly || name == "delegate_report",
                     "{name} is {risk:?} in plan mode"
+                );
+            }
+        }
+    }
+
+    /// #1039: a participant whose owner allowed it a connected tool keeps
+    /// that Write tool and nothing else that writes or runs a program; its
+    /// ReadOnly tools (files, search) stay. Without the allowance nothing
+    /// changes.
+    #[test]
+    fn plan_mode_keeps_only_the_named_connected_tools_of_a_participant() {
+        struct Mcp(&'static str);
+        impl Tool for Mcp {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::Write
+            }
+            fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({}))
+            }
+        }
+        let ws = workspace("plan-scope");
+        let env = |tools: Option<&'static str>| {
+            move |k: &str| match (k, tools) {
+                ("TOLE_DISCUSSION_PARTICIPANT", _) => Some("1".to_string()),
+                ("TOLE_DISCUSSION_ID", Some(_)) => Some("d-1".to_string()),
+                ("TOLE_DISCUSSION_TOOLS", Some(t)) => Some(t.to_string()),
+                _ => None,
+            }
+        };
+        for (tools, kept) in [
+            (Some("mcp_nginjen_search"), true),
+            (Some("mcp_other_search"), false),
+            (None, false),
+        ] {
+            let mut reg = build(Human, Roster::new(ws.to_path_buf())).unwrap();
+            add(&mut reg, Box::new(Mcp("mcp_nginjen_search"))).unwrap();
+            keep_read_only(&mut reg, &env(tools)).unwrap();
+            assert_eq!(reg.get("mcp_nginjen_search").is_some(), kept, "{tools:?}");
+            assert!(reg.get("read_file").is_some());
+            for gone in ["write_file", "edit_file", "run_command", "delete_file"] {
+                assert!(reg.get(gone).is_none(), "{gone} survived plan mode");
+            }
+            for name in names(&reg) {
+                let risk = reg.get(&name).unwrap().risk();
+                assert!(
+                    risk == Risk::ReadOnly || name == "mcp_nginjen_search",
+                    "{name} is {risk:?}"
                 );
             }
         }

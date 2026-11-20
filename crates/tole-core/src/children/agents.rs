@@ -601,6 +601,8 @@ pub struct ChildOpts {
     /// Set for an independent discussion participant (#704): the child's
     /// environment says so, and it may not start a discussion.
     pub participant: bool,
+    /// The connected tools the owner allowed that participant (#1039).
+    pub discussion: Option<crate::child_env::DiscussionScope>,
 }
 
 impl AgentStartTool {
@@ -919,7 +921,13 @@ impl Tool for AgentStartTool {
                 .delegated
                 .then(|| dir.join(crate::delegation_report::REPORT_FILE)),
             participant: self.opts.participant,
+            discussion: self.opts.discussion.clone(),
         };
+        // A scope reaches the child only from this launch: one inherited from
+        // the host's own environment is removed first (#1039).
+        for var in crate::child_env::SCOPE_VARS {
+            cmd.env_remove(var);
+        }
         cmd.envs(launch.vars());
         if self.opts.command.is_empty() {
             cmd.arg("run");

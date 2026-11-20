@@ -1869,7 +1869,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             let images = tole_cli::turn_runner::resolve_images(&images)?;
-            if host.plan_mode {
+            // An independent discussion participant (#704) is launched as
+            // `mission --plan-mode` by its host: read-only is the point of it.
+            // Only the host's participant marker lifts the refusal; plan mode
+            // there removes tools, it never adds one.
+            let participant = tole_core::child_env::discussion_participant(&config_apply::real_env);
+            if host.plan_mode && !participant {
                 return Err(refuse(
                     "--plan-mode has no meaning for a mission (missions mutate by definition)",
                     config_layer(settings.plan_mode.source),
