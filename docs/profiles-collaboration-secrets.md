@@ -305,8 +305,9 @@ Evidence:
 Loop (all state in the ledger, so a crash resumes mid-discussion):
 
 ```
-Goal contract   question, acceptance criteria, participants (from the
-                owner's prompt), budget, max rounds
+Goal contract   question (up to 12,000 characters), acceptance criteria,
+                participants (from the owner's prompt), budget, max rounds,
+                optional background files (by reference, #1038)
 Round n         each participant gets: contract + digest(n-1) + its OWN
                 previous contribution  → contribution(n) [raw, ledger]
 Sanitizer       deterministic pass, then digest pass → digest(n)

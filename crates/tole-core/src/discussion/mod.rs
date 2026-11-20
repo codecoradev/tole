@@ -294,8 +294,8 @@ impl Contract {
             // ledger contract would see a partial payload and believe it whole.
             return Err(format!(
                 "the question is {} characters, over the {MAX_QUESTION_CHARS}-character limit; \
-                 nothing was dropped and nothing started. Shorten it (put long data in a file \
-                 the participants can read) and try again",
+                 nothing was dropped and nothing started. Shorten it (long data can go in a file \
+                 in the working folder, named with `tole discuss start --file`) and try again",
                 question.chars().count()
             ));
         }
