@@ -7,4 +7,6 @@ pub mod bundle;
 #[cfg(feature = "mcp")]
 pub mod cmd;
 pub mod gate;
+#[cfg(feature = "mcp")]
+pub mod view;
 pub mod warn;

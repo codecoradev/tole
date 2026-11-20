@@ -10,3 +10,4 @@ pub mod fetch;
 pub mod outcome;
 pub mod propose;
 pub mod recall;
+pub mod state;

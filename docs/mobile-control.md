@@ -293,6 +293,20 @@ A job is addressed by its `id` (the name does not resolve; a wrong id is `404`).
 remove or run a job: those stay local-only owner actions (a job carries a prompt, an allow list and, for a script, a
 command run with the owner's authority).
 
+## Profiles, skills and connected tools (#1042)
+
+Three read-only views for the Helpers and Skills and tools pages. They answer from the owner's own files and change
+nothing; **no other verb is a route** (`POST`, `PUT`, `PATCH` or `DELETE` on these paths is `404`), because writing a
+profile, approving or revoking a skill or a connected tool, and changing the allow list stay with the owner at a
+terminal (`docs/faces.md`, "Owner actions that are not serve routes"). A test snapshots the owner's data directory and
+sends every such verb to every such path: nothing changes.
+
+| Action | Route | Answer |
+|---|---|---|
+| Profiles | `GET /profiles` | `{"profiles": [{"name", "persona", "persona_chars", "models", "memory_room", "may_use", "session_allow"}]}` from the user config (re-read per request; none under `--no-config`). `persona` is the first line of the persona file (200 characters at most); `models` has the tiers the profile sets (`light`, `standard`, `heavy`, `advisor`) and its `default` tier name; `may_use` is the profile's own allow list and `session_allow` what a session opened with it gets on this server (#740). Secret grants, skill paths and the rest of the persona are not shown. A profile that cannot be loaded is a row with `name` and `error` |
+| Skills | `GET /skills` | `{"skills", "drafts", "archived", "notes"}`. `skills`: every skill found from the serve workspace with `state` (`approved`, `changed` since its approval, `not_approved`, `refused` by the ledger, `unreadable`), its hash against the approved one, source and last ledger lines. `drafts`: skills the agent proposed that wait for review (`skill_propose`), with `tainted` when the session read untrusted text. `archived`: skills the curator moved to the archive. A part that cannot be read is a line in `notes` |
+| Connected tools | `GET /tools` | `{"servers", "notes", "probed": false}`. The owner's `--mcp-server` list against the plugin lock: per server `trust` (`trusted`, `changed`, `not_trusted`, `removed` for revoked or no longer configured), `state` (the sentence `tole plugin list` prints), tier, source, version, approval time, granted secret names and sandbox. **No server is started to answer**, so a manifest that changed since approval is not found here: a server the lock admits reads `locked (not probed: ...)` and `tole plugin list` at a terminal does the live check |
+
 ## Resume by id (#524)
 
 `POST /sessions {"resume": "<id>", "cwd"?: "..."}` makes an existing session live

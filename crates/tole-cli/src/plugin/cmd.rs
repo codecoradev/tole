@@ -307,7 +307,7 @@ pub(super) fn probe_listed(
     }
     if !ctx.probe {
         return (
-            "locked (not probed: running under a session)".to_string(),
+            "locked (not probed: this view starts no server)".to_string(),
             None,
         );
     }

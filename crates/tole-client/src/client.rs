@@ -47,10 +47,13 @@ pub enum Route {
     PauseCronJob,
     ResumeCronJob,
     CronRuns,
+    Profiles,
+    Skills,
+    Tools,
 }
 
 impl Route {
-    pub const ALL: [Route; 22] = [
+    pub const ALL: [Route; 25] = [
         Route::Health,
         Route::Sessions,
         Route::SessionIndex,
@@ -73,6 +76,9 @@ impl Route {
         Route::PauseCronJob,
         Route::ResumeCronJob,
         Route::CronRuns,
+        Route::Profiles,
+        Route::Skills,
+        Route::Tools,
     ];
 
     pub fn method(self) -> &'static str {
@@ -116,6 +122,9 @@ impl Route {
             Route::PauseCronJob => "/cron/jobs/{id}/pause",
             Route::ResumeCronJob => "/cron/jobs/{id}/resume",
             Route::CronRuns => "/cron/runs",
+            Route::Profiles => "/profiles",
+            Route::Skills => "/skills",
+            Route::Tools => "/tools",
         }
     }
 }
@@ -510,6 +519,24 @@ impl Client {
             query.push(format!("limit={l}"));
         }
         self.call(Route::CronRuns, None, &query.join("&"), None)
+    }
+
+    /// The owner's profiles (the helpers), read-only: persona summary, model
+    /// tiers, memory room and what each may use. Editing one is not a route.
+    pub fn profiles(&self) -> Result<Profiles> {
+        self.call(Route::Profiles, None, "", None)
+    }
+
+    /// Skills with their approval state, the drafts waiting for review and the
+    /// archive, read-only. Approving a skill is not a route.
+    pub fn skills(&self) -> Result<SkillsState> {
+        self.call(Route::Skills, None, "", None)
+    }
+
+    /// The connected (MCP) tools with their trust state from the plugin lock,
+    /// read-only; no server is started to answer. Approving one is not a route.
+    pub fn tools(&self) -> Result<ToolsState> {
+        self.call(Route::Tools, None, "", None)
     }
 }
 

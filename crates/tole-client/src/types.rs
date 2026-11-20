@@ -388,6 +388,103 @@ wire! {
         pub runs: Vec<CronRun>,
     }
 
+    /// One helper of `GET /profiles`. A profile that cannot be loaded is a row
+    /// with only `name` and `error`. `persona` is the first line of the persona
+    /// file (absent when it has none); `models` has the tiers the profile sets
+    /// and its `default` tier name; `may_use` is the profile's own allow list
+    /// and `session_allow` what a session opened with it gets on this server.
+    pub struct Profile {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub persona: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub persona_chars: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub models: Option<Map<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub memory_room: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub may_use: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_allow: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+
+    /// `GET /profiles`.
+    pub struct Profiles {
+        pub profiles: Vec<Profile>,
+    }
+
+    /// One skill of `GET /skills`. `state` is `approved`, `changed` (the
+    /// content differs from what was approved: it is not used), `not_approved`,
+    /// `refused` (the approval ledger disagrees) or `unreadable`.
+    pub struct SkillRow {
+        pub name: String,
+        pub state: String,
+        pub status: String,
+        pub hash: Option<String>,
+        pub approved_hash: Option<String>,
+        pub approved_at: Option<String>,
+        pub source: Option<Value>,
+        pub source_text: String,
+        pub history: Vec<Value>,
+    }
+
+    /// A skill the agent proposed, waiting for the owner's review.
+    pub struct SkillDraft {
+        pub id: String,
+        pub name: String,
+        pub description: String,
+        pub created_at: String,
+        pub hash: String,
+        /// The session that proposed it read untrusted text.
+        pub tainted: bool,
+        pub warnings: Vec<String>,
+        pub nearest: Option<String>,
+    }
+
+    /// A skill the curator moved to the archive.
+    pub struct ArchivedSkill {
+        pub skill: String,
+        pub entry: u64,
+        pub at: String,
+        pub reason: String,
+    }
+
+    /// `GET /skills`.
+    pub struct SkillsState {
+        pub skills: Vec<SkillRow>,
+        pub drafts: Vec<SkillDraft>,
+        pub archived: Vec<ArchivedSkill>,
+        pub notes: Vec<String>,
+    }
+
+    /// One connected tool server of `GET /tools`. `trust` is `trusted`,
+    /// `changed`, `not_trusted` or `removed` (revoked, or approved but no
+    /// longer configured); `state` is the sentence `tole plugin list` prints.
+    pub struct ToolServer {
+        pub trust: String,
+        pub name: String,
+        pub state: String,
+        pub tier: String,
+        pub source: Option<String>,
+        pub version: Option<String>,
+        pub approved_at: Option<String>,
+        pub secrets: Vec<String>,
+        pub sandbox: String,
+        pub manifest_hash: Option<String>,
+        pub lock: String,
+    }
+
+    /// `GET /tools`. `probed` is always false: the live manifest check starts
+    /// the server and is done at a terminal with `tole plugin list`.
+    pub struct ToolsState {
+        pub servers: Vec<ToolServer>,
+        pub notes: Vec<String>,
+        pub probed: bool,
+    }
+
     /// The answer to `POST /discussions/{id}/resume`.
     pub struct DiscussionResumed {
         pub id: String,
