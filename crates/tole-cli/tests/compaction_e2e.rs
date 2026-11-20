@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -129,19 +129,18 @@ fn spawn_mock_with(
 }
 
 fn tole(cwd: &Path, url: &str, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[]);
     c.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         // Outside the workspace: a jail that holds the data dir has no file
         // writers (#684).
-        .env("CODECORA_HOME", cwd.with_extension("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_NO_SESSION_INDEX", "1")
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_CONTEXT_WINDOW")
         .env_remove("TOLE_FALLBACK_BASE_URL")
         .env_remove("TOLE_MEMORY")

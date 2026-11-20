@@ -80,11 +80,10 @@ fn gates_unsandboxed(home: &Path) {
 }
 
 fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         // No cora / uteke / gh on the path: nothing auto-attaches.
         .env("PATH", format!("{}:/usr/bin:/bin", tmpdir().display()))
         .stdin(Stdio::null());

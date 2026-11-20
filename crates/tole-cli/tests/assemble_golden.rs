@@ -10,7 +10,7 @@
 #![cfg(feature = "shell-tools")]
 
 use std::io::{BufRead, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 mod common;
@@ -82,7 +82,7 @@ fn observe(tag: &str, env: &[(&str, &str)], prep: impl Fn(&TestDir) -> Vec<Strin
     }
     let extra = prep(&base);
     let (url, seen) = mock_provider();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
     // `--no-auto-mcp`: a `cora` binary on PATH would otherwise attach the cora
     // MCP preset, which adds tools and (with both review tools) a review
     // section to the prompt, so the result would depend on the machine. The
@@ -95,7 +95,6 @@ fn observe(tag: &str, env: &[(&str, &str)], prep: impl Fn(&TestDir) -> Vec<Strin
         .arg("go")
         .current_dir(base.join("w"))
         .env_remove("TOLE_SYSTEM_PROMPT")
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TZDIR", "/nonexistent")
         .env("TOLE_BASE_URL", &url)
