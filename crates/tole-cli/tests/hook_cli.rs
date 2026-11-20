@@ -10,7 +10,7 @@ use common::TestDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const KEY: &str = "route-key-for-hook-cli-tests-0123";
 
@@ -29,10 +29,9 @@ fn setup(tag: &str) -> TestDir {
 }
 
 fn tole(base: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[])
         .args(args)
         .current_dir(base.join("proj"))
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TOLE_HOOK_TEST_KEY", KEY)
         .env("MY_API_TOKEN", "payload-secret-value-42")

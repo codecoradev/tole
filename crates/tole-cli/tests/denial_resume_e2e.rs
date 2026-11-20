@@ -92,18 +92,16 @@ fn spawn_mock(reqs: Arc<Mutex<Vec<Value>>>) -> String {
 }
 
 fn run(cwd: &Path, url: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    // Home outside the workspace: a jail that holds the data dir has no file
+    // writers (#684).
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[])
         .args(args)
         .current_dir(cwd)
-        // Outside the workspace: a jail that holds the data dir has no file
-        // writers (#684).
-        .env("CODECORA_HOME", cwd.with_extension("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_NO_SESSION_INDEX", "1")
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .output()
         .unwrap()
