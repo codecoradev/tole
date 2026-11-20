@@ -86,6 +86,10 @@ fn route_types(r: Route) -> (Option<&'static str>, &'static str, &'static [&'sta
         Route::StartDiscussion => (Some("DiscussionRequest"), "DiscussionStarted", &[]),
         Route::ResumeDiscussion => (None, "DiscussionResumed", &[]),
         Route::StopDiscussion => (None, "DiscussionStopped", &[]),
+        Route::CronJobs => (None, "CronJobs", &[]),
+        Route::PauseCronJob => (None, "CronJobState", &[]),
+        Route::ResumeCronJob => (None, "CronJobState", &[]),
+        Route::CronRuns => (None, "CronRuns", &["job", "limit"]),
     }
 }
 
@@ -129,6 +133,9 @@ pub(crate) fn generate() -> Value {
         ("DiscussionStarted", g.subschema_for::<DiscussionStarted>()),
         ("DiscussionResumed", g.subschema_for::<DiscussionResumed>()),
         ("DiscussionStopped", g.subschema_for::<DiscussionStopped>()),
+        ("CronJobs", g.subschema_for::<CronJobs>()),
+        ("CronJobState", g.subschema_for::<CronJobState>()),
+        ("CronRuns", g.subschema_for::<CronRuns>()),
     ]);
     // Keyed by the SSE event name; the value is the JSON in the frame's `data:`.
     let events = group(vec![
