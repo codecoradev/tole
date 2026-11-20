@@ -2514,6 +2514,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tole-client"
+version = "0.12.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "tole-core"
 version = "0.12.0"
 dependencies = [
