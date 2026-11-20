@@ -82,12 +82,10 @@ fn home_with(config: &str, files: &[(&str, &str)]) -> TestDir {
 }
 
 fn cmd(cwd: &Path, home: &Path, url: &str, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
         .env("PATH", format!("{}:/usr/bin:/bin", tmpdir().display()))
         .env("TOLE_STREAM", "0")
         .env("TOLE_BASE_URL", url)

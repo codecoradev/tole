@@ -28,13 +28,11 @@ fn tole(root: &Path, config: Option<&str>, env: &[(&str, &str)], args: &[&str]) 
         std::fs::write(&cfg, c).unwrap();
     }
     let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    c.env_clear();
+    common::apply_hermetic_env(&mut c, &home, &[("PATH", "/usr/bin:/bin")]);
     c.args(args)
         .current_dir(&work)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", &home)
-        .env("HOME", &home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

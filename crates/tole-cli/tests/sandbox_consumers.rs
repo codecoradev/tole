@@ -20,13 +20,13 @@ fn tole(user_config: Option<&str>, args: &[&str]) -> Output {
         std::fs::create_dir_all(home.join("tole")).unwrap();
         std::fs::write(home.join("tole/config.toml"), c).unwrap();
     }
-    Command::new(env!("CARGO_BIN_EXE_tole"))
-        .args(args)
+    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    c.env_clear();
+    common::apply_hermetic_env(&mut c, &home, &[]);
+    c.args(args)
         .current_dir(&cwd)
-        .env_clear()
         .env("PATH", &path)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", &home)
         // A configured (never contacted) provider, so the offline doctor
         // has nothing else to fail on.
         .env("TOLE_BASE_URL", "http://127.0.0.1:9")
@@ -180,13 +180,13 @@ fn a_project_config_cannot_set_consumers() {
     )
     .unwrap();
     let run = |cwd: &Path| {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
-            .args(["config", "check"])
+        let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+        c.env_clear();
+        common::apply_hermetic_env(&mut c, &home, &[]);
+        c.args(["config", "check"])
             .current_dir(cwd)
-            .env_clear()
             .env("PATH", &path)
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", &home)
             .output()
             .unwrap()
     };
