@@ -61,7 +61,17 @@ pub const MAX_CRITERIA: usize = 12;
 /// Longest question, criterion and contribution, in characters. A question or
 /// criterion over its limit is refused, never cut; only a contribution (a
 /// model's output) is capped.
-pub const MAX_QUESTION_CHARS: usize = 2000;
+///
+/// The question limit is 12 000 characters (owner decision 2026-11-20, #1038;
+/// it was 2 000): about 3 000 tokens of English text. It stays a count of
+/// characters, not tokens, so the check is deterministic and does not depend
+/// on a provider's tokenizer. The question is stored once in the contract
+/// record (48 000 bytes at the worst, 4-byte UTF-8, far under
+/// [`log::MAX_RECORD_BYTES`]; `log_tests.rs` writes that record) but it is
+/// sent to every participant, the scribe and the checker in every round, so
+/// what it costs grows with the participants and the rounds: the dry run's
+/// estimate includes it and the token budget bounds it.
+pub const MAX_QUESTION_CHARS: usize = 12_000;
 pub const MAX_CRITERION_CHARS: usize = 400;
 pub const MAX_CONTRIBUTION_CHARS: usize = 8000;
 /// Longest digest line, and most lines in one digest section.

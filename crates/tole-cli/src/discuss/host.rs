@@ -123,6 +123,23 @@ pub fn round_floor(c: &Contract) -> u64 {
     voices + tokens(checker_request(c, &[]), CHECKER_REPLY_TOKENS)
 }
 
+/// Longest part of the question the closing text repeats, in characters.
+const REPORT_QUESTION_CHARS: usize = 600;
+
+/// The question as the closing text shows it: all of a short one, the start
+/// of a long one with its length. The question may be 12 000 characters
+/// (#1038) and the closing text is capped, so repeating it whole would push
+/// the checklist and the last round out of what the owner reads; the whole
+/// question stays in the ledger's contract record.
+fn question_excerpt(q: &str) -> String {
+    let n = q.chars().count();
+    if n <= REPORT_QUESTION_CHARS {
+        return q.to_string();
+    }
+    let head: String = q.chars().take(REPORT_QUESTION_CHARS).collect();
+    format!("{head}\u{2026} ({n} characters; the whole question is in the discussion ledger)")
+}
+
 /// A discussion's budget carved from the goal's pot: `requested`, or half
 /// of what is left; never more than is left.
 pub fn carve(requested: Option<u64>, pot: &Budget) -> Result<u64, String> {
@@ -838,7 +855,7 @@ impl Driver {
         };
         let mut out = vec![
             format!("Discussion `{}`: {}.", c.id, describe(outcome)),
-            format!("Question: {}", c.question),
+            format!("Question: {}", question_excerpt(&c.question)),
             format!(
                 "Rounds: {}; tokens used: {} of {}.",
                 st.summaries.keys().max().copied().unwrap_or(0),
