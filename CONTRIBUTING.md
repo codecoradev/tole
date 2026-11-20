@@ -15,7 +15,15 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
 - **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`,
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
-  warnings` → `cargo test --workspace`. CI enforces the same set.
+  warnings` → `cargo test --workspace`. CI enforces the same set. A change to
+  `crates/tole-desktop` or `crates/tole-desktop-model` also runs
+  `scripts/test-desktop-check.sh` and `scripts/desktop-check.sh` (#1028; see
+  [docs/design/desktop/README.md](docs/design/desktop/README.md); run
+  `cargo fetch` once first). A broken dependency-graph or size rule makes the
+  script exit 1; the literals check is advisory (it warns, never fails). Nothing in
+  CI runs them yet: a separate `Desktop` workflow (not part of `ci.yml`, not a
+  required check unless the owner adds it to the branch protection) is added by
+  a later change of #1028.
 - **Test directories** (#781): a test that needs a scratch directory uses
   `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
   and the `crate::test_dir` module in unit tests), never a hand-built
