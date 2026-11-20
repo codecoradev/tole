@@ -17,6 +17,9 @@ continuity, infra facts.
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
   `./target/release/tole`, never a PATH-resolved one.
+- `crates/tole-desktop-model` — the desktop's view state, reducers, design
+  tokens and string table (#1028). Not published. No GUI toolkit and no tole
+  dependency, so the compiler keeps the toolkit out of it.
 - `docs/` — architecture, PRD, epics (roadmap + tracking issues), threat
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live

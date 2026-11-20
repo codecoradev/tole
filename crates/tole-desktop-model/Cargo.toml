@@ -1,0 +1,16 @@
+[package]
+name = "tole-desktop-model"
+description = "View state, reducers, design tokens and strings of the tole desktop (no GUI toolkit)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not published: an internal crate of the desktop application.
+publish = false
+
+# No GUI toolkit (gpui*, zed*) and nothing from tole (tole-cli, tole-core,
+# tole-tui, tole-client), directly or through another crate, ever. There is
+# none today. The compiler then makes "the model cannot name the toolkit"
+# true, and `scripts/desktop-check.sh deps` checks the resolved dependency
+# graph (cargo metadata) to keep it so.
+[dependencies]
