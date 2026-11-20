@@ -13,6 +13,7 @@
 pub mod audit;
 pub mod files;
 pub mod host;
+pub mod owner;
 pub mod tool;
 
 use std::path::{Path, PathBuf};
@@ -291,10 +292,25 @@ fn check_participants(c: &Contract, env: &Env<'_>, log: DiscussionLog) -> Result
     .map(|_| ())
 }
 
-/// Starts a discussion from the owner's contract and runs it to its end.
-pub fn start(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
+/// A discussion that is recorded and ready to run: what [`begin`] and
+/// [`prepare_resume`] hand to whoever drives it (the terminal blocks on it,
+/// `tole serve` runs it on a thread).
+pub struct Ready {
+    pub driver: Driver,
+    pub id: String,
+    /// The cost plan shown to the owner before it ran.
+    pub plan: String,
+    /// What the owner should know before it spends anything ([`advice_with`]).
+    pub advice: Vec<String>,
+}
+
+/// Validates the owner's contract and records it, without running a round.
+/// Everything that can be refused is refused here, before anything is spent;
+/// `tole discuss start` and the serve route both go through this one path.
+pub fn begin(args: &StartArgs, env: &Env<'_>) -> Result<Ready, String> {
     let (c, bg) = prepared(args, env.workdir, now_secs(), &env.secrets)?;
     let plan = cost_plan_with(&c, &bg);
+    let advice = advice_with(&c, &bg);
     let driver = Driver::from_config(
         env.cfg,
         env.paths,
@@ -311,13 +327,25 @@ pub fn start(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
     driver.check_files(&c)?;
     let id = c.id.clone();
     driver.start(c)?;
+    Ok(Ready {
+        driver,
+        id,
+        plan,
+        advice,
+    })
+}
+
+/// Starts a discussion from the owner's contract and runs it to its end.
+pub fn start(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
+    let Ready {
+        driver, id, plan, ..
+    } = begin(args, env)?;
     let out = driver.run().map_err(|e| resumable(&id, &env.secrets, &e))?;
     Ok(format!("{plan}\n\n{}", finish(&out, &env.secrets)))
 }
 
-/// Continues discussion `id` where its ledger stands (after a crash or a
-/// failed call); a finished one just prints its outcome again.
-pub fn resume(id: &str, env: &Env<'_>) -> Result<String, String> {
+/// The driver that continues discussion `id` where its ledger stands.
+pub fn prepare_resume(id: &str, env: &Env<'_>) -> Result<Ready, String> {
     let log = DiscussionLog::at(env.dir, id)?;
     let st = log.state()?;
     let c = st
@@ -341,7 +369,22 @@ pub fn resume(id: &str, env: &Env<'_>) -> Result<String, String> {
     // A file that is gone or changed is not a failure a resume can cure, so it
     // is reported as it is, without the "continue it with resume" advice.
     driver.check_files(&c)?;
-    let out = driver.run().map_err(|e| resumable(id, &env.secrets, &e))?;
+    Ok(Ready {
+        driver,
+        id: id.to_string(),
+        plan: String::new(),
+        advice: Vec::new(),
+    })
+}
+
+/// Continues discussion `id` where its ledger stands (after a crash or a
+/// failed call); a finished one just prints its outcome again.
+pub fn resume(id: &str, env: &Env<'_>) -> Result<String, String> {
+    let ready = prepare_resume(id, env)?;
+    let out = ready
+        .driver
+        .run()
+        .map_err(|e| resumable(id, &env.secrets, &e))?;
     Ok(finish(&out, &env.secrets))
 }
 

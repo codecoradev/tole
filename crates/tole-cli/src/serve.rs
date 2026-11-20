@@ -145,6 +145,8 @@ struct State {
     missions: Arc<missions::Missions>,
     /// What a client may pick for `GET /models` (#574): the owner's list.
     models: models::ModelCatalog,
+    /// The discussions this process runs for its owner (#1042).
+    discussions: Arc<tole_cli::discuss::owner::Owner>,
     /// The `turn_finished` webhook callback (#962), set once at start-up when a
     /// destination lists the event. Empty, no turn path does anything extra.
     turn_events: std::sync::OnceLock<tole_cli::webhook_out::turn::TurnNotifier>,
@@ -264,6 +266,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         audit_pending: Mutex::default(),
         mission: cfg.mission.clone(),
         missions: Arc::default(),
+        discussions: Arc::default(),
         models: models::ModelCatalog::from_env(),
         turn_events: std::sync::OnceLock::new(),
     });
@@ -1855,6 +1858,13 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         // Discussions (#1042): the owner's `tole discuss`, read and dry run.
         ("GET", "/discussions") => discussions::list(state),
         ("POST", "/discussions/estimate") => discussions::estimate(state, body),
+        ("POST", "/discussions") => discussions::start(state, body),
+        ("POST", p) if p.starts_with("/discussions/") && p.ends_with("/resume") => {
+            discussions::resume(state, &p["/discussions/".len()..p.len() - "/resume".len()])
+        }
+        ("POST", p) if p.starts_with("/discussions/") && p.ends_with("/stop") => {
+            discussions::stop(state, &p["/discussions/".len()..p.len() - "/stop".len()])
+        }
         ("GET", p)
             if p.starts_with("/discussions/") && !p["/discussions/".len()..].contains('/') =>
         {
@@ -2635,6 +2645,7 @@ mod tests {
             audit_pending: Mutex::default(),
             mission: Default::default(),
             missions: Arc::default(),
+            discussions: Arc::default(),
             models: Default::default(),
             turn_events: std::sync::OnceLock::new(),
         }

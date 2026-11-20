@@ -249,16 +249,25 @@ restart or from a second device. `GET /sessions` stays the live list (`id`, `bus
 
 ## Discussions (#1042)
 
-The owner's `tole discuss`, read and dry-run over serve. They are the same library (`tole_cli::discuss`) the
-terminal uses; the routes only turn a request into its arguments and an error into a status. Starting, resuming and
-stopping are separate routes (below, when present in this build); a discussion a model starts with the `discuss`
-tool is still only an approval and is not started from here.
+The owner's `tole discuss` over serve: read, dry run, start, resume and stop. They are the same library
+(`tole_cli::discuss`) the terminal uses; the routes only turn a request into its arguments and an error into a
+status. Starting is the owner's action under the server's auth, at depth 0 (inline, read-only voices with no tools),
+with the contract, participant, budget and file rules of `tole discuss start`. A discussion a model starts with the
+`discuss` tool is still only an approval and is not started from here.
 
 | Action | Route | Answer |
 |---|---|---|
 | List | `GET /discussions` | `{"discussions": [{"id", "status", "rounds", "tokens_used", "budget", "question"}]}`, the rows of `tole discuss list --json` (without the server's directory); `status` is `open`, `closed (<gate>)` or `unreadable` (then `error`). Ids sort ascending, at most 200 |
-| Show | `GET /discussions/{id}` | the audit view of `tole discuss show --json`: `question`, `criteria`, `participants`, `budget`, `max_rounds`, `tokens_used`, `open_calls`, per round the `speakers`, the scribe's `summary` (decisions, claims, `disagreements` with each position, open questions, actions) or the speakers when it was passed on as written, the claim-checker's `checklist`, the `gate` and the `tokens`, and the `outcome` (`gate`, `why` and the report `text`) once closed. Never a raw contribution. Every string is redacted. `404` unknown, `400` malformed id |
+| Show | `GET /discussions/{id}` | the audit view of `tole discuss show --json`: `question`, `criteria`, `participants`, `budget`, `max_rounds`, `tokens_used`, `open_calls`, per round the `speakers`, the scribe's `summary` (decisions, claims, `disagreements` with each position, open questions, actions) or the speakers when it was passed on as written, the claim-checker's `checklist`, the `gate` and the `tokens`, and the `outcome` (`gate`, `why` and the report `text`) once closed. Never a raw contribution. Every string is redacted. `state` is `running` (a thread of this server drives it), `closed` or `interrupted`. `404` unknown, `400` malformed id |
+| Start | `POST /discussions` | `202 {"id", "status": "running", "plan", "advice"}` and returns at once; the discussion runs on a thread of the server. The body is the estimate's. Refused before anything is spent or written: the estimate's `400`s, `409` for an id that is already taken and on a `--plan-mode` server. There is no limit on how many discussions run at once; each one's own budget bounds it |
+| Resume | `POST /discussions/{id}/resume` | `tole discuss resume` for one that is open and not running (`state: interrupted`: a crash, a failed call). `202 {"id", "status": "running"}`; `409` when it is closed, already running or on a `--plan-mode` server; `404` unknown. No body: nothing can be changed. A file that is gone or changed since the start is refused, as on the CLI |
+| Stop | `POST /discussions/{id}/stop` | `200 {"id", "outcome", "state"}`. The ledger's own escalation (`stopped`), which no participant text can start or delay: a running discussion closes at its next step (`state: running` until then), one nobody runs is closed now. Repeating it, or stopping a closed one, changes nothing. Allowed on every server: it only ends spending. `404` unknown |
 | Estimate | `POST /discussions/estimate` | the dry run of `tole discuss start --dry-run`: `{"plan", "advice", "participants", "max_rounds", "max_calls", "budget_tokens", "round_floor_tokens", "files"}`. Validates the contract, the participants and the background files; writes nothing and calls no model |
+
+Not here yet, and left to the owner (see the open questions of #1042): continuing a discussion with a note for the next
+round or reopening a closed one (the ledger has no owner-note event and a closed discussion is final), per-discussion
+tool allowance (#1039), and discussion events on the live stream (`GET /sessions/{id}/events` is per session; read
+`GET /discussions/{id}` while the `state` is `running`).
 
 The request body carries what the owner types for `tole discuss start`: `question`, `criteria`, `participants`,
 `budget_tokens` (required), `max_rounds`, `files` and `id`. Any other key (`tools`, `allow`, `profile`, `modes`,

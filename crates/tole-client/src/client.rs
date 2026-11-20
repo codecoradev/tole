@@ -40,10 +40,13 @@ pub enum Route {
     Discussions,
     Discussion,
     DiscussionEstimate,
+    StartDiscussion,
+    ResumeDiscussion,
+    StopDiscussion,
 }
 
 impl Route {
-    pub const ALL: [Route; 15] = [
+    pub const ALL: [Route; 18] = [
         Route::Health,
         Route::Sessions,
         Route::SessionIndex,
@@ -59,6 +62,9 @@ impl Route {
         Route::Discussions,
         Route::Discussion,
         Route::DiscussionEstimate,
+        Route::StartDiscussion,
+        Route::ResumeDiscussion,
+        Route::StopDiscussion,
     ];
 
     pub fn method(self) -> &'static str {
@@ -67,7 +73,10 @@ impl Route {
             | Route::Prompt
             | Route::Cancel
             | Route::Decide
-            | Route::DiscussionEstimate => "POST",
+            | Route::DiscussionEstimate
+            | Route::StartDiscussion
+            | Route::ResumeDiscussion
+            | Route::StopDiscussion => "POST",
             _ => "GET",
         }
     }
@@ -90,6 +99,9 @@ impl Route {
             Route::Discussions => "/discussions",
             Route::Discussion => "/discussions/{id}",
             Route::DiscussionEstimate => "/discussions/estimate",
+            Route::StartDiscussion => "/discussions",
+            Route::ResumeDiscussion => "/discussions/{id}/resume",
+            Route::StopDiscussion => "/discussions/{id}/stop",
         }
     }
 }
@@ -438,6 +450,23 @@ impl Client {
     /// what it may cost. Writes nothing and calls no model.
     pub fn estimate_discussion(&self, req: &DiscussionRequest) -> Result<DiscussionEstimate> {
         self.call(Route::DiscussionEstimate, None, "", Some(req))
+    }
+
+    /// `tole discuss start` as the owner: records the contract and returns at
+    /// once; the discussion runs on the server. Follow it with
+    /// [`Client::discussion`].
+    pub fn start_discussion(&self, req: &DiscussionRequest) -> Result<DiscussionStarted> {
+        self.call(Route::StartDiscussion, None, "", Some(req))
+    }
+
+    /// `tole discuss resume`: continue one that was interrupted.
+    pub fn resume_discussion(&self, id: &str) -> Result<DiscussionResumed> {
+        self.call(Route::ResumeDiscussion, Some(id), "", None)
+    }
+
+    /// Stop a discussion: it closes with the ledger's escalation.
+    pub fn stop_discussion(&self, id: &str) -> Result<DiscussionStopped> {
+        self.call(Route::StopDiscussion, Some(id), "", None)
     }
 }
 

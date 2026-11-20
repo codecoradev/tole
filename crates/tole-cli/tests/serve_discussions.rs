@@ -18,6 +18,10 @@ use serve_harness::{home_of, spawn_mock, workspace_dir, Serve};
 /// A serve whose owner (the user config) defines two profiles, over a data
 /// directory holding one open and one closed discussion.
 fn serve() -> Serve {
+    serve_on(&spawn_mock(0))
+}
+
+fn serve_on(base: &str) -> Serve {
     let dir = workspace_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let data = home_of(&dir).join("tole");
@@ -48,7 +52,7 @@ fn serve() -> Serve {
     let log = DiscussionLog::at(&data.join("discussions"), "closed-one").unwrap();
     log.stop(2).unwrap();
     log.close("Stopped by the owner.", 3).unwrap();
-    Serve::spawn_in(&spawn_mock(0), dir, true)
+    Serve::spawn_in(base, dir, true)
 }
 
 fn client(serve: &Serve) -> Client {
@@ -193,4 +197,232 @@ fn a_request_cannot_carry_more_than_the_owner_types() {
         let (code, _) = serve.http("POST", "/discussions/estimate", Some(bad));
         assert_eq!(code, 400, "{bad}");
     }
+}
+
+/// A provider for discussions: participants answer with text, the checker
+/// meets its criteria citing the first entry it was shown, and a question that
+/// says `hold` is answered only after `hold_ms`.
+fn discussion_mock(hold_ms: u64) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 65536];
+                let body = loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let split = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                    if let Some(v) =
+                        split.and_then(|h| serde_json::from_slice::<Value>(&buf[h + 4..]).ok())
+                    {
+                        break v;
+                    }
+                    if n == 0 {
+                        break Value::Null;
+                    }
+                };
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let text = |role: &str| {
+                    let m = msgs.iter().find(|m| m["role"] == role);
+                    m.and_then(|m| m["content"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let (system, user) = (text("system"), text("user"));
+                if user.contains("hold") {
+                    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                }
+                let reply = if system.contains("against its acceptance criteria") {
+                    let e = user.lines().find_map(|l| l.strip_prefix("entry "));
+                    let e = e.and_then(|l| l.split_whitespace().next()).unwrap_or("e1");
+                    json!([{"met": true, "evidence": [e]}]).to_string()
+                } else {
+                    "use sqlite".to_string()
+                };
+                let data = json!({
+                    "id": "c", "object": "chat.completion", "created": 1, "model": "mock",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": reply}}],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+                })
+                .to_string();
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close";
+                let _ = write!(s, "{head}\r\nContent-Length: {}\r\n\r\n{data}", data.len());
+            });
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+fn wait_closed(c: &Client, id: &str) -> tole_client::Discussion {
+    let mut last = None;
+    common::wait_until(common::WAIT, "the discussion to close", || {
+        last = c.discussion(id).ok().filter(|d| d.state == "closed");
+        last.is_some()
+    });
+    last.unwrap()
+}
+
+fn ledger_files(serve: &Serve) -> usize {
+    std::fs::read_dir(home_of(&serve.dir).join("tole/discussions"))
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn a_start_runs_to_its_end_and_is_read_back() {
+    let serve = serve_on(&discussion_mock(0));
+    let c = client(&serve);
+    let started = c.start_discussion(&request()).unwrap();
+    assert_eq!(started.status, "running");
+    assert!(started.plan.contains("2 participants"), "{}", started.plan);
+
+    let done = wait_closed(&c, &started.id);
+    assert_eq!(done.outcome.as_ref().unwrap().gate, "report");
+    assert_eq!(done.participants, ["coder", "ops"]);
+    assert!(done.tokens_used > 0 && done.tokens_used <= done.budget);
+    let row = c.discussions().unwrap();
+    let row = row.discussions.iter().find(|r| r.id == started.id).unwrap();
+    assert_eq!(row.status, "closed (report)");
+
+    // An id that is taken is a conflict, and nothing is overwritten.
+    let mut again = request();
+    again.id = Some(started.id.clone());
+    assert!(matches!(
+        c.start_discussion(&again),
+        Err(Error::Status { status: 409, .. })
+    ));
+}
+
+#[test]
+fn a_start_applies_the_budget_participant_and_depth_rules_of_the_cli() {
+    let serve = serve_on(&discussion_mock(0));
+    let c = client(&serve);
+    // The budget is a hard cap: a call that does not fit stops the discussion
+    // with an escalation before anything is spent.
+    let mut tiny = request();
+    tiny.budget_tokens = 1;
+    let id = c.start_discussion(&tiny).unwrap().id;
+    let done = wait_closed(&c, &id);
+    assert_eq!(done.outcome.unwrap().gate, "escalate: budget");
+    assert_eq!(done.tokens_used, 0);
+
+    // What the estimate refuses a start refuses too, and leaves no ledger.
+    let files = ledger_files(&serve);
+    let mut unknown = request();
+    unknown.participants = vec!["stranger".into()];
+    let mut role = request();
+    role.participants = vec!["scribe".into()];
+    let mut outside = request();
+    outside.files = vec!["../outside.txt".into()];
+    for bad in [unknown, role, outside] {
+        let r = c.start_discussion(&bad);
+        assert!(matches!(r, Err(Error::Status { status: 400, .. })), "{r:?}");
+    }
+    // Depth 0, inline voices, no tools: a request cannot ask for more.
+    for extra in ["tools", "modes", "depth", "allow", "profile"] {
+        let mut body = serde_json::to_value(request()).unwrap();
+        body[extra] = json!(["x"]);
+        let (code, _) = serve.http("POST", "/discussions", Some(&body.to_string()));
+        assert_eq!(code, 400, "{extra}");
+    }
+    assert_eq!(ledger_files(&serve), files);
+}
+
+#[test]
+fn a_stop_closes_it_and_a_resume_continues_an_interrupted_one() {
+    let serve = serve_on(&discussion_mock(0));
+    let c = client(&serve);
+    // `open-one` has a contract and nobody drives it: interrupted.
+    assert_eq!(c.discussion("open-one").unwrap().state, "interrupted");
+    let resumed = c.resume_discussion("open-one").unwrap();
+    assert_eq!(resumed.status, "running");
+    let done = wait_closed(&c, "open-one");
+    assert_eq!(done.outcome.unwrap().gate, "report");
+
+    // A closed one is not resumed, an unknown one is not found.
+    for id in ["open-one", "closed-one"] {
+        let r = c.resume_discussion(id);
+        assert!(matches!(r, Err(Error::Status { status: 409, .. })), "{r:?}");
+    }
+    assert!(matches!(
+        c.resume_discussion("nope"),
+        Err(Error::Status { status: 404, .. })
+    ));
+
+    // A stop on one that is already closed changes nothing, however often.
+    for _ in 0..2 {
+        assert_eq!(c.stop_discussion("closed-one").unwrap().state, "closed");
+    }
+    assert!(matches!(
+        c.stop_discussion("nope"),
+        Err(Error::Status { status: 404, .. })
+    ));
+}
+
+#[test]
+fn any_number_of_discussions_run_at_once_each_to_its_own_end() {
+    let serve = serve_on(&discussion_mock(800));
+    let c = client(&serve);
+    let ids: Vec<String> = (0..4).map(|i| format!("many-{i}")).collect();
+    for id in &ids {
+        let mut req = request();
+        req.question = "hold this one".into();
+        req.id = Some(id.clone());
+        c.start_discussion(&req).unwrap();
+    }
+    // All four are running together: none was refused for the others.
+    for id in &ids {
+        assert_eq!(c.discussion(id).unwrap().state, "running", "{id}");
+    }
+    for id in &ids {
+        let done = wait_closed(&c, id);
+        assert_eq!(done.outcome.as_ref().unwrap().gate, "report", "{id}");
+        assert!(
+            done.tokens_used > 0 && done.tokens_used <= done.budget,
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn a_running_one_is_stopped_and_the_same_id_cannot_run_twice() {
+    let serve = serve_on(&discussion_mock(30_000));
+    let c = client(&serve);
+    let mut held = request();
+    held.question = "hold this one".into();
+    held.id = Some("first-one".into());
+    let first = c.start_discussion(&held).unwrap().id;
+    assert_eq!(c.discussion(&first).unwrap().state, "running");
+    // The same id, or a resume of the running one, is a conflict; another id
+    // is not.
+    let again = c.start_discussion(&held);
+    assert!(
+        matches!(again, Err(Error::Status { status: 409, .. })),
+        "{again:?}"
+    );
+    let again = c.resume_discussion(&first);
+    assert!(
+        matches!(again, Err(Error::Status { status: 409, .. })),
+        "{again:?}"
+    );
+    held.id = Some("second-one".into());
+    c.start_discussion(&held).unwrap();
+    // A stop is recorded at once; the call in flight finishes on its own.
+    let stopped = c.stop_discussion(&first).unwrap();
+    assert_eq!(stopped.state, "running");
+    assert!(stopped.outcome.contains("stopped"), "{}", stopped.outcome);
+}
+
+#[test]
+fn a_plan_mode_server_starts_and_resumes_nothing() {
+    let serve = Serve::spawn_with_args(&discussion_mock(0), &["--plan-mode"]);
+    let c = client(&serve);
+    let r = c.start_discussion(&request());
+    assert!(matches!(r, Err(Error::Status { status: 409, .. })), "{r:?}");
+    let r = c.resume_discussion("open-one");
+    assert!(matches!(r, Err(Error::Status { status: 409, .. })), "{r:?}");
 }
