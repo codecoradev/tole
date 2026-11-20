@@ -886,7 +886,7 @@ fn the_charge_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
 #[test]
 fn the_participant_ceiling_is_what_a_worst_case_fallback_record_can_hold() {
     use crate::discussion::{
-        sanitize, MAX_CONTRIBUTION_CHARS, MAX_PARTICIPANTS, MAX_ROUNDS_CEILING,
+        sanitize, MAX_CONTRIBUTION_CHARS, MAX_PARTICIPANTS, MAX_QUESTION_CHARS, MAX_ROUNDS_CEILING,
     };
     let worst = sanitize(
         &"\u{1F600}".repeat(MAX_CONTRIBUTION_CHARS + 50),
@@ -898,9 +898,12 @@ fn the_participant_ceiling_is_what_a_worst_case_fallback_record_can_hold() {
     let voices: Vec<String> = (1..=MAX_PARTICIPANTS)
         .map(|i| format!("voice-{i}"))
         .collect();
+    // The question is the longest one a contract accepts, in 4-byte
+    // characters (#1038), so the round below sits on top of the worst contract
+    // too.
     let k = Contract::new(
         "wide",
-        "Which database?",
+        &"\u{1F600}".repeat(MAX_QUESTION_CHARS),
         &strs(&["a choice is named"]),
         &voices,
         u64::MAX / 2,
@@ -938,5 +941,55 @@ fn the_participant_ceiling_is_what_a_worst_case_fallback_record_can_hold() {
     assert!(
         round * u64::from(MAX_ROUNDS_CEILING) < MAX_LOG_BYTES - CLOSE_RESERVE,
         "a worst-case round is {round} bytes"
+    );
+}
+
+/// #1038: the question limit is 12 000 characters. The worst contract is the
+/// longest question, the most criteria at their limit and the most
+/// participants with the longest ids, every character 4 bytes of UTF-8: its
+/// one record must fit [`MAX_RECORD_BYTES`], be written and be read back.
+#[test]
+fn a_worst_case_contract_with_the_longest_question_fits_one_record() {
+    use crate::discussion::{
+        MAX_CRITERIA, MAX_CRITERION_CHARS, MAX_PARTICIPANTS, MAX_QUESTION_CHARS,
+    };
+    let emoji = |n: usize| "\u{1F600}".repeat(n);
+    let voices: Vec<String> = (1..=MAX_PARTICIPANTS)
+        .map(|i| format!("{i:02}{}", "v".repeat(46)))
+        .collect();
+    let criteria: Vec<String> = (0..MAX_CRITERIA)
+        .map(|_| emoji(MAX_CRITERION_CHARS))
+        .collect();
+    let k = Contract::new(
+        "worst",
+        &emoji(MAX_QUESTION_CHARS),
+        &criteria,
+        &voices,
+        u64::MAX / 2,
+        Some(10),
+        &SecretSet::default(),
+    )
+    .unwrap();
+    assert_eq!(k.question.len(), MAX_QUESTION_CHARS * 4);
+    let record = serde_json::to_string(&Event::Contract(k.clone()))
+        .unwrap()
+        .len();
+    assert!(
+        record * 4 < MAX_RECORD_BYTES,
+        "the worst contract is {record} bytes: a record is {MAX_RECORD_BYTES}"
+    );
+    let d = dir("worst-contract");
+    let l = DiscussionLog::at(&d, "worst").unwrap();
+    l.start(k.clone(), 1).unwrap();
+    l.set_roster(1, &voices, 2).unwrap();
+    // A resume reads the very same contract back.
+    let again = DiscussionLog::at(&d, "worst").unwrap().state().unwrap();
+    assert_eq!(again.contract, Some(k));
+    assert_eq!(
+        again.next(),
+        Next::Contribute {
+            round: 1,
+            missing: voices
+        }
     );
 }

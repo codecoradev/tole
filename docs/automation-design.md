@@ -716,6 +716,36 @@ exposure. The rule is now the one a crash already had:
   contribution or a gate, and shows its retries and charged calls (text and
   `--json`, `charged: [{call, why, tokens}]`).
 
+### The question limit: 12,000 characters (#1038)
+
+Owner decision of 2026-11-20: `MAX_QUESTION_CHARS` is 12,000 characters (it
+was 2,000), about 3,000 tokens of English text; Indonesian text costs more
+tokens per character.
+
+- The limit stays a count of characters, not tokens: the core already counts
+  characters, so the check is deterministic and does not depend on a
+  provider's tokenizer. A question over the limit is still refused with its
+  length and the limit named, never cut (#922); the criteria (400) and digest
+  lines (600) are unchanged.
+- Ledger: the question lives once, in the `contract` record. The worst
+  contract (a 12,000-character question and 12 criteria of 400 characters, all
+  4-byte UTF-8, 16 participants with 48-character ids) is under 70 KB against
+  the 512 KiB record cap, and `log_tests.rs` writes it, reads it back and
+  puts the worst-case fallback round of #856 on top of a worst-case question.
+  Nothing else is added to the ledger, so old logs replay unchanged.
+- Cost: the question is sent to every participant, the scribe and the checker
+  in every round, so a 12,000-character question adds about 3,000 tokens to
+  each call: participants times rounds times 3,000. The dry run shows the
+  question's length and its token size, and the per-round floor
+  (`round_floor`) already counts the question inside each call's request, so
+  the estimate and the `budget_tokens` hard cap bound it like any other
+  input.
+- The closing text handed to the owner shows the first 600 characters of the
+  question and its length, not all of it: the closing text is capped at
+  16,000 characters, and a 12,000-character question repeated whole would push
+  the checklist and the last round out of it. The whole question stays in the
+  ledger.
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"

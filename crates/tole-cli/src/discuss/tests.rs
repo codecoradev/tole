@@ -525,6 +525,68 @@ fn the_cost_plan_scales_with_the_voices_and_a_tiny_budget_is_warned_about_first(
 }
 
 #[test]
+fn the_estimate_grows_with_the_question_and_says_how_long_it_is() {
+    // #1038: a question of 12 000 characters travels with every call, so the
+    // dry run's floor and the plan text both carry it.
+    let s = SecretSet::default();
+    let with = |q: &str| StartArgs {
+        question: q.into(),
+        ..args(500_000)
+    };
+    let short = contract(&with("Which database?"), 1, &s).unwrap();
+    let long_q = "q".repeat(tole_core::discussion::MAX_QUESTION_CHARS);
+    let long = contract(&with(&long_q), 1, &s).unwrap();
+    let (a, b) = (host::round_floor(&short), host::round_floor(&long));
+    // Two participants and the checker each read the question once: about
+    // 3 000 tokens apiece on top of the short question's floor.
+    assert!(
+        b >= a + 3 * 2_900,
+        "the floor grows with the question: {a} -> {b}"
+    );
+    let (pa, pb) = (cost_plan(&short), cost_plan(&long));
+    assert!(pa.contains("Question: 15 characters"), "{pa}");
+    assert!(
+        pb.contains("Question: 12000 characters (about 3000 tokens)"),
+        "{pb}"
+    );
+    assert!(
+        pb.contains(&format!("a round reserves at least {b} tokens")),
+        "{pb}"
+    );
+    // The dry run passes a 12 000-character question and writes nothing.
+    let dir = tmp("long-dry");
+    let cfg = config();
+    let (calls, make) = factory(100, agreeable());
+    let out = plan(&with(&long_q), &env(&dir, &cfg, make)).unwrap();
+    assert!(out.contains("Question: 12000 characters"), "{out}");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(!dir.join("pick-db.jsonl").exists());
+}
+
+#[test]
+fn a_twelve_thousand_character_question_runs_and_the_closing_text_stays_readable() {
+    let dir = tmp("long-run");
+    let cfg = config();
+    let (_, make) = factory(100, agreeable());
+    let q = format!("{}END-OF-QUESTION", "q".repeat(11_985));
+    let a = StartArgs {
+        question: q.clone(),
+        ..args(500_000)
+    };
+    let out = start(&a, &env(&dir, &cfg, make)).unwrap();
+    let st = state(&dir);
+    // The ledger holds the whole question; nothing was cut.
+    assert_eq!(st.contract.as_ref().unwrap().question, q);
+    // The closing text shows an excerpt and the length, so the checklist and
+    // the last round are not pushed out of the capped text.
+    let (_, text) = st.closed.unwrap();
+    assert!(text.contains("12000 characters; the whole question is in the discussion ledger"));
+    assert!(!text.contains("END-OF-QUESTION"), "{}", text.len());
+    assert!(text.contains("Checklist (claim-checker") && text.contains("<<<END LAST ROUND>>>"));
+    assert!(out.contains("Outcome: "), "{out}");
+}
+
+#[test]
 fn a_round_one_budget_escalation_says_why() {
     let dir = tmp("wide-r1");
     let cfg = wide_config(12);

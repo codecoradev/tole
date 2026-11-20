@@ -85,9 +85,12 @@ pub fn cost_plan(c: &Contract) -> String {
             k.min(u64::from(c.max_rounds))
         ),
     };
+    let q_chars = c.question.chars().count();
     format!(
         "Discussion `{}`: {} participants ({}), up to {} rounds, up to {} model calls \
          (each round: one per participant, a scribe and a claim-checker).\n\
+         Question: {q_chars} characters (about {} tokens), sent with every call and counted \
+         in the estimate below.\n\
          Estimate: a round reserves at least {floor} tokens ({n} participant calls and a \
          claim-checker, plus a scribe for a large round); {fit}\n\
          Budget: {} tokens, a hard cap: a call that does not fit stops the discussion \
@@ -97,6 +100,7 @@ pub fn cost_plan(c: &Contract) -> String {
         c.participants.join(", "),
         c.max_rounds,
         per_round * c.max_rounds as usize,
+        c.question.len() / 4,
         c.budget_tokens
     )
 }
