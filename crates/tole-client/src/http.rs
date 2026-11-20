@@ -281,6 +281,16 @@ fn window(buf_len: usize, left: u64) -> usize {
     buf_len.min(usize::try_from(left).unwrap_or(usize::MAX))
 }
 
+impl ResponseBody {
+    /// Lift the response deadline: the body is a stream that may legitimately
+    /// last (the event stream). Only the per-read bound applies from now on.
+    pub(crate) fn unlimit(&mut self) {
+        let g = self.inner.get_mut();
+        g.span = None;
+        g.deadline = None;
+    }
+}
+
 impl Read for ResponseBody {
     /// A failed read is final: every later read fails with the same kind.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

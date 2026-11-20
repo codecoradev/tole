@@ -47,6 +47,9 @@ pub enum Error {
     /// The body was JSON of an unexpected shape.
     #[error("could not decode the server's JSON: {0}")]
     Decode(#[from] serde_json::Error),
+    /// The event stream could not be re-established.
+    #[error("event stream lost: gave up after {0} failed reconnect attempts")]
+    ReconnectExhausted(u32),
 }
 
 impl From<std::io::Error> for Error {
