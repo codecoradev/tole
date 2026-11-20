@@ -618,6 +618,20 @@ fn the_estimate_counts_background_excerpts_once_per_participant() {
 }
 
 #[test]
+fn a_contract_with_background_files_is_refused_until_the_host_reads_them() {
+    // #1038: until the loader exists, naming files must not mean the voices
+    // quietly get the names without the excerpts.
+    let s = SecretSet::default();
+    let plain = contract(&wide_args(2, 100_000), 1, &s).unwrap();
+    assert!(host::no_unread_background(&plain).is_ok());
+    let named = plain
+        .with_files(&["brief.md".to_string()], &["a".repeat(64)])
+        .unwrap();
+    let err = host::no_unread_background(&named).unwrap_err();
+    assert!(err.contains("1 background file(s)"), "{err}");
+}
+
+#[test]
 fn a_round_one_budget_escalation_says_why() {
     let dir = tmp("wide-r1");
     let cfg = wide_config(12);

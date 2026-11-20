@@ -468,6 +468,7 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
+        no_unread_background(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -731,6 +732,7 @@ impl Driver {
         let voice = self.voices.get(who).ok_or_else(|| {
             format!("participant `{who}` has no profile here (was it removed from the config?)")
         })?;
+        no_unread_background(contract)?;
         let mut req = participant_request_with(
             contract,
             round,
@@ -1088,6 +1090,21 @@ fn speakers(cs: &[discussion::Contribution]) -> String {
         .map(|c| c.participant.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A contract that names background files (#1038) needs a host that reads
+/// them; this one does not yet, so a round refuses instead of quietly
+/// sending the voices the names without the excerpts the cost estimate
+/// counts. The loader replaces this check in the change that adds it.
+pub(super) fn no_unread_background(contract: &Contract) -> Result<(), String> {
+    if contract.files.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "this discussion names {} background file(s), and this host cannot read them yet",
+            contract.files.len()
+        ))
+    }
 }
 
 #[cfg(test)]
