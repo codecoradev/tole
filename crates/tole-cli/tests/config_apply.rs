@@ -32,11 +32,10 @@ const SCRUBBED: [&str; 13] = [
 ];
 
 fn cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .stdin(Stdio::null());
     for k in SCRUBBED {
         c.env_remove(k);
@@ -79,6 +78,7 @@ fn a_no_config_changes_nothing() {
         .env_remove("HOME")
         .env_remove("USERPROFILE")
         .env_remove("CODECORA_HOME")
+        .env("PATH", common::path_without_sibling_binaries())
         .stdin(Stdio::null());
     let plain = c.output().unwrap();
     assert!(plain.status.success(), "{}", text(&plain.stderr));
@@ -225,9 +225,10 @@ fn e_explicit_config_runs_without_a_trust_record_or_store() {
     // consulted for an explicit path.
     let mut c = cmd(
         &d,
-        Path::new("/nonexistent-tole-home"),
+        &d.join("hermetic-home"),
         &["--config", "custom.toml", "sessions"],
     );
+    c.env("CODECORA_HOME", "/nonexistent-tole-home");
     c.env_remove("HOME");
     let o = c.output().unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));

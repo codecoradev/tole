@@ -122,14 +122,12 @@ fn tmp(tag: &str) -> TestDir {
 }
 
 fn base_cmd(url: &str, home: &Path, cwd: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     cmd.current_dir(cwd)
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_VISION")
         .env_remove("TOLE_MODELS")
         .env_remove("TOLE_FALLBACK_BASE_URL")

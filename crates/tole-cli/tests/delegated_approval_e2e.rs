@@ -153,9 +153,8 @@ impl World {
     }
 
     fn tole(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &self.home, &[]);
         c.current_dir(&self.root)
-            .env("CODECORA_HOME", &self.home)
             .env("TOLE_NO_UPDATE_CHECK", "1")
             .env("TOLE_API_KEY", "test")
             .env("TOLE_MODEL", "mock")
