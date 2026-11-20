@@ -26,14 +26,20 @@ pub struct TuiPrompt(pub Prompter);
 
 impl PromptFn for TuiPrompt {
     fn prompt(&self, req: &ToolRequest<'_>) -> Verdict {
+        // The plain-language summary (#1041), the same one `GET /approvals`
+        // carries, then the tool's whole text as this prompt always showed it
+        // (not cut: the structured summary is bounded, this is not); the tier
+        // stays the request's own.
         let target = req.target.as_deref().map(|t| format!(" → {t}"));
-        self.0.ask(ApprovalRequest::new(
-            format!(
-                "{} — {}{}",
-                req.tool,
-                req.description,
-                target.unwrap_or_default()
-            ),
+        let detail = format!(
+            "{} — {}{}",
+            req.tool,
+            req.description,
+            target.unwrap_or_default()
+        );
+        self.0.ask(ApprovalRequest::from_summary(
+            req.action_summary(),
+            &detail,
             req.risk,
         ))
     }

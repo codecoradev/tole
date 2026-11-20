@@ -18,10 +18,10 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
 | Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
-| **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
+| **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status, and a `summary` (below); expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict. Only the first decision counts: the same verdict again answers `200` with `"resuming":false` and audits and resumes nothing; the opposite verdict, or any decision on an entry that already expired, answers `409` with the current `status`. An allow for a session this server no longer hosts (evicted from the 256-session live map, or the server restarted) with no cron run parked on it answers `409` with `"resuming":false` and an `error` saying the decision is recorded but nothing was resumed (reopen with `POST /sessions {"resume":"<id>"}` and send a new prompt); it never answers `202`. A session with a pending approval is never evicted, and eviction takes the least recently used idle session |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
-| Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | `approval` is the `GET /approvals` row (`description` is sanitized to one line but not length-capped, as there) of the entry THIS turn queued for this session, found by a queue snapshot taken before the turn; its `id` is what `POST /approvals/{id}/decision` takes. If that entry expired or was decided before the lookup, `approval` is omitted: use `GET /approvals?session=<id>`. A stop that queued nothing (a pre-tool hook denial, a blocked stop gate, an unknown tool, a provider failure, a loop) stays `refusal`; ACP and the MCP session tool keep their own vocabulary (`refusal`) |
+| Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | `approval` is the `GET /approvals` row (summary included) (`description` is sanitized to one line but not length-capped, as there) of the entry THIS turn queued for this session, found by a queue snapshot taken before the turn; its `id` is what `POST /approvals/{id}/decision` takes. If that entry expired or was decided before the lookup, `approval` is omitted: use `GET /approvals?session=<id>`. A stop that queued nothing (a pre-tool hook denial, a blocked stop gate, an unknown tool, a provider failure, a loop) stays `refusal`; ACP and the MCP session tool keep their own vocabulary (`refusal`) |
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
@@ -64,6 +64,86 @@ The round trip the app must support (the cross-repo acceptance):
 3. `POST /approvals/{id}/decision` — allow or deny.
 4. `202` (allow) means the resume is running; `GET /sessions/{id}/status`
    until `busy` clears.
+
+## Approval summary (#1041)
+
+Every approval row (`GET /approvals`, the `approval` of an `approval_required` stop, the `approval_requested` /
+`approval_resolved` events; the TUI prompt shows its one-line sentence) carries the same structured, code-derived `summary` of what the call
+will do, so a client does not word it from the tool name and arguments. It is built where the request is created (the
+tool's own `action_summary`, called by the registry before the approver is asked), from the tool and its input only.
+`kind`, `effect`, `insideWorkspace` and the English wording come from code; `target` and `preview` carry strings the
+model sent (a path, a command, a profile name, the arguments) and are shown as data, sanitized and redacted, not
+validated. The summary never changes the risk tier: the tier stays the authority.
+
+```json
+"summary": {
+  "kind": "create_file",
+  "target": "Reports/Weekly report.txt",
+  "effect": "adds",
+  "insideWorkspace": true,
+  "targetTruncated": false,
+  "preview": ["+ Done", "+ Next"],
+  "previewTruncated": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `create_file`, `replace_file`, `delete_file`, `run_program`, `use_connected_tool`, `start_discussion`, `delegate` or `unknown`. A client treats a code it does not know as `unknown`. |
+| `target` | A path relative to the working folder (symlinks resolved; for `delete_file` of a symlink, the link as sent), a command line (tokens re-quoted exactly as `describe` shows them, so `printf 'a b'` differs from `printf a b`; a line that does not split reads `<unparsable command: ...>` followed by the line), `<server>.<tool>` for a connected tool, `profile <name> (requested by the model)` or the participant names for a delegation or discussion, or the tool name for `unknown`. One safe line, at most 1000 characters. |
+| `effect` | `adds`, `replaces_no_backup`, `cannot_be_undone`, `runs_program`, `uses_connected_tool`, `starts_discussion`, `starts_child` or `unknown`. |
+| `insideWorkspace` | `true` only when the tool confirmed the target resolves inside the working folder. Always `false` for programs, connected tools and a path that escapes. |
+| `targetTruncated` | `true` when `target` was cut. |
+| `preview` | At most 12 lines of at most 400 characters: `-` / `+` lines for a file change (a removed block cannot push the new text out: with both sides present each gets half of the lines), `$ command` for a program, the policy lines (child allowlist, worktree, mode, budget, rounds, each marked "requested by the model" when it is the model's request) then the task or question for a delegation or discussion, the raw arguments for a connected tool or an unknown tool. Raw data, not wording. |
+| `previewTruncated` | `true` when `preview` is not all of it. |
+
+A cut keeps the head AND the tail and names the omitted amount inside the text (`... (N more characters, see the full
+description) ...`; a last line `... (N more lines, ...) ...` when lines were dropped; `+N more entries` for a list), and
+sets `targetTruncated` / `previewTruncated`. **The whole text is in the row's `description`**: it is the tool's own
+description (what the tool says about this call: the full command, the resolved repository, the allowlist), redacted
+with the secret set but never cut or bounded, and the summary is the bounded view of it. A client that shows a
+truncated summary should show `description` too, or offer it. Lists the human grants (a child's allowlist, the
+participants of a discussion) get ONE preview line per entry up to 6, then a `+N more entries` line, so padding a list
+cannot push an entry into a hidden middle; a budget shows its `tokens` / `steps` / `minutes` and only counts other keys.
+
+The English wording is a pair of tables keyed by `kind` and `effect` (`tole_core::action_summary::KIND_TEXT`,
+`EFFECT_TEXT`), so a client translates by code and never parses a sentence. Rules a client can rely on:
+
+- **What is shown is what runs.** Every field of the `agent_start`, `delegate` and `discuss` summaries is parsed by the
+  code their `execute` runs, not by a second reading of the input: the allowlist is the array's string entries (a lone
+  string or non-string entries are no request, so the child inherits and the summary says `child allowlist (inherited
+  from you)` with the parent's own list), a profile's allowlist is the profile's own and cannot be read by the summary
+  (`the profile's own list`; an `allow` next to a profile reads `REFUSED`), the task is the first string of `task` /
+  `prompt`, and the budget shows only the `tokens` / `steps` / `minutes` that are unsigned integers. A path a file tool
+  would refuse (outside the working folder, not found) is `kind: "unknown"` with `refused ...: <path>` as the detail,
+  never "creates a new file"; a resolved path whose name is not valid UTF-8 is shown lossy and marked, not refused.
+- **What the summary does not show.** It shows what the model asked for and the allowlist that results, not everything a
+  child is given: `discuss` `modes` (a `reviewer` participant is a read-only consult child session with workspace access,
+  an inline one holds no tools; the summary lists only the participant names), the harness-owned tools `agent_start` adds
+  to a child (`handoff_submit` for a `role` child, `delegate_report` for a delegated one: each writes one bounded file at a
+  path the harness chose), the parent's deny patterns appended to a child's list when `allow` is given (they only narrow
+  it), and, for `agent_start`, `role`, `consumes` and `keep_mailbox` (`delegate` shows `role`). None of these adds an allow
+  the shown list lacks. The `discuss` summary re-reads its own fields instead of sharing a parser with `discuss`, which
+  refuses a malformed input. `describe`, and so the row's `description`, is not cut for the task, the question or a
+  connected tool's arguments, which is why the summary's cut markers can point at it.
+- **Unknown tool.** A tool without a summary of its own (`git`, `gh`, `gitea`, `cron_create`, ...) is `kind: "unknown"`,
+  `effect: "unknown"`, `target` the tool name, the tool's own description as the first preview line (`the tool's own
+  description: ...`, so the resolved repository or the exact argv is there) and the raw input after it: "use the tool
+  <name>", never a reassuring sentence.
+- **Connected (MCP) tools.** Always `use_connected_tool` with `<server>.<tool>`, and the tier is `Write`. The server's
+  description and any other metadata are not used.
+- **Time of the check.** `create_file` / `replace_file` is decided when the request is made. The serve queue holds an
+  entry for up to 15 minutes, and the file can appear or vanish before an allow; the wording says "did not exist when
+  asked" for that reason, and the replayed call does what the tool does at that later time.
+- **Secrets.** Target and preview are redacted with the process secret set as one text BEFORE they are split into
+  lines and cut (a secret on the cut or spanning lines leaves no prefix), and again with the `web_fetch` header
+  secrets when the row is served.
+- **Older rows.** The field is additive: a row queued without a summary has no `summary` key, and a summary missing the
+  optional fields (`insideWorkspace`, `targetTruncated`, `preview`, `previewTruncated`) still loads with their defaults.
+- **The TUI prompt** is the summary's one-line sentence (what the call does and its effect), then ` :: ` and the tool's whole text character for character as before (`<tool> — <description> → <target>`), uncut; it does not show the preview lines or the flags; `job_start` reads `start job: ...` there and its summary says it STARTS A BACKGROUND JOB.
+- **Where it is not shown yet.** The stdio prompt, the ACP permission `title`, the delegated children's approvals
+  (`source: "delegation"`, which keep their own `display` and `text`) and the webhook events still use the older text
+  and carry no `summary`; see `docs/faces.md`.
 
 ## Status JSON fields
 

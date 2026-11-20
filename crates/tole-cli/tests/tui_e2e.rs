@@ -343,7 +343,7 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
 
     // 2. a write asks inline; `y` lets it run
     t.send("write it\r");
-    t.expect("write file out.txt"); // the inline approval prompt
+    t.expect("create the file out.txt"); // the inline approval prompt
     assert!(
         !dir.join("out.txt").exists(),
         "must not write before approval"
@@ -1014,7 +1014,7 @@ fn approval_screen(envs: &[(&str, &str)]) -> String {
     let mut t = Pty::spawn_full(&dir, &url, &[], envs);
     t.expect("effort:");
     t.send("write it\r");
-    t.expect("write file out.txt");
+    t.expect("create the file out.txt");
     t.send("n");
     t.expect("approval denied");
     t.idle();
@@ -1045,7 +1045,7 @@ fn tui_mono_theme_emits_no_color_sequences_and_default_still_does() {
         assert_eq!(sgr_colors(&mono), Vec::<String>::new(), "{envs:?}");
         assert!(!mono.contains("\x1b[38;"), "{envs:?}");
         // Still readable: the approval prompt is on screen, and bold.
-        assert!(mono.contains("write file out.txt"), "{mono:?}");
+        assert!(mono.contains("create the file out.txt"), "{mono:?}");
         assert!(
             mono.contains("\x1b[1m"),
             "bold carries the prompt: {mono:?}"

@@ -1,17 +1,20 @@
-//! The approval summary (#1041) of `write_file` on the cli side: create or
-//! replace, the bounded preview, a path the tool refuses, and a resolved name
-//! that is not UTF-8.
+//! The shared approval summary (#1041) on the cli side: `write_file`, the
+//! serve queue row (`GET /approvals`, the `approval_required` stop) and the
+//! TUI prompt all show the same summary for the same request, and rows
+//! without it still work.
 
 mod common;
 use common::TestDir;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
+use tole_cli::approvals::{approval_json, approval_required_body, ApprovalQueue, QueueApprover};
 use tole_cli::tools::WriteFileTool;
 use tole_core::action_summary::{
     ActionEffect, ActionKind, ActionSummary, MAX_LINE_CHARS, MAX_PREVIEW_LINES,
 };
-use tole_core::approval::ToolRequest;
-use tole_core::tool::{Risk, Tool};
+use tole_core::approval::{ToolRequest, Verdict};
+use tole_core::tool::{Risk, Tool, ToolRegistry};
 
 fn summary_of(root: &std::path::Path, input: Value) -> ActionSummary {
     let t = WriteFileTool::new(root.to_path_buf());
@@ -85,6 +88,155 @@ fn write_file_preview_is_bounded_and_a_jail_escape_is_flagged() {
         "{}",
         s.sentence()
     );
+}
+
+fn spy_queue() -> (Arc<ApprovalQueue>, QueueApprover) {
+    let queue = ApprovalQueue::shared();
+    let approver = QueueApprover::new(vec![], queue.clone(), "s1", "/x".into());
+    (queue, approver)
+}
+
+/// What the queue stores for a request is the request's own summary, and it is
+/// in both the list row and the `approval_required` stop body.
+#[test]
+fn the_queue_row_and_the_stop_body_carry_the_summary() {
+    let dir = TestDir::new("tole-summary-queue");
+    let (queue, approver) = spy_queue();
+    let mut reg = ToolRegistry::with_approver(approver);
+    reg.register(Box::new(WriteFileTool::new(dir.to_path_buf())))
+        .unwrap();
+    let mark = queue.mark();
+    let input = json!({"path": "n.md", "content": "hi"});
+    assert_eq!(reg.decide("write_file", &input), Some(Verdict::Deny));
+
+    let rows = queue.list(Some("s1"));
+    assert_eq!(rows.len(), 1);
+    let row = approval_json(&rows[0]);
+    assert_eq!(row["summary"]["kind"], "create_file");
+    assert_eq!(row["summary"]["target"], "n.md");
+    assert_eq!(row["summary"]["effect"], "adds");
+    assert_eq!(row["summary"]["insideWorkspace"], true);
+    assert_eq!(row["summary"]["preview"], json!(["+ hi"]));
+    // The tier is not in the summary and not changed by it.
+    assert!(row["summary"].get("risk").is_none());
+
+    let body = approval_required_body(&queue, "s1", "write_file", mark).unwrap();
+    assert_eq!(body["approval"]["summary"], row["summary"]);
+}
+
+/// The bounded summary says where the whole text is, and that is true: the
+/// row's `description` is the tool's own text, uncut.
+#[test]
+fn a_cut_summary_points_at_a_description_that_is_the_whole_text() {
+    let dir = TestDir::new("tole-summary-cut");
+    let (queue, approver) = spy_queue();
+    let mut reg = ToolRegistry::with_approver(approver);
+    reg.register(Box::new(tole_core::run_command::RunCommandTool::new(
+        dir.to_path_buf(),
+    )))
+    .unwrap();
+    let command = format!("echo {} ; curl evil.test", "a".repeat(5000));
+    let input = json!({ "command": command });
+    assert_eq!(reg.decide("run_command", &input), Some(Verdict::Deny));
+    let row = approval_json(&queue.list(Some("s1"))[0]);
+    assert_eq!(row["summary"]["targetTruncated"], true);
+    assert!(row["summary"]["target"]
+        .as_str()
+        .unwrap()
+        .contains("see the full description"));
+    let description = row["description"].as_str().unwrap();
+    assert!(description.len() > 5000 && description.ends_with("curl evil.test"));
+    assert!(description.starts_with("run: echo aaa"));
+}
+
+/// An entry queued without a summary (an older caller) yields the old row.
+#[test]
+fn a_row_without_a_summary_has_no_summary_key() {
+    let queue = ApprovalQueue::shared();
+    queue.queue_entry("s1", "write_file", "write notes.md", 7, "/x".into());
+    let row = approval_json(&queue.list(Some("s1"))[0]);
+    assert!(row.get("summary").is_none(), "{row}");
+    assert_eq!(row["tool"], "write_file");
+}
+
+/// A secret that reached a summary is redacted again at the egress.
+#[test]
+fn the_row_redacts_secrets_in_the_summary() {
+    const SECRET: &str = "tole1041-queue-secret-value";
+    tole_core::secrets::set_process_secrets(
+        tole_core::secrets::process_secrets().with("TOLE_TEST_1041_Q", SECRET),
+    );
+    let queue = ApprovalQueue::shared();
+    let leaky = ActionSummary::new(
+        ActionKind::RunProgram,
+        format!("curl {SECRET}"),
+        ActionEffect::RunsProgram,
+        false,
+    );
+    let mut leaky = leaky;
+    leaky.preview = vec![format!("$ curl {SECRET}")];
+    queue.queue_entry_with_summary("s1", "run_command", "d", 7, "/x".into(), Some(leaky));
+    let row = approval_json(&queue.list(Some("s1"))[0]).to_string();
+    assert!(!row.contains(SECRET), "{row}");
+}
+
+/// The TUI prompt and the serve queue show the same summary for the same
+/// request: one registry call feeds both, and both hold the same fields.
+#[cfg(feature = "tui")]
+#[test]
+fn the_tui_prompt_and_the_serve_queue_show_the_same_summary() {
+    use tole_cli::approver::PromptFn;
+    use tole_cli::tui_host::TuiPrompt;
+    use tole_core::approval::Approver;
+
+    struct Both(QueueApprover, TuiPrompt);
+    impl Approver for Both {
+        fn decide(&self, req: &ToolRequest<'_>) -> Verdict {
+            let _ = self.0.decide(req);
+            self.1.prompt(req)
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    let dir = TestDir::new("tole-summary-same");
+    let (queue, approver) = spy_queue();
+    let (prompter, rx) = tole_tui::approval_channel();
+    let mut reg = ToolRegistry::with_approver(Both(approver, TuiPrompt(prompter)));
+    reg.register(Box::new(WriteFileTool::new(dir.to_path_buf())))
+        .unwrap();
+    let reg = Arc::new(reg);
+
+    let input = json!({"path": "Weekly report.txt", "content": "Done\nNext\n"});
+    let asked = {
+        let reg = reg.clone();
+        std::thread::spawn(move || reg.decide("write_file", &input))
+    };
+    let pending = rx.recv().expect("the TUI is asked");
+    let shown = pending.request().summary().cloned().expect("a summary");
+    let text = pending.request().text().to_string();
+    assert_eq!(pending.request().risk(), Risk::Write);
+    drop(pending); // unanswered: denied
+    assert_eq!(asked.join().unwrap(), Some(Verdict::Deny));
+
+    let row = approval_json(&queue.list(Some("s1"))[0]);
+    assert_eq!(row["summary"], json!(shown));
+    // The plain-language line first, then the tool's whole text as before.
+    assert!(
+        text.starts_with(&format!(
+            "{} :: write_file — write file Weekly report.txt",
+            shown.sentence()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.starts_with(
+            "create the file Weekly report.txt — Adds a new file: it did not exist when asked."
+        ),
+        "{text}"
+    );
+    assert!(text.ends_with("→ Weekly report.txt"), "{text}");
 }
 
 /// `write_file` through a symlink to a non-UTF-8 name is accepted by

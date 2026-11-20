@@ -38,6 +38,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
+use tole_core::action_summary::ActionSummary;
 use tole_core::approval::Verdict;
 use tole_core::cancel::CancelToken;
 use tole_core::tool::Risk;
@@ -250,6 +251,7 @@ fn unsupported<T>() -> Result<T, String> {
 pub struct ApprovalRequest {
     text: String,
     risk: Risk,
+    summary: Option<ActionSummary>,
 }
 
 impl ApprovalRequest {
@@ -258,7 +260,25 @@ impl ApprovalRequest {
         Self {
             text: one_line(text.as_ref()),
             risk,
+            summary: None,
         }
+    }
+
+    /// A request worded by the shared summary (#1041): the plain-language line
+    /// first (what it does, its effect), then `detail` exactly as the prompt
+    /// showed it before (`<tool>: <the tool's whole text> → <target>`), never
+    /// cut. The structured fields are those every other face shows.
+    pub fn from_summary(summary: ActionSummary, detail: &str, risk: Risk) -> Self {
+        Self {
+            text: one_line(&format!("{} :: {detail}", summary.sentence())),
+            risk,
+            summary: Some(summary),
+        }
+    }
+
+    /// The structured summary, when the source had one.
+    pub fn summary(&self) -> Option<&ActionSummary> {
+        self.summary.as_ref()
     }
 
     /// What is being asked, as one line.
@@ -2063,6 +2083,37 @@ mod tests {
     }
 
     // ---- approvals as source-agnostic state (#526) ----
+
+    /// #1041: a request worded by the shared summary keeps the summary, shows
+    /// the summary's own line and still carries the tier it was given.
+    #[test]
+    fn a_request_from_a_summary_shows_its_line_and_keeps_the_tier() {
+        use tole_core::action_summary::{ActionEffect, ActionKind, ActionSummary};
+        let s = ActionSummary::new(
+            ActionKind::DeleteFile,
+            "a\x1b[2J.txt",
+            ActionEffect::CannotBeUndone,
+            true,
+        );
+        let detail = "delete_file: delete file a.txt \x1b[31m → a.txt";
+        let r = ApprovalRequest::from_summary(s.clone(), detail, Risk::Destructive);
+        // The plain-language line first, then the tool's whole text, uncut.
+        assert!(r.text().starts_with("delete the file a"), "{}", r.text());
+        assert!(r
+            .text()
+            .contains("Cannot be undone. :: delete_file: delete file a.txt"));
+        assert!(r.text().ends_with("→ a.txt"), "{}", r.text());
+        assert!(!r.text().contains('\x1b'));
+        let long = "x".repeat(5000);
+        let long_req = ApprovalRequest::from_summary(s.clone(), &long, Risk::Write);
+        assert!(
+            long_req.text().ends_with(&long),
+            "the tool's text is never cut"
+        );
+        assert_eq!(r.summary(), Some(&s));
+        assert!(r.is_destructive() && !r.can_allow_always());
+        assert!(ApprovalRequest::new("x", Risk::Write).summary().is_none());
+    }
 
     #[test]
     fn an_approval_request_is_one_safe_line_and_carries_its_risk_tier() {
