@@ -2,7 +2,7 @@
 
 Images of the desktop design draft, the "Simple edition" page of the Design canvas (sixteen boards). They are a reference for the desktop issues of #527 (epic #523), not a specification: wording, density and sample data are drafts. The editable canvas is not in this repository.
 
-Drawn for people who are not technical: plain words, one window on the local machine, technical detail behind "Show technical details". The look uses the dark tokens of the design canvas (background `#0F1113`, accent `#5CC8B0`, Inter and JetBrains Mono; they are not defined anywhere in the repository yet, #1028 creates the token module). Rows and buttons are about 34 to 38 px; boards S1, S11 and S12 were drawn first with 44 px controls and not redrawn.
+Drawn for people who are not technical: plain words, one window on the local machine, technical detail behind "Show technical details". The look uses the dark tokens of the design canvas (background `#0F1113`, accent `#5CC8B0`, Inter and JetBrains Mono; defined in `crates/tole-desktop-model/src/tokens.rs`). Rows and buttons are about 34 to 38 px; boards S1, S11 and S12 were drawn first with 44 px controls and not redrawn.
 
 Rendered from the board HTML with Chromium at 1x. They were not rendered by GPUI, and nothing here was built; check each part in a small spike (the GPUI Kit names on S13 were read from the source of gpui-component 0.9.1, not compiled).
 
