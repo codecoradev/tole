@@ -484,12 +484,9 @@ fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
 /// legacy namespace of the same name (mailboxes written before #422).
 /// Soft failure — cleanup is an optimization; the durable child JSONL is
 /// the real archive.
-fn clean_mailbox(ns: &str) {
-    clean_mailbox_with("uteke", ns);
-}
-
-/// [`clean_mailbox`] with an explicit uteke binary, so a test can aim it at
-/// a stand-in without touching the process-wide `PATH`.
+/// Mailbox cleanup with an explicit uteke binary (`AgentPollTool::uteke_bin`,
+/// default `uteke`), so a test can aim it at a stand-in without touching the
+/// process-wide `PATH`.
 fn clean_mailbox_with(bin: &str, ns: &str) {
     // Deleting a room only unlinks its memories, so forget them first.
     forget_listed(
@@ -986,6 +983,10 @@ pub struct AgentPollTool {
     /// Serialize consume-once: a settled agent's mailbox cleanup must
     /// not race a second poll.
     pub consumed: Mutex<Vec<String>>,
+    /// The `uteke` binary the mailbox recall and cleanup spawn. `None` (the
+    /// default) is `uteke` resolved from `PATH`; a test sets a stand-in so an
+    /// in-process poll never reaches a real store (#993).
+    pub uteke_bin: Option<PathBuf>,
 }
 
 impl AgentPollTool {
@@ -994,7 +995,20 @@ impl AgentPollTool {
             root: root.into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             consumed: Mutex::new(Vec::new()),
+            uteke_bin: None,
         }
+    }
+
+    /// Use `bin` as the `uteke` binary for the mailbox recall and cleanup.
+    pub fn with_uteke_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.uteke_bin = Some(bin.into());
+        self
+    }
+
+    fn uteke_bin_name(&self) -> String {
+        self.uteke_bin
+            .as_ref()
+            .map_or_else(|| "uteke".to_owned(), |b| b.display().to_string())
     }
 }
 
@@ -1119,14 +1133,9 @@ impl Tool for AgentPollTool {
         // ENTIRE consume section (issue #260, rescan #155: dropping it
         // after the read let two concurrent polls both recall+clean).
         attach_handoff(&dir, &meta, &mut out);
-        self.consume_mailbox(
-            &dir,
-            id,
-            &mut meta,
-            &mut out,
-            crate::memory::recall,
-            clean_mailbox,
-        );
+        self.consume_mailbox(&dir, id, &mut meta, &mut out, crate::memory::recall, |ns| {
+            clean_mailbox_with(&self.uteke_bin_name(), ns)
+        });
         Ok(out)
     }
 }
@@ -1208,7 +1217,7 @@ impl AgentPollTool {
         }
         let ns = mailbox_ns_for(id);
         let cfg = crate::memory::MemoryConfig {
-            bin: "uteke".into(),
+            bin: self.uteke_bin_name(),
             room: ns.clone(),
             limit: 3,
         };
