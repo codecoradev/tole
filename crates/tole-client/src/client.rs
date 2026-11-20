@@ -2,6 +2,8 @@
 
 use crate::error::{Error, Result};
 use crate::http::{self, Request, ResponseBody};
+use crate::resume::{ReconnectPolicy, ResumingStream};
+use crate::sse::FrameReader;
 use crate::transport::{TcpTransport, Transport};
 use crate::types::*;
 use serde::de::DeserializeOwned;
@@ -29,13 +31,14 @@ pub enum Route {
     Cancel,
     Status,
     Entries,
+    Events,
     Approvals,
     Decide,
     Models,
 }
 
 impl Route {
-    pub const ALL: [Route; 11] = [
+    pub const ALL: [Route; 12] = [
         Route::Health,
         Route::Sessions,
         Route::SessionIndex,
@@ -44,6 +47,7 @@ impl Route {
         Route::Cancel,
         Route::Status,
         Route::Entries,
+        Route::Events,
         Route::Approvals,
         Route::Decide,
         Route::Models,
@@ -67,6 +71,7 @@ impl Route {
             Route::Cancel => "/sessions/{id}/cancel",
             Route::Status => "/sessions/{id}/status",
             Route::Entries => "/sessions/{id}/entries",
+            Route::Events => "/sessions/{id}/events",
             Route::Approvals => "/approvals",
             Route::Decide => "/approvals/{id}/decision",
             Route::Models => "/models",
@@ -201,13 +206,18 @@ impl Client {
             path.push('?');
             path.push_str(query);
         }
+        let accept = if route == Route::Events {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         let req = Request {
             host: &self.transport.host_header(),
             method: route.method(),
             path: &path,
             token: self.token.as_ref().map(|t| t.0.as_str()),
             body,
-            accept: "application/json",
+            accept,
             read_timeout: timeout,
             deadline,
         };
@@ -278,7 +288,7 @@ impl Client {
     }
 
     /// Run one turn. Blocks until it stops (see [`PromptReply::stop_reason`]);
-    /// watch the session event stream meanwhile for the streamed text (next change).
+    /// watch [`Client::events`] meanwhile for the streamed text.
     pub fn prompt(&self, id: &str, req: &PromptRequest) -> Result<PromptReply> {
         self.call(Route::Prompt, Some(id), "", Some(req))
     }
@@ -333,6 +343,56 @@ impl Client {
 
     pub fn models(&self) -> Result<Models> {
         self.call(Route::Models, None, "", None)
+    }
+
+    /// One event stream connection, from the entry after `after`. It ends when
+    /// the connection does; use [`Client::follow_events`] to reconnect.
+    /// `idle_timeout` bounds the silence tolerated (the server sends a
+    /// heartbeat every 15 s by default).
+    pub fn events(
+        &self,
+        id: &str,
+        after: u64,
+        idle_timeout: Option<Duration>,
+    ) -> Result<FrameReader<ResponseBody>> {
+        let (status, mut resp) = self.open(
+            Route::Events,
+            Some(id),
+            &format!("after={after}"),
+            None,
+            idle_timeout,
+            // The head (and a refusal's body) must follow the first byte
+            // within the body deadline, like a call: a peer that drips them
+            // must not stall the caller or a reconnect loop.
+            Some(self.body_deadline),
+        )?;
+        if status == 200 {
+            // The stream itself is unbounded by design: only the per-read
+            // idle bound applies from here.
+            resp.unlimit();
+        } else {
+            let mut buf = Vec::new();
+            resp.by_ref().take(64 * 1024).read_to_end(&mut buf)?;
+            let body: Value = serde_json::from_slice(&buf).unwrap_or(Value::Null);
+            let message = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("event stream refused")
+                .to_string();
+            return Err(Error::Status {
+                status,
+                message,
+                body,
+            });
+        }
+        Ok(FrameReader::new(resp))
+    }
+
+    /// The event stream with automatic reconnect: after a drop it resumes with
+    /// `after=<last seq>`, so no entry is lost or delivered twice. Other
+    /// frames are best effort: see [`StreamItem::Reconnected`](crate::StreamItem::Reconnected).
+    pub fn follow_events(&self, id: &str, after: u64, policy: ReconnectPolicy) -> ResumingStream {
+        ResumingStream::new(self.clone(), id.to_string(), after, policy)
     }
 }
 

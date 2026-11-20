@@ -10,11 +10,18 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tole_client::{Client, Decision, Error, IndexQuery, NewSession, PromptRequest, Route};
+use std::sync::mpsc;
+use std::time::Duration;
+use tole_client::{
+    Client, Decision, Error, Event, IndexQuery, NewSession, PromptRequest, ReconnectPolicy, Route,
+    StreamItem,
+};
 
 mod common;
 mod serve_harness;
 use serve_harness::{spawn_mock, Serve};
+
+const WAIT: Duration = Duration::from_secs(20);
 
 fn client(serve: &Serve) -> Client {
     let url = format!("http://127.0.0.1:{}", serve.port);
@@ -33,8 +40,12 @@ fn raw(serve: &Serve, method: &str, path: &str, body: Option<&str>) -> Value {
     v
 }
 
+fn is_final_answer(e: &Event) -> bool {
+    matches!(e, Event::Entry(e) if e.payload["text"] == "ENTRIES-ANSWER")
+}
+
 #[test]
-fn create_prompt_and_entries_round_trip_through_the_client() {
+fn create_prompt_stream_and_entries_round_trip_through_the_client() {
     let serve = Serve::spawn(&spawn_mock(0));
     let c = client(&serve);
 
@@ -58,18 +69,74 @@ fn create_prompt_and_entries_round_trip_through_the_client() {
     assert!(list.sessions.iter().any(|s| s.id == id && !s.busy));
     lossless("sessions", &list, &raw(&serve, "GET", "/sessions", None));
 
+    // Open the stream and wait for `ready`: only then does the server attach
+    // an observer to the turn (a stream nobody reads costs nothing).
+    let (tx, rx) = mpsc::channel();
+    let follower = c.clone();
+    let sid = id.clone();
+    std::thread::spawn(move || {
+        for item in follower.follow_events(&sid, 0, ReconnectPolicy::default()) {
+            if tx.send(item).is_err() {
+                return;
+            }
+        }
+    });
+    let mut seen = Vec::new();
+    loop {
+        match rx.recv_timeout(WAIT).expect("a ready frame").unwrap() {
+            StreamItem::Event(Event::Ready(r)) => {
+                assert_eq!((r.id.as_str(), r.after, r.busy), (id.as_str(), 0, false));
+                break;
+            }
+            other => seen.push(other),
+        }
+    }
+
     let reply = c.prompt(&id, &PromptRequest::text("hello")).unwrap();
     assert_eq!(reply.text.as_deref(), Some("ENTRIES-ANSWER"), "{reply:?}");
     assert!(reply.approval.is_none());
 
-    // The transcript: the user message and the answer, in seq order.
-    let page = c.entries(&id, 0, None).unwrap();
-    let seqs: Vec<u64> = page.entries.iter().map(|e| e.seq).collect();
+    // The text delta arrives before the durable final answer; entries come in
+    // seq order, each once.
+    let mut events = Vec::new();
+    loop {
+        match rx
+            .recv_timeout(WAIT)
+            .expect("the final answer entry")
+            .unwrap()
+        {
+            StreamItem::Event(e) => {
+                let done = is_final_answer(&e);
+                events.push(e);
+                if done {
+                    break;
+                }
+            }
+            other => seen.push(other),
+        }
+    }
+    let delta = events
+        .iter()
+        .position(|e| matches!(e, Event::TextDelta { text } if text == "ENTRIES-ANSWER"));
+    assert!(delta.is_some_and(|d| d < events.len() - 1), "{events:?}");
+    let seqs: Vec<u64> = events
+        .iter()
+        .filter_map(|e| {
+            if let Event::Entry(e) = e {
+                Some(e.seq)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(
         seqs.len() >= 2 && seqs.windows(2).all(|w| w[0] < w[1]),
         "{seqs:?}"
     );
-    assert!(page.entries.iter().any(|e| e.payload["text"] == "hello"));
+
+    // The transcript read agrees with the stream.
+    let page = c.entries(&id, 0, None).unwrap();
+    assert_eq!(page.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), seqs);
     lossless(
         "entries",
         &page,
