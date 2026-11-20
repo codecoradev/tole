@@ -53,6 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+use tole_core::action_summary::{ActionEffect, ActionKind, ActionSummary};
 use tole_core::advisor::Budget;
 use tole_core::discussion::{self, Contract, Gate};
 use tole_core::discussion_log::{describe, DiscussionLog, Next};
@@ -463,17 +464,65 @@ impl Tool for DiscussTool {
          owner."
             .into()
     }
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        let who: Vec<&str> = input
+            .get("participants")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // Participants are profile names the model sent, not validated ones:
+        // one line each (the target only counts them).
+        use tole_core::action_summary::{list_lines, short_name};
+        let who: Vec<String> = who.iter().map(|p| short_name(p)).collect();
+        let target = if who.is_empty() {
+            "no named participants".to_string()
+        } else {
+            format!("{} participants (requested by the model)", who.len())
+        };
+        let question = tole_core::action_summary::redacted_text(
+            input.get("question").and_then(Value::as_str).unwrap_or(""),
+        );
+        let mut lines = list_lines("participant (requested by the model)", &who);
+        lines.push(format!(
+            "budget (requested by the model): {} tokens",
+            input
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .map_or("half of your remaining".to_string(), |n| n.to_string())
+        ));
+        lines.push(format!(
+            "rounds (requested by the model): up to {}",
+            input
+                .get("max_rounds")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::from(discussion::DEFAULT_MAX_ROUNDS))
+        ));
+        lines.extend(
+            question
+                .lines()
+                .map(|l| format!("question (from the model): {l}")),
+        );
+        Some(
+            ActionSummary::new(
+                ActionKind::StartDiscussion,
+                target,
+                ActionEffect::StartsDiscussion,
+                false,
+            )
+            .with_preview(lines),
+        )
+    }
     fn describe(&self, input: &Value) -> String {
         format!(
             "discuss {:?} among {} with {} tokens, up to {} rounds",
-            short(input.get("question"), 160),
+            short(input.get("question"), usize::MAX),
             input
                 .get("participants")
                 .and_then(Value::as_array)
                 .map(|a| a
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(|p| short(Some(&json!(p)), 48))
+                    .map(|p| short(Some(&json!(p)), usize::MAX))
                     .collect::<Vec<_>>()
                     .join(", "))
                 .unwrap_or_default(),

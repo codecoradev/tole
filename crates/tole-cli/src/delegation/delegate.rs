@@ -433,25 +433,14 @@ impl Delegator {
     /// caller's allow list can approve a Write) and it launches read-only.
     fn delegate_as(&self, input: &Value, participant: bool) -> Result<Value, String> {
         let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
-        let task = s("task")
-            .or_else(|| s("prompt"))
-            .filter(|t| !t.trim().is_empty())
+        let task = tole_core::action_summary::task_text(input, &["task", "prompt"])
             .ok_or("delegate: missing or empty 'task'")?;
         let mode = match s("mode").as_deref() {
             None | Some("execute") => Mode::Execute,
             Some("consult") => Mode::Consult,
             Some(m) => return Err(format!("delegate: mode {m:?} is not consult or execute")),
         };
-        let requested: Vec<String> = input
-            .get("allow")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let requested = tole_core::action_summary::requested_allow(input);
         let profile = match s("profile") {
             None => None,
             Some(name) => {
@@ -474,12 +463,11 @@ impl Delegator {
             None if requested.is_empty() => self.parent_allows.clone(),
             None => requested,
         };
-        let b = input.get("budget");
-        let num = |k: &str| b.and_then(|b| b.get(k)).and_then(Value::as_u64);
+        let (tokens, steps, minutes) = tole_core::action_summary::budget_numbers(input);
         let budget = BudgetRequest {
-            tokens: num("tokens"),
-            steps: num("steps").map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
-            minutes: num("minutes"),
+            tokens,
+            steps: steps.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            minutes,
         };
         let workspace = canonical(&self.root)?;
         self.locked(|d| {
@@ -1190,26 +1178,74 @@ impl Tool for DelegateTool {
              from yours; collect its result with delegate_poll.{alias}"
         )
     }
+    fn action_summary(&self, input: &Value) -> Option<tole_core::action_summary::ActionSummary> {
+        use tole_core::action_summary::{budget_line, requested_allow, short_name, task_text};
+        // Every field below is parsed by the code `delegate_as` runs
+        // (`task_text`, `requested_allow`, `budget_numbers`): what is shown is
+        // what will happen, not a second reading of the input.
+        let task = task_text(input, &["task", "prompt"]).unwrap_or_default();
+        let profile = input.get("profile").and_then(Value::as_str);
+        let requested = requested_allow(input);
+        let mut policy = vec![format!(
+            "mode (requested by the model): {}",
+            short_name(
+                input
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("execute")
+            )
+        )];
+        // The child's allowlist, as `delegate_as` decides it: a profile brings
+        // its own (and refuses an `allow`), else the requested list, else the
+        // parent's own.
+        match (profile, requested.is_empty()) {
+            (Some(_), false) => policy.push(
+                "child allowlist: REFUSED, a profile brings its own allow list; drop 'allow'"
+                    .into(),
+            ),
+            (Some(_), true) => policy.push(
+                "child allowlist: the profile's own list (read from the profile when the child starts, not shown here)"
+                    .into(),
+            ),
+            (None, _) => policy.extend(tole_core::agents::child_allow_lines(
+                &requested,
+                &self.host.parent_allows,
+            )),
+        }
+        if let Some(line) = budget_line("budget (requested by the model)", input) {
+            policy.push(line);
+        }
+        if let Some(r) = input.get("role").and_then(Value::as_str) {
+            policy.push(format!("role (requested by the model): {}", short_name(r)));
+        }
+        Some(tole_core::action_summary::delegate_summary(
+            profile, &task, &policy,
+        ))
+    }
     fn describe(&self, input: &Value) -> String {
+        // The whole task and the allowlist `delegate_as` will really use,
+        // parsed by the same code (`task_text`, `requested_allow`): the text
+        // the summary's cut markers point at is complete and is the truth.
+        let task = tole_core::action_summary::task_text(input, &["task", "prompt"])
+            .unwrap_or_else(|| "<missing task>".to_string());
+        let profile = input.get("profile").and_then(Value::as_str);
+        let requested = tole_core::action_summary::requested_allow(input);
+        let allow = if !requested.is_empty() {
+            format!("{requested:?}")
+        } else if profile.is_some() {
+            "the profile's own list".to_string()
+        } else {
+            format!("inherited {:?}", self.host.parent_allows)
+        };
         format!(
-            "delegate {:?} as {} ({}), allow {:?}",
-            input
-                .get("task")
-                .or_else(|| input.get("prompt"))
-                .and_then(Value::as_str)
-                .unwrap_or("<missing task>")
-                .chars()
-                .take(160)
-                .collect::<String>(),
-            input
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("no profile"),
+            "delegate {:?} as {} ({}), allow {}",
+            task,
+            profile.unwrap_or("no profile"),
             input
                 .get("mode")
                 .and_then(Value::as_str)
                 .unwrap_or("execute"),
-            input.get("allow").cloned().unwrap_or(Value::Null),
+            allow,
         )
     }
     fn spec(&self) -> Option<Value> {

@@ -633,6 +633,19 @@ impl AgentStartTool {
     }
 }
 
+/// The allowlist lines of a child started WITHOUT a profile: the requested
+/// patterns when the call carries a usable list, else what `execute` really
+/// gives the child, the parent's own list ("inherited from you"). The same
+/// `requested.is_empty()` test `execute` makes.
+pub fn child_allow_lines(requested: &[String], parent: &[String]) -> Vec<String> {
+    use crate::action_summary::list_lines;
+    if requested.is_empty() {
+        list_lines("child allowlist (inherited from you)", parent)
+    } else {
+        list_lines("child allowlist (requested by the model)", requested)
+    }
+}
+
 impl Tool for AgentStartTool {
     fn name(&self) -> &str {
         "agent_start"
@@ -647,25 +660,32 @@ impl Tool for AgentStartTool {
             .into()
     }
 
+    fn action_summary(&self, input: &Value) -> Option<crate::action_summary::ActionSummary> {
+        // Parsed by the same code `execute` uses (`task_text`,
+        // `requested_allow`): what is shown is what will run.
+        let task = crate::action_summary::task_text(input, &["prompt"]).unwrap_or_default();
+        // What `describe` showed: the child's allowlist, one line per entry so
+        // padding cannot hide one, and the worktree flag.
+        let mut policy = child_allow_lines(
+            &crate::action_summary::requested_allow(input),
+            &self.parent_allows,
+        );
+        policy.push(format!("worktree: {}", self.worktree_mode));
+        Some(crate::action_summary::delegate_summary(
+            None, &task, &policy,
+        ))
+    }
+
     fn describe(&self, input: &Value) -> String {
-        let prompt = input
-            .get("prompt")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing prompt>");
-        let preview: String = prompt.chars().take(160).collect();
-        let allows: Vec<String> = input
-            .get("allow")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The whole mission, parsed as `execute` parses it: the approver sees
+        // everything the child will be told (`describe` is the full text the
+        // summary's cut markers point at).
+        let prompt = crate::action_summary::task_text(input, &["prompt"])
+            .unwrap_or_else(|| "<missing prompt>".to_string());
+        let allows = crate::action_summary::requested_allow(input);
         format!(
             "start child agent: {:?} (child allowlist: {:?}, worktree: {})",
-            preview,
+            prompt,
             if allows.is_empty() {
                 self.parent_allows.clone()
             } else {
@@ -713,11 +733,7 @@ impl Tool for AgentStartTool {
                     .into(),
             );
         }
-        let prompt = input
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|p| !p.trim().is_empty())
+        let prompt = crate::action_summary::task_text(&input, &["prompt"])
             .ok_or("agent_start: missing or empty 'prompt'")?;
         let keep_mailbox = input
             .get("keep_mailbox")
@@ -749,16 +765,7 @@ impl Tool for AgentStartTool {
                 .map_err(|e| format!("agent_start: bad 'consumes' entry: {e}"))?;
         }
         let prompt = compose_prompt(&prompt, role, &consumes);
-        let requested: Vec<String> = input
-            .get("allow")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let requested = crate::action_summary::requested_allow(&input);
         for pat in &requested {
             if pat.starts_with('-') || pat.is_empty() {
                 return Err(format!("agent_start: bad allow pattern {pat:?}"));
