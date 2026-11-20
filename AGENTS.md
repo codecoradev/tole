@@ -96,10 +96,17 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
+# only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
+scripts/test-desktop-check.sh # self-test of the guardrail script
+scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps. ADVISORY (warns only): literals in the ui layer
 ```
 
-CI enforces the same set. There is no pre-commit hook installed by default —
-run these yourself.
+CI enforces the first three. Nothing in CI runs the desktop script yet: a
+separate `Desktop` workflow (not part of `ci.yml`, and not a required check
+unless the owner adds it to the branch protection) is added by a later change
+of #1028, until then run it yourself. The literals check is a heuristic: it
+warns and never fails, and it cannot see a literal bound to a variable first.
+There is no pre-commit hook installed by default — run these yourself.
 
 **Before opening a PR** (agents: mandatory) run Cora on your whole branch, not
 just the staged diff, and fix real findings first:

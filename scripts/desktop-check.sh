@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guardrails of the desktop crates (#1028).
 #
-# Usage: scripts/desktop-check.sh [deps|size|all] [workspace-root]
+# Usage: scripts/desktop-check.sh [deps|size|literals|all] [workspace-root]
 #   workspace-root defaults to the repository root (the self-test points it at
 #   fixture workspaces). Needs bash, cargo and Python 3.8+. `deps` runs
 #   `cargo metadata` and `cargo tree`, both --offline, so the crates must be downloaded first
@@ -28,6 +28,9 @@
 #               toolkit package resolved from anywhere else (a [patch], a path)
 #               is refused.
 #             - a default build (no features) reaches no gpui* or zed* package.
+#             - secondary, by text: in the tole-desktop crate (every .rs file,
+#               tests and build scripts included) only src/ui/adapter.rs names
+#               gpui*, and `#[path]` and `include!` are not used.
 # size      At most 500 lines per .rs file and 2,000 per crate in each desktop
 #           crate. Other crates are only reported, as warnings: the cap is for
 #           the desktop alone. Every check walks a crate the same way: paths
@@ -36,8 +39,21 @@
 #           or a symlinked directory, and refusing a crate with no src/ or no
 #           .rs file (so a check can never pass over zero files).
 #
+# ADVISORY (warns, never fails the gate):
+#
+# literals  Under tole-desktop/src/ui: numeric colours and sizes (`rgb(0x..)`,
+#           `0xRRGGBB`, `px(..)`, `len(8.0)`), and string literals handed to
+#           text (`.child("..")`, `.label("..")`, `String::from("..")`,
+#           `"..".into()`, `.font_family("..")`). Colours and sizes belong in
+#           tole-desktop-model's tokens, words in its strings. It is a pattern
+#           match over comment-stripped source and CANNOT see: a literal first
+#           bound to a `let`, `const` or `static` and used later, a literal made
+#           by a macro or a helper, a number reaching a size by arithmetic on a
+#           non-token constant, or text assembled at run time. Review reads the
+#           diff; do not read a clean run as proof.
+#
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
-# missing, cargo failing, an unreadable file, a dangling symlink,
+# missing, cargo failing, an unreadable or non-UTF-8 file, a dangling symlink,
 # a crate with no source, an exception in the helper) makes this script exit 2 with a message.
 # It never prints `ok` for a check that did not run to the end.
 #
@@ -76,12 +92,17 @@ lint() {
 case "$mode" in
   deps) lint deps ;;
   size) lint size ;;
-  all) lint deps; lint size ;;
-  *) echo "usage: $0 [deps|size|all] [workspace-root]" >&2; exit 2 ;;
+  literals) lint literals ;;
+  all) lint deps; lint size; lint literals ;;
+  *) echo "usage: $0 [deps|size|literals|all] [workspace-root]" >&2; exit 2 ;;
 esac
 
 if [ "$fails" -gt 0 ]; then
   echo "desktop-check ($mode): $fails violation(s)"
   exit 1
 fi
-echo "desktop-check ($mode): ok (enforced rules)"
+case "$mode" in
+  literals) echo "desktop-check (literals): finished (advisory only, no enforced rule ran)" ;;
+  all) echo "desktop-check (all): ok (enforced rules; literals are advisory)" ;;
+  *) echo "desktop-check ($mode): ok (enforced rules)" ;;
+esac

@@ -6,6 +6,7 @@ that script.
 
     desktop-lint.py deps <workspace-root>      enforced
     desktop-lint.py size <workspace-root>      enforced
+    desktop-lint.py literals <workspace-root>  advisory (never exits 1)
 
 Output: `error: path:line: message` or `warning: ...` or `info: ...` per
 finding. Exit 0 = no error, 1 = at least one `error:` line, 2 = the check
@@ -111,6 +112,11 @@ def rust_files(crate, strict=True):
     return sorted(found)
 
 
+def read(path):
+    with open(path, encoding="utf-8") as fh:  # raises on a bad file: fail closed
+        return fh.read()
+
+
 def count_lines(path):
     with open(path, "rb") as fh:
         data = fh.read()
@@ -162,6 +168,73 @@ def member(meta, name):
     if not found:
         raise RuntimeError(f"package {name} not found in the workspace")
     return found[0]
+
+
+# ---- Rust source scrubbing ---------------------------------------------------
+
+RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
+
+
+def scrub(src, keep_strings):
+    """Rust source with comments blanked, newlines kept (line numbers hold).
+
+    Handles `//`, nested `/* */`, strings with escapes, raw strings (`r`, `br`,
+    `cr`, with any number of #) and char literals, so `"//"` does not hide
+    code. With keep_strings False string contents are blanked too (code only).
+    """
+    out, i, n = [], 0, len(src)
+
+    def blank(text):
+        return "".join(c if c == "\n" else " " for c in text)
+
+    while i < n:
+        c = src[i]
+        m = RAW_STRING.match(src, i) if c in "rbc" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")) else None
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            out.append(blank(src[i:j]))
+            i = j
+        elif src.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(blank(src[i:j]))
+            i = j
+        elif m:
+            end = src.find('"' + m.group(1), m.end())
+            j = n if end < 0 else end + 1 + len(m.group(1))
+            out.append(src[i:j] if keep_strings else blank(src[i:j]))
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append(src[i:j] if keep_strings else '"' + blank(src[i + 1:j - 1]) + '"')
+            i = j
+        elif c == "'":
+            cm = re.match(r"'(?:\\.[^']*|[^\\'])'", src[i:i + 12])
+            if cm:  # a char literal; otherwise a lifetime
+                out.append(cm.group(0) if keep_strings else blank(cm.group(0)))
+                i += len(cm.group(0))
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def scan(emit, path, text, regex, msg):
+    for m in re.finditer(regex, text):
+        emit(path, text.count("\n", 0, m.start()) + 1, msg)
 
 
 # ---- size --------------------------------------------------------------------
@@ -273,8 +346,54 @@ def check_deps(root):
     for pkg in (model, desk):
         check_target_paths(pkg)
 
+    # (d) secondary, by text: in the desktop crate only ui/adapter.rs names the toolkit.
+    # Fails closed: an unreadable file, a dangling link or no source at all ends the run with exit 2.
+    desk_dir = crate_dir(root, DESKTOP)
+    adapter = os.path.normpath(os.path.join(desk_dir, "src", "ui", "adapter.rs"))
+    for path in rust_files(desk_dir):
+        code = scrub(read(path), keep_strings=False)
+        if os.path.normpath(path) != adapter:
+            scan(error, path, code, r"\bgpui\w*",
+                 "toolkit named outside src/ui/adapter.rs (re-export it from the adapter)")
+        scan(error, path, code, r"#\s*!?\s*\[[^\]]*\bpath\s*=|\binclude(?:_str|_bytes)?\s*!",
+             "a `path` attribute (also inside cfg_attr) and include! are not allowed in the desktop crate "
+             "(they hide files from the scan)")
+
+
+# ---- literals (advisory) -----------------------------------------------------
+
+TEXT_METHODS = r"(?:child|label|text|title|description|tooltip|placeholder|aria_label)"
+STRING = r'(?:r#*)?"'
+LITERAL_RULES = [
+    (r"\brgba?\s*\(\s*(?:0x|[0-9])", "numeric colour (use a tokens colour)"),
+    (r"\bhsla?\s*\(\s*[0-9.]", "numeric colour (use a tokens colour)"),
+    (r"\b(?:Hsla|Rgba)\s*\{\s*[a-z]\w*\s*:(?!:)", "colour built from fields (use a tokens colour)"),
+    (r"\b0x(?:[0-9a-fA-F]_?){6,8}\b", "hex colour literal (use a tokens colour)"),
+    (r'"#[0-9a-fA-F]{3,8}"', "hex colour string (use a tokens colour)"),
+    (r"\b(?:px|rems?|Pixels|len)\s*\(\s*[0-9_]*\.?[0-9_]*[1-9]", "numeric size (use a tokens size)"),
+    (rf"\.{TEXT_METHODS}\s*\(\s*(?:format!\s*\(\s*)?{STRING}", "string literal passed to a text element (use a strings entry)"),
+    (rf"\.font_family\s*\(\s*{STRING}", "font name literal (use a tokens font family)"),
+    (rf"\b(?:Label|SharedString|StyledText|Tooltip|Text|String)\s*::\s*(?:new|from)\s*\(\s*(?:format!\s*\(\s*)?{STRING}",
+     "string literal turned into text (use a strings entry)"),
+    (r'"(?:[^"\\\n]|\\.)*"\s*\.\s*(?:into|to_string|to_owned)\s*\(\s*\)',
+     "string literal turned into text (use a strings entry)"),
+]
+
+
+def check_literals(root):
+    desk_dir = crate_dir(root, DESKTOP)
+    ui_prefix = os.path.join("src", "ui") + os.sep
+    ui_files = [p for p in rust_files(desk_dir) if os.path.relpath(p, desk_dir).startswith(ui_prefix)]
+    if not ui_files:
+        raise RuntimeError(f"{desk_dir}: no .rs files under src/ui, nothing to check")
+    for path in ui_files:
+        text = scrub(read(path), keep_strings=True)
+        for regex, msg in LITERAL_RULES:
+            scan(warning, path, text, regex, msg)
+
+
 def main(argv):
-    modes = {"deps": check_deps, "size": check_size}
+    modes = {"deps": check_deps, "size": check_size, "literals": check_literals}
     if len(argv) != 3 or argv[1] not in modes:
         print(__doc__, file=sys.stderr)
         return 2
