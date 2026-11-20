@@ -1,0 +1,16 @@
+[package]
+name = "tole-client"
+description = "Typed blocking client for the tole serve protocol, for graphical front ends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not published yet: publish.yml does not list it and the protocol surface is partial (#1040).
+publish = false
+# std only below the JSON layer: no async runtime, no HTTP stack, no TLS yet.
+rust-version = "1.89"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
