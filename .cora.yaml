@@ -48,6 +48,15 @@ ignore:
     #   diagnostics channel. The real constraint (tole-core never writes to
     #   stdout) is enforced precisely by the core-no-stdout rule below.
     - "bug-println"
+    # - sec-hardcoded-url: matches an `http://` literal. Run over the whole
+    #   repo with `cora scan --no-llm` (49 bug-unwrap hits aside) it finds one
+    #   place: the error text `expected http://host[:port]` in
+    #   crates/tole-client/src/transport.rs, the code that REFUSES https until
+    #   a TLS transport exists and allows plain http only to loopback or, when
+    #   the caller opts in, a private network (never a public address; the
+    #   policy is unit-tested there). The literal is the parser's own grammar,
+    #   not a connection to an insecure endpoint.
+    - "sec-hardcoded-url"
 
 # #705 (cora 0.21): files removed from the REVIEWED DIFF. They are never sent
 # to the model and never produce a finding, so a PR's changelog, docs and
