@@ -11,6 +11,7 @@
 //! ([`crate::discussion_host`]) does the work and only the gate decides.
 
 pub mod audit;
+pub mod files;
 pub mod host;
 pub mod tool;
 
