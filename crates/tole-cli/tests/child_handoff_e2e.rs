@@ -187,21 +187,24 @@ fn spawn_mock() -> String {
 }
 
 /// A stand-in `tole` the children are started through: it pins the mock
-/// provider and a no-op `uteke` (hermetic: the real memory store is never
-/// touched), then execs the real binary.
+/// provider, a no-op `uteke` and a test `HOME`/`CODECORA_HOME` (hermetic: the
+/// real memory store and data dir are never touched), then execs the real
+/// binary.
 #[cfg(unix)]
 fn wrapper(root: &std::path::Path, base: &str) -> std::path::PathBuf {
     let bin_dir = root.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
     let uteke = bin_dir.join("uteke");
     common::write_executable(&uteke, "#!/bin/sh\necho '[]'\n");
     let w = bin_dir.join("tole-wrapper");
     common::write_executable(
         &w,
         format!(
-            "#!/bin/sh\nexport PATH=\"{}:$PATH\" TOLE_BASE_URL=\"{base}\" TOLE_API_KEY=test TOLE_MODEL=mock\nunset TOLE_TRUST TOLE_SYSTEM_PROMPT\nexec \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport HOME=\"{home}\" CODECORA_HOME=\"{home}\" PATH=\"{}:$PATH\" TOLE_BASE_URL=\"{base}\" TOLE_API_KEY=test TOLE_MODEL=mock\nunset TOLE_TRUST TOLE_SYSTEM_PROMPT\nexec \"{}\" \"$@\"\n",
             bin_dir.display(),
-            env!("CARGO_BIN_EXE_tole")
+            env!("CARGO_BIN_EXE_tole"),
+            home = root.join("home").display()
         ),
     );
     w
@@ -223,7 +226,9 @@ fn a_failed_verification_is_not_closed_and_the_fix_child_reads_the_artifact_itse
     std::fs::write(root.join("out.txt"), "ARTIFACT_BODY\n").unwrap();
     let bin = wrapper(&root, &base);
     let start = AgentStartTool::new(&bin, root.to_path_buf());
-    let poll = AgentPollTool::new(root.to_path_buf());
+    // The in-process poll recalls and cleans the mailbox: aim it at the no-op
+    // `uteke` rather than whatever the developer's PATH holds.
+    let poll = AgentPollTool::new(root.to_path_buf()).with_uteke_bin(root.join("bin/uteke"));
 
     // 1. implement child: verification failed.
     let s = start
