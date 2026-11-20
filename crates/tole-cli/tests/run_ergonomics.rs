@@ -2,10 +2,12 @@
 //! provider: --prompt-file, --name (sessions listing + resume by name),
 //! and the wall-clock timeout settling resumably.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 /// Mock: `SLOW` prompts sleep 5 s before the final (exercises the
@@ -88,8 +90,8 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+fn run_tole(home: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -110,18 +112,8 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-ergo-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-ergo-{tag}"))
 }
 
 /// --prompt-file feeds the prompt (the echo proves it reached the
@@ -131,6 +123,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 fn prompt_file_name_and_resume_by_name() {
     let base = spawn_mock();
     let dir = temp_dir("name");
+    let home = dir.join("home");
     let env = [
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
@@ -142,6 +135,7 @@ fn prompt_file_name_and_resume_by_name() {
     std::fs::write(&prompt_file, "PROMPT_FROM_FILE please").unwrap();
 
     let (out, err, code) = run_tole(
+        &home,
         &env_ref,
         &[
             "run",
@@ -161,7 +155,11 @@ fn prompt_file_name_and_resume_by_name() {
     assert!(out.contains("name: batch-1"), "{out}");
 
     // sessions lists the alias.
-    let (list, _err, code) = run_tole(&env_ref, &["sessions", "-s", sessions.to_str().unwrap()]);
+    let (list, _err, code) = run_tole(
+        &home,
+        &env_ref,
+        &["sessions", "-s", sessions.to_str().unwrap()],
+    );
     assert_eq!(code, 0);
     assert!(
         list.contains("batch-1"),
@@ -172,6 +170,7 @@ fn prompt_file_name_and_resume_by_name() {
     // have matched directly; batch-1 contains a dash but no file → the
     // name scan must resolve it).
     let (out2, err2, code2) = run_tole(
+        &home,
         &env_ref,
         &[
             "resume",
@@ -192,6 +191,7 @@ fn prompt_file_name_and_resume_by_name() {
 fn prompt_source_conflicts_are_loud() {
     let base = spawn_mock();
     let dir = temp_dir("conflict");
+    let home = dir.join("home");
     let env = [
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
@@ -202,6 +202,7 @@ fn prompt_source_conflicts_are_loud() {
     let pf = dir.join("p.txt");
     std::fs::write(&pf, "x").unwrap();
     let (_, err, code) = run_tole(
+        &home,
         &env_ref,
         &[
             "run",
@@ -214,7 +215,7 @@ fn prompt_source_conflicts_are_loud() {
     );
     assert_ne!(code, 0);
     assert!(err.contains("not both"), "{err}");
-    let (_, err2, code2) = run_tole(&env_ref, &["run", "-s", sessions.to_str().unwrap()]);
+    let (_, err2, code2) = run_tole(&home, &env_ref, &["run", "-s", sessions.to_str().unwrap()]);
     assert_ne!(code2, 0);
     assert!(err2.contains("missing prompt"), "{err2}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -227,6 +228,7 @@ fn prompt_source_conflicts_are_loud() {
 fn wall_clock_timeout_settles_resumably() {
     let base = spawn_mock();
     let dir = temp_dir("timeout");
+    let home = dir.join("home");
     let env = [
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
@@ -235,6 +237,7 @@ fn wall_clock_timeout_settles_resumably() {
     let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let sessions = dir.join("sessions");
     let (out, err, code) = run_tole(
+        &home,
         &env_ref,
         &[
             "run",
@@ -258,6 +261,7 @@ fn wall_clock_timeout_settles_resumably() {
         .expect("session id")
         .to_string();
     let (out2, err2, code2) = run_tole(
+        &home,
         &env_ref,
         &[
             "resume",

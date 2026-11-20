@@ -9,39 +9,60 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.10.1 is the latest release; `develop` is the v0.11.0 release
-candidate (see [CHANGELOG.md](CHANGELOG.md); the BREAKING changes since 0.10.1,
-each with its migration step, are in [docs/migrating-0.11.md](docs/migrating-0.11.md)).
+**Status:** v0.12.0 is the latest release (see [CHANGELOG.md](CHANGELOG.md); its
+BREAKING changes, each with how to opt out, are listed first under `[0.12.0]`; the
+0.11 changes, each with its migration step, are in [docs/migrating-0.11.md](docs/migrating-0.11.md)).
 0.10 shipped the inline terminal UI (`tole-tui`, bare `tole` on a TTY). 0.11 is the
 automation and secrets release:
 
 - **Automation:** `tole cron` (scheduled script and agent jobs, per-job time zones,
   parked approvals resumed from `/approvals`), `tole hook` and `POST /hooks/<route>`
-  on `tole serve` (signed webhooks that fire a cron job), `tole route` (model routing
-  by task weight), and `tole serve --cron` as the in-process ticker.
+  on `tole serve` (signed webhooks that fire a cron job), outbound signed webhooks
+  (`[webhook_out.<name>]` in the user config: a finished cron run, approval requests and (opt-in) a finished serve turn
+  are posted to a receiver such as a chat gateway; `tole webhook test`), `tole route`
+  (model routing by task weight), and `tole serve --cron` as the in-process ticker.
 - **Profiles and delegation:** `[profiles.<name>]` personas (`--profile`), the
   `delegate` tools (budget carved from the parent, depth-limited, one completion
-  report per child), `tole audit [goal] [--json]` to read the tree, the advisor tier
+  report per child), `tole audit [goal] [--json]` to read the tree, an opt-in approval queue for
+  delegated children (`tole delegation approvals`), the advisor tier
   (`consult_advisor`) and `tole discuss` / the `discuss` tools for budgeted
   multi-round discussions (`tole audit --discussions` reads them).
 - **Skills:** approval is required by default (`tole skills approve`), agents grow
   skills only through drafts (`skill_propose`, `tole skills drafts`), and
   `tole curator` keeps the library small.
 - **Plugins:** every MCP server needs the owner's approval, pinned in a plugin lock
-  (`tole plugin list|diff|approve|revoke`).
+  (`tole plugin list|diff|audit|approve|revoke|add`); third-party skills are pinned by
+  approved hash with a stated source in an append-only ledger.
 - **Secrets:** scoped release with `[secrets]`, known-value redaction at every egress
   sink and in the session log, sensitive files read redacted (`read_file_raw` for the
   verbatim read), and owner-only subcommands that refuse under a session
   ([docs/threat-model.md](docs/threat-model.md)).
+- **Sandbox:** third-party stdio MCP servers can run in bubblewrap (Linux, opt-in),
+  and `[sandbox.consumers]` does the same for model commands. Since 0.12 the mission
+  `--verify` command and the `--on-turnend` stop gates are sandboxed BY DEFAULT
+  (`optional`): sandboxed where bubblewrap works, run unsandboxed with a loud warning
+  only on a host with no sandbox at all. A `cargo`-based verify cannot see `~/.cargo`
+  inside it, so set `verify = "off"` / `turnend = "off"` under `[sandbox.consumers]`
+  in the user config to opt out (see [CHANGELOG.md](CHANGELOG.md) and
+  [docs/sandbox-design.md](docs/sandbox-design.md) §9.4).
+- **0.12 (face parity and the gateway events):** a `tole serve` session
+  now gets the default prompt, approved skills and model routing like `tole chat` does,
+  `serve` and `acp` sessions attach the owner's MCP client servers behind the plugin lock
+  (epic #941), and `serve` adds fork, compact, rename, missions and plan mode per session
+  ([docs/faces.md](docs/faces.md)); signed outbound webhooks gain the
+  opt-in `turn_finished` event. Breaking: `verify` and `turnend` are sandboxed by default
+  (`verify = "off"` under `[sandbox.consumers]` opts out), `POST /approvals/{id}/decision`
+  acts only on the first decision, and the uteke home moves under `CODECORA_HOME`.
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
-the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in.
+the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in. The desktop client's local and remote use of that API is a design note with open owner decisions ([docs/desktop-design.md](docs/desktop-design.md)).
 Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), `tole serve` (REST + multi-session
 MCP-over-HTTP daemon), and the inline terminal UI (`tole-tui`, bare
-`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)). Identity (owner-approved): a chat-first
+`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)); what the faces share and the
+few differences that are deliberate are in [docs/faces.md](docs/faces.md). Identity (owner-approved): a chat-first
 personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
@@ -83,9 +104,12 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   not a security boundary: see the threat model for what it does not see.
   `--trust internal` allows the `mcp_cora_*` tools without prompting. The
   guidance is in the pinned prompt of `run`, `chat`, the TUI and `mission`
-  (#536). `serve`, `acp` and `mcp` sessions serve their own registry and attach
-  no external MCP server (the flag is refused there), so they have no review
-  tools and no review section.
+  (#536). `serve` and `acp` sessions attach only the MCP servers the OWNER names
+  (`--mcp-server` or the user config, read at start-up, through the same plugin
+  lock; a project-config `mcp_server` is refused at start-up and the cora auto-detection never applies, #946),
+  so they carry the review section when the cora review tools are configured;
+  `tole mcp` and `mission` serve their own registry, refuse the flag and have
+  no review tools.
 - **[uteke](https://github.com/codecoradev/uteke)** (`uteke`) — semantic
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
@@ -138,12 +162,17 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
 - **tole as an HTTP daemon**: `tole serve` (issue #96) exposes the session
   host over token-authenticated REST — remote clients create sessions, run
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
-  default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
+  default. `--auth basic` (#742, first slice: one user, a PBKDF2 password hash
+  from `tole serve-hash`, TLS at a reverse proxy) adds HTTP Basic next to the
+  bearer token; OIDC and read-only scopes are not built. `POST /sessions/{id}/cancel` (#178, REST face) stops an
   in-flight turn — it settles `stopReason: "cancelled"`.
   `POST /sessions/{id}/interrupt` (#377) steers the running turn instead,
   without losing its work: the `{"text", "urgent"}` message is injected at
   the turn's next safe point as an attributed entry (`409` when no turn
   is running).
+  `POST /sessions {"profile": "<name>"}` (#740, create and resume) opens a
+  session as one `[profiles.<name>]` table of your user config (persona,
+  allow list, memory room, model; fixed for that session).
   `POST /sessions/{id}/detach` (#217) stops waiting without aborting: the
   running tool settles, the turn ends `stopReason: "detached"` (resumable),
   and background jobs keep running and nudge the session when they finish
@@ -182,7 +211,7 @@ tole chat                                   # multi-turn REPL on one durable ses
 tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
-tole sessions                               # list durable sessions
+tole sessions                               # list durable sessions (+ serve profile when set)
 tole sessions --all [--grep <text>]         # every project's sessions + where they live
 tole sessions --tree                        # sessions with their forks nested
 tole branch <id> [--at <entry>]             # fork a session at a settled entry, then resume the fork
@@ -192,12 +221,18 @@ tole cron create "0 9 * * 1-5" "Summarize open PRs" --allow write_file --model M
 tole cron create "@daily" "Triage new issues" --skill triage --profile ops  # agent job with a skill (name or SKILL.md, content pinned on save: a changed skill blocks the run until `cron edit --skill` re-pins) and a user-config profile; Writes need --allow AND the profile's allow
 tole cron edit NAME --deliver file:reports/prs.md   # also: run NAME (now), cancel NAME, status (ticker alive?)
 tole hook add gh --key-env GH_HOOK_KEY --job triage --event push --template "commit: {head_commit.message}"  # webhook route in the USER config (never a project one); the key is named, never given or shown; allow_writes/filters are hand edits
+tole sandbox set github --profile strict  # bind an MCP server to a sandbox profile in the USER config (never a project one); also: list, show SERVER; profiles are defined by hand in [sandbox.profiles.NAME]
 tole route "Summarize open PRs" --kind cron --risk read_only  # dry run of [router] (#586): which tier and model a run would get, the configured model and its source (e.g. `from env TOLE_MODEL`), and why; no provider call
 tole hook test gh --event push --payload push.json  # local dry run: sign, filter, print the fenced context; fires nothing (--fire --url http://127.0.0.1:PORT posts it to a loopback serve); also: list, remove ROUTE
 tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 tole audit [goal] [--json]                  # this workspace's delegation tree, read-only, capped and redacted (default: list the goals)
 tole audit --discussions                    # the multi-round discussions in the data dir, read-only (also: --discussion <ID>)
-tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap; drop --dry-run to run it (also: resume ID, list, show ID)
+tole delegation approvals list [--all]      # owner-only (#714): the approval requests of delegated children, read-only
+tole delegation approvals show <ID>         # one request in full: who asked, the chain, the call, a redacted input (fenced as data)
+tole delegation approvals allow <ID>        # allow ONE call of ONE request: shows it, then type the id back (--yes skips the typing; --fingerprint <HEX> pins the content)
+tole delegation approvals deny <ID>         # deny it (no answer is a denial too); allow and deny refuse under an agent session
+tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap, any number of participants is accepted (8 recommended, 16 at most) and the dry run shows the cost for that many; a question over 2000 characters or a criterion over 400 is refused with an error naming the limit, never cut; drop --dry-run to run it (also: resume ID, list, show ID)
+tole plugin audit [NAME] [--json]           # read-only report: tier, approved vs live manifest hash, grants, sandbox profile, scan findings, last sandbox fallbacks, skills with source and ledger (starts only what `list` would)
 tole plugin list                            # every MCP server with its lock state (approved, changed, unapproved, revoked); also: diff NAME, approve NAME [--hash H], revoke NAME
 tole skills list                            # discovered skills with approval status and hash; approve NAME [--hash H], revoke NAME, drafts list|show|reject|verdict|promote|revoke, index|retire|search
 tole curator status                         # the skill curator: run [--dry-run], restore, pin, lock, adopt, pause, schedule
@@ -252,15 +287,16 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at`. **Gateways whose `/models` carries no window** (the fleet gateway lists only `id`, `created`, `owned_by`) never compact on their own: set `TOLE_CONTEXT_WINDOW` (e.g. `200000`); `tole doctor --tier catalog` warns when no window is known. **Overflow recovery:** if the provider rejects a request as larger than its context window (HTTP 400/413/422 `context_length_exceeded`, "maximum context length", ...) the turn ends with the provider's message and `(compaction will run on the next resume)`; the next `resume <id> "<prompt>"` (or the next `chat` message) first forces one compaction pass — whatever the window or threshold — then runs the prompt. Compaction stays between turns, never inside one; `--no-compaction` also disables the recovery pass. The turn that overflowed is kept verbatim, so if it alone exceeds the window, ask for less output per turn |
 | `TOLE_REASONING_EFFORT` | reasoning effort sent as `reasoning_effort` on chat completions (#457): `minimal`, `low`, `medium` or `high`; unset (default) sends nothing, so the request body is unchanged. Also `--effort <level>` (flag > env > config `reasoning_effort` > user config). A session's durable `fact/reasoning_effort` register overrides it, so a session keeps its level on resume. A provider that answers HTTP 400 naming `reasoning_effort` gets ONE retry without it (remembered for the rest of the turn and recorded under `tole_degraded` in the step's usage row); an invalid level is a startup error. `tole config check` shows the effective value and its source |
 | `TOLE_VISION` | `0` declares the model non-vision: image input (`--image`) fails with a model-capability error before any request; `1` declares it vision-capable. Unset = the server decides (a 400/415/422 that names images becomes the same capability error) |
-| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
-| `TOLE_SKILL_APPROVAL` | `required` (default since 2026-11-11, #591) or `off` (every discovered skill loads, the old behaviour; environment only, no config file can set it): a discovered skill loads only when its whole directory hashes to the owner's approval; a session with unapproved skills prints one startup note with the count and the fix, and `tole doctor` shows the same. `--skill <file>` and a profile's `skills` are not gated (you named the file). Approve with `tole skills approve <name>` (`--hash <sha256:…>` to pin the hash you reviewed), check with `tole skills list` (status, hash, approval time), undo with `tole skills revoke <name>`. Approvals live in `$CODECORA_HOME/tole/skill-approvals.json`; any change to any file of a skill needs a new approval. An unapproved skill is listed by name only, as unavailable, and `load_skill` refuses it. Anything else fails startup, and so does a malformed approvals file |
+| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by `tole mcp` and `mission` like `--skill` (`serve` and `acp` load skills, #945) |
+| `TOLE_SKILL_APPROVAL` | `required` (default since 2026-11-11, #591) or `off` (every discovered skill loads, the old behaviour; environment only, no config file can set it): a discovered skill loads only when its whole directory hashes to the owner's approval; a session with unapproved skills prints one startup note with the count and the fix, and `tole doctor` shows the same. `--skill <file>` and a profile's `skills` are not gated (you named the file). Approve with `tole skills approve <name>` (`--hash <sha256:…>` to pin the hash you reviewed), check with `tole skills list` (status, hash, approval time), undo with `tole skills revoke <name>`; `tole skills fetch <registry-id> --pinned-sha <sha256>` approves a skill you placed yourself after checking its hash against your pin and uteke's record (terminal only, downloads nothing, #878); `tole skills adopt <name>|--all` records in the skill ledger approvals it does not name, and `tole skills recheckpoint` accepts the ledger after the checkpoint in the approvals file caught it deleted, truncated or rewritten (every approval is refused until then). Approvals live in `$CODECORA_HOME/tole/skill-approvals.json`; any change to any file of a skill needs a new approval. An unapproved skill is listed by name only, as unavailable, and `load_skill` refuses it. Anything else fails startup, and so does a malformed approvals file |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_SKILL_INDEX` | which skills a session is shown (#590): `local` (default; every discovered skill is listed, as before) or `uteke` (the pinned core plus the top K recalled by meaning from the `uteke doc` index for the `run` prompt, and the `skill_search` tool; an interactive session gets the pinned core only). With `--profile <name>` only skills scoped to that profile (or unscoped) are recalled. Every query is redacted against the process secrets before it reaches uteke. Index the skills first with `tole skills index`. `uteke` without the binary falls back to `local` with a note; anything else fails startup |
+| `TOLE_SKILL_INDEX` | which skills a session is shown (#590): `local` (default; every discovered skill is listed, as before) or `uteke` (the pinned core plus the top K recalled by meaning from the uteke skill library (`uteke skill search`, uteke >= 0.24.1; an older uteke falls back to `uteke doc` with a note) for the `run` prompt, and the `skill_search` tool; an interactive session gets the pinned core only). With `--profile <name>` only skills scoped to that profile (or unscoped) are recalled. Every query is redacted against the process secrets before it reaches uteke. Index the skills first with `tole skills index`. `uteke` without the binary falls back to `local` with a note; anything else fails startup |
 | `TOLE_SKILLS_PINNED` | comma-separated skill names always listed with `TOLE_SKILL_INDEX=uteke` (at most 5; a name with no local skill is skipped with a note) |
 | `TOLE_SKILL_RECALL_K` | skills recalled by meaning per task, `0` to `10` (default `5`); anything else fails startup |
 | `TOLE_SKILL_FLOOR` | cosine similarity floor for that recall, `0.0` to `1.0` (default `0.35`: a documented starting value, not a calibrated one; check it with `tole skills search` on your own store); fewer or zero skills is fine |
 | `TOLE_REVIEW_GATE` | `off` / `warn` / `block` (default): what a `git commit` does while the cora review tools are attached and its staged diff has no validated review (#534); `--review-gate` sets it and wins; anything else fails startup. Also a config key `review_gate` (flag > env > config > user config); a project's `.tole/config.toml` can keep or tighten the gate but never loosen what your user config sets (the stricter of the two layers applies), and the key is covered by the project-config trust gate |
+| `TOLE_DISCUSSION_TIMEOUT_SECS` | request timeout of one discussion provider call, in whole seconds, 1 to 3600 (default 120); beats the user config's `[discussions] request_timeout_secs` (#786). It may go below that key's 10 s floor: it is the test hook (#813), not a setting to rely on. Anything else (text, `0`, above 3600) stops tole at startup naming this variable. A project config cannot set it |
 | `TOLE_THEME` | TUI color theme (#463): `default`, `light` or `mono`; beats the user config's `[tui] theme`. A set, non-empty `NO_COLOR` selects `mono` when neither is set. An unknown name falls back to `default` with a note. A project config cannot set it |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
@@ -350,7 +386,7 @@ keys and validation, e.g. a skill to preload everywhere. It sits below the
 project file: **flag > env > config > user config > default**, key by key (a
 project key replaces the user key, lists included). It needs no trust record
 (it lives outside any repository, like the trust store), prints
-`tole: using user config <path>`, and `--no-config` ignores it too.
+`tole: using user config <path>`, and `--no-config` ignores it too (when the user config sets `[sandbox]` or `[secrets]`, `--no-config` needs a terminal, see the sandbox design note).
 `tole config check` lists both files and shows which layer wins each key.
 
 **Keys.** Every key is optional; the schema is strict (an unknown key, a wrong
@@ -364,9 +400,11 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[mission]` `max_steps`, `max_minutes`, `max_tokens` | `mission --max-*` | flag > config > budget tier |
 | `[tui]` `theme`, `[tui.colors]` | `TOLE_THEME`, `NO_COLOR` | **user config only** (a project's `[tui]` is ignored with a warning): env > user config > `NO_COLOR` (`mono`) > `default`; see docs/tui.md |
 | `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
+| `[discussions]` `request_timeout_secs` | `TOLE_DISCUSSION_TIMEOUT_SECS` | **user config only** (a project's `[discussions]` is ignored): env > user config > default (`120`); the config accepts 10 to 3600 seconds (1 to 9 is an error naming the key and the floor, #813), the env 1 to 3600. The global timeout of ONE discussion provider call (connect, send and reading the whole reply, which is not streamed), not an idle timeout; raise it for reasoning models that think for minutes. An invalid env value is a startup error. `tole config check` and `tole doctor` show the effective value and its source |
 | `[cron]` `daily_token_cap` | (none) | **user config only** (a project's `[cron]` is ignored): tokens all cron agent runs of one UTC day may spend; past it they settle `budget` |
 | `[delegation]` `max_depth`, `max_live_processes`, `goal_budget`, `goal_steps`, `goal_minutes` | (none) | **user config only** (a project's `[delegation]` is ignored): depth below the orchestrator (1–3, default 2), delegated processes live at once before spawns queue (default 8), and a goal's default budget (1,000,000 tokens, 400 steps, 120 minutes; used by the `delegate` tool, next PR) |
 | `[delegation]` `min_free_memory_mb`, `child_memory_mb`, `max_load_per_cpu`, `min_free_disk_mb`, `min_free_pids_percent`, `spawn_interval_secs`, `machine_max_live`, `child_nice` | `1024`, `512`, `1.5`, `2048`, `10`, `2`, max(2, CPUs), `10` | **user config only**: the machine resource guard `delegate` and `delegate_poll` run before every delegated launch. A child starts only when the machine-wide live count is under `machine_max_live`, the last start was at least `spawn_interval_secs` ago, free memory covers `min_free_memory_mb` plus `child_memory_mb` for it and each child still ramping up (cgroup v2 limits count), the one-minute load per CPU is at most `max_load_per_cpu`, `min_free_pids_percent` of the process-id limit is free, and `min_free_disk_mb` is free on the data dir, workspace and worktree filesystems; otherwise the spawn waits in the queue, and the replies carry its `queued_reason` and `waited_secs` (`tole doctor` shows the headroom). Children run at niceness `child_nice`. Zero, negative or absurd values are config errors |
+| `[delegation]` `approvals`, `approval_secs`, `approval_level_secs` | `"off"`, `900`, `120` | **user config only**, for the escalating approval queue of delegated children (#714). `approvals` is `"off"`, `"owner"` or `"chain"`; with `owner` or `chain` (both opt-in; `off` stays the default so nothing waits that did not before) a delegated child parks at a non-allowlisted Write instead of denying it, and no answer is a denial. You answer with `tole delegation approvals` or `/approvals` in `tole serve`; in `chain` mode a level holding a `delegate_decide` grant answers first, within its own allow list. `off` is today's behavior exactly; `tole doctor` hints at `owner` when delegation is in use (a `[delegation]` table, or a recorded delegated run in this workspace) and `approvals` is unset (#813). See [docs/approving-delegated-work.md](docs/approving-delegated-work.md). `approval_secs` (1 to 3600) is how long a request may wait in all, `approval_level_secs` (1 to 3600, at most `approval_secs`) how long each agent level gets before it moves up. No answer is a denial |
 | `[cron]` `max_concurrent` | `4` | **user config only**: runs one tick (`tole cron tick`, the `tole serve --cron` ticker) executes at once, 1 to 64; `tole cron tick --max-concurrent N` overrides it for that tick |
 | `[cron]` `timezone` | (none: plain UTC) | **user config only**: the time zone of a job saved without `tole cron create --timezone` (`UTC`, `+07:00` or an IANA name like `Asia/Jakarta`). Jobs saved earlier keep no zone |
 | `[cron]` `tz_source` | `system` on unix, else `offset-only` | **user config only**: where IANA zone names resolve. `system` reads the host's zoneinfo at run time (`$TZDIR`, else `/usr/share/zoneinfo`; no zone data in the binary); `offset-only` takes only `UTC` and fixed offsets |
@@ -375,6 +413,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[router]` `enabled`, `allow_tiers`, `[router.tiers]`, `[[router.rules]]` | off | **user config only** (a project config can only set `enabled = false` or narrow `allow_tiers`): model routing by task weight (#586). Each rule picks a tier (`light`, `standard`, `heavy`) when all its conditions hold (`kinds`, `min_chars`/`max_chars`, `min_risk`/`max_risk`, `profiles`, `jobs`, `budget_below`, `keywords`). The cheapest matching tier wins, and no match keeps the configured model. A matching rule replaces the configured model whether it comes from `TOLE_MODEL`, the config's `model` or a profile's default; only a session's own model (`/model`) and a cron job's `--model` pin are never routed. A rule without `profiles` applies only to runs without a profile. A tier resolves through `[router.tiers]`, or through `profiles.<name>.models` for rules naming `profiles`; an undeclared tier is an error, never another model. `tole route` is the dry run. A new `run`, `mission`, delegated child or cron run is routed once, before its first provider call: an explicit model (a session's `/model`, a job's `--model`) wins, the decision goes to the session's `fact/route` register (redacted), and a resumed session keeps its model |
 | `[hooks.<route>]` `cron_job`, `events`, `filter`, `template`, `allow_writes` | (none), all, (none), (none), `false` | **user config only**: what a verified delivery does.<br>• A delivery whose event (`X-GitHub-Event` / `X-Tole-Event`) is not in `events`, or whose JSON body fails `filter`, gets `200 ignored` and fires nothing. The native event is signed (scheme v2, #678); GitHub's `X-GitHub-Event` is not, so put what must hold in `filter`.<br>• A match fires the existing job `cron_job` (`202` once the run is claimed). It goes through the checks a scheduled run does: a paused, running, untrusted or out-of-budget job gets `409`.<br>• The fired run sees `template` (`{dot.path}` placeholders, scalars only, redacted and capped) as fenced untrusted data appended to its prompt for that run only.<br>• It has no Write tools unless `allow_writes = true`.<br>• `[hooks.<route>.filter]` takes one of `equals`, `contains`, `in`, `regex`, `exists` on a `path`, or `all` / `any` / `not` over nested filters. `contains` is a substring match on a string, but a whole-element match on an array: `labels` contains `"bug"` matches `["bug"]`, not `["bugfix"]`. Regexes are `regex-lite` (at most 256 bytes; strings over 16 KiB never match) |
 | `sensitive_files` (list of name globs) | (none) | extra file names `read_file`, the git diff filter and `cora_search` treat as sensitive (`*` wildcards, no directory part), e.g. `["*.secret", "vault-*.json"]`; the project layer's list is added to the user's and can never remove a name |
+| `redaction_allowlist` (list of regexes) | (none) | **user config only**: values the secret-shape detector (#597) keeps instead of masking, e.g. `["^ghp_0{20}"]` for a test fixture; each regex is matched against the candidate secret; a project config cannot set it |
 | `review_gate` | `--review-gate`, `TOLE_REVIEW_GATE` | flag > env > config > user config > `block`; a project config can keep or tighten but never loosen |
 | `[secrets]` | (none) | binds each secret NAME to the tools whose child processes may receive it; a project config can only narrow (see below) |
 | `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
@@ -457,8 +496,10 @@ name is a startup error that lists the defined ones.
   unregistered).
 - **Faces that refuse a flag refuse it from the config too.** `serve`, `acp`,
   `mcp` and `mission` refuse `--on-pretool`/`--on-posttool` (and `--on-turnend`
-  where the flag is refused), `--skill`, `--no-skills`, `--mcp-server` (and
-  `--plan-mode` on `mission`). A value that arrives from the config is refused
+  where the flag is refused); `mcp` and `mission` also refuse `--skill`,
+  `--no-skills` and `--mcp-server` (`serve` and `acp` accept them, #945, #946,
+  but refuse a `skill` or `mcp_server` that comes from the project config at
+  start-up), and `mission` refuses `--plan-mode`. A value that arrives from the config is refused
   with the same message plus `use --no-config to ignore the project config`;
   tole never silently drops a project's safety hook.
 - **Feature-less builds.** In a build without the `mcp` feature, `mcp_server` /
@@ -523,10 +564,11 @@ hard error.
 | `skill_search` | RO | with `TOLE_SKILL_INDEX=uteke` (#590): finds skills by meaning in the uteke index; returns names and descriptions from the local skill files, bodies still come through `load_skill` |
 | `gitea` | Write | Gitea counterpart of `gh` over the instance REST API — registers when `origin` is a Gitea remote AND `TOLE_GITEA_TOKEN`/`GITEA_TOKEN` is set; same six ops |
 | `delegate`, `delegate_poll` | Write / Write | the CLI faces (`run`, `chat`, `mission`): start a delegated child (`task`, optional `profile`, `mode`, `budget`, `allow`, `role`) as a budgeted `tole mission` whose budget is carved from the parent's, within `[delegation]` limits and the machine resource guard (a held-back spawn is queued, never failed); the child hands in one `delegate_report` and is `done` only with a complete one; `tole audit` prints the tree (#585) |
+| `delegate_pending`, `delegate_decide` | ReadOnly / Write | #714, only with `[delegation] approvals = "chain"` and only where the session's own allow list holds a `delegate_decide` grant (typed by you with `--allow`, or a profile's pattern the parent's list covers), alongside `delegate`; never for a discussion participant. `delegate_pending` lists the requests of your delegated children that wait for you, shown as data (redacted, capped, fenced). `delegate_decide` takes `{request, decision}` and nothing else, `decision` being `allow`, `deny` or `escalate` (one level up): only what your own allow list already allows, only while you are the request's current level, once; a request in an always-owner class (secrets, trust or approval records, plugin, skill or MCP effects, a Write outside the workspace, an oversized input) never reaches an agent level. Without the grant nothing is registered and the owner answers with `tole delegation approvals` |
 | `cron_create` | Write | an agent saves a cron job paused and within its own allow list; only the owner's `tole cron resume` enables it (#581). Session faces at depth 0 outside plan mode; never in a cron run |
 | `skill_propose` | Write | an agent proposes a skill as a draft that is never loadable; the owner reads it with `tole skills drafts` and promotes it (#592) |
 | `consult_advisor` | RO | missions, delegated children and cron runs of a profile with `models.advisor`: asks the advisor model about a hard decision, within the run's own token budget; only its fenced verdict comes back (#587) |
-| `discuss`, `discuss_status`, `discuss_stop` | Write / Write / Write | a multi-round discussion among user-config profiles, started in the background under the rules of `delegate` (budget carved from the caller); status and stop work only on discussions the same session started (#588). The owner's entry point is `tole discuss` |
+| `discuss`, `discuss_status`, `discuss_stop` | Write / Write / Write | a multi-round discussion among user-config profiles, started in the background under the rules of `delegate` (budget carved from the caller); status and stop work only on discussions the same session started (#588); more than 8 participants is allowed (up to 16) but the result then carries an `advice` line (#856). The owner's entry point is `tole discuss` |
 | `agent_start`, `agent_poll` | Write / Write | deprecated aliases of `delegate` / `delegate_poll` in the CLI faces; `tole serve` keeps the classic depth-1 child agents, which spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `agent_poll` is Write because a settled poll consumes (cleans) the mailbox, and `--trust internal` allowlists it by name; `--agents-worktree` gives each child its own git worktree; siblings are told (#380) when another child changes a file they read or wrote, at their next safe point; `role` (`explore`/`implement`/`verify`/`fix`) and `consumes` (artifacts by reference) give children a typed handoff, and an implement/fix child without passing verification is not closed (#383) |
 | `systemone_decide` | RO | typed decisions (choice/score/noul + confidence) from a System One backend — active when `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend (hosted Jev default, self-hosted compatible) |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
@@ -555,6 +597,16 @@ decision lands a durable audit register on the session. MCP/ACP parity
 is a follow-up. This is also the surface uteke-mobile drives —
 [docs/mobile-control.md](docs/mobile-control.md) is the mobile-control
 guide (#202).
+
+## Approving delegated work
+
+A delegated child has no terminal, so a Write its allow list does not cover is
+denied at once. With `[delegation] approvals = "owner"` (user config; the default
+is `off`) it asks instead and waits, and you answer with `tole delegation
+approvals list|show|allow|deny` or `/approvals` in `tole serve`; no answer is a
+denial. `"chain"` also lets a parent holding a `delegate_decide` grant answer
+within its own authority. `tole doctor` shows the mode. Guide:
+[docs/approving-delegated-work.md](docs/approving-delegated-work.md).
 
 ## Mission mode
 
@@ -598,7 +650,11 @@ approver, allowlists deny them on sight, and `--yes` never covers them. There
 is no bypass path. Known secret values are redacted at every egress sink and,
 since #596, before a line reaches the durable session log: the log stores the
 form the provider saw (`"redacted": ["NAME"]` names what an entry hid; lines
-written by older versions stay raw). See the threat model for the forms a
+written by older versions stay raw). Since #597 the secret shapes tole never
+knew (AWS, GitHub, npm, Slack and Google keys, bearer headers, JWTs, PEM
+blocks, URL passwords, `NAME=value` secrets) are masked at the same sinks as
+`prefix[REDACTED:<kind>]` by the ruleset shared with uteke (`uteke-privacy`);
+`redaction_allowlist` keeps a false positive. See the threat model for the forms a
 redactor cannot recognise.
 
 ## Memory loop
@@ -639,7 +695,7 @@ injecting fewer items, and the turn proceeds without memory.
   · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md) ·
   [Performance record](docs/perf.md) ·
   [Child-agent handoff](docs/child-agents-handoff.md)
-- Upgrading: [Migrating to 0.11](docs/migrating-0.11.md)
+- Upgrading: [Migrating to 0.11](docs/migrating-0.11.md) · Using: [Approving delegated work](docs/approving-delegated-work.md)
 - Design records: [Automation](docs/automation-design.md) ·
   [Profiles, collaboration and secrets](docs/profiles-collaboration-secrets.md) ·
   [Secrets and integrations](docs/secrets-integrations-design.md) ·

@@ -10,24 +10,28 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
+use common::TestDir;
 
 struct ServeProcess {
     child: Child,
     port: u16,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: TestDir,
 }
 
 impl ServeProcess {
     /// `_port` is ignored: a free port is chosen (and retried) by
     /// `common::spawn_listening`, which also waits for the listener.
     fn spawn(env: &[(&str, &str)], token: &str, _port: u16) -> Self {
+        let home = TestDir::new("tole-approvals-home");
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", token])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null());
@@ -36,7 +40,11 @@ impl ServeProcess {
             }
             cmd
         });
-        Self { child, port }
+        Self {
+            child,
+            port,
+            _home: home,
+        }
     }
 
     fn http(&self, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
@@ -91,9 +99,14 @@ impl Drop for ServeProcess {
 
 /// Mock: TOOL_MISSION → write_file; after the tool result → final.
 fn spawn_mock() -> String {
+    spawn_mock_counted(Arc::new(AtomicUsize::new(0)), "approved.txt")
+}
+
+/// [`spawn_mock`], counting every request it answers in `hits` and writing
+/// `file` (tests that run side by side in one directory use their own name).
+fn spawn_mock_counted(hits: Arc<AtomicUsize>, file: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let hits = Arc::new(AtomicUsize::new(0));
     let h2 = Arc::clone(&hits);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -121,7 +134,7 @@ fn spawn_mock() -> String {
                         break;
                     }
                 }
-                let _ = h.load(Ordering::SeqCst);
+                h.fetch_add(1, Ordering::SeqCst);
                 let msgs = body["messages"].as_array().cloned().unwrap_or_default();
                 let has_tool_result = match msgs.iter().rposition(|m| m["role"] == "user") {
                     Some(i) => msgs[i + 1..].iter().any(|m| m["role"] == "tool"),
@@ -134,7 +147,7 @@ fn spawn_mock() -> String {
                             "content": null,
                             "tool_calls": [{"id": "call_1", "type": "function",
                                 "function": {"name": "write_file", "arguments":
-                                    "{\"path\":\"approved.txt\",\"content\":\"remote ok\"}"}}]},
+                                    &format!("{{\"path\":\"{file}\",\"content\":\"remote ok\"}}")}}]},
                             "finish_reason": "tool_calls"}],
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                     })
@@ -192,18 +205,8 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-approvals-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-approvals-{tag}"))
 }
 
 /// The full round trip: queue → allow → work executes → audit register.
@@ -231,7 +234,10 @@ fn approval_allow_round_trip_executes_the_work() {
         &format!("/sessions/{sid}/prompt"),
         Some(&json!({"text": "TOOL_MISSION write it"}).to_string()),
     );
-    assert_eq!(prompt_body["stopReason"], "refusal", "fail-closed settle");
+    assert_eq!(
+        prompt_body["stopReason"], "approval_required",
+        "fail-closed settle"
+    );
 
     // The queue shows the pending decision.
     let (code, list) = serve.http("GET", "/approvals", None);
@@ -257,19 +263,15 @@ fn approval_allow_round_trip_executes_the_work() {
     // a "not busy" read proves nothing and the file may not exist yet
     // (the CI flake). Poll for the effect itself, then for the settle.
     let work_file = std::path::Path::new("approved.txt");
-    for _ in 0..100 {
-        if work_file.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for _ in 0..50 {
+    common::wait_until(
+        common::WAIT,
+        "the resumed turn to write approved.txt",
+        || work_file.exists(),
+    );
+    common::wait_until(common::WAIT, "the resumed turn to settle", || {
         let (_, st) = serve.http("GET", &format!("/sessions/{sid}/status"), None);
-        if st["busy"] != json!(true) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        st["busy"] != json!(true)
+    });
     // The queue entry is approved; the work landed.
     let (_, list) = serve.http("GET", "/approvals", None);
     assert_eq!(list["approvals"][0]["status"], "approved", "{list}");
@@ -317,6 +319,125 @@ fn approval_deny_records_verdict_without_executing() {
     let _ = dir;
 }
 
+/// Only the first decision counts (#911): the same verdict again is an
+/// idempotent 200 that audits and resumes nothing, the opposite verdict after
+/// it is a 409 and leaves the queue and the one-shot as the first one left
+/// them.
+#[test]
+fn only_the_first_decision_takes_effect() {
+    let work_file = std::path::Path::new("approved-first-decision.txt");
+    let _ = std::fs::remove_file(work_file);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let base = spawn_mock_counted(Arc::clone(&hits), "approved-first-decision.txt");
+    let dir = temp_dir("first-decision");
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let serve = ServeProcess::spawn(&env_ref, "t0ken", 47905);
+
+    let (_, body) = serve.http("POST", "/sessions", Some("{}"));
+    let sid = body["sessionId"].as_str().unwrap().to_string();
+    let _ = serve.http(
+        "POST",
+        &format!("/sessions/{sid}/prompt"),
+        Some(&json!({"text": "TOOL_MISSION write it"}).to_string()),
+    );
+    let (_, list) = serve.http("GET", "/approvals", None);
+    let id = list["approvals"][0]["id"].as_str().unwrap().to_string();
+    let path = format!("/approvals/{id}/decision");
+    let allow = json!({"decision": "allow"}).to_string();
+    let deny = json!({"decision": "deny"}).to_string();
+
+    // The first allow resumes the turn once.
+    let (code, d) = serve.http("POST", &path, Some(&allow));
+    assert_eq!(code, 202, "{d}");
+    common::wait_until(
+        common::WAIT,
+        "the resumed turn to write approved.txt",
+        || work_file.exists(),
+    );
+    common::wait_until(common::WAIT, "the resumed turn to settle", || {
+        let (_, st) = serve.http("GET", &format!("/sessions/{sid}/status"), None);
+        st["busy"] != json!(true)
+    });
+    let settled = hits.load(Ordering::SeqCst);
+
+    // The same verdict again: idempotent, no second resume.
+    let (code, d) = serve.http("POST", &path, Some(&allow));
+    assert_eq!(code, 200, "{d}");
+    assert_eq!(d["status"], "approved");
+    assert_eq!(d["resuming"], false);
+    // The opposite verdict after the fact: a conflict, nothing changes.
+    let (code, d) = serve.http("POST", &path, Some(&deny));
+    assert_eq!(code, 409, "{d}");
+    assert_eq!(d["status"], "approved");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        settled,
+        "a repeat decision must not start another turn"
+    );
+    let (_, st) = serve.http("GET", &format!("/sessions/{sid}/status"), None);
+    assert_ne!(st["busy"], json!(true), "no resume is running");
+    let (_, list) = serve.http("GET", "/approvals", None);
+    assert_eq!(list["approvals"][0]["status"], "approved", "{list}");
+    let _ = std::fs::remove_file(work_file);
+    let _ = dir;
+}
+
+/// A decision on an approval that already left `pending` another way is a
+/// conflict too: a deny, then an allow, must not resume anything.
+#[test]
+fn an_allow_after_a_deny_is_a_conflict_and_runs_nothing() {
+    let work_file = std::path::Path::new("approved-deny-then-allow.txt");
+    let _ = std::fs::remove_file(work_file);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let base = spawn_mock_counted(Arc::clone(&hits), "approved-deny-then-allow.txt");
+    let dir = temp_dir("deny-then-allow");
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let serve = ServeProcess::spawn(&env_ref, "t0ken", 47906);
+
+    let (_, body) = serve.http("POST", "/sessions", Some("{}"));
+    let sid = body["sessionId"].as_str().unwrap().to_string();
+    let _ = serve.http(
+        "POST",
+        &format!("/sessions/{sid}/prompt"),
+        Some(&json!({"text": "TOOL_MISSION write it"}).to_string()),
+    );
+    let (_, list) = serve.http("GET", "/approvals", None);
+    let id = list["approvals"][0]["id"].as_str().unwrap().to_string();
+    let path = format!("/approvals/{id}/decision");
+    let before = hits.load(Ordering::SeqCst);
+
+    let (code, d) = serve.http(
+        "POST",
+        &path,
+        Some(&json!({"decision": "deny"}).to_string()),
+    );
+    assert_eq!(code, 200, "{d}");
+    let (code, d) = serve.http(
+        "POST",
+        &path,
+        Some(&json!({"decision": "allow"}).to_string()),
+    );
+    assert_eq!(code, 409, "{d}");
+    assert_eq!(d["status"], "denied");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(hits.load(Ordering::SeqCst), before, "nothing resumed");
+    assert!(!work_file.exists(), "a denied write must not run");
+    let (_, list) = serve.http("GET", "/approvals", None);
+    assert_eq!(list["approvals"][0]["status"], "denied", "{list}");
+    let _ = dir;
+}
+
 /// The CLI consumer (`tole approvals list`) speaks to the same queue.
 #[test]
 fn cli_consumer_lists_the_queue() {
@@ -344,7 +465,8 @@ fn cli_consumer_lists_the_queue() {
         Some(&json!({"text": "TOOL_MISSION write"}).to_string()),
     );
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let home = TestDir::new("tole-approvals-cli-home");
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
     cmd.args([
         "approvals",
         "list",

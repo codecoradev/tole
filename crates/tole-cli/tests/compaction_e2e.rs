@@ -4,30 +4,19 @@
 //! from the mock's `/models`), and the third turn's request carries the
 //! fenced summary instead of the first turn.
 
+mod common;
+use common::WorkDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-static N: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-compaction-e2e-{tag}-{}-{}-{:x}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst),
-        // A pid is reused, so a stale directory of an earlier run can carry
-        // the same name: the clock makes it unique (#702).
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir(tag: &str) -> WorkDir {
+    WorkDir::new(&format!("tole-compaction-e2e-{tag}"))
 }
 
 /// Mock provider. Chat completions answer `SUMMARY-TEXT` when asked to
@@ -140,19 +129,18 @@ fn spawn_mock_with(
 }
 
 fn tole(cwd: &Path, url: &str, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[]);
     c.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         // Outside the workspace: a jail that holds the data dir has no file
         // writers (#684).
-        .env("CODECORA_HOME", cwd.with_extension("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_NO_SESSION_INDEX", "1")
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_CONTEXT_WINDOW")
         .env_remove("TOLE_FALLBACK_BASE_URL")
         .env_remove("TOLE_MEMORY")

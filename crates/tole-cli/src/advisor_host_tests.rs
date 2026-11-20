@@ -202,9 +202,7 @@ fn a_reply_cannot_make_the_host_act() {
 #[test]
 fn queued_usage_becomes_session_usage_records() {
     use tole_core::storage::Storage;
-    let dir = std::env::temp_dir().join(format!("tole-advhost-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::TestDir::new("tole-advhost");
     let mut s =
         tole_core::storage::JsonlStorage::create_named(&dir, "s-1", None, None, None).unwrap();
     s.commit(

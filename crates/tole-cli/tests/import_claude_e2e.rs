@@ -1,18 +1,18 @@
 //! #381: `tole import-claude` with the REAL binary.
 
-use std::process::Command;
+mod common;
+use common::TestDir;
 
 #[test]
 fn import_claude_creates_a_resumable_session_and_refuses_a_repeat() {
-    let dir = std::env::temp_dir().join(format!("tole-cc-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-cc-e2e");
+    let home = TestDir::new("tole-cc-e2e-home");
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../tole-core/tests/fixtures/cc_session.jsonl"
     );
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .arg("--sessions-dir")
             .arg(&dir)
             .args(["import-claude", fixture])

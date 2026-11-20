@@ -2,6 +2,8 @@
 //! content-driven mock: chaining, the completion marker, the verify
 //! gate, and budget exhaustion that stays resumable.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -189,18 +191,8 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-mission-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-mission-{tag}"))
 }
 
 /// The happy chain: turn 1 works, continuation completes, the durable
@@ -256,7 +248,20 @@ fn mission_chains_to_completion_with_summary() {
 fn verify_gate_overrides_the_completion_marker() {
     let dir = temp_dir("verify");
     let base = spawn_mock(dir.join("done.marker"));
+    // `verify` is sandboxed by default (#748) and runs in the process's
+    // working directory, not `--workspace`; this tests the gate, so it opts out.
+    // Its own TestDir (removed on drop, also on a panic), not a sibling of `dir`
+    // that nothing owns (#781: that one was left behind on every run).
+    let home_dir = temp_dir("verify-home");
+    let home = home_dir.join("home");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[sandbox.consumers]\nverify = \"off\"\n",
+    )
+    .unwrap();
     let env = [
+        ("CODECORA_HOME".to_string(), home.display().to_string()),
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
         ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
@@ -286,17 +291,18 @@ fn verify_gate_overrides_the_completion_marker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Stop gates (`--on-turnend`) need the shell-tools feature.
-#[cfg(feature = "shell-tools")]
+// Stop gates (`--on-turnend`) need the shell-tools feature; the probes
+// read /proc and run `#!/bin/sh` scripts, so they are unix-only.
+#[cfg(all(unix, feature = "shell-tools"))]
 const PROVIDER_KEY: &str = "sk-mission-provider-key-0123456789";
-#[cfg(feature = "shell-tools")]
+#[cfg(all(unix, feature = "shell-tools"))]
 const GH_TOKEN: &str = "ghp_missionGithubToken0123456789";
 
 /// A hermetic `tole` command in `dir` with the two secrets in its
 /// environment. Root reads every process's /proc files whatever tole does,
 /// so under root tole runs as `nobody`: the guard is about same-user
 /// children.
-#[cfg(feature = "shell-tools")]
+#[cfg(all(unix, feature = "shell-tools"))]
 fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Command {
     let home = dir.join("home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
@@ -343,13 +349,19 @@ fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Comm
 /// (`/proc/$PPID/environ`). `user_config` is the hermetic user config.
 /// Returns [verify env, tole's environ read by verify, gate env, tole's
 /// environ read by the gate].
-#[cfg(feature = "shell-tools")]
+#[cfg(all(unix, feature = "shell-tools"))]
 fn children_see(tag: &str, user_config: &str) -> [String; 4] {
-    use std::os::unix::fs::PermissionsExt;
     let dir = temp_dir(tag);
     let home = dir.join("home");
     std::fs::create_dir_all(home.join("tole")).unwrap();
-    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    // `verify` and `turnend` are sandboxed by default (#748); these probes
+    // write outside the workspace and test the environment scrub, not the
+    // sandbox, so they opt out.
+    std::fs::write(
+        home.join("tole/config.toml"),
+        format!("[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n{user_config}"),
+    )
+    .unwrap();
     let probe = |name: &str| {
         format!(
             "printenv > {d}/{name}_env.txt; \
@@ -358,8 +370,7 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
         )
     };
     let gate = dir.join("gate.sh");
-    std::fs::write(&gate, format!("#!/bin/sh\n{}\n", probe("gate"))).unwrap();
-    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&gate, format!("#!/bin/sh\n{}\n", probe("gate")));
     let sessions = dir.join("sessions");
     let (s, w, g) = (
         sessions.to_str().unwrap(),
@@ -411,7 +422,7 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
 /// wrote, unattended. By default they get no secret, and they cannot read
 /// the secrets out of tole's own environment through /proc either.
 #[test]
-#[cfg(feature = "shell-tools")]
+#[cfg(all(unix, feature = "shell-tools"))]
 fn verify_and_stop_gates_get_no_secret_by_default() {
     let seen = children_see("noscrt", "");
     let what = [
@@ -436,7 +447,7 @@ fn verify_and_stop_gates_get_no_secret_by_default() {
 /// An explicit `[secrets]` grant to `verify` and `turnend` restores a token
 /// for them, and only that token.
 #[test]
-#[cfg(feature = "shell-tools")]
+#[cfg(all(unix, feature = "shell-tools"))]
 fn a_secrets_grant_restores_a_token_for_verify_and_stop_gates() {
     let seen = children_see(
         "grant",
@@ -623,7 +634,6 @@ fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
 /// list the two review tools, so the auto-preset attaches them.
 #[cfg(all(unix, feature = "mcp"))]
 fn fake_cora_dir(dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = r#"#!/usr/bin/env python3
@@ -652,8 +662,7 @@ for line in sys.stdin:
         reply(i, error={"code": -32601, "message": "method not found"})
 "#;
     let path = bin.join("cora");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&path, script);
     bin
 }
 

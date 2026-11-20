@@ -7,23 +7,20 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 const SECRET: &str = "advisor-e2e-secret-0123456789";
 
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-advisor-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-advisor-e2e")
 }
 
 type Seen = Arc<Mutex<Vec<Value>>>;
@@ -114,6 +111,7 @@ struct Env {
     cron: PathBuf,
     work: PathBuf,
     url: String,
+    _root: TestDir,
 }
 
 const CONFIG: &str = r#"
@@ -127,11 +125,13 @@ advisor = "wise-model"
 impl Env {
     fn new(url: &str) -> Env {
         let root = tmpdir();
+        let (home, cron, work) = (root.join("home"), root.join("cron"), root.join("work"));
         let e = Env {
-            home: root.join("home"),
-            cron: root.join("cron"),
-            work: root.join("work"),
+            home,
+            cron,
+            work,
             url: url.into(),
+            _root: root,
         };
         for d in [&e.home.join("tole"), &e.cron, &e.work] {
             std::fs::create_dir_all(d).unwrap();
@@ -141,14 +141,11 @@ impl Env {
     }
 
     fn tole(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &self.home, &[]);
         c.args(args)
             .current_dir(&self.work)
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", &self.home)
-            .env("HOME", &self.home)
             .env("TOLE_CRON_DIR", &self.cron)
-            .env("PATH", "/usr/bin:/bin")
             .env("TOLE_STREAM", "0")
             .env("TOLE_BASE_URL", &self.url)
             .env("TOLE_MODEL", "env-model")
@@ -170,17 +167,11 @@ impl Env {
             c.env_remove(k);
         }
         let mut child = c.spawn().unwrap();
-        let start = Instant::now();
-        loop {
-            if child.try_wait().unwrap().is_some() {
-                return child.wait_with_output().unwrap();
-            }
-            if start.elapsed() > Duration::from_secs(60) {
-                let _ = child.kill();
-                panic!("{args:?} did not finish in 60s");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if common::wait_exit(&mut child, common::WAIT).is_none() {
+            let _ = child.kill();
+            panic!("{args:?} did not finish in {:?}", common::WAIT);
         }
+        child.wait_with_output().unwrap()
     }
 
     fn mission(&self, extra: &[&str]) -> Output {

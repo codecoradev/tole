@@ -1,36 +1,33 @@
 //! #684 end-to-end with the REAL binary: the owner-only subcommands
-//! (`cron create|resume|edit`, `plugin approve`, `skills approve`,
-//! `config trust`) refuse to write under a session (`TOLE_UNDER_SESSION`,
+//! (`cron create|resume|edit`, `plugin approve`, `skills approve|adopt|recheckpoint`,
+//! `config trust`, `discuss start|resume`) refuse to write under a session (`TOLE_UNDER_SESSION`,
 //! or a child agent's `TOLE_AGENT_DEPTH`), and a human at a terminal keeps
 //! working. `CODECORA_HOME` is set on the CHILD only.
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Output, Stdio};
 
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use tole_core::run_command::RunCommandTool;
+#[cfg(unix)]
 use tole_core::tool::Tool;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-owner-684-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-owner-684")
 }
 
 /// `tole` with `extra` env on top of a clean session-free environment.
 fn tole(bin: &Path, cwd: &Path, home: &Path, extra: &[(&str, &str)], args: &[&str]) -> Output {
-    let mut cmd = Command::new(bin);
+    let mut cmd = common::hermetic_command(bin, home, &[]);
     cmd.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .env_remove("TOLE_UNDER_SESSION")
         .env_remove("TOLE_AGENT_DEPTH")
         .stdin(Stdio::null());
@@ -72,7 +69,7 @@ fn data_files(home: &Path) -> Vec<String> {
     out
 }
 
-fn project(home_for_cfg: &str) -> PathBuf {
+fn project(home_for_cfg: &str) -> TestDir {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), home_for_cfg).unwrap();
@@ -83,16 +80,54 @@ const SESSION: &[(&str, &str)] = &[("TOLE_UNDER_SESSION", "1")];
 const CHILD: &[(&str, &str)] = &[("TOLE_AGENT_DEPTH", "1")];
 
 fn owner_commands() -> Vec<Vec<&'static str>> {
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
     let mut v = vec![
         vec!["cron", "create", "@every 10m", "--script", "echo pwned"],
         vec!["cron", "resume", "job-x"],
         vec!["cron", "edit", "job-x", "--script", "echo pwned"],
         vec!["skills", "approve", "evil", "--hash", "sha256:00"],
         vec!["skills", "drafts", "promote", "d-1", "--hash", "sha256:00"],
+        vec!["skills", "drafts", "revoke", "s-1"],
+        vec!["skills", "revoke", "evil"],
+        vec![
+            "skills",
+            "fetch",
+            "evil",
+            "--pinned-sha",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+        vec!["skills", "adopt", "--all"],
+        vec!["skills", "adopt", "evil"],
+        vec!["skills", "recheckpoint", "--sha256", "sha256:00"],
         vec!["config", "trust", "--yes"],
+        vec![
+            "delegation",
+            "approvals",
+            "allow",
+            "dap-1-abcdefgh",
+            "--yes",
+        ],
+        vec!["delegation", "approvals", "deny", "dap-1-abcdefgh"],
+        vec![
+            "discuss",
+            "start",
+            "--question",
+            "q",
+            "--criterion",
+            "c",
+            "--participant",
+            "p",
+            "--budget",
+            "1000",
+        ],
+        vec!["discuss", "resume", "d-1"],
     ];
     #[cfg(feature = "mcp")]
-    v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
+    {
+        v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
+        v.push(vec!["plugin", "revoke", "evil", "--hash", "sha256:00"]);
+        v.push(vec!["plugin", "add", "evil=true"]);
+    }
     v
 }
 
@@ -114,6 +149,35 @@ fn owner_only_subcommands_refuse_under_a_session_and_write_nothing() {
     }
 }
 
+/// #813: a dry run calls no model and writes nothing, so the guard leaves it
+/// alone (it may still fail later for lack of profiles; not by the guard).
+#[test]
+fn a_discuss_dry_run_is_not_an_owner_decision() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let o = tole(
+        &real(),
+        &bare,
+        &home,
+        SESSION,
+        &[
+            "discuss",
+            "start",
+            "--dry-run",
+            "--question",
+            "q",
+            "--criterion",
+            "c",
+            "--participant",
+            "p",
+            "--budget",
+            "1000",
+        ],
+    );
+    assert!(!text(&o).contains("agent session"), "{}", text(&o));
+    assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
+}
+
 #[test]
 fn a_human_at_a_terminal_keeps_working() {
     let home = tmpdir();
@@ -129,6 +193,35 @@ fn a_human_at_a_terminal_keeps_working() {
     let o = tole(&real(), &cwd, &home, &[], &["config", "trust", "--yes"]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(!data_files(&home).is_empty());
+}
+
+/// #714: a human reads the approval queue (empty here) and a request that
+/// does not exist is refused by name, not by the session guard.
+#[test]
+fn the_owner_reads_and_decides_at_a_terminal() {
+    let home = tmpdir();
+    let cwd = tmpdir();
+    let o = tole(
+        &real(),
+        &cwd,
+        &home,
+        &[],
+        &["delegation", "approvals", "list"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        text(&o).contains("no pending approval requests"),
+        "{}",
+        text(&o)
+    );
+    let args = ["delegation", "approvals", "deny", "dap-1-abcdefgh"];
+    let o = tole(&real(), &cwd, &home, &[], &args);
+    assert!(
+        !o.status.success() && text(&o).contains("no approval request"),
+        "{}",
+        text(&o)
+    );
+    assert!(!text(&o).contains("#684"), "{}", text(&o));
 }
 
 /// The discussion host is in-process (no tole subprocess), so the argv
@@ -159,8 +252,8 @@ fn run_command_cannot_reach_the_owner_only_records() {
     let home = tmpdir();
     let work = tmpdir();
     let copy = work.join("helper");
-    std::fs::copy(real(), &copy).unwrap();
-    let t = RunCommandTool::new(work.clone());
+    common::copy_executable(real(), &copy);
+    let t = RunCommandTool::new(work.to_path_buf());
     let envs = format!("CODECORA_HOME={}", home.display());
 
     // By name (and behind a wrapper): refused before any spawn.
@@ -181,4 +274,62 @@ fn run_command_cannot_reach_the_owner_only_records() {
     assert_ne!(out["status"], 0, "{out}");
     assert!(out["stderr"].as_str().unwrap().contains("#684"), "{out}");
     assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
+}
+
+/// #878: `skills fetch` has no --hash bypass: without a terminal (a script,
+/// cron, serve, acp) it is refused even outside a session, writes nothing,
+/// and never reaches uteke.
+#[test]
+fn skills_fetch_without_a_terminal_is_refused_and_writes_nothing() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let o = tole(
+        &real(),
+        &bare,
+        &home,
+        &[],
+        &[
+            "skills",
+            "fetch",
+            "evil",
+            "--pinned-sha",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+    );
+    assert!(!o.status.success());
+    assert!(text(&o).contains("needs a terminal"), "{}", text(&o));
+    assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
+}
+
+/// #878: the session guard and the terminal check run BEFORE uteke is
+/// looked up or called: a fake `uteke` on PATH logs every call.
+#[cfg(unix)]
+#[test]
+fn skills_fetch_refuses_before_it_calls_uteke() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let bin = tmpdir();
+    let log = bin.join("calls.log");
+    common::write_executable(
+        bin.join("uteke"),
+        format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let pin = "0000000000000000000000000000000000000000000000000000000000000000";
+    let args = ["skills", "fetch", "evil", "--pinned-sha", pin];
+    for env in [SESSION, CHILD, &[]] {
+        let mut e: Vec<(&str, &str)> = env.to_vec();
+        e.push(("PATH", &path));
+        let o = tole(&real(), &bare, &home, &e, &args);
+        assert!(!o.status.success(), "{env:?}: {}", text(&o));
+    }
+    assert!(
+        !log.exists(),
+        "uteke was called: {:?}",
+        std::fs::read_to_string(&log)
+    );
 }

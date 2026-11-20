@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// What a tool is allowed to touch. Drives the approval gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Risk {
     /// Pure read: runs without approval; replay-safe.
     ReadOnly,
@@ -102,6 +103,9 @@ pub struct ToolRegistry {
     /// Per registry, so sessions with different plugin locks in one process
     /// (serve, the cron loop) never share a decision.
     mcp_admitted: std::collections::BTreeSet<String>,
+    /// Guards released when the registry (the session) is dropped, e.g. the
+    /// lease of a sandboxed MCP server (#601).
+    holds: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ToolRegistry {
@@ -121,7 +125,13 @@ impl ToolRegistry {
             hooks: None,
             taint: None,
             mcp_admitted: Default::default(),
+            holds: Vec::new(),
         }
+    }
+
+    /// Keeps `guard` alive as long as this registry lives.
+    pub fn hold(&mut self, guard: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.holds.push(guard);
     }
 
     /// Records whether the MCP server `name` passed this registry's

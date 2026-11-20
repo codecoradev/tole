@@ -3118,8 +3118,20 @@ mod tests {
 
     #[test]
     fn file_walk_is_shallow_skips_noise_and_unsafe_names() {
-        let d = std::env::temp_dir().join(format!("tole-tui-files-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        // Removed when the test ends, also when it fails (#781).
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("tole-tui-files-{}-{stamp:x}", std::process::id())),
+        );
+        let d = scratch.0.clone();
         for p in [
             "a.rs",
             "src/b.rs",
@@ -3135,7 +3147,6 @@ mod tests {
         std::fs::write(d.join("bad\x1bname"), "").unwrap();
         std::fs::write(d.join("two\nlines"), "").unwrap();
         assert_eq!(files::list(&d), ["a.rs", "src/b.rs"]);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -3190,7 +3201,8 @@ mod tests {
         }
         fn run_turn(&self, p: &str, c: &CancelToken, _o: Arc<dyn TurnObserver>) -> TurnEnd {
             if p == "first" {
-                let end = Instant::now() + Duration::from_secs(3);
+                // Generous: only a run that never steers waits for it.
+                let end = Instant::now() + Duration::from_secs(60);
                 while c.interrupts().is_empty() && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(5));
                 }

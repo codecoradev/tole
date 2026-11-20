@@ -15,6 +15,7 @@ rules:
   - "Tool execution uses Command::new with explicit argv arrays (cora_search.rs, gh.rs, uteke.rs, subprocess.rs). Binary paths and arguments are validated (gh.rs validates number/base against strict regex; read_file/write_file enforce a path jail). This is a controlled subprocess invocation pattern, not command injection. Do not flag 'command injection' on these call sites."
   - "Since #596/#634 the durable session log stores the redacted form: storage.rs redacts every entry payload and the pinned system prompt with the process SecretSet before the line is written. A durable write (session log, ledger, usage record) that can carry a secret without going through that redaction is a real finding; flag it."
   - "Loop-guard fingerprinting (E10) hashes tool name + sorted-keys JSON input to detect repeated identical calls. The guard intentionally allows up to 3 identical consecutive calls before erroring; this is deliberate budget behavior, not a missing validation."
+  - "GitHub Actions version bumps in .github/workflows/** (for example actions/download-artifact@v4 to @v8): the reviewer's knowledge of current action releases is out of date and cannot be checked from the diff. Do not report an action's major version, tag or ref as nonexistent, unreleased or unpublished, and do not report a jump of several majors as risky or unvetted, solely because the version is newer than what you know. The repo uses floating major tags (upload-artifact@v7 is already in use) and a bump PR is verified by running the workflow. Still flag what the diff itself shows: removed or renamed inputs or outputs of the action, changed permissions or token scopes, exposed secrets, script injection through untrusted expressions, a switch to a different or unknown publisher, and changes to how an action is pinned (floating tag to branch, or a SHA pin dropped)."
 
 # Ignore patterns
 ignore:
@@ -22,10 +23,9 @@ ignore:
     - "*.lock"
     - "Cargo.lock"
     - "target/"
-    # #705: generated or prose files. NOTE: in cora 0.20 `ignore.files` scopes
-    # the symbol index and the context chain (what is injected as surrounding
-    # code), not the diff the reviewer reads; a PR's own CHANGELOG/docs lines
-    # still count toward its size until cora-code can exclude paths from a diff.
+    # #705: generated or prose files. `ignore.files` scopes the symbol index
+    # and the context chain (what is injected as surrounding code), not the
+    # diff the reviewer reads; the diff is filtered by `review.exclude` below.
     - "CHANGELOG.md"
     - "docs/**"
   rules:
@@ -48,6 +48,19 @@ ignore:
     #   diagnostics channel. The real constraint (tole-core never writes to
     #   stdout) is enforced precisely by the core-no-stdout rule below.
     - "bug-println"
+
+# #705 (cora 0.21): files removed from the REVIEWED DIFF. They are never sent
+# to the model and never produce a finding, so a PR's changelog, docs and
+# lockfile lines no longer count toward its size. Large diffs are chunked by
+# whole files above review.max_chunk_chars (cora's default), and a review that
+# did not cover the whole diff exits 1 (`fail_on_incomplete`, the default):
+# the CI job fails visibly instead of passing on a partial review.
+review:
+  exclude:
+    - "CHANGELOG.md"
+    - "docs/**"
+    - "*.lock"
+    - "Cargo.lock"
 
 # Deterministic custom rules (no LLM; run by `cora review` and `cora scan`).
 # `languages` takes file extensions, and `exclude` is required.

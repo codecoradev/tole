@@ -1,6 +1,9 @@
 //! #683: common credential files are sensitive, so `read_file` redacts them.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use std::path::Path;
+use test_dir::TestDir;
 use tole_core::sensitive::{is_sensitive_name, is_sensitive_path};
 
 #[test]
@@ -41,10 +44,9 @@ fn common_secret_files_are_sensitive() {
 #[test]
 fn read_file_redacts_a_suffix_env_file() {
     use tole_core::tool::Tool;
-    let dir = std::env::temp_dir().join(format!("tole-683-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-683");
     std::fs::write(dir.join("prod.env"), "DB_PASSWORD=hunter2hunter2\n").unwrap();
-    let tool = tole_core::read_file::ReadFileTool::new(dir.clone());
+    let tool = tole_core::read_file::ReadFileTool::new(dir.to_path_buf());
     let out = tool
         .execute(serde_json::json!({"path": "prod.env"}))
         .unwrap();

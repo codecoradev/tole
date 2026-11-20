@@ -1,14 +1,20 @@
 //! #137: session_tools unit tests — multi-session routing semantics
 //! without an LLM (CI-safe).
 
+mod common;
+use common::TestDir;
 use serde_json::json;
 use std::sync::Arc;
 use tole_cli::session_tools::SessionToolState;
 use tole_core::tool::Tool;
 
-fn ws(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-sess-tools-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn ws(tag: &str) -> TestDir {
+    // The entrypoint fixes the skills choice before a session opens (#945).
+    tole_cli::session_host::set_server_skills(
+        tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
+    );
+    tole_cli::session::owner_mcp::set(vec![]).unwrap();
+    let d = TestDir::new(&format!("tole-sess-tools-{tag}"));
     std::fs::create_dir_all(d.join("a")).unwrap();
     std::fs::create_dir_all(d.join("b")).unwrap();
     std::fs::write(d.join("a/note.txt"), "ALPHA").unwrap();
@@ -117,7 +123,7 @@ fn resolver_routes_to_session_jail() {
 #[test]
 fn unknown_session_is_a_clear_error() {
     let root = ws("unknown-sid");
-    let state = SessionToolState::new(vec![], false, None, root, None, vec![]);
+    let state = SessionToolState::new(vec![], false, None, root.to_path_buf(), None, vec![]);
     let tools = state.tools();
     let err = tool_by_name(&tools, "tole_session_status")
         .execute(json!({"session_id": "nope"}))
@@ -131,14 +137,13 @@ fn unknown_session_is_a_clear_error() {
 #[test]
 fn sessions_dir_override_relocates_the_jsonl() {
     let dir = ws("sdir-override");
-    let store = std::env::temp_dir().join(format!("tole-sess-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&store);
+    let store = TestDir::new("tole-sess-store");
     let state = SessionToolState::new(
         vec![],
         false,
         None,
         std::path::PathBuf::from(&dir),
-        Some(store.clone()),
+        Some(store.to_path_buf()),
         vec![],
     );
     let tools = state.tools();
@@ -360,10 +365,9 @@ fn session_detach_tool_flags_only_a_running_turn_and_jobs_nudge_the_session() {
             .execute(json!({"command": "sh -c 'sleep 0.2'"}))
             .unwrap();
         let id = job["job"].as_str().unwrap().to_string();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while token.interrupts().is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        common::wait_until(common::WAIT, "the finished job's interrupt notice", || {
+            !token.interrupts().is_empty()
+        });
         let q = token.interrupts().drain();
         assert_eq!(q.len(), 1, "{q:?}");
         assert!(q[0].text.contains(&id), "{}", q[0].text);

@@ -17,6 +17,9 @@
 //! blocker, fix command, timestamp); [`Ledger::summary`] renders the
 //! `READY n-of-m` line.
 
+// `redact_url` lives in `provider_chain` (an engines module) so that module
+// does not import this face; the old `doctor::redact_url` path stays.
+pub use crate::provider_chain::redact_url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -27,7 +30,7 @@ use tole_core::openai::{
 };
 use tole_core::storage::JsonlStorage;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
-use tole_core::turn::{run_turn, TurnOutcome};
+use tole_core::turn::TurnOutcome;
 
 /// Ledger file name under the tole data dir.
 pub const LEDGER_FILE: &str = "doctor-ledger.json";
@@ -234,7 +237,10 @@ fn drive(
             .with_streaming(streaming)
             .with_timeout(FULL_CALL_TIMEOUT)
             .with_tool_specs(registry.specs());
-        run_turn(&mut storage, &mut provider, registry, prompt).map_err(|e| e.to_string())
+        let cancel = tole_core::cancel::CancelToken::default();
+        let plan = crate::turn_runner::TurnPlan::new(cfg.clone(), registry, &cancel);
+        crate::turn_runner::run_turn_with(&mut storage, &mut provider, &plan, prompt)
+            .map_err(crate::turn_runner::TurnRunError::into_message)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -447,20 +453,6 @@ pub fn secrets_lines(
         tole_core::sensitive::builtin_rules().join(", ")
     ));
     out
-}
-
-pub fn redact_url(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((s, r)) => (format!("{s}://"), r),
-        None => (String::new(), url),
-    };
-    let rest = rest.split(['?', '#']).next().unwrap_or("");
-    let (authority, path) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-    let host = authority.rsplit('@').next().unwrap_or("");
-    format!("{scheme}{host}{path}")
 }
 
 /// Strip the API key and any URL credentials from a diagnostic string.
@@ -821,6 +813,16 @@ pub fn run_cli(
             crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
         );
     }
+    let home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(w) = crate::ecosystem::store_move_warning(
+        std::env::var("CODECORA_HOME").ok().as_deref(),
+        std::env::var("UTEKE_HOME").ok().as_deref(),
+        home_dir.as_deref(),
+    ) {
+        println!("{w}");
+    }
     // Review gate (#534): what a `git commit` needs while cora is attached.
     #[cfg(feature = "shell-tools")]
     println!(
@@ -849,9 +851,13 @@ pub fn run_cli(
     }
     // Model routing (#586): state, rule and tier names only. Tiers and rules
     // live in the user config; a broken router fails the doctor.
-    let user = crate::config::user_config_path()
-        .filter(|p| p.exists())
-        .map(|p| crate::config::load(&p));
+    let user = crate::config::user_config_path().and_then(|p| {
+        match crate::config::user_config_present(&p) {
+            Ok(true) => Some(crate::config::load(&p).map_err(|e| e.to_string())),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        }
+    });
     let router_lines = match &user {
         None => crate::routing::doctor_lines(&crate::config::Config::default()),
         Some(Ok(c)) => crate::routing::doctor_lines(c),
@@ -859,6 +865,76 @@ pub fn run_cli(
     };
     let ok = ok && !router_lines.iter().any(|l| l.starts_with("router: ERROR"));
     router_lines.iter().for_each(|l| println!("{l}"));
+    // Sandbox (#601): the backend (bwrap present and usable, or why not) and
+    // the user config's mode. Names and states only.
+    let sandbox = match &user {
+        Some(Ok(c)) => c.sandbox.as_ref().and_then(|s| s.policy().ok()),
+        _ => None,
+    };
+    // `--no-sandbox` (#750): the listing below reads "off", and the line
+    // from `doctor_lines` says a flag overrode the config.
+    // `--sandbox <profile>`: the process policy already carries the profile.
+    let sandbox = match tole_core::sandbox::flags::current() {
+        Some(tole_core::sandbox::flags::Override::Profile { .. }) => {
+            tole_core::sandbox::session_policy().or(sandbox)
+        }
+        _ => sandbox.filter(|_| !tole_core::sandbox::flags::no_sandbox_active()),
+    };
+    for l in tole_core::sandbox::doctor_lines(sandbox.as_ref(), &tole_core::sandbox::detect()) {
+        println!("{l}");
+    }
+    // Lazy start (#750): which servers register from the lock's snapshot.
+    if matches!(&user, Some(Ok(c)) if c.sandbox.as_ref().and_then(|s| s.lazy_start) == Some(true)) {
+        println!(
+            "sandbox: lazy start on (a locked, sandboxed stdio server with a complete snapshot \
+             starts on its first call, after the same lock checks; any other server starts at \
+             session start)"
+        );
+    }
+    // Sandbox of model commands (#748): which tools run in the `command`
+    // profile and whether a working sandbox is there for them. A consumer
+    // that cannot run (required, or unattended optional, with no sandbox)
+    // fails the doctor. Names and states only.
+    let consumers = match &user {
+        Some(Ok(c)) => c
+            .sandbox
+            .as_ref()
+            .and_then(|s| s.consumers().ok())
+            .unwrap_or_else(tole_core::sandbox::command::Consumers::host_default),
+        _ => tole_core::sandbox::command::Consumers::host_default(),
+    };
+    let consumer_lines =
+        tole_core::sandbox::command::doctor_lines(&consumers, &tole_core::sandbox::detect());
+    let ok = ok && !consumer_lines.iter().any(|l| l.contains("ERROR"));
+    consumer_lines.iter().for_each(|l| println!("{l}"));
+    // Grants of each sandboxed stdio server and consumer (#809): mode,
+    // workspace and extra paths, network, the decision, and any grant that
+    // touches `$HOME` or a credential directory. Paths the owner wrote.
+    #[cfg(feature = "mcp")]
+    let servers: Vec<String> = match &user {
+        Some(Ok(c)) => c
+            .mcp_server
+            .iter()
+            .flatten()
+            .filter_map(|s| tole_core::mcp::McpServerConfig::parse(s).ok())
+            .filter(|m| matches!(m.transport, tole_core::mcp::McpTransport::Stdio { .. }))
+            .map(|m| m.name)
+            .collect(),
+        _ => Vec::new(),
+    };
+    #[cfg(not(feature = "mcp"))]
+    let servers: Vec<String> = Vec::new();
+    for l in tole_core::sandbox::report::doctor_grant_lines(
+        sandbox.as_ref(),
+        &consumers,
+        &tole_core::sandbox::detect(),
+        tole_core::sandbox::unattended(),
+        &servers,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        tole_core::paths::tole_data_dir().as_deref(),
+    ) {
+        println!("{l}");
+    }
     // Advisor tier (#587): the profiles that declare one, names only. A
     // broken user config is already reported (and failed) above.
     let advisor_lines = match &user {
@@ -867,6 +943,20 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     advisor_lines.iter().for_each(|l| println!("{l}"));
+    // Profiles `tole serve` can open a session as (#740): names only, from
+    // the user config; nothing is printed when it defines none.
+    if let Some(Ok(c)) = &user {
+        if let Some(l) = crate::profile::serve_profiles_doctor_line(c) {
+            println!("{l}");
+        }
+    }
+    // Outbound webhook destinations (#911): names, events and flags only, from
+    // the user config; nothing is printed when it defines none.
+    if let Some(Ok(c)) = &user {
+        crate::webhook_out::doctor_lines(c)
+            .iter()
+            .for_each(|l| println!("{l}"));
+    }
     // Discussion roles (#588): where the scribe's and the claim-checker's
     // models come from, names only.
     let role_lines = match &user {
@@ -875,6 +965,8 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     role_lines.iter().for_each(|l| println!("{l}"));
+    // Discussion request timeout (#786): the effective value and its source.
+    println!("{}", crate::config_apply::discussion_timeout_line());
     // Web tools (#625): which lane each tool uses, names only.
     for l in crate::tool_roster::web_doctor_lines(&|k: &str| std::env::var(k).ok()) {
         println!("{l}");
@@ -889,7 +981,18 @@ pub fn run_cli(
             Err(e) => (vec![format!("  ! cron: {e}")], true),
         };
         lines.iter().for_each(|l| println!("{l}"));
-        ok && cron_ok
+        // The webhook outbox (#911): counts and names, never a URL or a body.
+        let hook_ok = match (crate::cron::default_dir(), crate::webhook_out::load_user()) {
+            (Ok(dir), Ok(dests)) => {
+                let (lines, hook_ok) =
+                    crate::cron::webhook::doctor_lines(&dir, &dests, crate::cron::now());
+                lines.iter().for_each(|l| println!("{l}"));
+                hook_ok
+            }
+            // A config that does not load is reported above.
+            _ => true,
+        };
+        ok && cron_ok && hook_ok
     };
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {

@@ -4,13 +4,16 @@
 //! one (`tole sessions` lists it).
 #![cfg(all(unix, feature = "tui"))]
 
+mod common;
+use common::{wait_for, WorkDir, WAIT};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -134,11 +137,35 @@ fn serve(mut s: std::net::TcpStream, bodies: Bodies) {
     }
 }
 
+/// `text` without its CSI sequences (`ESC [ ... final byte`), plus, for each
+/// byte of the result, the byte offset in `text` it came from.
+fn strip_csi(text: &str) -> (String, Vec<usize>) {
+    let (mut flat, mut at) = (String::new(), Vec::new());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\x1b' && chars.peek().is_some_and(|(_, n)| *n == '[') {
+            chars.next();
+            for (_, n) in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&n) {
+                    break;
+                }
+            }
+            continue;
+        }
+        flat.push(c);
+        at.extend(std::iter::repeat_n(i, c.len_utf8()));
+    }
+    (flat, at)
+}
+
 /// `tole` on a fresh pty; everything it prints lands in `out`.
 struct Pty {
     child: Child,
     master: std::fs::File,
     out: Arc<Mutex<Vec<u8>>>,
+    /// Set by the reader thread once the pty reports end of output (every
+    /// slave end closed and the buffer drained).
+    eof: Arc<AtomicBool>,
     seen: usize,
 }
 
@@ -153,20 +180,29 @@ impl Pty {
 
     fn spawn_full(cwd: &Path, url: &str, args: &[String], envs: &[(&str, &str)]) -> Pty {
         let (mut m, mut sl) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 30,
             ws_col: 100,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let rc =
-            unsafe { libc::openpty(&mut m, &mut sl, std::ptr::null_mut(), std::ptr::null(), &ws) };
+        // macOS declares the termios and winsize arguments `*mut`, Linux `*const`;
+        // `*mut` coerces to both.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut sl,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ws),
+            )
+        };
         assert_eq!(rc, 0, "openpty");
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(sl)) };
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd =
+            common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[]);
         cmd.args(args)
             .current_dir(cwd)
-            .env("CODECORA_HOME", cwd.with_extension("home"))
             .env("TOLE_BASE_URL", url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -198,6 +234,8 @@ impl Pty {
         let mut answer = master.try_clone().unwrap();
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
+        let eof = Arc::new(AtomicBool::new(false));
+        let done = eof.clone();
         std::thread::spawn(move || {
             let mut b = [0u8; 4096];
             while let Ok(n) = reader.read(&mut b) {
@@ -209,11 +247,13 @@ impl Pty {
                 }
                 sink.lock().unwrap().extend_from_slice(&b[..n]);
             }
+            done.store(true, Ordering::SeqCst);
         });
         Pty {
             child,
             master,
             out,
+            eof,
             seen: 0,
         }
     }
@@ -225,21 +265,34 @@ impl Pty {
 
     /// Wait until `needle` appears in output not yet consumed; consumes up to it.
     fn expect(&mut self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            {
-                let o = self.out.lock().unwrap();
-                let text = String::from_utf8_lossy(&o[self.seen..]).to_string();
-                if let Some(i) = text.find(needle) {
-                    self.seen += text[..i + needle.len()].len();
-                    return;
-                }
-                if Instant::now() > deadline {
-                    panic!("timed out waiting for {needle:?}; got: {text:?}");
-                }
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let (out, seen) = (self.out.clone(), self.seen);
+        let upto = wait_for(WAIT, &format!("{needle:?} in the screen output"), || {
+            let o = out.lock().unwrap();
+            let text = String::from_utf8_lossy(&o[seen..]).to_string();
+            text.find(needle).map(|i| text[..i + needle.len()].len())
+        });
+        self.seen += upto;
+    }
+
+    /// Like [`Pty::expect`], but matches across the terminal's own line
+    /// wrapping (#835). The TUI hard-wraps a long status line at the screen
+    /// width, so a message that embeds a path (whose length depends on where
+    /// the test directory lives) can break inside the needle. Wrapping only
+    /// inserts cursor-movement sequences, so the needle is searched in the
+    /// output with every CSI sequence removed.
+    fn expect_unwrapped(&mut self, needle: &str) {
+        let (out, seen) = (self.out.clone(), self.seen);
+        let what = format!("{needle:?} in the unwrapped screen output");
+        let upto = wait_for(WAIT, &what, || {
+            let o = out.lock().unwrap();
+            let text = String::from_utf8_lossy(&o[seen..]).to_string();
+            let (flat, at) = strip_csi(&text);
+            flat.find(needle).map(|i| {
+                let last = at[i + needle.len() - 1];
+                last + text[last..].chars().next().map_or(0, char::len_utf8)
+            })
+        });
+        self.seen += upto;
     }
 
     /// The turn is over: the idle hint (redrawn when `working…` goes away)
@@ -249,29 +302,29 @@ impl Pty {
     }
 
     fn wait_exit(&mut self) -> Option<i32> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if let Ok(Some(st)) = self.child.try_wait() {
-                return st.code();
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        let child = &mut self.child;
+        let mut code = None;
+        let exited = common::poll_until(WAIT, || {
+            child.try_wait().ok().flatten().map(|st| code = st.code())
+        });
+        if exited.is_none() {
+            let _ = self.child.kill();
+        } else {
+            // The child is gone, but the reader thread may not have copied
+            // its last output (the terminal-restore sequences) yet: an
+            // assertion on the final screen must wait for the pty's end of
+            // output, not race it (#877). Expiry is not a failure here, a
+            // grandchild may still hold the slave end; the caller's own
+            // assertion then reports what is missing.
+            let eof = self.eof.clone();
+            let _ = common::poll_until(WAIT, || eof.load(Ordering::SeqCst).then_some(()));
         }
-        let _ = self.child.kill();
-        None
+        code
     }
 }
 
-fn workdir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-tui-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn workdir() -> WorkDir {
+    WorkDir::new("tole-tui-e2e")
 }
 
 #[test]
@@ -283,6 +336,10 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
     // 1. streamed answer
     t.send("hello\r");
     t.expect("STREAM-ANSWER");
+    // The answer text lands before the turn is over: a prompt typed now
+    // would steer the still-running turn instead of starting a new one
+    // (#877), so wait for the idle hint before every next prompt.
+    t.idle();
 
     // 2. a write asks inline; `y` lets it run
     t.send("write it\r");
@@ -293,11 +350,15 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
     );
     t.send("y");
     t.expect("WROTE-OK");
+    t.idle();
     assert!(dir.join("out.txt").exists(), "approved write must run");
 
     // 3. Shift+Enter (kitty CSI-u) makes a newline instead of submitting
     t.send("multi1\x1b[13;2umulti2\r");
     t.expect("STREAM-ANSWER");
+    // If "slow" were typed while this turn still runs it would steer it, and
+    // the Esc below would cancel the already-finished turn (#877).
+    t.idle();
 
     // 4. Esc cancels a running turn
     t.send("slow\r");
@@ -325,13 +386,13 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
         .to_string_lossy()
         .trim_end_matches(".jsonl")
         .to_string();
-    let listed = Command::new(env!("CARGO_BIN_EXE_tole"))
-        .arg("sessions")
-        .current_dir(&dir)
-        .env("CODECORA_HOME", dir.with_extension("home"))
-        .env("TOLE_NO_UPDATE_CHECK", "1")
-        .output()
-        .unwrap();
+    let listed =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
+            .arg("sessions")
+            .current_dir(&dir)
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
     assert!(
         String::from_utf8_lossy(&listed.stdout).contains(&id),
         "sessions lists {id}: {}",
@@ -449,10 +510,9 @@ fn tui_model_picker_and_thinking_reach_the_next_request_and_survive_resume() {
         .trim_end_matches(".jsonl")
         .to_string();
     let tole = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
             .args(args)
             .current_dir(&dir)
-            .env("CODECORA_HOME", dir.with_extension("home"))
             .env("TOLE_BASE_URL", &url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -522,6 +582,8 @@ fn tui_steers_queues_and_returns_the_queue_on_cancel() {
     t.expect("(turn cancelled)");
     t.send("\r"); // the editor holds "qc" again: sending it runs it
     t.expect("STREAM-ANSWER");
+    // `/quit` is ignored while a turn runs (#877): wait for the turn to end.
+    t.idle();
     t.send("/quit\r");
     assert_eq!(t.wait_exit(), Some(0));
 
@@ -658,11 +720,11 @@ fn tui_attaches_pasted_and_slash_image_paths_to_the_next_message() {
 
     // Outside the jail: refused with the host's error, nothing queued.
     t.send(&format!("/image {}\r", outside.display()));
-    t.expect("outside the workspace jail");
+    t.expect_unwrapped("outside the workspace jail");
     // A pasted path outside the jail is text after all (and says why).
     t.send("see ");
     t.send(&format!("\x1b[200~{}\x1b[201~", outside.display()));
-    t.expect("pasted as text, not attached");
+    t.expect_unwrapped("pasted as text, not attached");
     t.send("\r");
     t.expect("STREAM-ANSWER");
     t.idle();
@@ -753,13 +815,13 @@ fn tui_fork_continues_in_the_new_session_and_tree_switches_back() {
     let (url, dir) = (spawn_mock_recording(bodies.clone()), workdir());
     let sessions = dir.join(".tole/sessions");
     let tole = |args: &[&str]| {
-        let o = Command::new(env!("CARGO_BIN_EXE_tole"))
-            .args(args)
-            .current_dir(&dir)
-            .env("CODECORA_HOME", dir.with_extension("home"))
-            .env("TOLE_NO_UPDATE_CHECK", "1")
-            .output()
-            .unwrap();
+        let o =
+            common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.with_extension("home"), &[])
+                .args(args)
+                .current_dir(&dir)
+                .env("TOLE_NO_UPDATE_CHECK", "1")
+                .output()
+                .unwrap();
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     let mut t = Pty::spawn(&dir, &url);
@@ -901,7 +963,7 @@ fn tui_export_writes_the_transcript_and_refuses_to_overwrite() {
     t.expect("pick another path");
     t.idle();
     t.send("/export ../escape.html\r");
-    t.expect("outside the workspace jail");
+    t.expect_unwrapped("outside the workspace jail");
     t.idle();
     t.send("/export t.jsonl\r");
     t.expect("transcript written to");

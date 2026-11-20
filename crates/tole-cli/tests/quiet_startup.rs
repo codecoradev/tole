@@ -5,7 +5,9 @@
 
 #![cfg(feature = "shell-tools")]
 
-use std::process::{Command, Stdio};
+mod common;
+use common::TestDir;
+use std::process::Stdio;
 
 const NOTICES: [&str; 3] = [
     "uteke binary not found",
@@ -14,18 +16,20 @@ const NOTICES: [&str; 3] = [
 ];
 
 fn startup_stderr(verbose: Option<&str>) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-quiet-{}-{}",
-        verbose.unwrap_or("default"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    // Outside the checkout (cargo's target dir is inside it in CI): the test
+    // is about a cwd that is not a git checkout.
+    let dir = TestDir::in_system_temp(&format!("tole-quiet-{}", verbose.unwrap_or("default")));
+    let home =
+        TestDir::in_system_temp(&format!("tole-quiet-home-{}", verbose.unwrap_or("default")));
+    // No uteke / cora on PATH, and the temp dir is not a git checkout.
+    let path = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
+    let mut cmd = common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        &home,
+        &[("PATH", path.to_str().unwrap())],
+    );
     cmd.args(["run", "-s", dir.join("sessions").to_str().unwrap(), "hi"])
         .current_dir(&dir)
-        // No uteke / cora on PATH, and the temp dir is not a git checkout.
-        .env("PATH", "/usr/bin:/bin")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")

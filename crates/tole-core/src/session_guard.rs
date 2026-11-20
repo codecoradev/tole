@@ -221,9 +221,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_to_the_running_executable_is_refused() {
-        let dir = std::env::temp_dir().join(format!("tole-guard-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-guard-link");
         let exe = std::env::current_exe().unwrap();
         std::os::unix::fs::symlink(&exe, dir.join("helper")).unwrap();
         assert!(check_session_argv(&["./helper".into(), "x".into()], &dir).is_err());

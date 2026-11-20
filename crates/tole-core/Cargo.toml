@@ -35,11 +35,13 @@ libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 base64 = "0.23"
 # SKILL.md content hashes for the skill index (#590); already in the tree via rmcp.
 sha2 = "0.11"
 ureq = { workspace = true }
+# Shared secret-shape detector (#597), the ruleset uteke runs on its write path;
+# pure Rust, depends on `regex` only, no IO.
+uteke-privacy = "0.24.1"
 
 [[test]]
 name = "mcp_tests"
@@ -54,8 +56,44 @@ name = "mcp_admission"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_lazy"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_secret_grant"
 required-features = ["mcp"]
+
+[[test]]
+name = "mcp_probe"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_probe_parent_death"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_off"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_lifecycle"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_idle"
+required-features = ["mcp"]
+
+[[test]]
+name = "command_sandbox"
+required-features = ["shell-tools"]
+
+[[test]]
+name = "command_sandbox_none"
+required-features = ["shell-tools"]
 
 [[test]]
 name = "mcp_http"

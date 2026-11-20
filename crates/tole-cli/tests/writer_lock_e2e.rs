@@ -3,10 +3,12 @@
 //! holder (no duplicated seq in the file), read-only commands still work,
 //! and once the holder exits the session resumes normally.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -71,10 +73,9 @@ fn spawn_mock() -> String {
 }
 
 fn cmd(cwd: &Path, url: &str, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.join("home"), &[]);
     c.args(args)
         .current_dir(cwd)
-        .env("CODECORA_HOME", cwd.join("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
@@ -94,7 +95,13 @@ fn text(b: &[u8]) -> String {
 
 fn seqs(file: &Path) -> Vec<u64> {
     let mut out = Vec::new();
-    for l in std::fs::read_to_string(file).unwrap().lines().skip(1) {
+    // Whole lines only: the writer may be in the middle of one.
+    let all = std::fs::read_to_string(file).unwrap();
+    for l in all
+        .split_inclusive('\n')
+        .filter(|l| l.ends_with('\n'))
+        .skip(1)
+    {
         let v: Value = serde_json::from_str(l).unwrap();
         match v {
             Value::Array(a) => out.extend(a.iter().map(|r| r["seq"].as_u64().unwrap())),
@@ -107,9 +114,7 @@ fn seqs(file: &Path) -> Vec<u64> {
 #[test]
 fn second_process_is_refused_and_the_file_stays_valid() {
     let url = spawn_mock();
-    let d: PathBuf = std::env::temp_dir().join(format!("tole-lock-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = TestDir::new("tole-lock-e2e");
     let o = run(&d, &url, &["run", "first turn"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     let id = text(&o.stdout)
@@ -128,20 +133,28 @@ fn second_process_is_refused_and_the_file_stays_valid() {
         .unwrap();
     let mut a_in = a.stdin.take().unwrap();
     writeln!(a_in, "from A, message 1").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while seqs(&file).len() <= base {
-        assert!(Instant::now() < deadline, "A never wrote");
-        std::thread::sleep(Duration::from_millis(50));
+    common::wait_until(common::WAIT, "A to write its message", || {
+        seqs(&file).len() > base
+    });
+    // A may still be appending (its answer): B must leave what is there
+    // now alone, so the snapshot ends at a whole line and B's refusal is
+    // checked against it below.
+    let mut before = std::fs::read(&file).unwrap();
+    if let Some(end) = before.iter().rposition(|b| *b == b'\n') {
+        before.truncate(end + 1);
     }
-    std::thread::sleep(Duration::from_millis(300));
-    let before = std::fs::read(&file).unwrap();
 
     // Process B: refused, naming A; file untouched.
     let o = run(&d, &url, &["resume", &id, "from B"]);
     assert!(!o.status.success());
     let err = text(&o.stderr);
     assert!(err.contains(&format!("pid {}", a.id())), "{err}");
-    assert_eq!(std::fs::read(&file).unwrap(), before);
+    let after = std::fs::read(&file).unwrap();
+    assert!(after.starts_with(&before), "B changed what A had written");
+    assert!(
+        !text(&after).contains("from B"),
+        "B's message reached the file"
+    );
 
     // Read-only commands work while A holds the lock.
     assert!(run(&d, &url, &["status", &id]).status.success());

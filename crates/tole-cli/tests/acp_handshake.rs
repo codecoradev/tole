@@ -6,20 +6,25 @@
 // with the `shell-tools` feature (#349): the bare profile has no such face.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 struct AcpProcess {
     child: Child,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: TestDir,
     rx: mpsc::Receiver<String>,
 }
 
 impl AcpProcess {
     fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
+        let home = TestDir::new("tole-acp-home");
+        let mut child = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home.path(), &[])
             .arg("acp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -36,7 +41,11 @@ impl AcpProcess {
                 }
             }
         });
-        Self { child, rx }
+        Self {
+            child,
+            _home: home,
+            rx,
+        }
     }
 
     fn send(&mut self, v: &Value) {
@@ -77,11 +86,8 @@ impl Drop for AcpProcess {
     }
 }
 
-fn temp_cwd(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("tole-acp-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_cwd(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-acp-{tag}"))
 }
 
 #[test]

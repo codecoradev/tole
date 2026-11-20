@@ -2,10 +2,11 @@
 //! is unreachable, the reserve configured with `TOLE_FALLBACK_*` answers,
 //! and the switch is recorded in the durable session log.
 
+mod common;
+use common::TestDir;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::time::Duration;
 
 /// A provider that answers every chat completion with `text`.
@@ -58,15 +59,12 @@ fn closed_port_url() -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-failover-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-failover-e2e-{tag}"))
 }
 
 fn tole(dir: &std::path::Path, primary: &str, fallback: &[(&str, &str)]) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.join("home"), &[]);
     cmd.args(["--sessions-dir"])
         .arg(dir.join("sessions"))
         .args(["run", "say hi"])

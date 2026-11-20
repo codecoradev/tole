@@ -17,7 +17,12 @@ use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Command;
+
+/// Appended to the summary of `run_command` and `job_start` when their
+/// consumer runs in the sandbox: the `.git` directory is read-only there, so a
+/// git write fails with a read-only error, and the model needs the way out.
+pub(crate) const GIT_NOTE: &str = " Inside the sandbox the .git directory is read-only: git write \
+    operations (add, commit) fail there, use the git tool, which runs outside it.";
 
 /// Generic command runner. `cwd` is the jail: the command runs with this
 /// working directory and cannot be re-pointed via the input.
@@ -123,8 +128,13 @@ impl Tool for RunCommandTool {
     }
 
     fn summary(&self) -> String {
-        "Run one command (program plus arguments, no shell) in the workspace and return its output."
-            .into()
+        let mut s = String::from(
+            "Run one command (program plus arguments, no shell) in the workspace and return its output.",
+        );
+        if crate::sandbox::command::consumers().run_command != crate::sandbox::Mode::Off {
+            s.push_str(GIT_NOTE);
+        }
+        s
     }
 
     fn describe(&self, input: &Value) -> String {
@@ -188,16 +198,27 @@ impl Tool for RunCommandTool {
         // #684, every session kind: never the tole binary, never the
         // session marker.
         crate::session_guard::check_session_argv(&argv, &self.cwd)?;
-        let mut cmd = Command::new(program);
+        // The plain command, or `bwrap ... -- command` when the owner opted
+        // in (`[sandbox.consumers] run_command`, #748); a refusal (required
+        // sandbox, none available) is the tool's error. The approval above
+        // this tool is unchanged: a sandbox never replaces it.
+        let mut cmd = crate::sandbox::command::command_for(
+            crate::sandbox::command::Consumer::RunCommand,
+            &self.cwd,
+            program,
+            &argv[1..],
+        )?;
         // Secret env never reaches children (threat-model ENV-1) unless a
-        // `[secrets]` entry grants it to `run_command` (#598).
+        // `[secrets]` entry grants it to `run_command` (#598). With a
+        // sandbox this scrubs the `bwrap` process, whose environment its
+        // child inherits.
         let release = self
             .release
             .clone()
             .unwrap_or_else(crate::secret_release::release);
         crate::subprocess::scrub_env_with(&mut cmd, "run_command", &release);
         crate::session_guard::mark(&mut cmd);
-        cmd.args(&argv[1..]).current_dir(&self.cwd);
+        cmd.current_dir(&self.cwd);
         let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -301,18 +322,11 @@ mod tests {
         // `rm -rf ./build` — running it against the SHARED temp dir
         // deleted any peer test's files living at <temp>/build. Each
         // run gets its own scratch jail with a `build` dir inside.
-        let jail = std::env::temp_dir().join(format!(
-            "tole-run-benign-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let jail = crate::test_dir::TestDir::new("tole-run-benign");
         std::fs::create_dir_all(jail.join("build")).unwrap();
         std::fs::write(jail.join("middleware.ts"), "x").unwrap();
         std::fs::write(jail.join("runbook.md"), "x").unwrap();
-        let t = RunCommandTool::new(jail.clone());
+        let t = RunCommandTool::new(jail.to_path_buf());
         for line in [
             "cat middleware.ts",
             "grep shutdown runbook.md",
@@ -410,9 +424,8 @@ mod tests {
     #[test]
     fn execute_cwd_is_jailed() {
         // The command sees the jail as its working directory.
-        let jail = std::env::temp_dir().join("tole-runcommand-jail");
-        std::fs::create_dir_all(&jail).unwrap();
-        let t = RunCommandTool::new(jail.clone());
+        let jail = crate::test_dir::TestDir::new("tole-runcommand-jail");
+        let t = RunCommandTool::new(jail.to_path_buf());
         let out = t.execute(json!({"command": "pwd"})).unwrap();
         // POSIX pwd prints the logical path; canonicalize both sides.
         let got = std::path::Path::new(out["stdout"].as_str().unwrap().trim())
@@ -524,10 +537,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_session_refuses_the_tole_binary() {
-        let dir = std::env::temp_dir().join(format!("tole-rc-684-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = RunCommandTool::new(dir.clone());
+        let dir = crate::test_dir::TestDir::new("tole-rc-684");
+        let t = RunCommandTool::new(dir.to_path_buf());
         assert!(!t.child_agent_mode);
         for line in [
             "tole cron resume job-1",
@@ -552,9 +563,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawned_commands_carry_the_session_marker() {
-        let dir = std::env::temp_dir().join(format!("tole-rc-684m-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = RunCommandTool::new(dir.clone());
+        let dir = crate::test_dir::TestDir::new("tole-rc-684m");
+        let t = RunCommandTool::new(dir.to_path_buf());
         let out = t
             .execute(json!({ "command": "sh -c 'printenv | grep ^TOLE_UNDER'" }))
             .unwrap();

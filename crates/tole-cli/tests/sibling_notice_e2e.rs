@@ -9,14 +9,34 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::{wait_until, TestDir, WAIT};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// The scenario is timing-based (B's edit must land inside A's 4 s slow
-/// step), so the tests in this file run one at a time.
+/// A model answer held until child B is done (see [`spawn_mock`]).
+const HELD: Duration = Duration::MAX;
+
+/// After B is done, A's held answer waits this long for A's watcher (it
+/// polls every 300 ms) to fold B's write and queue the notice.
+const WATCH_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Waits until `child` has read `shared.txt` (its touch is in the shared
+/// log): only then does B's edit count as a change after the read (#812).
+fn wait_for_read_by(log: &std::path::Path, child: &str) {
+    let needle = format!("\"a\":\"{child}\"");
+    wait_until(WAIT, &format!("{child}'s read in the touch log"), || {
+        std::fs::read_to_string(log).is_ok_and(|t| t.contains(&needle))
+    });
+}
+
+/// The tests in this file share one mock with a hold that waits for B, and
+/// the machine-wide touch log, so they run one at a time.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -90,7 +110,7 @@ fn final_text(t: &str) -> Value {
     completion(json!({"role": "assistant", "content": t}), "stop")
 }
 
-/// Content-driven: CHILD_A reads twice (the second model step is slow) and
+/// Content-driven: CHILD_A reads twice (the second model step is held) and
 /// reports whether a sibling notice reached it; CHILD_B overwrites the file.
 fn decide(body: &Value) -> (Value, Duration) {
     let msgs = body["messages"].as_array().cloned().unwrap_or_default();
@@ -112,10 +132,11 @@ fn decide(body: &Value) -> (Value, Duration) {
                 tool_call(1, "read_file", json!({"path": "shared.txt"})),
                 Duration::ZERO,
             ),
-            // The slow step: B changes the file while this answer is held.
+            // The held step: B changes the file while this answer is held,
+            // which lasts until B is done, however slow the machine is.
             1 => (
                 tool_call(2, "read_file", json!({"path": "shared.txt", "limit": 5})),
-                Duration::from_secs(4),
+                HELD,
             ),
             _ if notice_seen => (final_text("A_NOTICED"), Duration::ZERO),
             _ => (final_text("A_BLIND"), Duration::ZERO),
@@ -137,8 +158,11 @@ fn decide(body: &Value) -> (Value, Duration) {
 fn spawn_mock() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    // Set once the mock has answered B's last request (its write ran).
+    let b_done = Arc::new(AtomicBool::new(false));
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let b_done = b_done.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -162,7 +186,15 @@ fn spawn_mock() -> String {
                 }
                 let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
                 let (reply, delay) = decide(&body);
-                std::thread::sleep(delay);
+                if delay == HELD {
+                    wait_until(WAIT, "child B to finish", || b_done.load(Ordering::SeqCst));
+                    std::thread::sleep(WATCH_SETTLE);
+                } else {
+                    std::thread::sleep(delay);
+                }
+                if reply["choices"][0]["message"]["content"] == "B_DONE" {
+                    b_done.store(true, Ordering::SeqCst);
+                }
                 let (ctype, payload) = if streamed {
                     ("text/event-stream", completion_to_sse(&reply))
                 } else {
@@ -186,7 +218,9 @@ fn tole(
     id: &str,
     prompt: &str,
 ) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    // Hermetic HOME (#993) next to the workspace, shared by both children.
+    let home = ws.with_file_name("home");
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
     cmd.args(["run", "--allow", "write_file", "--"])
         .arg(prompt)
         .current_dir(ws)
@@ -208,8 +242,7 @@ fn tole(
 fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
     let _serial = serial();
     let base = spawn_mock();
-    let root = std::env::temp_dir().join(format!("tole-sibling-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = TestDir::new("tole-sibling-e2e");
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("shared.txt"), "original contents\n").unwrap();
@@ -219,7 +252,7 @@ fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
     let a = tole(&base, &ws, &log, "a-a", "CHILD_A: read shared.txt twice")
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_read_by(&log, "a-a");
 
     // Child B overwrites it while A is waiting.
     let b = tole(&base, &ws, &log, "a-b", "CHILD_B: overwrite shared.txt")
@@ -253,8 +286,7 @@ fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
 fn a_notice_reaches_child_a_via(face: &str) {
     let _serial = serial();
     let base = spawn_mock();
-    let root = std::env::temp_dir().join(format!("tole-sibling-{face}-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = TestDir::new(&format!("tole-sibling-{face}-e2e"));
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("shared.txt"), "original contents\n").unwrap();
@@ -308,7 +340,7 @@ fn a_notice_reaches_child_a_via(face: &str) {
                 .unwrap()
         }
     };
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_read_by(&log, "a-a");
 
     let b = tole(&base, &ws, &log, "a-b", "CHILD_B: overwrite shared.txt")
         .output()

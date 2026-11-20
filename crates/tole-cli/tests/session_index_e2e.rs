@@ -3,24 +3,17 @@
 //! project B, and `tole resume <id>` from B names the command to run in A.
 //! `CODECORA_HOME` is isolated per test.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
-static N: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-index-e2e-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-index-e2e-{tag}"))
 }
 
 /// Mock provider: every request gets the final answer `ok`.
@@ -82,16 +75,19 @@ fn spawn_mock() -> String {
 }
 
 fn tole(cwd: &Path, home: &Path, url: &str, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let path = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
+    let mut c = common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        home,
+        &[("PATH", path.to_str().unwrap())],
+    );
     c.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .env("CODECORA_HOME", home)
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_NO_SESSION_INDEX")
         .env_remove("TOLE_FALLBACK_BASE_URL")
         .env_remove("TOLE_MEMORY")

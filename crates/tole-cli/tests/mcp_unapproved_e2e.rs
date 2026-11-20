@@ -4,13 +4,16 @@
 //! those for any server its admission check did not accept).
 
 #![cfg(feature = "mcp")]
+// The fake servers are `#!/bin/sh` scripts.
+#![cfg(unix)]
 
+mod common;
+use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-mcp-unseen-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn tmp(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-mcp-unseen-{tag}"));
     std::fs::create_dir_all(d.join("home/tole")).unwrap();
     std::fs::create_dir_all(d.join("ws")).unwrap();
     d
@@ -18,22 +21,18 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 
 /// A "server" that only records that it was started.
 fn spy(dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let script = dir.join("spy.sh");
-    std::fs::write(
+    common::write_executable(
         &script,
         format!("#!/bin/sh\ntouch {}/started\nexit 1\n", dir.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     format!("spy={}", script.display())
 }
 
 fn run(dir: &Path, spec: &str) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), dir.join("home").as_path(), &[])
         .args(["run", "--mcp-server", spec, "hi"])
         .current_dir(dir.join("ws"))
-        .env("CODECORA_HOME", dir.join("home"))
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
@@ -112,19 +111,19 @@ fn a_changed_server_offers_no_prompts_in_chat() {
     );
     lock.save(&d.join("home/tole").join(tole_core::plugin_lock::LOCK_FILE))
         .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
-        .args(["chat", "--mcp-server", &spec])
-        .current_dir(d.join("ws"))
-        .env("CODECORA_HOME", d.join("home"))
-        .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
-        .env("TOLE_MODEL", "m")
-        .env("TOLE_API_KEY", "k")
-        .env("TOLE_NO_UPDATE_CHECK", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run tole chat");
+    let mut child =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), d.join("home").as_path(), &[])
+            .args(["chat", "--mcp-server", &spec])
+            .current_dir(d.join("ws"))
+            .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run tole chat");
     child
         .stdin
         .take()

@@ -2,17 +2,14 @@
 //! delegation log in the data dir, prints the tree redacted, and writes
 //! nothing.
 
-use std::path::PathBuf;
-use std::process::Command;
+mod common;
+use common::TestDir;
 
 use tole_cli::ledger_file::FileStore;
 use tole_core::delegation::{Budget, Delegation, Goal};
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-audit-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-audit-cli-{tag}"))
 }
 
 #[test]
@@ -42,11 +39,10 @@ fn tole_audit_reads_the_workspace_log_from_the_data_dir() {
     .unwrap();
     let before = std::fs::read(&log).unwrap();
     let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .arg("--workspace")
             .arg(&ws)
             .args(args)
-            .env("CODECORA_HOME", &home)
             .env("AUDIT_CLI_TOKEN", secret)
             .env("TOLE_NO_UPDATE_CHECK", "1")
             .output()

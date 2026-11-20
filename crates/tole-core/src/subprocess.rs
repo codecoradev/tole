@@ -10,6 +10,10 @@ use std::time::Duration;
 /// Default ceiling for tool subprocesses (mirrors cora_search's E4 value).
 pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How the runners below word a failure to start the child, so a caller can
+/// tell it from the child's own failure.
+pub const SPAWN_FAILED: &str = "failed to spawn subprocess";
+
 /// Per-stream capture ceiling: a hostile or chatty child must not be able
 /// to exhaust host memory before the timeout fires (CodeCora scan
 /// 2026-09-18). Generous on purpose — real tool output (diffs, logs) sits
@@ -97,6 +101,45 @@ pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &
     scrub_env_keeping(cmd, &|name| {
         keep.iter().any(|n| n.eq_ignore_ascii_case(name))
     })
+}
+
+/// The store directory a sibling `uteke` should use: `<CODECORA_HOME>/uteke`
+/// (uteke's own layout, `~/.codecora/uteke`, moved under the CodeCora root).
+/// `Ok(None)` when `CODECORA_HOME` is unset or empty (tole's own rule: empty
+/// counts as unset), so uteke keeps its default under `$HOME`, as tole's own
+/// data does. `Err` when `CODECORA_HOME` is set but not an absolute path:
+/// tole's own data is unresolvable then, and letting uteke fall back to the
+/// real `$HOME` store would be the leak this guards against (fail closed).
+pub fn uteke_store_dir() -> Result<Option<std::path::PathBuf>, String> {
+    if std::env::var("CODECORA_HOME").map_or(true, |v| v.is_empty()) {
+        return Ok(None);
+    }
+    match crate::paths::codecora_root() {
+        Some(root) => Ok(Some(root.join("uteke"))),
+        None => Err(
+            "CODECORA_HOME is not an absolute path: refusing to start uteke, \
+                     which would use the store under the real HOME"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Point a child `uteke` at tole's data root (#992). uteke resolves its
+/// store, embedding model, `uteke.toml` and logs from `--store`, then
+/// `UTEKE_HOME`, then `$HOME/.codecora/uteke`; it knows nothing of
+/// `CODECORA_HOME`. With `CODECORA_HOME` set this exports
+/// `UTEKE_HOME=<CODECORA_HOME>/uteke`, and refuses (`Err`, nothing spawned)
+/// when `CODECORA_HOME` is set but relative. A `UTEKE_HOME` the user set
+/// themselves is kept: it is a deliberate choice of store. Every tole spawn
+/// of `uteke` calls this and does not start the child on `Err`.
+pub fn point_uteke_at_data_dir(cmd: &mut Command) -> Result<&mut Command, String> {
+    if std::env::var("UTEKE_HOME").is_ok_and(|v| !v.is_empty()) {
+        return Ok(cmd);
+    }
+    if let Some(dir) = uteke_store_dir()? {
+        cmd.env("UTEKE_HOME", dir);
+    }
+    Ok(cmd)
 }
 
 fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
@@ -353,7 +396,7 @@ pub fn run_with_timeout_or_cancel(
         .stdin(Stdio::null());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
+        .map_err(|e| format!("{SPAWN_FAILED} (is it on PATH?): {e}"))?;
     let stdout_pipe = child.stdout.take().expect("stdout piped above");
     let stderr_pipe = child.stderr.take().expect("stderr piped above");
     let (tx_out, rx_out) = mpsc::channel();
@@ -408,7 +451,7 @@ pub fn run_with_timeout_stdin(
         .stdin(Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
+        .map_err(|e| format!("{SPAWN_FAILED} (is it on PATH?): {e}"))?;
     let mut stdin_pipe = child.stdin.take().expect("stdin piped above");
     let data = stdin_data.to_vec();
     let (tx_in, rx_in) = mpsc::channel();

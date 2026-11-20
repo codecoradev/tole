@@ -32,6 +32,20 @@ pub struct AgentTools {
     pub delegation: Option<crate::delegate::Setup>,
 }
 
+/// An MCP server a session did not start, and why (#946). The reason is
+/// built from the plugin lock's refusal text, never from the server's own
+/// output, and carries no secret.
+#[cfg(feature = "mcp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpNotice {
+    pub server: String,
+    pub reason: String,
+}
+
+/// Collects [`McpNotice`]s while the roster is built.
+#[cfg(feature = "mcp")]
+pub type McpNoticeSink = std::sync::Arc<std::sync::Mutex<Vec<McpNotice>>>;
+
 /// What a face asks of the roster.
 pub struct Roster {
     /// File-tool jail root; job logs live under it too.
@@ -49,6 +63,15 @@ pub struct Roster {
     /// MCP servers whose tools join the session (#74).
     #[cfg(feature = "mcp")]
     pub mcp_servers: Vec<tole_core::mcp::McpServerConfig>,
+    /// Where [`build`] reports the servers it did not start (#946), for a
+    /// face that records them in its session log. `None`: only stderr.
+    #[cfg(feature = "mcp")]
+    pub mcp_notices: Option<McpNoticeSink>,
+    /// Offer `mcp_read` (a ReadOnly tool over the resources of admitted
+    /// servers) when a server has resources. A server face turns it off: on
+    /// it every MCP tool is `Write` and goes through the approval gate.
+    #[cfg(feature = "mcp")]
+    pub mcp_resources: bool,
     /// Plan publishing (#196): only for a transport that renders plans.
     pub plan_emitter: Option<PlanEmitter>,
     /// Where finished background jobs nudge the session (#217).
@@ -69,6 +92,10 @@ impl Roster {
             agents: None,
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_notices: None,
+            #[cfg(feature = "mcp")]
+            mcp_resources: true,
             plan_emitter: None,
             job_notices: None,
             session: None,
@@ -108,7 +135,7 @@ pub fn binary_available(name: &str) -> bool {
 }
 
 /// Env var that turns on the probe notices below (#435).
-pub const VERBOSE_ENV: &str = "TOLE_VERBOSE";
+pub const VERBOSE_ENV: &str = tole_core::sandbox::report::VERBOSE_ENV;
 
 /// A probe miss (an optional binary or the GitHub origin is absent): an
 /// expected state on most machines, so it is printed only with
@@ -122,7 +149,7 @@ fn probe_notice(msg: &str) {
 
 #[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes run only with shell-tools
 fn verbose(env: &dyn Fn(&str) -> Option<String>) -> bool {
-    env(VERBOSE_ENV).is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    env(VERBOSE_ENV).is_some_and(|v| tole_core::sandbox::report::verbose_value(&v))
 }
 
 /// The review gate for this session (#534): `Some` only when the policy is
@@ -376,6 +403,18 @@ fn build_with_data_dir(
                 }),
             )?;
         }
+        // The agent-level approval tools (#714) exist where `delegate` does,
+        // in `chain` mode, for a level whose allow list grants them.
+        if host.grants_decide() {
+            add(
+                &mut reg,
+                Box::new(crate::delegate_decide::DelegatePendingTool { host: host.clone() }),
+            )?;
+            add(
+                &mut reg,
+                Box::new(crate::delegate_decide::DelegateDecideTool { host: host.clone() }),
+            )?;
+        }
         // The discussion tools (#588) exist exactly where `delegate` does:
         // the same host, so the same depth limit, and they need a provider.
         if let (Some(data), Some(pc)) = (
@@ -383,7 +422,11 @@ fn build_with_data_dir(
             crate::config_apply::provider_config(),
         ) {
             let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
-            let make = crate::discussion_host::factory(pc, secrets.clone());
+            let make = crate::discussion_host::factory(
+                pc,
+                secrets.clone(),
+                crate::config_apply::discussion_timeout(),
+            );
             let d = crate::discuss_tool::DiscussHost::new(
                 host.clone(),
                 data.join(tole_core::discussion_log::DISCUSSIONS_DIR),
@@ -589,10 +632,10 @@ fn build_with_data_dir(
     // The rug-pull guard (#599): a server registers only when its live
     // manifest matches its lock entry.
     #[cfg(feature = "mcp")]
-    let plugin_gate = crate::plugin_gate::Gate::load(
+    let plugin_gate = std::sync::Arc::new(crate::plugin_gate::Gate::load(
         tole_core::plugin_lock::Lockfile::user_path(),
         &roster.workspace,
-    );
+    ));
     #[cfg(feature = "mcp")]
     if !roster.mcp_servers.is_empty() {
         for n in &plugin_gate.notes {
@@ -606,26 +649,72 @@ fn build_with_data_dir(
         // The lock also binds them after connect (`check`), and the
         // server's process gets only the secrets its approval granted.
         let source = crate::plugin_gate::source_of(cfg);
+        let notice = |reason: String| {
+            if let Some(sink) = &roster.mcp_notices {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(McpNotice {
+                        server: cfg.name.clone(),
+                        reason,
+                    });
+            }
+        };
         if let Some(note) = plugin_gate.refuse_unseen(&cfg.name, &source) {
             eprintln!("tole: mcp[{}]: {note}", cfg.name);
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            notice(note);
             continue;
         }
+        // The refusal of the connect-time check, kept for the notice.
+        let refused = std::cell::RefCell::new(None::<String>);
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
-            plugin_gate.check(s, &source, v, t)
+            plugin_gate.check(s, &source, v, t).inspect_err(|e| {
+                *refused.borrow_mut() = Some(e.clone());
+            })
         };
         let mut cfg = cfg.clone();
         cfg.secret_grant = plugin_gate.secret_grant(&cfg.name);
+        // The sandbox binds THIS session's workspace (#601), never a
+        // process-wide one.
+        cfg.workspace = Some(roster.workspace.clone());
         let cfg = &cfg;
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
+        // Lazy start (#750, opt-in): a locked, sandbox-wrapped stdio server
+        // with a complete, consistent snapshot registers from it; anything
+        // else starts eagerly as before.
+        let lazy = lazy_snapshot(cfg, &plugin_gate);
+        let names = match lazy {
+            Some(tools) => {
+                let (pre, post) = (
+                    std::sync::Arc::clone(&plugin_gate),
+                    std::sync::Arc::clone(&plugin_gate),
+                );
+                let (name, source2) = (cfg.name.clone(), source.clone());
+                let guard = tole_core::mcp::LazyGuard {
+                    pre_start: Box::new(move || {
+                        pre.refuse_unseen(&name, &source2).map_or(Ok(()), Err)
+                    }),
+                    admit: Box::new(move |s, v, t| post.check(s, &source, v, t)),
+                };
+                tole_core::mcp::register_server_tools_lazy(&mut reg, cfg, &secrets, tools, guard)
+            }
+            None => tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit),
+        };
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;
         }
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            notice(refused.take().unwrap_or_else(|| {
+                "it did not start or list its tools (a failed start, or no sandbox could wrap \
+                 it: with no human attached an optional sandbox counts as required)"
+                    .to_string()
+            }));
         }
         // #680: only a server this session admitted is asked for resources.
-        if reg.mcp_admitted(&cfg.name) && tole_core::mcp::probe_server_extras(cfg).resources {
+        if roster.mcp_resources
+            && reg.mcp_admitted(&cfg.name)
+            && tole_core::mcp::probe_server_extras(cfg).resources
+        {
             resource_servers.push(cfg.name.clone());
         }
     }
@@ -633,7 +722,10 @@ fn build_with_data_dir(
     if !resource_servers.is_empty() {
         add(
             &mut reg,
-            Box::new(tole_core::mcp::McpReadTool::new(resource_servers)),
+            Box::new(
+                tole_core::mcp::McpReadTool::new(resource_servers)
+                    .in_workspace(roster.workspace.clone()),
+            ),
         )?;
     }
     // Review gate (#534): on only when the agent can actually get a review.
@@ -667,6 +759,25 @@ fn build_with_data_dir(
         keep_read_only(&mut reg, env)?;
     }
     Ok(reg)
+}
+
+/// The snapshot a server registers from when lazy start applies (#750):
+/// `[sandbox] lazy_start` is on, the sandbox wraps this stdio server, and its
+/// lock entry stored a complete snapshot that hashes to the entry's
+/// manifest hash. `None`: start it eagerly.
+#[cfg(feature = "mcp")]
+fn lazy_snapshot(
+    cfg: &tole_core::mcp::McpServerConfig,
+    gate: &crate::plugin_gate::Gate,
+) -> Option<Vec<(String, String)>> {
+    if !tole_core::sandbox::lazy_start()
+        || !matches!(cfg.transport, tole_core::mcp::McpTransport::Stdio { .. })
+        || !cfg.conn_key().contains('@')
+    {
+        return None;
+    }
+    let e = gate.entries().get(&cfg.name)?;
+    tole_core::mcp::lazy_tools(&e.manifest, &e.manifest_hash)
 }
 
 /// Plan mode: only ReadOnly tools stay. A delegated child in plan mode (an
@@ -724,10 +835,9 @@ mod tests {
         }
     }
 
-    fn workspace(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-roster-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn workspace(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-roster-{tag}"))
     }
 
     fn names(reg: &ToolRegistry) -> Vec<String> {
@@ -741,9 +851,13 @@ mod tests {
     #[test]
     fn destructive_only_behind_an_interactive_approver() {
         let ws = workspace("destructive");
-        let human = build(Human, Roster::new(ws.clone())).unwrap();
+        let human = build(Human, Roster::new(ws.to_path_buf())).unwrap();
         assert!(human.get("delete_file").is_some());
-        let server = build(AllowlistApprover::allow_only(vec![]), Roster::new(ws)).unwrap();
+        let server = build(
+            AllowlistApprover::allow_only(vec![]),
+            Roster::new(ws.to_path_buf()),
+        )
+        .unwrap();
         assert!(server.get("delete_file").is_none());
         assert!(server.get("write_file").is_some());
     }
@@ -763,7 +877,7 @@ mod tests {
             (&none as &dyn Fn(&str) -> Option<String>, false),
             (&with, true),
         ] {
-            let mut reg = build(Human, Roster::new(ws.clone())).unwrap();
+            let mut reg = build(Human, Roster::new(ws.to_path_buf())).unwrap();
             assert!(reg.get("write_file").is_some());
             keep_read_only(&mut reg, env).unwrap();
             assert_eq!(reg.get("delegate_report").is_some(), report);
@@ -780,7 +894,7 @@ mod tests {
     #[test]
     fn plan_mode_leaves_only_read_only_tools() {
         let ws = workspace("plan");
-        let mut roster = Roster::new(ws);
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.plan_mode = true;
         roster.agents = Some(AgentTools::default());
         let reg = build(Human, roster).unwrap();
@@ -797,9 +911,9 @@ mod tests {
     #[test]
     fn agent_tools_only_when_the_face_allows_children() {
         let ws = workspace("agents");
-        let none = build(Human, Roster::new(ws.clone())).unwrap();
+        let none = build(Human, Roster::new(ws.to_path_buf())).unwrap();
         assert!(none.get("agent_start").is_none());
-        let mut roster = Roster::new(ws);
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools::default());
         let parent = build(Human, roster).unwrap();
         // A test process is never a child (no TOLE_AGENT_DEPTH).
@@ -813,15 +927,15 @@ mod tests {
     fn discussion_tools_come_only_with_delegate_and_a_provider() {
         let ws = workspace("discuss-roster");
         let all = ["discuss", "discuss_status", "discuss_stop"];
-        for roster in [Roster::new(ws.clone()), {
-            let mut r = Roster::new(ws.clone());
+        for roster in [Roster::new(ws.to_path_buf()), {
+            let mut r = Roster::new(ws.to_path_buf());
             r.agents = Some(AgentTools::default());
             r
         }] {
             let reg = build(Human, roster).unwrap();
             assert!(all.iter().all(|t| reg.get(t).is_none()));
         }
-        let mut roster = Roster::new(ws.clone());
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools {
             delegation: Some(crate::delegate::Setup {
                 data_dir: Some(ws.join("data")),
@@ -834,7 +948,7 @@ mod tests {
         let provider = crate::config_apply::provider_config().is_some();
         assert!(all.iter().all(|t| reg.get(t).is_some() == provider));
         // Plan mode registers no agent tools at all, so no discussion.
-        let mut plan = Roster::new(ws);
+        let mut plan = Roster::new(ws.to_path_buf());
         plan.agents = Some(AgentTools {
             delegation: Some(crate::delegate::Setup::default()),
             ..AgentTools::default()
@@ -844,20 +958,70 @@ mod tests {
         assert!(all.iter().all(|t| reg.get(t).is_none()));
     }
 
+    /// #714: the agent-level approval tools come with `delegate`, in `chain`
+    /// mode, for a level whose allow list grants them; never in `off` or
+    /// `owner` mode, without the grant, or in plan mode.
+    #[test]
+    fn approval_tools_come_only_in_chain_mode_with_a_grant() {
+        let ws = workspace("decide-roster");
+        let build_with = |mode: &str, allows: &[&str], plan: bool| {
+            let cfg = crate::config::parse(
+                &format!("[delegation]\napprovals = \"{mode}\"\n"),
+                std::path::Path::new("u.toml"),
+            )
+            .unwrap();
+            let mut roster = Roster::new(ws.to_path_buf());
+            roster.agents = Some(AgentTools {
+                parent_allows: allows.iter().map(|s| s.to_string()).collect(),
+                delegation: Some(crate::delegate::Setup {
+                    cfg,
+                    data_dir: Some(ws.join("data")),
+                    ..Default::default()
+                }),
+                ..AgentTools::default()
+            });
+            roster.plan_mode = plan;
+            build(Human, roster).unwrap()
+        };
+        let both = |reg: &ToolRegistry| {
+            (
+                reg.get("delegate_pending").map(|t| t.risk()),
+                reg.get("delegate_decide").map(|t| t.risk()),
+            )
+        };
+        let reg = build_with("chain", &["delegate_decide"], false);
+        assert!(reg.get("delegate").is_some());
+        assert_eq!(both(&reg), (Some(Risk::ReadOnly), Some(Risk::Write)));
+        for (mode, allows) in [
+            ("off", &["delegate_decide"][..]),
+            ("owner", &["delegate_decide"][..]),
+            ("chain", &[][..]),
+            ("chain", &["write_file"][..]),
+        ] {
+            let reg = build_with(mode, allows, false);
+            assert!(reg.get("delegate").is_some(), "{mode}");
+            assert_eq!(both(&reg), (None, None), "{mode} {allows:?}");
+        }
+        assert_eq!(
+            both(&build_with("chain", &["delegate_decide"], true)),
+            (None, None)
+        );
+    }
+
     /// #581: `cron_create` is a session face's tool. A cron run (no
     /// agents) and a plan-mode session never have it.
     #[cfg(feature = "shell-tools")]
     #[test]
     fn cron_create_only_where_a_face_allows_agents() {
         let ws = workspace("cron-create");
-        assert!(build(Human, Roster::new(ws.clone()))
+        assert!(build(Human, Roster::new(ws.to_path_buf()))
             .unwrap()
             .get("cron_create")
             .is_none());
-        let mut roster = Roster::new(ws.clone());
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools::default());
         assert!(build(Human, roster).unwrap().get("cron_create").is_some());
-        let mut plan = Roster::new(ws);
+        let mut plan = Roster::new(ws.to_path_buf());
         plan.agents = Some(AgentTools::default());
         plan.plan_mode = true;
         assert!(build(Human, plan).unwrap().get("cron_create").is_none());
@@ -873,8 +1037,8 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let project = home.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let with = |ws: &PathBuf, agents: bool| {
-            let mut r = Roster::new(ws.clone());
+        let with = |ws: &std::path::Path, agents: bool| {
+            let mut r = Roster::new(ws.to_path_buf());
             if agents {
                 r.agents = Some(AgentTools::default());
             }

@@ -18,8 +18,11 @@
 //! differences between a crashed run and a clean one; the *content* must
 //! be identical. That is the E5 acceptance criterion.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::machine::{begin, ReplaySafety};
@@ -77,11 +80,8 @@ fn registry(with_hang: bool) -> ToolRegistry {
     r
 }
 
-fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-e5-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("cora-e5-{name}"))
 }
 
 /// Canonical golden rendering of a session: the durable content only.
@@ -232,21 +232,17 @@ fn sigkill_mid_sandwich_resumes_to_same_result() {
         .unwrap();
     // The child commits: user message, ToolCall transition, begin (intent
     // + pending). Then it parks inside the tool. Poll for those 4 lines.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    let reached = test_dir::poll_until(test_dir::WAIT, || {
         let n = std::fs::read_to_string(&file)
             .map(|c| c.lines().count())
             .unwrap_or(0);
-        if n >= 4 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "child never reached the effect window; file so far: {:?}",
-            std::fs::read_to_string(&file).unwrap_or_default()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+        (n >= 4).then_some(())
+    });
+    assert!(
+        reached.is_some(),
+        "child never reached the effect window; file so far: {:?}",
+        std::fs::read_to_string(&file).unwrap_or_default()
+    );
     child.kill().unwrap();
     child.wait().unwrap();
 

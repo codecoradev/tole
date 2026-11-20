@@ -6,7 +6,7 @@
 //! alongside the regular registry tools. rmcp's
 //! `StreamableHttpService` is a tower Service; it is served with hyper
 //! directly (no axum — the smallest HTTP stack that can host a tower
-//! Service) behind the same bearer-token auth as the REST transport.
+//! Service) behind the same `Authenticator` (bearer token, or Basic with `--auth basic`) as the REST transport.
 //!
 //! Wire: hyper accept loop → auth check (401 pre-routing) →
 //! StreamableHttpService (MCP JSON-RPC + SSE) → RegistryServer (with
@@ -56,7 +56,7 @@ where
 pub async fn run_mcp_http(
     bind: &str,
     port: u16,
-    token: &str,
+    auth: tole_cli::auth::Authenticator,
     allow_patterns: Vec<String>,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
@@ -133,7 +133,7 @@ pub async fn run_mcp_http(
     const SERVE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
-    let token = token.to_string();
+    let auth = Arc::new(auth);
     // Failed-auth limiter shared by every connection (same policy as REST).
     let limiter = Arc::new(tole_cli::auth::AuthLimiter::new());
     loop {
@@ -156,35 +156,39 @@ pub async fn run_mcp_http(
             continue;
         };
         let svc = svc.clone();
-        let token = token.clone();
+        let auth = Arc::clone(&auth);
         tokio::spawn(async move {
             // Hold the permit for the whole connection; dropped on close.
             let _permit = permit;
             let io = TokioIo::new(stream);
             let svc_for_conn = svc.clone();
-            let token_for_conn = token.clone();
+            let auth_for_conn = Arc::clone(&auth);
             let limiter_for_conn = Arc::clone(&limiter);
             let hyper_service =
                 hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let svc = svc_for_conn.clone();
-                    let token = token_for_conn.clone();
+                    let auth = Arc::clone(&auth_for_conn);
                     let limiter = Arc::clone(&limiter_for_conn);
                     async move {
                         use http_body_util::BodyExt;
-                        // Bearer-token gate BEFORE the MCP service sees
+                        // Auth gate (`Authenticator`, #742) BEFORE the MCP service sees
                         // anything (#137 auth surface): constant-time
                         // comparison, and a per-IP limiter on failures —
                         // both shared with the REST transport. The header
                         // read itself is bounded by `header_read_timeout`
                         // on the connection below.
                         let limited = limiter.is_limited(peer_ip);
-                        let auth = !limited
-                            && tole_cli::auth::bearer_matches(
-                                req.headers()
-                                    .get(hyper::header::AUTHORIZATION)
-                                    .and_then(|v| v.to_str().ok()),
-                                &token,
-                            );
+                        // Basic costs a PBKDF2 run: off the async workers.
+                        let header = req
+                            .headers()
+                            .get(hyper::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let challenge = auth.challenge();
+                        let authed = !limited
+                            && tokio::task::spawn_blocking(move || auth.check(header.as_deref()))
+                                .await
+                                .unwrap_or(false);
                         // Unified response body type for both arms.
                         type RespBody = http_body_util::combinators::BoxBody<
                             hyper::body::Bytes,
@@ -195,16 +199,22 @@ pub async fn run_mcp_http(
                                 .map_err(|never| match never {})
                                 .boxed()
                         }
-                        if !auth {
+                        if !authed {
                             let (status, msg) = if limited {
                                 (429, "{\"error\":\"too many failed auth attempts\"}")
                             } else {
                                 limiter.record_failure(peer_ip);
                                 (401, "{\"error\":\"unauthorized\"}")
                             };
-                            let resp = hyper::Response::builder()
+                            let mut builder = hyper::Response::builder()
                                 .status(status)
-                                .header("content-type", "application/json")
+                                .header("content-type", "application/json");
+                            if status == 401 {
+                                if let Some(c) = challenge {
+                                    builder = builder.header("www-authenticate", c);
+                                }
+                            }
+                            let resp = builder
                                 .body(box_full(hyper::body::Bytes::from(msg)))
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
                             return Ok::<_, std::io::Error>(resp);

@@ -8,23 +8,18 @@
 //! request bodies; `uteke` on PATH is a fake that logs its argv.
 #![cfg(all(unix, feature = "shell-tools"))]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-cron-prof-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-cron-prof")
 }
 
 fn text(b: &[u8]) -> String {
@@ -104,6 +99,7 @@ struct Env {
     bin: PathBuf,
     url: String,
     /// Run the child with TOLE_SKILL_APPROVAL=required.
+    _root: TestDir,
     required: std::cell::Cell<bool>,
     /// Leave TOLE_SKILL_APPROVAL unset (the default: required).
     default_approval: std::cell::Cell<bool>,
@@ -117,6 +113,7 @@ impl Env {
             cron: root.join("cron"),
             work: root.join("work"),
             bin: root.join("bin"),
+            _root: root,
             url: url.to_string(),
             required: std::cell::Cell::new(false),
             default_approval: std::cell::Cell::new(false),
@@ -143,12 +140,10 @@ impl Env {
     }
 
     fn tole(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &self.home, &[]);
         c.args(args)
             .current_dir(&self.work)
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", &self.home)
-            .env("HOME", &self.home)
             .env("TOLE_CRON_DIR", &self.cron)
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("TOLE_STREAM", "0")
@@ -220,12 +215,10 @@ fn a_profiled_job_runs_with_persona_model_skills_and_memory_room() {
     // A fake uteke: logs its argv, recalls nothing.
     let log = e.bin.join("uteke.log");
     let fake = e.bin.join("uteke");
-    std::fs::write(
+    common::write_executable(
         &fake,
         format!("#!/bin/sh\necho \"$@\" >> {}\necho '[]'\n", log.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    );
 
     let out = e.ok(&[
         "cron",

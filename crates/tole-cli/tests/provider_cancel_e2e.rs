@@ -3,10 +3,11 @@
 //! call that is already in flight, instead of waiting for the provider to
 //! answer. Real `tole` binary against a mock that stays silent for a while.
 
+mod common;
+use common::TestDir;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// How long the slow mock stays silent before answering.
@@ -68,16 +69,13 @@ fn serve(text: &'static str, delay: Duration, stream: bool) -> String {
     format!("http://{addr}/v1")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cancel-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cancel-e2e-{tag}"))
 }
 
 fn tole(dir: &std::path::Path, base: &str, stream: bool, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
-        .arg("--sessions-dir")
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.join("home"), &[]);
+    cmd.arg("--sessions-dir")
         .arg(dir.join("sessions"))
         .args(args)
         .current_dir(dir)
@@ -90,9 +88,8 @@ fn tole(dir: &std::path::Path, base: &str, stream: bool, args: &[&str]) -> std::
         .env_remove("TOLE_TRUST")
         .env_remove("OPENAI_BASE_URL")
         .env_remove("OPENAI_API_KEY")
-        .env_remove("OPENAI_MODEL")
-        .output()
-        .unwrap()
+        .env_remove("OPENAI_MODEL");
+    cmd.output().unwrap()
 }
 
 fn cancel_while_silent(stream: bool) {

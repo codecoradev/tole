@@ -13,13 +13,18 @@
 //!   `TOLE_CRON_JOB`/`TOLE_CRON_FIRE`/`TOLE_CRON_STATUS` set. Trust-gated:
 //!   only a job saved by a human through the CLI (`created_by = cli`) may
 //!   run one; any other job is `blocked` (`delivery_untrusted`).
+//! - `webhook:<name>` (#911): a signed POST to a destination the owner
+//!   declared in `[webhook_out.<name>]` of the user config. The job names the
+//!   destination and nothing else; a job created by an agent may only name
+//!   one whose `allow_agent_jobs` is set (`delivery_untrusted` otherwise).
+//!   Nothing is sent from here: the producer (`cron::webhook`) appends the
+//!   event to the outbox and the sender writes the ledger row when it settles.
 //!
 //! Empty output, or a first line of `[SILENT]`, delivers nothing (every
 //! target records `skipped`).
 
 use std::io::Write;
 use std::path::{Component, Path};
-use std::process::Command;
 use std::time::Duration;
 
 use tole_core::ledger::{DeliveryStatus, Job, RunStatus};
@@ -37,6 +42,8 @@ pub enum Target {
     Session,
     File(String),
     Command(String),
+    /// The name of a `[webhook_out.<name>]` destination.
+    Webhook(String),
 }
 
 impl Target {
@@ -67,8 +74,18 @@ impl Target {
                 tole_core::subprocess::check_destructive_argv(&argv)?;
                 Ok(Target::Command(line.to_string()))
             }
+            Some(("webhook", name)) => {
+                if !crate::webhook_out::valid_name(name) {
+                    return Err(format!(
+                        "webhook target `{name}`: a destination name is 1-{} of [a-z0-9_-]",
+                        crate::webhook_out::MAX_NAME
+                    ));
+                }
+                Ok(Target::Webhook(name.to_string()))
+            }
             _ => Err(format!(
-                "unknown delivery target `{spec}` (log, session, file:PATH or command:ARGV)"
+                "unknown delivery target `{spec}` (log, session, file:PATH, command:ARGV or \
+                 webhook:NAME)"
             )),
         }
     }
@@ -80,6 +97,7 @@ impl Target {
             Target::Session => "session".into(),
             Target::File(p) => format!("file:{p}"),
             Target::Command(c) => format!("command:{c}"),
+            Target::Webhook(n) => format!("webhook:{n}"),
         }
     }
 }
@@ -113,24 +131,72 @@ pub fn targets(job: &Job) -> Result<Vec<Target>, String> {
 }
 
 /// Pre-dispatch check (P10): `Err((code, detail))` blocks the occurrence
-/// before anything runs.
-pub fn check(job: &Job) -> Result<(), (&'static str, String)> {
+/// before anything runs. Pure: it runs under the host lock, so it reads no
+/// config and no secret. `webhooks` is the destination map the host loaded at
+/// start (`None`: a standalone tick that loaded none, so a webhook target is
+/// refused, never guessed).
+pub fn check(
+    job: &Job,
+    webhooks: Option<&crate::webhook_out::Destinations>,
+) -> Result<(), (&'static str, String)> {
     let targets = targets(job).map_err(|e| ("delivery_invalid", e))?;
     let trusted = field(job, "created_by") == Some("cli");
-    match targets.iter().find(|t| matches!(t, Target::Command(_))) {
-        Some(t) if !trusted => Err((
-            "delivery_untrusted",
-            format!(
-                "`{}` runs a command, which only a job saved with `tole cron create` may do",
-                t.spec()
-            ),
-        )),
-        _ => Ok(()),
+    if let Some(t) = targets.iter().find(|t| matches!(t, Target::Command(_))) {
+        if !trusted {
+            return Err((
+                "delivery_untrusted",
+                format!(
+                    "`{}` runs a command, which only a job saved with `tole cron create` may do",
+                    t.spec()
+                ),
+            ));
+        }
     }
+    for t in &targets {
+        let Target::Webhook(name) = t else { continue };
+        let dest = webhooks.and_then(|w| w.get(name)).ok_or_else(|| {
+            (
+                "delivery_invalid",
+                format!(
+                    "`{}` names no webhook destination this process loaded: declare \
+                     [webhook_out.{name}] in the user config (a running `tole serve` loads it \
+                     at start)",
+                    t.spec()
+                ),
+            )
+        })?;
+        if !dest
+            .events
+            .contains(&crate::webhook_out::Event::CronRunFinished)
+        {
+            return Err((
+                "delivery_invalid",
+                format!(
+                    "webhook destination `{name}` does not list `cron_run_finished` in its events"
+                ),
+            ));
+        }
+        // An agent can put anything it read into a job's output, so letting
+        // it pick a third-party sink by default would be an exfiltration
+        // channel the owner never opted into.
+        if !trusted && !dest.allow_agent_jobs {
+            return Err((
+                "delivery_untrusted",
+                format!(
+                    "`{}` sends to a webhook destination, which a job created by an agent may \
+                     only do when the destination sets allow_agent_jobs = true",
+                    t.spec()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What a delivery is told about its run.
 pub struct RunInfo<'a> {
+    /// The cron dir (the sandbox keeps a command apart from it).
+    pub cron_dir: &'a Path,
     pub job: &'a Job,
     pub fire_id: &'a str,
     pub scheduled_for: i64,
@@ -165,6 +231,12 @@ pub fn deliver(
         Target::Log | Target::Session => Ok(()),
         Target::File(p) => append_file(run, p),
         Target::Command(line) => run_command(run, line),
+        // Never reached from the tick (a webhook target goes to the outbox,
+        // see `cron::webhook`): if something calls this, fail visibly and
+        // never claim `sent`.
+        Target::Webhook(_) => {
+            Err("not_implemented: a webhook target is queued, not sent here".to_string())
+        }
     };
     match result {
         Ok(()) => (DeliveryStatus::Sent, None),
@@ -249,20 +321,28 @@ fn safe_parent(root: &Path, dir: &Path) -> Result<std::path::PathBuf, String> {
 fn run_command(run: &RunInfo<'_>, line: &str) -> Result<(), String> {
     let argv = tole_core::run_command::RunCommandTool::split_argv(line)?;
     tole_core::subprocess::check_destructive_argv(&argv)?;
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(w) = field(run.job, "workdir") {
-        cmd.current_dir(w);
-    }
-    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
-    cmd.env("TOLE_CRON_JOB", &run.job.id)
+    // The one launcher (#748 slice 3): plain, or in the sandbox when
+    // `[sandbox.consumers] cron` is on (the job's workdir is the workspace; the
+    // network and every other grant are the profile's, never widened here).
+    let mut prepared = super::launch::prepare(run.job, &argv, run.cron_dir)?;
+    prepared
+        .cmd
+        .env("TOLE_CRON_JOB", &run.job.id)
         .env("TOLE_CRON_FIRE", run.fire_id)
         .env("TOLE_CRON_STATUS", status_text(run.status));
-    let out = tole_core::subprocess::run_with_timeout_stdin(
-        &mut cmd,
+    let out = match tole_core::subprocess::run_with_timeout_stdin(
+        &mut prepared.cmd,
         COMMAND_TIMEOUT,
         run.output.as_bytes(),
-    )?;
+    ) {
+        Ok(o) => o,
+        Err(e) => return Err(prepared.spawn_failure(e)),
+    };
+    // The launcher failing is a failed delivery that says so, not the
+    // command's own exit.
+    if let Some(why) = prepared.launcher_failure(&out) {
+        return Err(why);
+    }
     if out.status.success() {
         return Ok(());
     }
