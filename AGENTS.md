@@ -21,9 +21,10 @@ continuity, infra facts.
   tokens and string table (#1028). Not published. No GUI toolkit and no tole
   dependency, so the compiler keeps the toolkit out of it.
 - `crates/tole-desktop` — the native desktop client (`tole-desktop` binary):
-  the `ui` module renders the model. Not published. A thin client of
-  `tole serve`: it never depends on the session host (`tole-cli`),
-  `tole-core` or `tole-tui`.
+  the `ui` module renders the model; the GPUI toolkit is behind the
+  off-by-default `gpui` feature, so `cargo test --workspace` does not build it.
+  Not published. A thin client of `tole serve`: it never depends on the
+  session host (`tole-cli`), `tole-core` or `tole-tui`.
 - `docs/` — architecture, PRD, epics (roadmap + tracking issues), threat
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live

@@ -8,12 +8,28 @@ repository.workspace = true
 # Not published: the desktop ships as an application, not as a library.
 publish = false
 
-# No tole dependency beyond the desktop's own model crate. When the typed
+# No tole dependency yet beyond the desktop's own model crate. When the typed
 # client crate (#1040) is on develop the desktop depends on it and on nothing
 # else from tole: never on `tole-core`, `tole-tui` or `tole-cli` (the session
-# host).
+# host). `scripts/desktop-check.sh deps` checks the resolved dependency graph
+# (cargo metadata), so renames, target tables and spelling do not matter.
+#
+# The GUI toolkit is behind the `gpui` feature, off by default, so
+# `cargo test --workspace` never builds it. Every pin is exact (`=`),
+# optional and from crates.io, and only `src/ui/adapter.rs` names these crates,
+# so an upgrade changes this block and that file. `gpui-component` 0.9.1
+# depends on `gpui-pre =0.3.12`, a crates.io snapshot of Zed's GPUI whose
+# library is named `gpui`; the `gpui` and `gpui_platform` pins below must stay
+# equal to that version.
+[features]
+default = []
+gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
+
 [dependencies]
 tole-desktop-model = { version = "0.12.0", path = "../tole-desktop-model" }
+gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", optional = true, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { version = "=0.9.1", optional = true }
 
 [lib]
 name = "tole_desktop"
