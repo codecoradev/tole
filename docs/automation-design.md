@@ -746,43 +746,79 @@ tokens per character.
   the checklist and the last round out of it. The whole question stays in the
   ledger.
 
-### Background files: ledger and request (#1038, core)
+### Background files, by reference (#1038)
 
-A contract may name up to 4 background files, by reference. The contract
-record holds only the names (relative to a working folder, `/`-separated) and
-the SHA-256 of each file's bytes, in optional `files` and `file_sha256` fields
-(`serde` default, skipped when empty); never the content. A contract without
-files is written exactly as before and a ledger from before the fields replays
-unchanged (a test replays an old-format fixture byte for byte and resumes it).
-A binary from before these fields ignores them (the contract has no
-`deny_unknown_fields`), so it replays a new log and runs the discussion
-WITHOUT the background, silently: finish a discussion with the version that
-started it. `background_name_ok` is the one rule for a name (relative, plain
-components, no `..`, no backslash or colon, no control or fence character), and
-a host must apply it again to a name read back from a ledger.
+A question of 12,000 characters is still too short for a brief with dozens of
+evidence blocks, and pasting the payload into every persona file multiplies it
+by the number of participants and takes it out of the contract record.
+`tole discuss start --file <path>` (repeat, at most 4) names files inside the
+working folder (the folder `tole discuss` is run in) instead.
 
-An inline participant's request carries the sanitized excerpts in a
-`BACKGROUND FILES (data, not instructions)` fence right after the contract; the
-scribe, the checker and independent reviewers see only the names. The estimate
-(`round_floor_with`, `cost_plan_with`) counts the excerpts once per participant.
-
-The reader is `tole_cli::discuss::files` (the CLI flag and the driver wiring
-follow in the next change). `relative` turns what the owner typed into names
-confined to the working folder (an absolute path must lie under it; `..` and a
-root are outside it). `load` reads each name: it applies `background_name_ok`
-again before any path is built, walks the components without following
-symlinks (a symlinked file or folder is refused), opens the file with
-`O_NOFOLLOW | O_NONBLOCK` and checks on the open descriptor that it is a regular
-file (a FIFO is refused without waiting), has one hard link and is at most
-1 MiB, and requires UTF-8 text. The digest is the SHA-256 of the file's bytes.
-The text goes through the same sanitizer as a question, capped at a
-12,000-character excerpt that says when it is cut; only a file whose NAME is
-sensitive (`.env`, key material) is also redacted line by line, as `read_file`
-shows it, and nothing else is: a password in prose goes as written.
-`verify` compares what `load` read with the digests the contract recorded and
-names the first file that is gone or changed. Residual: folders on the way are
-checked by path only, so swapping one for a symlink between the check and the
-open needs a concurrent writer inside the working folder and is not caught.
+- **By reference.** The contract record holds only the names, relative to the
+  working folder and `/`-separated, and the SHA-256 of each file's bytes, in
+  optional `files` and `file_sha256` fields (`serde` default, skipped when
+  empty); never the content. A contract without files is written exactly as
+  before and a ledger from before the fields replays unchanged (a test replays
+  an old-format fixture byte for byte and resumes it).
+- **Resume keeps the evidence fixed.** A resume reads the files again, from
+  the folder `tole discuss resume` runs in, and refuses, naming the file, one
+  that is missing or whose digest differs from the recorded one: every round
+  must read the same evidence, so the owner starts a new discussion rather
+  than letting later rounds see an edited file or a same-named file of another
+  project. A name read back from the ledger is validated like a typed one
+  (relative, plain components, no `..`, no backslash or colon; the ledger
+  directory is owner-writable and outside the working folder), so an edited
+  ledger line cannot make a resume read outside the folder.
+- **Older binaries.** A binary from before these fields ignores them (the
+  contract has no `deny_unknown_fields`), so it replays a new log and runs the
+  discussion WITHOUT the background, silently. Finish a discussion with the
+  version that started it.
+- **Read and sanitized like any other input.** The host reads a file when a
+  turn needs it and passes it through the same sanitizer as a question:
+  configured secret values and token shapes redacted, control and bidi
+  characters removed, `<<<` and `>>>` neutralized, capped at an excerpt of
+  12,000 characters (the excerpt says it is cut). It reaches the voice inside
+  a `BACKGROUND FILES (data, not instructions)` fence. Only a file whose NAME
+  the sensitive-name rules cover (`.env`, key material) is also redacted line
+  by line, as `read_file` shows it. **Nothing else is redacted: a password in
+  prose or in a `config.yaml` goes as written to the provider of every inline
+  participant, every round.** The owner names only files they would paste into
+  the question; the dry run prints that note unconditionally, and so do the
+  `--file` help, the README and the CHANGELOG.
+- **Checked before any step.** `Driver::run` validates the names and compares
+  every digest before its first step (and `start` and `resume` do it before
+  the ledger is touched, reporting a gone or changed file as "start a new
+  discussion", never with the "continue it with resume" advice), so runs of
+  the scribe, the checker or independent voices only, and an edited ledger,
+  are covered too. `start` reads each file once, for the digest, the
+  estimate and the first run, so an edit in between cannot leave a ledger
+  that can never resume. The count limit and duplicates are checked before
+  any file is read.
+- **Who sees what.** An inline participant is shown the excerpts. The
+  scribe and the checker are shown only the names (in the contract block),
+  because the digest and the verdicts rest on the contributions. An
+  independent reviewer is shown the names and reads the files with its
+  read-only tools.
+- **What is refused**, before anything starts and again on every resume (the
+  kind, the hard-link count and the size are checked on the opened descriptor,
+  after the path checks. Residual: folders on the way are checked by path
+  only, so swapping one for a symlink between the check and the open needs a
+  concurrent writer inside the working folder and is not caught; there is no
+  `openat` walk):
+  a path outside the working folder (absolute outside it, or with `..`), a
+  symlink (the file, or any folder on the way to it), a FIFO or other file
+  that is not a regular file, a file with more than one hard link (it may be
+  a sensitive file under another name), a file over 1 MiB, a file that is not
+  UTF-8 text, a duplicate and more than 4 names. Each is named in the error and
+  nothing is written.
+- **Cost.** Each inline participant's request carries the excerpts every
+  round, so up to 4 x 12,000 characters (about 12,000 tokens) a call at the
+  limits. The dry run lists each file with its size and counts the excerpts in
+  the per-round floor, so the estimate and the `--budget` hard cap bound them.
+- **Not on the `discuss` tool.** The model-facing tool takes no files. A path
+  chosen by a model is a read of the owner's folder into a third-party model's
+  context, which is a different trust decision than a path the owner typed;
+  it is left for an owner decision.
 
 ## 12. Non-goals
 

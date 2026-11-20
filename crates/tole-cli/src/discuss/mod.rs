@@ -36,6 +36,9 @@ pub struct StartArgs {
     pub participants: Vec<String>,
     pub budget_tokens: u64,
     pub max_rounds: Option<u32>,
+    /// Background files (#1038): paths as the owner typed them, inside the
+    /// working folder ([`Env::workdir`]).
+    pub files: Vec<String>,
 }
 
 /// Where and with what a discussion runs.
@@ -47,6 +50,8 @@ pub struct Env<'a> {
     pub paths: (Option<&'a Path>, Option<&'a Path>),
     pub secrets: SecretSet,
     pub make: Factory,
+    /// The working folder background files are named against and read from.
+    pub workdir: &'a Path,
 }
 
 /// A fresh discussion id from the clock (`d-<unix seconds>`).
@@ -54,10 +59,30 @@ pub fn fresh_id(now: u64) -> String {
     format!("d-{now}")
 }
 
-/// The validated contract for `args`.
-pub fn contract(args: &StartArgs, now: u64, secrets: &SecretSet) -> Result<Contract, String> {
+/// The validated contract for `args`. Background files are named against
+/// `workdir`: each is confined to it and read once here, so a refused file
+/// (outside it, a symlink, a FIFO, over the size cap) fails before anything
+/// starts; the contract keeps only the names and digests.
+pub fn contract(
+    args: &StartArgs,
+    workdir: &Path,
+    now: u64,
+    secrets: &SecretSet,
+) -> Result<Contract, String> {
+    contract_and_background(args, workdir, now, secrets).map(|(c, _)| c)
+}
+
+/// [`contract`] and the files it read, as the voices will see them: ONE read
+/// of each file serves the digest in the contract, the estimate and the first
+/// run, so an edit in between cannot leave a ledger that can never resume.
+fn contract_and_background(
+    args: &StartArgs,
+    workdir: &Path,
+    now: u64,
+    secrets: &SecretSet,
+) -> Result<(Contract, Vec<Background>), String> {
     let id = args.id.clone().unwrap_or_else(|| fresh_id(now));
-    Contract::new(
+    let c = Contract::new(
         &id,
         &args.question,
         &args.criteria,
@@ -65,8 +90,53 @@ pub fn contract(args: &StartArgs, now: u64, secrets: &SecretSet) -> Result<Contr
         args.budget_tokens,
         args.max_rounds,
         secrets,
-    )
+    )?;
+    if args.files.is_empty() {
+        return Ok((c, Vec::new()));
+    }
+    // The count and the duplicates first: nothing is read, hashed or
+    // sanitized for a list that is refused anyway, and a per-file error
+    // cannot hide them.
+    if args.files.len() > discussion::MAX_BACKGROUND_FILES {
+        return Err(format!(
+            "{} background files: at most {} are accepted",
+            args.files.len(),
+            discussion::MAX_BACKGROUND_FILES
+        ));
+    }
+    let names = files::relative(workdir, &args.files)?;
+    if let Some(dup) = names
+        .iter()
+        .enumerate()
+        .find_map(|(i, n)| names[..i].contains(n).then_some(n))
+    {
+        return Err(format!("background file {dup:?} is listed twice"));
+    }
+    // Read once now: a refused file fails here, and the contract records the
+    // names with the digests of the bytes it saw.
+    let read = files::load(workdir, &names, secrets)?;
+    let digests: Vec<String> = read.iter().map(|b| b.sha256.clone()).collect();
+    Ok((c.with_files(&names, &digests)?, read))
 }
+
+/// The contract for `args` and the background files it names, as the voices
+/// will read them.
+fn prepared(
+    args: &StartArgs,
+    workdir: &Path,
+    now: u64,
+    secrets: &SecretSet,
+) -> Result<(Contract, Vec<Background>), String> {
+    contract_and_background(args, workdir, now, secrets)
+}
+
+/// What the dry run and the start say about the content of background files,
+/// whether or not anything was replaced: what is redacted is only what tole
+/// can recognise.
+const NOTE: &str = "Secrets: only known values and token shapes are redacted from the \
+files (a `.env`-style file is redacted line by line); anything else in a file, such as a password in \
+prose or in a config file, goes as written to the provider of every inline participant. Name only \
+files you would paste into the question.";
 
 /// What the discussion may cost, before it runs: the budget is a hard cap
 /// (every call is reserved in the ledger before it runs), the rounds and
@@ -115,7 +185,8 @@ pub fn cost_plan_with(c: &Contract, background: &[Background]) -> String {
             .collect();
         format!(
             "Background files, read by every inline participant each round and counted in the \
-             estimate below: {}.\n",
+             estimate below: {}.\n\
+             {NOTE}\n",
             list.join("; ")
         )
     };
@@ -166,9 +237,9 @@ pub fn advice_with(c: &Contract, background: &[Background]) -> Vec<String> {
 
 /// [`advice`] for what the owner typed, for the terminal before a start or
 /// a dry run; empty when the contract is invalid (the start reports that).
-pub fn advice_for(args: &StartArgs, secrets: &SecretSet) -> Vec<String> {
-    contract(args, now_secs(), secrets)
-        .map(|c| advice(&c))
+pub fn advice_for(args: &StartArgs, workdir: &Path, secrets: &SecretSet) -> Vec<String> {
+    prepared(args, workdir, now_secs(), secrets)
+        .map(|(c, bg)| advice_with(&c, &bg))
         .unwrap_or_default()
 }
 
@@ -181,10 +252,10 @@ fn now_secs() -> u64 {
 /// Dry run: validates the contract and its participants against the config
 /// and returns the cost plan. Writes nothing and calls no provider.
 pub fn plan(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
-    let c = contract(args, now_secs(), &env.secrets)?;
+    let (c, bg) = prepared(args, env.workdir, now_secs(), &env.secrets)?;
     let log = DiscussionLog::at(env.dir, &c.id)?;
     check_participants(&c, env, log)?;
-    Ok(format!("{}\n", cost_plan(&c)))
+    Ok(format!("{}\n", cost_plan_with(&c, &bg)))
 }
 
 fn check_participants(c: &Contract, env: &Env<'_>, log: DiscussionLog) -> Result<(), String> {
@@ -202,8 +273,8 @@ fn check_participants(c: &Contract, env: &Env<'_>, log: DiscussionLog) -> Result
 
 /// Starts a discussion from the owner's contract and runs it to its end.
 pub fn start(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
-    let c = contract(args, now_secs(), &env.secrets)?;
-    let plan = cost_plan(&c);
+    let (c, bg) = prepared(args, env.workdir, now_secs(), &env.secrets)?;
+    let plan = cost_plan_with(&c, &bg);
     let driver = Driver::from_config(
         env.cfg,
         env.paths,
@@ -212,7 +283,12 @@ pub fn start(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
         env.secrets.clone(),
         Arc::clone(&env.make),
         Arc::new(Budget::new(c.budget_tokens)),
-    )?;
+    )?
+    .with_workdir(env.workdir)
+    .with_background(bg);
+    // Before anything is written: the files the contract was built from are
+    // the ones the driver will show, so the ledger can always be resumed.
+    driver.check_files(&c)?;
     let id = c.id.clone();
     driver.start(c)?;
     let out = driver.run().map_err(|e| resumable(&id, &env.secrets, &e))?;
@@ -240,7 +316,11 @@ pub fn resume(id: &str, env: &Env<'_>) -> Result<String, String> {
         env.secrets.clone(),
         Arc::clone(&env.make),
         pot,
-    )?;
+    )?
+    .with_workdir(env.workdir);
+    // A file that is gone or changed is not a failure a resume can cure, so it
+    // is reported as it is, without the "continue it with resume" advice.
+    driver.check_files(&c)?;
     let out = driver.run().map_err(|e| resumable(id, &env.secrets, &e))?;
     Ok(finish(&out, &env.secrets))
 }

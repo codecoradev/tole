@@ -98,16 +98,23 @@ fn args(budget: u64) -> StartArgs {
         participants: vec!["coder".into(), "ops".into()],
         budget_tokens: budget,
         max_rounds: Some(3),
+        files: vec![],
     }
 }
 
 fn env<'a>(dir: &'a Path, cfg: &'a Config, make: Factory) -> Env<'a> {
+    env_in(dir, dir, cfg, make)
+}
+
+/// [`env`] with a working folder apart from the ledger directory.
+fn env_in<'a>(dir: &'a Path, workdir: &'a Path, cfg: &'a Config, make: Factory) -> Env<'a> {
     Env {
         dir,
         cfg,
         paths: (None, None),
         secrets: SecretSet::default().with("MY_TOKEN", SECRET),
         make,
+        workdir,
     }
 }
 
@@ -380,10 +387,13 @@ fn wide_answers() -> Answer {
 fn the_advice_starts_above_eight_voices_and_never_refuses() {
     let s = SecretSet::default();
     for n in [1, 7, 8] {
-        assert!(advice_for(&wide_args(n, 500_000), &s).is_empty(), "{n}");
+        assert!(
+            advice_for(&wide_args(n, 500_000), Path::new("."), &s).is_empty(),
+            "{n}"
+        );
     }
     for n in [9, 12, 16] {
-        let a = advice_for(&wide_args(n, 500_000), &s);
+        let a = advice_for(&wide_args(n, 500_000), Path::new("."), &s);
         assert_eq!(a.len(), 1, "{a:?}");
         assert!(
             a[0].starts_with(&format!(
@@ -393,7 +403,7 @@ fn the_advice_starts_above_eight_voices_and_never_refuses() {
         );
     }
     // An invalid contract has no advice; the start reports the error.
-    assert!(advice_for(&wide_args(17, 500_000), &s).is_empty());
+    assert!(advice_for(&wide_args(17, 500_000), Path::new("."), &s).is_empty());
 }
 
 #[test]
@@ -493,7 +503,7 @@ fn the_ceiling_runs_end_to_end_when_the_scribe_fails_and_the_round_is_kept_as_wr
 fn the_cost_plan_scales_with_the_voices_and_a_tiny_budget_is_warned_about_first() {
     let dir = tmp("wide-dry");
     let s = SecretSet::default();
-    let c = |n: usize, b: u64| contract(&wide_args(n, b), 1, &s).unwrap();
+    let c = |n: usize, b: u64| contract(&wide_args(n, b), Path::new("."), 1, &s).unwrap();
     let (few, many) = (host::round_floor(&c(2, 1)), host::round_floor(&c(12, 1)));
     assert!(
         many > few * 5,
@@ -509,7 +519,10 @@ fn the_cost_plan_scales_with_the_voices_and_a_tiny_budget_is_warned_about_first(
             && out.contains("covers about 3 round(s)"),
         "{out}"
     );
-    assert_eq!(advice_for(&wide_args(12, 500_000), &s).len(), 1);
+    assert_eq!(
+        advice_for(&wide_args(12, 500_000), Path::new("."), &s).len(),
+        1
+    );
     // A tiny budget: the plan and the advice both say one round does not fit,
     // and the dry run still passes (the owner may want it).
     let out = plan(&wide_args(12, 2_000), &e).unwrap();
@@ -517,7 +530,7 @@ fn the_cost_plan_scales_with_the_voices_and_a_tiny_budget_is_warned_about_first(
         out.contains("does not fit one round of 12 participants"),
         "{out}"
     );
-    let a = advice_for(&wide_args(12, 2_000), &s);
+    let a = advice_for(&wide_args(12, 2_000), Path::new("."), &s);
     assert_eq!(a.len(), 2, "{a:?}");
     assert!(a[1].contains("budget escalation in round 1"), "{a:?}");
     assert!(calls.lock().unwrap().is_empty());
@@ -533,9 +546,9 @@ fn the_estimate_grows_with_the_question_and_says_how_long_it_is() {
         question: q.into(),
         ..args(500_000)
     };
-    let short = contract(&with("Which database?"), 1, &s).unwrap();
+    let short = contract(&with("Which database?"), Path::new("."), 1, &s).unwrap();
     let long_q = "q".repeat(tole_core::discussion::MAX_QUESTION_CHARS);
-    let long = contract(&with(&long_q), 1, &s).unwrap();
+    let long = contract(&with(&long_q), Path::new("."), 1, &s).unwrap();
     let (a, b) = (host::round_floor(&short), host::round_floor(&long));
     // Two participants and the checker each read the question once: about
     // 3 000 tokens apiece on top of the short question's floor.
@@ -586,49 +599,439 @@ fn a_twelve_thousand_character_question_runs_and_the_closing_text_stays_readable
     assert!(out.contains("Outcome: "), "{out}");
 }
 
-#[test]
-fn the_estimate_counts_background_excerpts_once_per_participant() {
-    // #1038: the excerpts are in every inline participant's request.
-    let s = SecretSet::default();
-    let c = contract(&wide_args(4, 500_000), 1, &s).unwrap();
-    let file = |path: &str, chars: usize| tole_core::discussion::Background {
-        path: path.into(),
-        text: "b".repeat(chars),
-        sha256: tole_core::discussion::sha256_hex(path.as_bytes()),
-        truncated: chars >= 12_000,
-        redacted: path == "keys.md",
-    };
-    let bg = [file("brief.md", 12_000), file("keys.md", 400)];
-    let (plain, with) = (host::round_floor(&c), host::round_floor_with(&c, &bg));
-    // Four participants each read about 12 400 characters (3 100 tokens) more.
-    assert!(with >= plain + 4 * 3_000, "{plain} -> {with}");
-    assert_eq!(host::round_floor_with(&c, &[]), plain);
-    let (a, b) = (cost_plan(&c), cost_plan_with(&c, &bg));
-    assert_eq!(a, cost_plan_with(&c, &[]));
-    assert!(!a.contains("Background files"), "{a}");
-    assert!(
-        b.contains("brief.md (12000 characters shown, cut to the excerpt cap)")
-            && b.contains("keys.md (400 characters shown, values redacted)")
-            && b.contains(&format!("a round reserves at least {with} tokens")),
-        "{b}"
-    );
-    // The budget warning uses the same floor.
-    let tight = contract(&wide_args(4, with - 1), 1, &s).unwrap();
-    assert!(advice(&tight).len() < advice_with(&tight, &bg).len());
+// ------------------------------------------------ background files (#1038)
+
+/// `agreeable()` that also keeps every request `(kind, user text)`.
+type Seen = Arc<Mutex<Vec<(String, String)>>>;
+
+fn recording() -> (Seen, Answer) {
+    let seen: Seen = Arc::default();
+    let s2 = Arc::clone(&seen);
+    let inner = agreeable();
+    let a: Answer = Arc::new(move |kind, user| {
+        s2.lock()
+            .unwrap()
+            .push((kind.to_string(), user.to_string()));
+        inner(kind, user)
+    });
+    (seen, a)
+}
+
+fn with_files(files: &[&str], budget: u64) -> StartArgs {
+    StartArgs {
+        files: files.iter().map(|f| f.to_string()).collect(),
+        ..args(budget)
+    }
 }
 
 #[test]
-fn a_contract_with_background_files_is_refused_until_the_host_reads_them() {
-    // #1038: until the loader exists, naming files must not mean the voices
-    // quietly get the names without the excerpts.
-    let s = SecretSet::default();
-    let plain = contract(&wide_args(2, 100_000), 1, &s).unwrap();
-    assert!(host::no_unread_background(&plain).is_ok());
-    let named = plain
-        .with_files(&["brief.md".to_string()], &["a".repeat(64)])
+fn a_background_file_reaches_the_inline_voices_by_reference_and_is_counted() {
+    let dir = tmp("bg-run");
+    let work = tmp("bg-run-work");
+    std::fs::write(
+        work.join("brief.md"),
+        format!("the brief: pick sqlite. token {SECRET} must not leak\n"),
+    )
+    .unwrap();
+    std::fs::write(work.join("plain.md"), "nothing secret here").unwrap();
+    let cfg = config();
+    let (seen, answer) = recording();
+    let (_, make) = factory(100, answer);
+    let e = env_in(&dir, &work, &cfg, make);
+    // The dry run lists the file and the floor grows with it.
+    let plain = plan(&args(50_000), &e).unwrap();
+    let dry = plan(&with_files(&["brief.md"], 50_000), &e).unwrap();
+    assert!(
+        dry.contains("Background files") && dry.contains("brief.md ("),
+        "{dry}"
+    );
+    assert!(dry.contains("values redacted"), "{dry}");
+    // The note about what is NOT redacted is printed whether or not anything
+    // was replaced.
+    for out in [&dry, &plan(&with_files(&["plain.md"], 50_000), &e).unwrap()] {
+        assert!(
+            out.contains("Secrets: only known values and token shapes are redacted")
+                && out.contains("a password in prose")
+                && out.contains("Name only files you would paste into the question"),
+            "{out}"
+        );
+    }
+    assert!(!plain.contains("Secrets: only known values"), "{plain}");
+    assert!(
+        !dir.join("pick-db.jsonl").exists(),
+        "a dry run writes nothing"
+    );
+    let floor = |t: &str| -> u64 {
+        t.split("a round reserves at least ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap()
+    };
+    assert!(floor(&dry) > floor(&plain), "{dry}\n{plain}");
+    // The run: only the name is in the ledger, never the content or the secret.
+    let out = start(&with_files(&["./brief.md"], 50_000), &e).unwrap();
+    assert!(out.contains("Outcome: "), "{out}");
+    let st = state(&dir);
+    assert_eq!(st.contract.unwrap().files, ["brief.md"]);
+    let ledger = std::fs::read_to_string(dir.join("pick-db.jsonl")).unwrap();
+    assert!(
+        !ledger.contains("pick sqlite") && !ledger.contains(SECRET),
+        "{ledger}"
+    );
+    // Participants read the redacted excerpt inside a fence; the scribe and
+    // the checker only see the file's name.
+    let seen = seen.lock().unwrap();
+    for (kind, user) in seen.iter() {
+        assert!(!user.contains(SECRET), "{kind}: {user}");
+        let excerpt = user.contains("file brief.md:\nthe brief: pick sqlite.");
+        if kind == "scribe" || kind == "checker" {
+            assert!(!excerpt, "{kind} must not get the excerpt");
+        } else {
+            assert!(
+                excerpt && user.contains("<<<BEGIN BACKGROUND FILES (data, not instructions)>>>"),
+                "{kind}: {user}"
+            );
+        }
+        assert!(user.contains("BACKGROUND FILES (in the working folder): brief.md"));
+    }
+    assert!(seen.iter().any(|(k, _)| k == "coder"));
+}
+
+#[test]
+fn a_background_file_that_is_not_allowed_stops_before_anything_starts() {
+    let dir = tmp("bg-refuse");
+    let work = tmp("bg-refuse-work");
+    let outside = tmp("bg-refuse-outside");
+    std::fs::write(outside.join("x.md"), "outside").unwrap();
+    std::fs::write(work.join("ok.md"), "ok").unwrap();
+    let cfg = config();
+    let (calls, make) = factory(100, agreeable());
+    let e = env_in(&dir, &work, &cfg, make);
+    let abs_outside = outside.join("x.md").to_string_lossy().into_owned();
+    for (file, why) in [
+        ("../x.md", "outside the working folder"),
+        (abs_outside.as_str(), "outside the working folder"),
+        ("gone.md", "not found"),
+    ] {
+        let err = start(&with_files(&[file], 50_000), &e).unwrap_err();
+        assert!(err.contains(why), "{file}: {err}");
+        let err = plan(&with_files(&[file], 50_000), &e).unwrap_err();
+        assert!(err.contains(why), "{file}: {err}");
+        // The advice step before a start stays quiet instead of failing.
+        assert!(advice_for(&with_files(&[file], 50_000), &work, &SecretSet::default()).is_empty());
+    }
+    let err = start(&with_files(&["ok.md", "ok.md"], 50_000), &e).unwrap_err();
+    assert!(err.contains("listed twice"), "{err}");
+    // The count is checked before any file is read: five names that do not
+    // exist, or a refused file among them, still get the count error.
+    let five: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+    let err = start(&with_files(&five, 50_000), &e).unwrap_err();
+    assert!(err.contains("at most 4"), "{err}");
+    let six = ["../x.md", "gone.md", "a", "b", "c", "d"];
+    let err = start(&with_files(&six, 50_000), &e).unwrap_err();
+    assert!(err.contains("6 background files: at most 4"), "{err}");
+    assert!(plan(&with_files(&six, 50_000), &e)
+        .unwrap_err()
+        .contains("at most 4"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.join("x.md"), work.join("link.md")).unwrap();
+        let err = start(&with_files(&["link.md"], 50_000), &e).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(!dir.join("pick-db.jsonl").exists(), "nothing was written");
+}
+
+#[test]
+fn a_resume_reads_the_files_again_and_refuses_one_that_no_longer_passes() {
+    let dir = tmp("bg-resume");
+    let work = tmp("bg-resume-work");
+    std::fs::write(work.join("brief.md"), "the brief").unwrap();
+    let cfg = config();
+    // The first run fails in round 1 (a participant's provider error), so the
+    // ledger is left resumable.
+    let broken: Answer = Arc::new(|_, _| Err("the provider is down".into()));
+    let (_, make) = factory(100, broken);
+    let err = start(
+        &with_files(&["brief.md"], 50_000),
+        &env_in(&dir, &work, &cfg, make),
+    )
+    .unwrap_err();
+    assert!(err.contains("tole discuss resume pick-db"), "{err}");
+    // The file is gone: the resume names it and the discussion stays saved.
+    std::fs::remove_file(work.join("brief.md")).unwrap();
+    let (_, make) = factory(100, agreeable());
+    let err = resume("pick-db", &env_in(&dir, &work, &cfg, make)).unwrap_err();
+    assert!(err.contains("background file brief.md: not found"), "{err}");
+    // No cure by resuming: the error says to start a new discussion and never
+    // advises "continue it with resume".
+    assert!(
+        err.contains("start a new discussion") && !err.contains("continue it with"),
+        "{err}"
+    );
+    // Edited: the digest the contract recorded no longer matches, so the
+    // resume refuses it, naming the file, and nobody is shown the new text.
+    std::fs::write(work.join("brief.md"), "the brief, edited").unwrap();
+    let (seen, answer) = recording();
+    let (_, make) = factory(100, answer);
+    let err = resume("pick-db", &env_in(&dir, &work, &cfg, make)).unwrap_err();
+    assert!(
+        err.contains("background file brief.md: it changed since the discussion started")
+            && err.contains("Start a new discussion")
+            && !err.contains("continue it with"),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "no model was called");
+    // Put it back exactly as it was: the same resume now runs to the end.
+    std::fs::write(work.join("brief.md"), "the brief").unwrap();
+    let (seen, answer) = recording();
+    let (_, make) = factory(100, answer);
+    let out = resume("pick-db", &env_in(&dir, &work, &cfg, make)).unwrap();
+    assert!(out.contains("Outcome: "), "{out}");
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, u)| u.contains("file brief.md:\nthe brief")));
+}
+
+#[test]
+fn a_resume_from_another_folder_never_reads_a_same_named_file_there() {
+    let dir = tmp("bg-other");
+    let work = tmp("bg-other-work");
+    let other = tmp("bg-other-elsewhere");
+    std::fs::write(work.join("brief.md"), "the brief").unwrap();
+    std::fs::write(other.join("brief.md"), "ANOTHER PROJECT'S BRIEF").unwrap();
+    let cfg = config();
+    let broken: Answer = Arc::new(|_, _| Err("the provider is down".into()));
+    let (_, make) = factory(100, broken);
+    start(
+        &with_files(&["brief.md"], 50_000),
+        &env_in(&dir, &work, &cfg, make),
+    )
+    .unwrap_err();
+    // The contract records the digest of the bytes, and only that.
+    let k = state(&dir).contract.unwrap();
+    assert_eq!(
+        k.file_sha256,
+        [tole_core::discussion::sha256_hex(b"the brief")]
+    );
+    // Another folder with a file of that name: refused as changed, not read
+    // into the remaining rounds; and the error says where files are read from.
+    let (seen, answer) = recording();
+    let (_, make) = factory(100, answer);
+    let err = resume("pick-db", &env_in(&dir, &other, &cfg, make)).unwrap_err();
+    assert!(
+        err.contains("it changed since the discussion started"),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    // A folder with no such file: not found, with the folder named.
+    let empty = tmp("bg-other-empty");
+    let (_, make) = factory(100, agreeable());
+    let err = resume("pick-db", &env_in(&dir, &empty, &cfg, make)).unwrap_err();
+    assert!(
+        err.contains("background file brief.md: not found")
+            && err.contains("resume from the folder the discussion was started in"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_name_planted_in_the_ledger_is_never_followed_out_of_the_folder() {
+    // The ledger directory is owner-writable and outside the working folder:
+    // a contract line edited to name `../secret.md` must not be read on resume.
+    let dir = tmp("bg-planted");
+    let parent = tmp("bg-planted-parent");
+    let work = parent.join("work");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(parent.join("secret.md"), "OUTSIDE THE FOLDER").unwrap();
+    let cfg = config();
+    let sum = tole_core::discussion::sha256_hex(b"OUTSIDE THE FOLDER");
+    for name in [
+        "../secret.md",
+        "a//b",
+        "./x",
+        "sub\\..\\x",
+        "C:secret.md",
+        "/etc/passwd",
+    ] {
+        let _ = std::fs::remove_file(dir.join("pick-db.jsonl"));
+        let mut c = contract(&args(50_000), Path::new("."), 1, &SecretSet::default()).unwrap();
+        c.files = vec![name.to_string()];
+        c.file_sha256 = vec![sum.clone()];
+        DiscussionLog::at(&dir, "pick-db")
+            .unwrap()
+            .start(c, 1)
+            .unwrap();
+        let (seen, answer) = recording();
+        let (_, make) = factory(100, answer);
+        let err = resume("pick-db", &env_in(&dir, &work, &cfg, make)).unwrap_err();
+        assert!(
+            err.contains("is not a relative name of plain components"),
+            "{name}: {err}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{name}: no model was called"
+        );
+        assert!(!err.contains("OUTSIDE THE FOLDER"));
+    }
+    // A contract with a file but no digest cannot be checked: refused.
+    let _ = std::fs::remove_file(dir.join("pick-db.jsonl"));
+    std::fs::write(work.join("brief.md"), "the brief").unwrap();
+    let mut c = contract(&args(50_000), Path::new("."), 1, &SecretSet::default()).unwrap();
+    c.files = vec!["brief.md".into()];
+    DiscussionLog::at(&dir, "pick-db")
+        .unwrap()
+        .start(c, 1)
         .unwrap();
-    let err = host::no_unread_background(&named).unwrap_err();
-    assert!(err.contains("1 background file(s)"), "{err}");
+    let (_, make) = factory(100, agreeable());
+    let err = resume("pick-db", &env_in(&dir, &work, &cfg, make)).unwrap_err();
+    assert!(err.contains("records no SHA-256"), "{err}");
+}
+
+#[test]
+fn start_shows_the_files_it_digested_so_an_edit_in_the_gap_cannot_strand_the_ledger() {
+    let dir = tmp("bg-gap");
+    let work = tmp("bg-gap-work");
+    std::fs::write(work.join("brief.md"), "the brief as digested").unwrap();
+    let cfg = config();
+    let (_, make) = factory(100, agreeable());
+    let e = env_in(&dir, &work, &cfg, make);
+    // The one read: the contract's digest and the files the driver is seeded with.
+    let (c, bg) = prepared(
+        &with_files(&["brief.md"], 50_000),
+        &work,
+        1,
+        &SecretSet::default(),
+    )
+    .unwrap();
+    // The file is edited after that read, before the first turn.
+    std::fs::write(work.join("brief.md"), "EDITED IN THE GAP").unwrap();
+    let (seen, answer) = recording();
+    let (_, make) = factory(100, answer);
+    let driver = Driver::from_config(
+        e.cfg,
+        e.paths,
+        &c.participants,
+        DiscussionLog::at(&dir, &c.id).unwrap(),
+        SecretSet::default(),
+        make,
+        Arc::new(Budget::new(c.budget_tokens)),
+    )
+    .unwrap()
+    .with_workdir(&work)
+    .with_background(bg);
+    driver.check_files(&c).unwrap();
+    driver.start(c).unwrap();
+    driver.run().unwrap();
+    // Every turn showed what the digest in the ledger describes, so the
+    // ledger resumes against the same file; the edit is never shown.
+    let seen = seen.lock().unwrap();
+    assert!(seen
+        .iter()
+        .any(|(_, u)| u.contains("file brief.md:\nthe brief as digested")));
+    assert!(seen.iter().all(|(_, u)| !u.contains("EDITED IN THE GAP")));
+    let k = state(&dir).contract.unwrap();
+    assert_eq!(
+        k.file_sha256,
+        [tole_core::discussion::sha256_hex(b"the brief as digested")]
+    );
+}
+
+/// An independent participant that answers at once and records that it ran.
+#[derive(Default)]
+struct Reviewer {
+    started: Mutex<Vec<String>>,
+}
+
+impl host::Independent for Reviewer {
+    fn start(&self, who: &str, task: &str, _tokens: u64, key: &str) -> Result<String, String> {
+        self.started.lock().unwrap().push(task.to_string());
+        let _ = (who, key);
+        Ok("node".into())
+    }
+    fn find(&self, _key: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn poll(&self, _handle: &str) -> Result<Option<(String, u64)>, String> {
+        Ok(Some((
+            "a short review".into(),
+            host::INDEPENDENT_MIN_TOKENS,
+        )))
+    }
+}
+
+#[test]
+fn an_edited_ledger_is_caught_before_any_step_even_with_only_independent_voices() {
+    let dir = tmp("bg-eager");
+    let work = tmp("bg-eager-work");
+    let outside = tmp("bg-eager-outside");
+    std::fs::write(work.join("brief.md"), "the brief").unwrap();
+    std::fs::write(outside.join("secret.md"), "OUTSIDE").unwrap();
+    let sum = tole_core::discussion::sha256_hex(b"the brief");
+    let driver = |runner: Arc<Reviewer>| {
+        let (_, make) = factory(100, agreeable());
+        let voices = std::iter::once((
+            "coder".to_string(),
+            host::Voice {
+                persona: None,
+                model: None,
+            },
+        ))
+        .collect();
+        Driver::new(
+            DiscussionLog::at(&dir, "pick-db").unwrap(),
+            SecretSet::default(),
+            voices,
+            (None, None),
+            make,
+            Arc::new(Budget::new(50_000)),
+        )
+        .with_independent(&["coder".to_string()], runner)
+        .unwrap()
+        .with_workdir(&work)
+    };
+    let plant = |name: &str, digest: &str| {
+        let _ = std::fs::remove_file(dir.join("pick-db.jsonl"));
+        let mut c = contract(&args(50_000), Path::new("."), 1, &SecretSet::default()).unwrap();
+        c.participants = vec!["coder".into()];
+        c.files = vec![name.to_string()];
+        c.file_sha256 = vec![digest.to_string()];
+        DiscussionLog::at(&dir, "pick-db")
+            .unwrap()
+            .start(c, 1)
+            .unwrap();
+    };
+    // A planted name: refused before the reviewer is started, and its
+    // prompt (which names the files) never carries it.
+    plant("../outside.md", &sum);
+    let r = Arc::new(Reviewer::default());
+    let err = driver(Arc::clone(&r)).run().unwrap_err();
+    assert!(err.contains("plain components"), "{err}");
+    assert!(r.started.lock().unwrap().is_empty());
+    // A changed file: refused before any step.
+    plant(
+        "brief.md",
+        &tole_core::discussion::sha256_hex(b"another brief"),
+    );
+    let err = driver(Arc::clone(&r)).run().unwrap_err();
+    assert!(
+        err.contains("it changed since the discussion started"),
+        "{err}"
+    );
+    assert!(r.started.lock().unwrap().is_empty());
+    // The matching ledger runs; the reviewer is told the name, not the content.
+    plant("brief.md", &sum);
+    driver(Arc::clone(&r)).run().unwrap();
+    let started = r.started.lock().unwrap();
+    assert!(!started.is_empty());
+    assert!(started.iter().all(|t| t
+        .contains("BACKGROUND FILES (in the working folder): brief.md")
+        && !t.contains("the brief\n")));
 }
 
 #[test]

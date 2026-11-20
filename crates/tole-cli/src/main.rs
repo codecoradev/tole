@@ -825,6 +825,17 @@ enum DiscussAction {
         /// Discussion id (default: d-<unix seconds>).
         #[arg(long)]
         id: Option<String>,
+        /// A background file inside the current folder, passed by reference:
+        /// inline participants read a capped, sanitized excerpt (fenced as
+        /// data), counted in the cost estimate. Repeat for more (at most 4).
+        /// A path outside the folder, a symlink or a FIFO is refused. Only
+        /// known secret values and token shapes are redacted (a .env-style
+        /// file line by line): anything else in the file, such as a password
+        /// in prose, goes as written to every inline participant's provider.
+        /// Name only files you would paste into the question. A resume
+        /// refuses a file that is gone or changed.
+        #[arg(long = "file")]
+        files: Vec<String>,
         /// Validate the contract and show what it may cost; call no model
         /// and write nothing.
         #[arg(long)]
@@ -2587,6 +2598,9 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                 .and_then(|p| p.parent().map(Path::to_path_buf));
             let home = std::env::var_os("HOME").map(PathBuf::from);
             let dry = matches!(action, DiscussAction::Start { dry_run: true, .. });
+            // Background files are named against the folder the owner runs
+            // `tole discuss` in.
+            let workdir = std::env::current_dir()?;
             // A dry run calls no model, so it needs no provider config.
             let make = if dry {
                 tole_cli::discussion_host::factory(
@@ -2608,6 +2622,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                 paths: (base.as_deref(), home.as_deref()),
                 secrets,
                 make,
+                workdir: &workdir,
             };
             match action {
                 DiscussAction::Start {
@@ -2617,6 +2632,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                     budget,
                     max_rounds,
                     id,
+                    files,
                     dry_run,
                 } => {
                     let args = discuss::StartArgs {
@@ -2626,8 +2642,9 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                         participants,
                         budget_tokens: budget,
                         max_rounds,
+                        files,
                     };
-                    for line in discuss::advice_for(&args, &env.secrets) {
+                    for line in discuss::advice_for(&args, env.workdir, &env.secrets) {
                         eprintln!("tole: advice: {line}");
                     }
                     if dry_run {

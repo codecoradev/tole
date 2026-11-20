@@ -309,6 +309,10 @@ pub struct Driver {
     poll_every: std::time::Duration,
     docs: Option<Box<dyn RoundDocs>>,
     notes: std::sync::Mutex<Vec<String>>,
+    /// The working folder the contract's background files are read from.
+    workdir: Option<std::path::PathBuf>,
+    /// The files, read once per driver (a resume reads them again).
+    background: std::sync::Mutex<Option<Arc<Vec<Background>>>>,
 }
 
 fn now_secs() -> u64 {
@@ -362,7 +366,71 @@ impl Driver {
             poll_every: std::time::Duration::from_secs(5),
             docs: None,
             notes: std::sync::Mutex::new(Vec::new()),
+            workdir: None,
+            background: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The working folder the contract's background files are named
+    /// against (#1038). Without one, a contract with files cannot run.
+    pub fn with_workdir(mut self, workdir: impl Into<std::path::PathBuf>) -> Driver {
+        self.workdir = Some(workdir.into());
+        self
+    }
+
+    /// Seeds the background files with a read the caller already made (the
+    /// one the contract's digests came from), so the first run shows exactly
+    /// those and not a second read.
+    pub fn with_background(self, files: Vec<Background>) -> Driver {
+        if !files.is_empty() {
+            if let Ok(mut slot) = self.background.lock() {
+                *slot = Some(Arc::new(files));
+            }
+        }
+        self
+    }
+
+    /// Checks the contract's background files now: every name is validated,
+    /// every file read and compared with the digest the contract recorded. A
+    /// file that is gone or changed (or a name that is not plain) is an error
+    /// that no resume can cure: the owner starts a new discussion. [`run`]
+    /// does it before any step, so a run of scribe, checker or independent
+    /// voices only, and an edited ledger, are covered too.
+    ///
+    /// [`run`]: Driver::run
+    pub fn check_files(&self, c: &Contract) -> Result<(), String> {
+        self.background(c).map(|_| ())
+    }
+
+    /// The contract's background files as an inline voice reads them: read
+    /// and sanitized once per driver, refused if they no longer pass.
+    fn background(&self, c: &Contract) -> Result<Arc<Vec<Background>>, String> {
+        if c.files.is_empty() {
+            return Ok(Arc::default());
+        }
+        let mut slot = self.background.lock().map_err(|_| "poisoned".to_string())?;
+        if let Some(b) = slot.as_ref() {
+            // A seeded or earlier read: still the very files the contract
+            // recorded (by construction for a seed, checked here).
+            super::files::verify(&c.files, &c.file_sha256, b)?;
+            return Ok(Arc::clone(b));
+        }
+        let root = self.workdir.as_deref().ok_or(
+            "this discussion names background files, but this host has no working folder to read \
+             them from",
+        )?;
+        let read = super::files::load(root, &c.files, &self.secrets).map_err(|e| {
+            format!(
+                "{e}. The files are read from the folder `tole discuss` runs in ({}): resume \
+                 from the folder the discussion was started in, or start a new discussion",
+                root.display()
+            )
+        })?;
+        // The very files the discussion started with, or none.
+        super::files::verify(&c.files, &c.file_sha256, &read)?;
+        let b = Arc::new(read);
+        *slot = Some(Arc::clone(&b));
+        Ok(b)
     }
 
     /// Runs `names` (some of this driver's voices) as independent read-only
@@ -468,7 +536,6 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
-        no_unread_background(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -494,6 +561,11 @@ impl Driver {
     /// error (a participant's provider failing, the ledger refusing a step)
     /// leaves the ledger resumable: run again to continue.
     pub fn run(&self) -> Result<Outcome, String> {
+        // Before any step: the background files are the contract's, or nothing
+        // runs (a no-op without files, cached after the first check).
+        if let Some(c) = self.log.state()?.contract {
+            self.check_files(&c)?;
+        }
         loop {
             let st = self.log.state()?;
             match st.next() {
@@ -732,14 +804,20 @@ impl Driver {
         let voice = self.voices.get(who).ok_or_else(|| {
             format!("participant `{who}` has no profile here (was it removed from the config?)")
         })?;
-        no_unread_background(contract)?;
+        // An independent reviewer reads the files itself with its read-only
+        // tools (the contract names them); an inline voice is shown excerpts.
+        let background = if self.independent.contains_key(who) {
+            Arc::default()
+        } else {
+            self.background(contract)?
+        };
         let mut req = participant_request_with(
             contract,
             round,
             who,
             st.prior_summary(round),
             st.own_previous(who, round),
-            &[],
+            &background,
         );
         if let Some(persona) = &voice.persona {
             req[0].1 = format!(
@@ -881,7 +959,7 @@ impl Driver {
                  or seat fewer participants.",
                 c.budget_tokens,
                 c.participants.len(),
-                round_floor(c)
+                round_floor_with(c, &self.background(c).unwrap_or_default())
             ));
         }
         match st.verdicts.iter().next_back() {
@@ -1090,21 +1168,6 @@ fn speakers(cs: &[discussion::Contribution]) -> String {
         .map(|c| c.participant.as_str())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// A contract that names background files (#1038) needs a host that reads
-/// them; this one does not yet, so a round refuses instead of quietly
-/// sending the voices the names without the excerpts the cost estimate
-/// counts. The loader replaces this check in the change that adds it.
-pub(super) fn no_unread_background(contract: &Contract) -> Result<(), String> {
-    if contract.files.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "this discussion names {} background file(s), and this host cannot read them yet",
-            contract.files.len()
-        ))
-    }
 }
 
 #[cfg(test)]
