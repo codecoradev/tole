@@ -147,18 +147,20 @@ impl Daemon {
 
     fn start(&mut self, extra: &[&str]) {
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd =
+                common::hermetic_command(env!("CARGO_BIN_EXE_tole"), self.home.path(), &[]);
+            // The test's own `uteke` shim stays first on PATH; the system
+            // directories lose any real cora/uteke.
+            let sys = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .args(["--workspace", self.work.to_str().unwrap()])
                 .args(["--memory", "uteke"])
                 .args(extra)
                 .current_dir(self.work.path())
                 .env("TOLE_NO_UPDATE_CHECK", "1")
-                .env("CODECORA_HOME", self.home.path())
-                .env("HOME", self.home.path())
                 .env(
                     "PATH",
-                    format!("{}:/usr/bin:/bin", self.bin.path().display()),
+                    format!("{}:{}", self.bin.path().display(), sys.to_string_lossy()),
                 )
                 .env("TOLE_STREAM", "0")
                 .env("TOLE_BASE_URL", &self.url)
@@ -597,11 +599,9 @@ fn a_project_config_cannot_add_a_selectable_profile() {
     .unwrap();
     // An untrusted project config stops the daemon at start-up (fail
     // closed); trusted, its `profiles` are still ignored.
-    let trust = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let trust = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), d.home.path(), &[])
         .args(["config", "trust", "--yes"])
         .current_dir(d.work.path())
-        .env("CODECORA_HOME", d.home.path())
-        .env("HOME", d.home.path())
         .output()
         .unwrap();
     assert!(trust.status.success(), "{trust:?}");

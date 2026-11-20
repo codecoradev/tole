@@ -181,7 +181,7 @@ fn spawn(o: Opts) -> Daemon {
     let log = home.join("serve.log");
     for _ in 0..5 {
         let port = free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
         cmd.arg("serve")
             .args(["--port", &port.to_string()])
             .args(["--workspace", work.to_str().unwrap()]);
@@ -198,8 +198,6 @@ fn spawn(o: Opts) -> Daemon {
         cmd.args(o.extra)
             .current_dir(work.path())
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", home.path())
-            .env("HOME", home.path())
             .env("TOLE_CRON_DIR", home.join("cron"))
             .env("TOLE_BASE_URL", &mock)
             .env("TOLE_MODEL", "mock-model")
@@ -237,12 +235,10 @@ fn spawn(o: Opts) -> Daemon {
 /// Run `tole serve ...` expecting it to refuse; returns its stderr.
 fn refused(args: &[&str], env: &[(&str, &str)]) -> String {
     let home = TestDir::new("tole-basic-refuse");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let mut child = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .arg("serve")
         .args(["--port", &free_port().to_string()])
         .args(args)
-        .env("CODECORA_HOME", home.path())
-        .env("HOME", home.path())
         .env_remove("TOLE_SERVE_TOKEN")
         .env_remove("TOLE_SERVE_BASIC_USER")
         .env_remove("TOLE_SERVE_BASIC_HASH")
@@ -690,7 +686,8 @@ fn no_credential_reaches_the_log_or_the_command_line() {
 #[test]
 fn serve_hash_makes_a_hash_the_server_accepts_and_never_prints_the_password() {
     let make = |input: &str, extra: &[&str]| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
+        let home = TestDir::new("tole-basic-hash");
+        let mut child = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .arg("serve-hash")
             .args(extra)
             .stdin(Stdio::piped())

@@ -40,10 +40,9 @@ fn setup(tag: &str, hooks: &str) -> TestDir {
 }
 
 fn command(base: &Path, port: u16, bind: &str) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
     cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
         .args(["--bind", bind])
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TOLE_TEST_HOOK_KEY", KEY)
         .stdin(Stdio::null())
