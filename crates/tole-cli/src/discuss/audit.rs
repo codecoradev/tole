@@ -243,14 +243,14 @@ fn text_of(v: &Value) -> String {
     out.join("\n") + "\n"
 }
 
-/// The discussions in `dir`, or discussion `id`, as text or JSON, every
-/// string redacted through `secrets`.
-pub fn discussions(
+/// The discussions in `dir` (`id` `None`), or discussion `id`, as the JSON
+/// value the audit shows, every string redacted through `secrets`. `tole
+/// discuss list|show --json` prints it and `tole serve` answers with it.
+pub fn discussions_value(
     dir: &Path,
     id: Option<&str>,
-    as_json: bool,
     secrets: &SecretSet,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let value = match id {
         Some(id) => {
             let st = DiscussionLog::at(dir, id)?.state()?;
@@ -294,7 +294,18 @@ pub fn discussions(
             json!({ "dir": dir, "discussions": list })
         }
     };
-    let value = secrets.redact_value(&value);
+    Ok(secrets.redact_value(&value))
+}
+
+/// The discussions in `dir`, or discussion `id`, as text or JSON, every
+/// string redacted through `secrets`.
+pub fn discussions(
+    dir: &Path,
+    id: Option<&str>,
+    as_json: bool,
+    secrets: &SecretSet,
+) -> Result<String, String> {
+    let value = discussions_value(dir, id, secrets)?;
     if as_json {
         return Ok(format!(
             "{}\n",

@@ -80,6 +80,9 @@ fn route_types(r: Route) -> (Option<&'static str>, &'static str, &'static [&'sta
         Route::Approvals => (None, "ApprovalList", &["session"]),
         Route::Decide => (Some("DecisionRequest"), "DecisionReply", &[]),
         Route::Models => (None, "Models", &[]),
+        Route::Discussions => (None, "DiscussionList", &[]),
+        Route::Discussion => (None, "Discussion", &[]),
+        Route::DiscussionEstimate => (Some("DiscussionRequest"), "DiscussionEstimate", &[]),
     }
 }
 
@@ -100,6 +103,7 @@ pub(crate) fn generate() -> Value {
         ("NewSession", g.subschema_for::<NewSession>()),
         ("PromptRequest", g.subschema_for::<PromptRequest>()),
         ("DecisionRequest", g.subschema_for::<DecisionRequest>()),
+        ("DiscussionRequest", g.subschema_for::<DiscussionRequest>()),
     ]);
     let responses = group(vec![
         ("Health", g.subschema_for::<Health>()),
@@ -113,6 +117,12 @@ pub(crate) fn generate() -> Value {
         ("ApprovalList", g.subschema_for::<ApprovalList>()),
         ("DecisionReply", g.subschema_for::<DecisionReply>()),
         ("Models", g.subschema_for::<Models>()),
+        ("DiscussionList", g.subschema_for::<DiscussionList>()),
+        ("Discussion", g.subschema_for::<Discussion>()),
+        (
+            "DiscussionEstimate",
+            g.subschema_for::<DiscussionEstimate>(),
+        ),
     ]);
     // Keyed by the SSE event name; the value is the JSON in the frame's `data:`.
     let events = group(vec![

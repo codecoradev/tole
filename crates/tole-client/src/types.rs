@@ -253,6 +253,94 @@ wire! {
         pub models: Vec<String>,
         pub default: Option<String>,
     }
+
+    /// One row of `GET /discussions`. A ledger that cannot be read is a row
+    /// with `status` `unreadable` and an `error` instead of the figures.
+    pub struct DiscussionRow {
+        pub id: String,
+        /// `open`, `closed (<gate>)` or `unreadable`.
+        pub status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rounds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tokens_used: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub question: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+
+    /// `GET /discussions`.
+    pub struct DiscussionList {
+        pub discussions: Vec<DiscussionRow>,
+    }
+
+    /// One round of a discussion. `summary` is the scribe's digest (decisions,
+    /// claims, `disagreements`, open questions, actions) or the list of
+    /// speakers when it was passed on as written; `checklist` is the
+    /// claim-checker's verdict per criterion. Both stay as the server's JSON.
+    pub struct DiscussionRound {
+        pub round: u32,
+        pub speakers: Vec<String>,
+        pub summary: Option<Value>,
+        pub checklist: Option<Vec<Value>>,
+        pub gate: Option<String>,
+        pub tokens: u64,
+        pub retries: u64,
+        pub charged: Vec<Value>,
+    }
+
+    /// How a closed discussion ended: the gate's decision and the report text.
+    pub struct DiscussionOutcome {
+        pub gate: String,
+        pub why: String,
+        pub text: String,
+    }
+
+    /// `GET /discussions/{id}`.
+    pub struct Discussion {
+        pub id: String,
+        pub status: String,
+        pub question: String,
+        pub criteria: Vec<String>,
+        pub participants: Vec<String>,
+        pub budget: u64,
+        pub max_rounds: u32,
+        pub tokens_used: u64,
+        pub open_calls: u64,
+        pub rounds: Vec<DiscussionRound>,
+        pub outcome: Option<DiscussionOutcome>,
+    }
+
+    /// The body of `POST /discussions/estimate`: what the owner types for
+    /// `tole discuss start`. Participants are profile names of the server
+    /// owner's user config; `files` are paths inside the server's workspace.
+    pub struct DiscussionRequest {
+        pub question: String,
+        pub criteria: Vec<String>,
+        pub participants: Vec<String>,
+        pub budget_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_rounds: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+    }
+
+    /// The answer to the estimate: the cost plan as text and as numbers.
+    pub struct DiscussionEstimate {
+        pub plan: String,
+        pub advice: Vec<String>,
+        pub participants: Vec<String>,
+        pub max_rounds: u32,
+        pub max_calls: u64,
+        pub budget_tokens: u64,
+        pub round_floor_tokens: u64,
+        pub files: Vec<String>,
+    }
 }
 
 /// The verdict of `POST /approvals/{id}/decision`.

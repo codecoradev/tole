@@ -245,6 +245,27 @@ restart or from a second device. `GET /sessions` stays the live list (`id`, `bus
   `skipped`, never replayed) and 64 MiB in total. A torn or unreadable file is skipped (`skipped`), never an error.
 - `401` without the token, like every route.
 
+## Discussions (#1042)
+
+The owner's `tole discuss`, read and dry-run over serve. They are the same library (`tole_cli::discuss`) the
+terminal uses; the routes only turn a request into its arguments and an error into a status. Starting, resuming and
+stopping are separate routes (below, when present in this build); a discussion a model starts with the `discuss`
+tool is still only an approval and is not started from here.
+
+| Action | Route | Answer |
+|---|---|---|
+| List | `GET /discussions` | `{"discussions": [{"id", "status", "rounds", "tokens_used", "budget", "question"}]}`, the rows of `tole discuss list --json` (without the server's directory); `status` is `open`, `closed (<gate>)` or `unreadable` (then `error`). Ids sort ascending, at most 200 |
+| Show | `GET /discussions/{id}` | the audit view of `tole discuss show --json`: `question`, `criteria`, `participants`, `budget`, `max_rounds`, `tokens_used`, `open_calls`, per round the `speakers`, the scribe's `summary` (decisions, claims, `disagreements` with each position, open questions, actions) or the speakers when it was passed on as written, the claim-checker's `checklist`, the `gate` and the `tokens`, and the `outcome` (`gate`, `why` and the report `text`) once closed. Never a raw contribution. Every string is redacted. `404` unknown, `400` malformed id |
+| Estimate | `POST /discussions/estimate` | the dry run of `tole discuss start --dry-run`: `{"plan", "advice", "participants", "max_rounds", "max_calls", "budget_tokens", "round_floor_tokens", "files"}`. Validates the contract, the participants and the background files; writes nothing and calls no model |
+
+The request body carries what the owner types for `tole discuss start`: `question`, `criteria`, `participants`,
+`budget_tokens` (required), `max_rounds`, `files` and `id`. Any other key (`tools`, `allow`, `profile`, `modes`,
+`secrets`, ...) is a `400` naming it. `participants` are profile names of the server OWNER's user config, read per
+request; a built-in role or an unknown name is a `400`. `files` are paths inside the serve workspace root, confined
+and read by the library exactly as `--file` is (a path outside it, a symlink, a FIFO, a file over 1 MiB, more than 4,
+a duplicate are refused). The contract's own rules (question length, 1 to 12 criteria, a positive budget, at most 10
+rounds) are the CLI's, because the library applies them.
+
 ## Resume by id (#524)
 
 `POST /sessions {"resume": "<id>", "cwd"?: "..."}` makes an existing session live

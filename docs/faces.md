@@ -74,6 +74,21 @@ true; the status column says where the work is.
 | The action summary of an approval (#1041; built by `ToolRegistry::decide`, so every face's request carries it) | TUI prompt shows it; the stdio prompt (the plain-terminal CLI paths) still prints the tool's `describe` text | `serve` shows it (`GET /approvals`, the `approval_required` stop, the approval events); the ACP permission `title` still uses `describe`; a delegated child's `dap-` approval and the webhook events carry none | n/a (pre-authorized allowlist, no prompt) | n/a (a parked run is answered through the `serve` queue) | drift #1041 follow-up: each of these is a prompt or row that does not render the summary yet, because it is a different presentation (a one-line ACP title, the delegation queue's own row, a fixed webhook payload). The summary is already on the request, so closing it is a rendering change, not new derivation |
 | Sandbox profile for process tools | yes | yes | yes | yes | one path |
 
+## Owner actions that are not serve routes
+
+`tole serve` is also the interface of the desktop and of mobile clients (#1042), so every read a person needs and
+every action that only spends the owner's own budget is a route. What changes who is trusted or what is allowed
+stays with the owner at a terminal, and has no route on purpose. Each row is a decision of the owner (desktop
+design, section 0) or a design rule, not a gap:
+
+| Action | Where it lives | Why it has no serve route |
+|---|---|---|
+| Write the user config or a profile | the owner's editor, `tole config` | A profile carries the allow list and the secret grants. A token holder must not widen them (design rule: authority is the owner's file). |
+| Approve, revoke or re-approve a skill or a connected tool (`tole skills approve`, `tole plugin approve`) | `tole skills`, `tole plugin` at a terminal | Trust approval is never a serve route; whether the desktop may approve at all is the owner's pending decision (#1034). Serve only reads the trust state. |
+| Change the allow list | the owner's config and `--allow` | An approval answers one call; the standing allow list is configuration. |
+| Create or edit a cron job | `tole cron create`, `tole cron edit` | A job carries a prompt, an allow list and, for a script job, a command run with the owner's authority. Stays local-only unless the owner decides otherwise (#1042). |
+| Choose a folder with the operating system's dialog | the desktop process | It is a window on the client's machine; the server only checks that a folder is inside its workspace. |
+
 ## Adding or changing a face capability
 
 1. Put the capability in the shared assembly (`session::assemble`, `tool_roster`,

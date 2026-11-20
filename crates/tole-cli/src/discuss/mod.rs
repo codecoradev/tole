@@ -258,6 +258,26 @@ pub fn plan(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
     Ok(format!("{}\n", cost_plan_with(&c, &bg)))
 }
 
+/// [`plan`] for a client that draws its own screen: the same dry run (the
+/// contract, its participants and background files are validated, nothing is
+/// written, no provider is called) as numbers next to the text. The cost plan
+/// is redacted like every other text the owner reads.
+pub fn estimate(args: &StartArgs, env: &Env<'_>) -> Result<serde_json::Value, String> {
+    let (c, bg) = prepared(args, env.workdir, now_secs(), &env.secrets)?;
+    check_participants(&c, env, DiscussionLog::at(env.dir, &c.id)?)?;
+    let calls = (c.participants.len() + 2) * c.max_rounds as usize;
+    Ok(env.secrets.redact_value(&serde_json::json!({
+        "plan": cost_plan_with(&c, &bg),
+        "advice": advice_with(&c, &bg),
+        "participants": c.participants,
+        "max_rounds": c.max_rounds,
+        "max_calls": calls,
+        "budget_tokens": c.budget_tokens,
+        "round_floor_tokens": host::round_floor_with(&c, &bg),
+        "files": c.files,
+    })))
+}
+
 fn check_participants(c: &Contract, env: &Env<'_>, log: DiscussionLog) -> Result<(), String> {
     Driver::from_config(
         env.cfg,
