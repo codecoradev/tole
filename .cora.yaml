@@ -3,6 +3,16 @@
 
 # Provider settings — use global config (~/.cora/config.yaml)
 
+# LLM call budget. The Cora Review action only passes `llm.timeout: 600` (and
+# retries up to 3 times) when the repository has NO .cora.yaml; with one it
+# runs a plain `cora review`, so a provider call that stalls hangs the job
+# until the 30-minute limit and ends as "Review could not complete" (seen four
+# times on one PR, 2026-11-20, with the deterministic part finishing in under
+# a second). The same budget here makes a stalled call fail after 10 minutes,
+# so the action's retry loop can run again.
+llm:
+  timeout: 600
+
 # Review focus areas
 focus:
   - security
