@@ -1279,3 +1279,27 @@ fn sixteen_independent_participants_run_one_process_at_a_time_within_the_budget(
     assert!(runner.live.lock().unwrap().is_empty());
     assert_eq!(*runner.peak.lock().unwrap(), 1);
 }
+
+/// #1039: a contract that allows helper tools needs the independent helpers
+/// and approval wiring a later change adds; until then it is refused before
+/// anything is written or called, never run with inline helpers that would
+/// silently have no tools.
+#[test]
+fn a_contract_with_helper_tools_is_refused_not_run_without_them() {
+    let (s, make) = script(&[]);
+    let (lg, dir) = log("tools-refused");
+    let d = driver(lg, make, 1_000_000);
+    let c = contract(100_000, None)
+        .with_tools(&["mcp_nginjen_search".to_string()])
+        .unwrap();
+    let e = d.start(c.clone()).unwrap_err();
+    assert!(
+        e.contains("allows helper tools") && e.contains("mcp_nginjen_search"),
+        "{e}"
+    );
+    assert!(!dir.join("pick-db.jsonl").exists());
+    // A ledger that holds one (written by a newer build) is refused on run.
+    d.log.start(c, 1).unwrap();
+    assert!(d.run().unwrap_err().contains("allows helper tools"));
+    assert!(kinds(&s).is_empty());
+}

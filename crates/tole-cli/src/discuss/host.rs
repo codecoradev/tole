@@ -130,6 +130,22 @@ pub fn round_floor_with(c: &Contract, background: &[Background]) -> u64 {
     voices + tokens(checker_request(c, &[]), CHECKER_REPLY_TOKENS)
 }
 
+/// A contract that allows helper tools needs independent helpers and the
+/// approval wiring (#1039), which this host does not have yet: refuse it
+/// loudly rather than run its helpers inline, where they would silently get
+/// no tools at all.
+fn refuse_tools(c: &Contract) -> Result<(), String> {
+    if c.tools.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "discussion `{}` allows helper tools ({}), which this host cannot run yet: its helpers \
+         would run without them",
+        c.id,
+        c.tools.join(", ")
+    ))
+}
+
 /// Longest part of the question the closing text repeats, in characters.
 const REPORT_QUESTION_CHARS: usize = 600;
 
@@ -536,6 +552,7 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
+        refuse_tools(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -564,6 +581,7 @@ impl Driver {
         // Before any step: the background files are the contract's, or nothing
         // runs (a no-op without files, cached after the first check).
         if let Some(c) = self.log.state()?.contract {
+            refuse_tools(&c)?;
             self.check_files(&c)?;
         }
         loop {

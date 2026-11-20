@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tole_core::discussion::{Gate, Item, Reason, RoundSummary};
+use tole_core::discussion::{Gate, Item, Reason, RoundSummary, ToolVerdict};
 use tole_core::discussion_log::{describe, DiscussionLog, State};
 use tole_core::secrets::SecretSet;
 
@@ -40,6 +40,14 @@ fn gate_name(g: &Gate) -> String {
                 Reason::Stopped => "stopped",
             }
         ),
+    }
+}
+
+fn verdict_name(v: ToolVerdict) -> &'static str {
+    match v {
+        ToolVerdict::Allow => "allow",
+        ToolVerdict::Deny => "deny",
+        ToolVerdict::Expired => "expired",
     }
 }
 
@@ -148,7 +156,7 @@ fn discussion_json(id: &str, st: &State, secrets: &SecretSet) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut out = json!({
         "id": id,
         "status": status(st),
         "question": c.map(|c| line(secrets, &c.question, LINE_CHARS)),
@@ -164,7 +172,27 @@ fn discussion_json(id: &str, st: &State, secrets: &SecretSet) -> Value {
             "why": describe(*g),
             "text": line(secrets, t, TEXT_CHARS),
         })),
-    })
+    });
+    // The owner's allowance and each decision about it (#1039). Present only
+    // when there is one, so the JSON of a discussion without helper tools is
+    // exactly what it was and a client that predates them reads it unchanged.
+    if let Some(c) = c.filter(|c| !c.tools.is_empty()) {
+        out["tools"] = json!(c.tools);
+    }
+    if !st.tool_approvals.is_empty() {
+        out["tool_approvals"] = st
+            .tool_approvals
+            .iter()
+            .map(|a| {
+                json!({
+                    "request": line(secrets, &a.req, LINE_CHARS),
+                    "tool": line(secrets, &a.tool, LINE_CHARS),
+                    "verdict": verdict_name(a.verdict),
+                })
+            })
+            .collect();
+    }
+    out
 }
 
 fn text_of(v: &Value) -> String {
@@ -186,6 +214,26 @@ fn text_of(v: &Value) -> String {
         v["budget"],
         v["max_rounds"]
     ));
+    let tools: Vec<&str> = v["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !tools.is_empty() {
+        out.push(format!(
+            "  helper tools the owner allowed (each asked once, for this discussion): {}",
+            tools.join(", ")
+        ));
+    }
+    for a in v["tool_approvals"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "  tool approval: {} {} (request {})",
+            s(&a["tool"]),
+            s(&a["verdict"]),
+            s(&a["request"])
+        ));
+    }
     for r in v["rounds"].as_array().into_iter().flatten() {
         out.push(format!(
             "  round {}: {} tokens, gate {}",

@@ -22,7 +22,7 @@
 
 use crate::discussion::{
     gate, is_small, Contract, Contribution, CriterionVerdict, Gate, GateInput, Reason,
-    RoundSummary, MAX_FALLBACK_REASON_CHARS,
+    RoundSummary, ToolApproval, ToolVerdict, MAX_APPROVAL_REQ_CHARS, MAX_FALLBACK_REASON_CHARS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,6 +96,16 @@ pub enum Event {
         /// ignore the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         charged: Option<String>,
+    },
+    /// The owner's decision about a helper's first call of an allowed tool
+    /// (#1039): `req` is the approvals-queue request it answers, `tool` a
+    /// registry name the contract allows. Added later: a binary from before
+    /// it refuses a log that holds one (it is not a record it knows), so a
+    /// discussion that has one is finished with the version that wrote it.
+    ToolApproval {
+        req: String,
+        tool: String,
+        verdict: ToolVerdict,
     },
     /// What the host saw after `round` that only it can see.
     Flags {
@@ -192,6 +202,8 @@ pub struct State {
     flags: BTreeMap<u32, (bool, bool)>,
     pub gates: BTreeMap<u32, Gate>,
     pub closed: Option<(Gate, String)>,
+    /// The owner's decisions about allowed tools, in ledger order (#1039).
+    pub tool_approvals: Vec<ToolApproval>,
     last_seq: u64,
 }
 
@@ -266,6 +278,10 @@ impl State {
                     }
                 }
             }
+            Event::ToolApproval { req, tool, verdict } => {
+                self.tool_approvals
+                    .push(ToolApproval { req, tool, verdict });
+            }
             Event::Flags {
                 round,
                 owner_only_disagreement,
@@ -279,6 +295,33 @@ impl State {
             }
             Event::Closed { outcome, text } => self.closed = Some((outcome, text)),
         }
+    }
+
+    /// The allowed tools whose first call the owner approved for THIS
+    /// discussion (#1039): the latest decision of each tool wins, so a later
+    /// denial or expiry takes the grant back. Empty once the discussion is
+    /// stopped, finishing or closed (the grant ends with it), and for a tool
+    /// the contract does not allow. It lives in this state only, so no other
+    /// discussion, session or process ever inherits it.
+    pub fn tool_grants(&self) -> BTreeSet<String> {
+        let open = matches!(
+            self.next(),
+            Next::Contribute { .. }
+                | Next::Summarize { .. }
+                | Next::Check { .. }
+                | Next::Decide { .. }
+        );
+        let Some(c) = self.contract.as_ref().filter(|_| open) else {
+            return BTreeSet::new();
+        };
+        let mut last: BTreeMap<&str, ToolVerdict> = BTreeMap::new();
+        for a in &self.tool_approvals {
+            last.insert(a.tool.as_str(), a.verdict);
+        }
+        last.into_iter()
+            .filter(|(t, v)| *v == ToolVerdict::Allow && c.tools.iter().any(|x| x == t))
+            .map(|(t, _)| t.to_string())
+            .collect()
     }
 
     /// The participants who speak in `round`: the latest roster at or before
@@ -930,6 +973,48 @@ impl DiscussionLog {
         }
         self.append(&st, Event::Verdicts { round, verdicts }, now)
             .map(|_| ())
+    }
+
+    /// Record the owner's decision about the first call of allowed tool
+    /// `tool` (#1039), once per approvals-queue request `req`: a request the
+    /// ledger already holds is a no-op (`Ok(false)`), so seeing the same
+    /// decision again, or after a resume, writes nothing. `tool` must be one
+    /// the contract allows; a closed discussion takes none. Append-only: a
+    /// grant is taken back by a later record, never by editing one.
+    pub fn tool_approval(
+        &self,
+        req: &str,
+        tool: &str,
+        verdict: ToolVerdict,
+        now: u64,
+    ) -> Result<bool, String> {
+        if !short_id(req, MAX_APPROVAL_REQ_CHARS, true) {
+            return Err(format!(
+                "approval request {req:?}: a short id of letters, digits, '.', '_' and '-'"
+            ));
+        }
+        let _guard = self.lock()?;
+        let st = self.state()?;
+        let c = st.contract.as_ref().ok_or("no contract")?;
+        if st.closed.is_some() {
+            return Err("the discussion is closed".into());
+        }
+        if !c.tools.iter().any(|t| t == tool) {
+            return Err(format!("`{tool}` is not a tool this discussion allows"));
+        }
+        if st.tool_approvals.iter().any(|a| a.req == req) {
+            return Ok(false);
+        }
+        self.append(
+            &st,
+            Event::ToolApproval {
+                req: req.to_string(),
+                tool: tool.to_string(),
+                verdict,
+            },
+            now,
+        )?;
+        Ok(true)
     }
 
     /// Add tokens spent by any role.

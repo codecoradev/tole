@@ -195,7 +195,9 @@
         "rounds": {"items":{"$ref":"#/$defs/DiscussionRound"},"type":"array"},
         "state": {"description":"`running` (a thread of this server drives it), `closed`, or\n`interrupted` (open and nobody drives it: resume it).","type":"string"},
         "status": {"type":"string"},
-        "tokens_used": {"format":"uint64","minimum":0,"type":"integer"}
+        "tokens_used": {"format":"uint64","minimum":0,"type":"integer"},
+        "tool_approvals": {"description":"The owner's decisions about those tools, in ledger order; left out\nwhen none.","items":{"$ref":"#/$defs/DiscussionToolApproval"},"type":"array"},
+        "tools": {"description":"The connected tools the owner allowed the helpers (#1039); left\nout when none.","items":{"type":"string"},"type":"array"}
       },
       "required": ["id","status","question","criteria","participants","budget","max_rounds","tokens_used","open_calls","rounds","state"],
       "type": "object"
@@ -305,6 +307,16 @@
         "state": {"type":"string"}
       },
       "required": ["id","outcome","state"],
+      "type": "object"
+    },
+    "DiscussionToolApproval": {
+      "description": "The owner's decision about a helper's first call of an allowed tool\n(#1039): `verdict` is `allow`, `deny` or `expired`.",
+      "properties": {
+        "request": {"type":"string"},
+        "tool": {"type":"string"},
+        "verdict": {"type":"string"}
+      },
+      "required": ["request","tool","verdict"],
       "type": "object"
     },
     "EffortReply": {

@@ -194,3 +194,53 @@ fn a_round_that_never_completed_shows_its_retry_and_charged_timeouts() {
             .unwrap();
     assert_eq!(v["rounds"][0]["charged"].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn the_allowance_and_each_approval_are_shown() {
+    use tole_core::discussion::ToolVerdict;
+    let dir = tmp("tools");
+    let l = DiscussionLog::at(&dir, "pick-db").unwrap();
+    let c = Contract::new(
+        "pick-db",
+        "Which invoice tool?",
+        &["a choice is named".to_string()],
+        &["coder".to_string()],
+        10_000,
+        None,
+        &SecretSet::default(),
+    )
+    .unwrap()
+    .with_tools(&["mcp_nginjen_search".to_string()])
+    .unwrap();
+    l.start(c, 1).unwrap();
+    l.tool_approval("dap-1", "mcp_nginjen_search", ToolVerdict::Deny, 2)
+        .unwrap();
+    l.tool_approval("dap-2", "mcp_nginjen_search", ToolVerdict::Allow, 3)
+        .unwrap();
+    let text = discussions(&dir, Some("pick-db"), false, &secrets()).unwrap();
+    for want in [
+        "helper tools the owner allowed (each asked once, for this discussion): mcp_nginjen_search",
+        "tool approval: mcp_nginjen_search deny (request dap-1)",
+        "tool approval: mcp_nginjen_search allow (request dap-2)",
+    ] {
+        assert!(text.contains(want), "{want}:\n{text}");
+    }
+    let v: Value =
+        serde_json::from_str(&discussions(&dir, Some("pick-db"), true, &secrets()).unwrap())
+            .unwrap();
+    assert_eq!(v["tools"][0], "mcp_nginjen_search");
+    assert_eq!(v["tool_approvals"][1]["verdict"], "allow");
+    // A discussion without an allowance shows neither.
+    let plain = tmp("plain");
+    discussion(&plain);
+    let text = discussions(&plain, Some("pick-db"), false, &secrets()).unwrap();
+    assert!(!text.contains("helper tools") && !text.contains("tool approval"));
+    // ... and its JSON is what it was: the two keys are absent, not empty.
+    let v: Value =
+        serde_json::from_str(&discussions(&plain, Some("pick-db"), true, &secrets()).unwrap())
+            .unwrap();
+    assert!(
+        v.get("tools").is_none() && v.get("tool_approvals").is_none(),
+        "{v}"
+    );
+}
