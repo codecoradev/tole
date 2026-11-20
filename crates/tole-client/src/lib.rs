@@ -31,7 +31,8 @@
 //!
 //! # Not yet
 //!
-//! The live event stream (`GET /sessions/{id}/events`, with resume), routes
+//! The live event stream (`GET /sessions/{id}/events`, with reconnect and
+//! resume: the SSE parser and typed events are in, the stream follows), routes
 //! beyond the first desktop set (interrupt, detach, fork, tree, compact,
 //! name, model, effort, images, missions, and the discussion, cron and
 //! profile routes of #1042) and the generated JSON Schema. The types derive
@@ -41,10 +42,12 @@
 mod client;
 mod error;
 mod http;
+mod sse;
 pub mod transport;
 mod types;
 
 pub use client::{Client, IndexQuery, Route};
 pub use error::{Error, Result};
+pub use sse::{Event, Frame, FrameReader, Ready, SseItem, SseParser};
 pub use transport::{Connection, TcpTransport, Transport};
 pub use types::*;
