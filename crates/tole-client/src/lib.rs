@@ -5,8 +5,9 @@
 //! serve`; this crate is the Rust side of that contract. It holds no agent
 //! logic and no session host.
 //!
-//! This first piece has the [`Transport`] layer and the error type. The typed
-//! requests and responses, the HTTP framing, the `Client` and the event stream
+//! This first piece has the typed requests and responses of the routes the
+//! desktop needs first (re-exported at the root) and the
+//! [`Transport`] layer. The HTTP framing, the `Client` and the event stream
 //! follow.
 //!
 //! # Transports
@@ -24,7 +25,7 @@
 //!
 //! # Not yet
 //!
-//! The wire types, the HTTP layer and the `Client`, the live event stream, routes beyond the
+//! The HTTP layer and the `Client`, the live event stream, routes beyond the
 //! first desktop set (interrupt, detach, fork, tree, compact, name, model,
 //! effort, images, missions, and the discussion, cron and profile routes of
 //! #1042) and the generated JSON Schema. The types derive `Serialize` and
@@ -32,6 +33,8 @@
 
 mod error;
 pub mod transport;
+mod types;
 
 pub use error::{Error, Result};
 pub use transport::{Connection, TcpTransport, Transport};
+pub use types::*;
