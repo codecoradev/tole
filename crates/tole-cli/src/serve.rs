@@ -793,8 +793,9 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
         }
     };
 
-    // Auth: bearer token on everything except /health (which carries no
-    // information — it is a liveness probe). Failed auths are rate-limited
+    // Auth: bearer token on everything except /health (a liveness probe that
+    // reports only the protocol and binary version, see the threat model).
+    // Failed auths are rate-limited
     // per source IP (CodeCora scan-3 Wave-2: brute-force hardening).
 
     // Rate-limit: refuse when this IP has too many recent auth failures. On the
