@@ -38,6 +38,13 @@ ignore:
     # diff the reviewer reads; the diff is filtered by `review.exclude` below.
     - "CHANGELOG.md"
     - "docs/**"
+    # Integration tests are not an API: each file under crates/*/tests/ is its
+    # own crate, and the symbol index resolves Rust calls by bare name (#669),
+    # so a test helper named `raw` was reported as "removed, 10 callers" because
+    # a method and a local variable called `raw` exist in other test crates
+    # (#1074, index-breaking-change). Keeping tests out of the index silences
+    # that without turning the rule off for the code under src/.
+    - "crates/*/tests/**"
   rules:
     - "Hardcoded password or secret"
     - "Command injection via exec/system with dynamic input"
