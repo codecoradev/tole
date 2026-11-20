@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 fn tmpdir(tag: &str) -> TestDir {
@@ -75,16 +75,19 @@ fn spawn_mock() -> String {
 }
 
 fn tole(cwd: &Path, home: &Path, url: &str, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let path = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
+    let mut c = common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        home,
+        &[("PATH", path.to_str().unwrap())],
+    );
     c.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .env("CODECORA_HOME", home)
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_NO_SESSION_INDEX")
         .env_remove("TOLE_FALLBACK_BASE_URL")
         .env_remove("TOLE_MEMORY")

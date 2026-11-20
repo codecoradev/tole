@@ -133,14 +133,16 @@ impl Daemon {
 
     fn start(&mut self) {
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd =
+                common::hermetic_command(env!("CARGO_BIN_EXE_tole"), self.home.path(), &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .args(["--workspace", self.work.to_str().unwrap()])
                 .current_dir(self.work.path())
                 .env("TOLE_NO_UPDATE_CHECK", "1")
-                .env("CODECORA_HOME", self.home.path())
-                .env("HOME", self.home.path())
-                .env("PATH", "/usr/bin:/bin")
+                .env(
+                    "PATH",
+                    common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref()),
+                )
                 .env("TOLE_STREAM", "0")
                 .env("TOLE_BASE_URL", &self.url)
                 .env("TOLE_MODEL", "env-model")

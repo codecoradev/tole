@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use tole_cli::cron::{self, store, CreateSpec};
@@ -97,9 +97,8 @@ fn spawn(base: &Path) -> Serve {
 /// `tole serve` with the provider at `provider` (a mock), if any.
 fn spawn_with(base: &Path, provider: Option<&str>) -> Serve {
     let (child, port) = common::spawn_listening(|port| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
         cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
-            .env("CODECORA_HOME", base.join("home"))
             .env("TOLE_CRON_DIR", base.join("cron"))
             .env("TOLE_TEST_HOOK_KEY", KEY)
             .stdin(Stdio::null())

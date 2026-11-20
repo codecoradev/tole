@@ -8,7 +8,7 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use tole_cli::delegated_approver::Store;
 use tole_core::delegation::{
     Budget, BudgetRequest, DelegateRequest, Delegation, Goal, Mode, Spend,
@@ -29,9 +29,8 @@ struct Serve {
 impl Serve {
     fn spawn(home: &Path, env: &[(&str, &str)]) -> Self {
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
-                .env("CODECORA_HOME", home)
                 .env("TOLE_NO_UPDATE_CHECK", "1")
                 .env_remove("TOLE_UNDER_SESSION")
                 .env_remove("TOLE_AGENT_DEPTH")

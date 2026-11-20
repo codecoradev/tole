@@ -129,16 +129,16 @@ fn run_from_subdir(root: &Path, url: &str) -> (Output, PathBuf) {
         "[sandbox.consumers]\njob_start = \"required\"\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    // Cleared first, then the hermetic HOME / CODECORA_HOME / PATH on top.
+    cmd.env_clear();
+    common::apply_hermetic_env(&mut cmd, &home, &[]);
+    let out = cmd
         .args(["run", "--workspace"])
         .arg(&ws)
         .args(["--allow", "job_start", "touch the sessions"])
         .current_dir(&sub)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", &home)
-        .env("HOME", &home)
         .env("TOLE_STREAM", "0")
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "mock-model")
@@ -207,12 +207,13 @@ fn sessions_from_a_deleted_cwd(root: &Path, config: &str) -> (String, bool) {
         gone.display(),
         env!("CARGO_BIN_EXE_tole")
     );
-    let out = Command::new("sh")
+    let path = common::path_without_sibling_binaries_from("/usr/bin:/bin".as_ref());
+    let mut cmd = Command::new("sh");
+    cmd.env_clear();
+    common::apply_hermetic_env(&mut cmd, &home, &[("PATH", path.to_str().unwrap())]);
+    let out = cmd
         .args(["-c", &script])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", &home)
         .stdin(Stdio::null())
         .output()
         .unwrap();

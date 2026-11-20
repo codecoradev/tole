@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use serve_harness::{new_session, spawn_mock, Serve};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use tole_core::plugin_lock::{manifest_hash, LockEntry, Lockfile, LOCK_FILE};
 
 const SECRET: &str = "sk-test";
@@ -65,6 +65,7 @@ fn notices(serve: &Serve, id: &str) -> Vec<Value> {
 fn env_of<'a>(home: &'a Path, path: &'a Path) -> Vec<(&'a str, &'a str)> {
     vec![
         ("CODECORA_HOME", home.to_str().unwrap()),
+        ("HOME", home.to_str().unwrap()),
         ("PATH", path.to_str().unwrap()),
         ("TOLE_NO_UPDATE_CHECK", "1"),
     ]
@@ -176,10 +177,9 @@ fn an_optional_sandbox_counts_as_required_on_serve() {
     }
     // Attended CLI run: the approved server is started (unsandboxed).
     let ws = TestDir::new("tole-srv-mcp-ws");
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &h, &env_of(&h, &empty))
         .args(["run", "--mcp-server", &cli_spec, "hi"])
         .current_dir(&ws)
-        .envs(env_of(&h, &empty))
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
@@ -219,10 +219,9 @@ fn acp_uses_the_owner_list_and_ignores_the_clients_mcp_servers() {
     let h = home(&format!("mcp_server = [{uns:?}]\n"));
     let empty = TestDir::new("tole-srv-mcp-path");
     let cwd = TestDir::new("tole-srv-mcp-acp-ws");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let mut child = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &h, &env_of(&h, &empty))
         .arg("acp")
         .current_dir(&cwd)
-        .envs(env_of(&h, &empty))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -12,7 +12,7 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -220,10 +220,9 @@ fn a_queued_write_and_its_denial_are_announced_signed_and_redacted() {
     .unwrap();
     let provider = mock_provider();
     let (child, sport) = common::spawn_listening(|p| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
         cmd.args(["serve", "--port", &p.to_string(), "--token", "t0ken"])
             .current_dir(base.join("w"))
-            .env("CODECORA_HOME", base.join("home"))
             .env("TOLE_CRON_DIR", base.join("cron"))
             .env("TOLE_BASE_URL", &provider)
             .env("TOLE_MODEL", "mock-model")

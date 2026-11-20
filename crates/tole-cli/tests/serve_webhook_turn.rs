@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -337,10 +337,10 @@ impl World {
                 .local_addr()
                 .unwrap()
                 .port();
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd =
+                common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &self.base.join("home"), &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .current_dir(self.base.join("w"))
-                .env("CODECORA_HOME", self.base.join("home"))
                 .env("TOLE_CRON_DIR", self.base.join("cron"))
                 .env("TOLE_BASE_URL", provider)
                 .env("TOLE_MODEL", "mock-model")

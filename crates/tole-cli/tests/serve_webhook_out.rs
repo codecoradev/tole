@@ -231,9 +231,8 @@ fn candidate_port() -> u16 {
 }
 
 fn serve_cmd(base: &Path, port: u16, stderr: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
     cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TOLE_TEST_HOOK_KEY", HOOK_KEY)
         .env(SIGN_VAR, SIGN_KEY)
