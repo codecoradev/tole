@@ -114,6 +114,9 @@ pub(super) fn parse(body: &str) -> Result<StartArgs, (u16, Value)> {
         budget_tokens,
         max_rounds,
         files: strings(&req, "files").map_err(bad)?,
+        // Helper tools are the owner's `--tool` on the command line (#1039):
+        // a request over serve names none, whatever it carries.
+        tools: Vec::new(),
     })
 }
 
@@ -154,6 +157,9 @@ pub(super) fn with_env<T>(
         secrets,
         make,
         workdir: &state.workspace_root,
+        // No host to start helper children here: a discussion that allows
+        // tools is refused over serve, never run without them (#1039).
+        delegator: None,
     };
     f(&env).map_err(|e| refused(&env.secrets.redact(&e)))
 }

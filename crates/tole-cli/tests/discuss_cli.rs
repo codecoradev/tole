@@ -81,7 +81,10 @@ fn spawn_mock() -> String {
 
 fn run(home: &std::path::Path, base: Option<&str>, args: &[&str]) -> Output {
     let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
+    // The working folder is the test's own: helper children (#1039) create
+    // their agent directories in it, never in the source tree.
     c.args(args)
+        .current_dir(home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("DISCUSS_CLI_TOKEN", SECRET)
         .env_remove("TOLE_BASE_URL")
@@ -192,4 +195,94 @@ fn list_and_show_need_no_config_and_no_provider() {
     assert!(out(&o).contains("no discussions"));
     let o = run(&home, None, &["discuss", "show", "nope"]);
     assert!(!o.status.success());
+}
+
+/// #1039: `--tool <server>.<tool>` names a connected tool of a configured
+/// server; the first call of it is asked of the owner in the approvals queue,
+/// so the queue must be on. Everything is checked before anything is written.
+#[cfg(feature = "mcp")] // `--mcp-server` exists only with the feature
+#[test]
+fn the_tool_flag_names_a_configured_server_and_needs_the_approvals_queue() {
+    let home = home_with_profiles("tool-flag");
+    let dry = |extra: &[&str]| {
+        let mut args = START.to_vec();
+        args.push("--dry-run");
+        args.extend_from_slice(extra);
+        run(&home, None, &args)
+    };
+    // Not <server>.<tool>, and a server nobody configured.
+    let o = dry(&["--tool", "search"]);
+    assert!(!o.status.success());
+    assert!(out(&o).contains("<server>.<tool>"), "{}", out(&o));
+    let o = dry(&["--tool", "nginjen.search"]);
+    assert!(!o.status.success());
+    assert!(
+        out(&o).contains("no connected server `nginjen`"),
+        "{}",
+        out(&o)
+    );
+    // Configured, but the approvals queue is off: every call would be denied.
+    let o = dry(&["--mcp-server", "nginjen=true", "--tool", "nginjen.search"]);
+    assert!(!o.status.success());
+    assert!(out(&o).contains("approvals = \"owner\""), "{}", out(&o));
+    // With the queue on, the plan shows the allowance and writes nothing.
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[profiles.coder]\n[profiles.ops]\n[delegation]\napprovals = \"owner\"\n",
+    )
+    .unwrap();
+    let o = dry(&["--mcp-server", "nginjen=true", "--tool", "nginjen.search"]);
+    let text = out(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains("Helper tools: mcp_nginjen_search")
+            && text.contains("independent read-only child"),
+        "{text}"
+    );
+    assert!(!home.join("tole/discussions").exists());
+}
+
+/// #1039, through the real binary: with an allowance every participant runs as
+/// an independent read-only child (a `tole mission --plan-mode` of its own),
+/// the contract records the allowance, and `discuss show` prints it. The mock
+/// provider answers the children with plain text, so each one hands in no
+/// report; the discussion still runs to its end.
+#[cfg(feature = "mcp")] // `--mcp-server` exists only with the feature
+#[test]
+fn a_discussion_with_tools_runs_its_helpers_as_children_and_shows_the_allowance() {
+    let home = tmp("tool-run");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[profiles.coder]\n[profiles.ops]\n[delegation]\napprovals = \"owner\"\n",
+    )
+    .unwrap();
+    let base = spawn_mock();
+    let mut args = START.to_vec();
+    args.extend(["--max-rounds", "1", "--mcp-server", "nginjen=true"]);
+    args.extend(["--tool", "nginjen.search"]);
+    let o = run(&home, Some(&base), &args);
+    let text = out(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(text.contains("Helper tools: mcp_nginjen_search"), "{text}");
+    assert!(text.contains("Outcome: "), "{text}");
+    let show = out(&run(&home, None, &["discuss", "show", "pick-db"]));
+    assert!(
+        show.contains("helper tools the owner allowed") && show.contains("mcp_nginjen_search"),
+        "{show}"
+    );
+    // The helpers really were children of the delegation host: two consult
+    // nodes carved for the two participants.
+    let log = std::fs::read_dir(home.join("tole/delegation"))
+        .unwrap()
+        .flatten()
+        .map(|d| d.path().join("delegation.jsonl"))
+        .find(|p| p.exists())
+        .expect("a delegation log");
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(
+        log.matches("[tole discussion call pick-db-").count(),
+        2,
+        "{log}"
+    );
 }

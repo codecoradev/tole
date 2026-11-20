@@ -843,6 +843,16 @@ enum DiscussAction {
         /// refuses a file that is gone or changed.
         #[arg(long = "file")]
         files: Vec<String>,
+        /// A connected (MCP) tool the participants may use, as
+        /// <server>.<tool> (e.g. nginjen.search); repeat for more (at most
+        /// 8). The server must be configured. With any, every participant
+        /// runs as an independent read-only child (it cannot write or run
+        /// programs) and the FIRST call of each tool in this discussion is
+        /// asked of you in the approvals queue (`tole approvals`): allow
+        /// covers that tool for this discussion only, never another one. It
+        /// needs `[delegation] approvals = "owner"` in your user config.
+        #[arg(long = "tool")]
+        tools: Vec<String>,
         /// Validate the contract and show what it may cost; call no model
         /// and write nothing.
         #[arg(long)]
@@ -2373,7 +2383,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        Command::Discuss { action } => discuss_command(action, cfg.as_ref()),
+        Command::Discuss { action } => {
+            #[cfg(feature = "mcp")]
+            let servers: Vec<String> = host
+                .mcp_server
+                .iter()
+                .filter_map(|s| s.split('=').next())
+                .map(str::to_string)
+                .collect();
+            #[cfg(not(feature = "mcp"))]
+            let servers: Vec<String> = Vec::new();
+            discuss_command(action, cfg.as_ref(), &servers, &host.delegation)
+        }
         Command::Delegation { action } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
             delegation_command(action, &root)
@@ -2598,7 +2619,12 @@ fn delegation_command(action: DelegationAction, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>) -> Result<()> {
+fn discuss_command(
+    action: DiscussAction,
+    cfg: Option<&tole_cli::config::Config>,
+    servers: &[String],
+    delegation: &tole_cli::delegate::Setup,
+) -> Result<()> {
     use tole_cli::discuss;
     let dir = discuss::dir().map_err(anyhow::Error::msg)?;
     let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
@@ -2642,6 +2668,20 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                     tole_cli::config_apply::discussion_timeout(),
                 )
             };
+            // The host that starts helper children, for a discussion that
+            // allows tools (#1039): one root goal in this folder, no allow
+            // patterns of its own (a helper's authority is nothing but the
+            // owner's allowance).
+            let delegator = std::env::current_exe().ok().and_then(|bin| {
+                tole_cli::delegate::Delegator::for_session(
+                    bin,
+                    workdir.clone(),
+                    false,
+                    Vec::new(),
+                    delegation.clone(),
+                    &tole_cli::config_apply::real_env,
+                )
+            });
             let env = discuss::Env {
                 dir: &dir,
                 cfg,
@@ -2649,6 +2689,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                 secrets,
                 make,
                 workdir: &workdir,
+                delegator: delegator.map(std::sync::Arc::new),
             };
             match action {
                 DiscussAction::Start {
@@ -2659,6 +2700,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                     max_rounds,
                     id,
                     files,
+                    tools,
                     dry_run,
                 } => {
                     let args = discuss::StartArgs {
@@ -2669,6 +2711,8 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                         budget_tokens: budget,
                         max_rounds,
                         files,
+                        tools: discuss::helper_tools::resolve(&tools, servers)
+                            .map_err(anyhow::Error::msg)?,
                     };
                     for line in discuss::advice_for(&args, env.workdir, &env.secrets) {
                         eprintln!("tole: advice: {line}");

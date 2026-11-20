@@ -99,6 +99,7 @@ fn args(budget: u64) -> StartArgs {
         budget_tokens: budget,
         max_rounds: Some(3),
         files: vec![],
+        tools: vec![],
     }
 }
 
@@ -115,6 +116,7 @@ fn env_in<'a>(dir: &'a Path, workdir: &'a Path, cfg: &'a Config, make: Factory) 
         secrets: SecretSet::default().with("MY_TOKEN", SECRET),
         make,
         workdir,
+        delegator: None,
     }
 }
 
@@ -1049,3 +1051,6 @@ fn a_round_one_budget_escalation_says_why() {
     );
     assert!(state(&dir).tokens_used <= 300);
 }
+
+#[path = "start_tools_tests.rs"]
+mod tools;

@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use tole_core::advisor::Budget;
+use tole_core::child_env::DiscussionScope;
 use tole_core::discussion::{
     self, checker_request, participant_request_with, scribe_request, Background, Contract,
     CriterionVerdict, Gate, RoundSummary, MAX_CONTRIBUTION_CHARS, MAX_FALLBACK_REASON_CHARS,
@@ -45,6 +46,7 @@ use tole_core::entry::{Entry, EntryType};
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::secrets::SecretSet;
 
+use super::helper_tools::{self, ToolDecision};
 use crate::config::Config;
 use crate::discussion_roles::{self, Role};
 
@@ -130,22 +132,6 @@ pub fn round_floor_with(c: &Contract, background: &[Background]) -> u64 {
     voices + tokens(checker_request(c, &[]), CHECKER_REPLY_TOKENS)
 }
 
-/// A contract that allows helper tools needs independent helpers and the
-/// approval wiring (#1039), which this host does not have yet: refuse it
-/// loudly rather than run its helpers inline, where they would silently get
-/// no tools at all.
-fn refuse_tools(c: &Contract) -> Result<(), String> {
-    if c.tools.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "discussion `{}` allows helper tools ({}), which this host cannot run yet: its helpers \
-         would run without them",
-        c.id,
-        c.tools.join(", ")
-    ))
-}
-
 /// Longest part of the question the closing text repeats, in characters.
 const REPORT_QUESTION_CHARS: usize = 600;
 
@@ -202,6 +188,24 @@ pub trait Independent: Send + Sync {
     fn find(&self, key: &str) -> Result<Option<String>, String>;
     /// `None` while it runs; once ended, its contribution and what it spent.
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String>;
+    /// [`start`](Independent::start) for a helper whose owner allowed it the
+    /// connected tools of `scope` (#1039). A runner that cannot give a helper
+    /// tools refuses, never starts it without them.
+    fn start_scoped(
+        &self,
+        _who: &str,
+        _task: &str,
+        _tokens: u64,
+        _key: &str,
+        _scope: &DiscussionScope,
+    ) -> Result<String, String> {
+        Err("this runner cannot give a helper tools".into())
+    }
+    /// What the owner decided about the helper's tool requests so far
+    /// (#1039); none for a runner that has no approvals.
+    fn decisions(&self, _handle: &str) -> Result<Vec<ToolDecision>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Independent participants as delegated `consult` children (#585): the
@@ -217,6 +221,28 @@ impl Independent for DelegateIndependent {
             &format!("{}\n\n{task}", call_marker(key)),
             tokens,
             None,
+        )
+    }
+    fn start_scoped(
+        &self,
+        who: &str,
+        task: &str,
+        tokens: u64,
+        key: &str,
+        scope: &DiscussionScope,
+    ) -> Result<String, String> {
+        self.0.consult_participant(
+            who,
+            &format!("{}\n\n{task}", call_marker(key)),
+            tokens,
+            Some(scope),
+        )
+    }
+    fn decisions(&self, handle: &str) -> Result<Vec<ToolDecision>, String> {
+        helper_tools::decisions(
+            &self.0.approvals_store(),
+            handle,
+            crate::delegated_approver::real_now(),
         )
     }
     fn find(&self, key: &str) -> Result<Option<String>, String> {
@@ -556,7 +582,7 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
-        refuse_tools(&contract)?;
+        self.check_tools(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -585,7 +611,7 @@ impl Driver {
         // Before any step: the background files are the contract's, or nothing
         // runs (a no-op without files, cached after the first check).
         if let Some(c) = self.log.state()?.contract {
-            refuse_tools(&c)?;
+            self.check_tools(&c)?;
             self.check_files(&c)?;
         }
         loop {
@@ -670,10 +696,20 @@ impl Driver {
     ) -> Result<Option<String>, String> {
         let what = format!("participant-{who}");
         let id = st.contract.as_ref().map_or("", |c| c.id.as_str());
+        // The owner's allowance, if any (#1039): what this helper may ask for,
+        // from the ledger as it stands now.
+        let scope = st
+            .contract
+            .as_ref()
+            .filter(|c| !c.tools.is_empty())
+            .map(|c| helper_tools::scope(st, c));
         let (call, handle) = match st.open_call(round, &what) {
             Some((call, Some(handle))) => (call, handle),
             open => {
-                let task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
+                let mut task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
+                if let Some(s) = &scope {
+                    task = format!("{task}\n\n{}", helper_tools::task_note(&s.tools));
+                }
                 let (call, need) = match open {
                     Some((call, None)) => {
                         let need = st.reservations.get(&call).map_or(0, |r| r.tokens);
@@ -691,7 +727,10 @@ impl Driver {
                 let found = runner.find(&key)?;
                 let handle = match found {
                     Some(h) => Ok(h),
-                    None => runner.start(who, &task, need, &key),
+                    None => match &scope {
+                        Some(s) => runner.start_scoped(who, &task, need, &key, s),
+                        None => runner.start(who, &task, need, &key),
+                    },
                 }
                 .map_err(|e| {
                     format!(
@@ -704,12 +743,64 @@ impl Driver {
             }
         };
         loop {
-            if let Some((text, spent)) = runner.poll(&handle)? {
+            let ended = runner.poll(&handle)?;
+            if scope.is_some() {
+                self.record_decisions(runner, &handle);
+            }
+            if let Some((text, spent)) = ended {
                 self.log.settle(&call, spent, (self.now)())?;
                 self.pot.charge(spent);
                 return Ok(Some(text));
             }
             std::thread::sleep(self.poll_every);
+        }
+    }
+
+    /// Copies the owner's answers about helper `handle`'s tool requests into
+    /// the ledger, once per request (#1039). A failure is a note, never a
+    /// silent drop and never a change of gate: the answer is still in the
+    /// approvals queue and is seen again on the next poll.
+    fn record_decisions(&self, runner: &dyn Independent, handle: &str) {
+        let found = match runner.decisions(handle) {
+            Ok(d) => d,
+            Err(e) => return self.note(format!("tool approvals could not be read: {e}")),
+        };
+        for d in found {
+            if let Err(e) = self
+                .log
+                .tool_approval(&d.req, &d.tool, d.verdict, (self.now)())
+            {
+                self.note(format!("tool approval {} was not recorded: {e}", d.req));
+            }
+        }
+    }
+
+    /// A contract that allows helper tools needs every participant seated as
+    /// an independent helper (inline voices have no tools): refused loudly
+    /// otherwise, rather than run without them, and a name no connected tool
+    /// can have is refused too (#1039).
+    fn check_tools(&self, c: &Contract) -> Result<(), String> {
+        if c.tools.is_empty() {
+            return Ok(());
+        }
+        if let Some(t) = c.tools.iter().find(|t| !discussion::tool_name_ok(t)) {
+            return Err(format!(
+                "discussion `{}` allows {t:?}, which is not a connected tool name",
+                c.id
+            ));
+        }
+        match c
+            .participants
+            .iter()
+            .find(|p| !self.independent.contains_key(*p))
+        {
+            None => Ok(()),
+            Some(p) => Err(format!(
+                "discussion `{}` allows helper tools ({}), but participant `{p}` is not seated as \
+                 an independent helper here: it would run without them",
+                c.id,
+                c.tools.join(", ")
+            )),
         }
     }
 
