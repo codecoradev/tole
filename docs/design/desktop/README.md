@@ -1,8 +1,8 @@
 # Desktop UI draft (Simple edition)
 
-Images of the desktop design draft, the "Simple edition" page of the Design canvas (sixteen boards). They are a reference for the desktop issues of epic #527, not a specification: wording, density and sample data are drafts. The editable canvas is not in this repository.
+Images of the desktop design draft, the "Simple edition" page of the Design canvas (sixteen boards). They are a reference for the desktop issues of #527 (epic #523), not a specification: wording, density and sample data are drafts. The editable canvas is not in this repository.
 
-Drawn for people who are not technical: plain words, one window on the local machine, technical detail behind "Show technical details". The look follows the existing dark tokens (background `#0F1113`, accent `#5CC8B0`, Inter and JetBrains Mono). Rows and buttons are about 34 to 38 px; boards S1, S11 and S12 keep the first version's 44 px.
+Drawn for people who are not technical: plain words, one window on the local machine, technical detail behind "Show technical details". The look uses the dark tokens of the design canvas (background `#0F1113`, accent `#5CC8B0`, Inter and JetBrains Mono; they are not defined anywhere in the repository yet, #1028 creates the token module). Rows and buttons are about 34 to 38 px; boards S1, S11 and S12 were drawn first with 44 px controls and not redrawn.
 
 Rendered from the board HTML with Chromium at 1x. They were not rendered by GPUI, and nothing here was built; check each part in a small spike (the GPUI Kit names on S13 were read from the source of gpui-component 0.9.1, not compiled).
 
@@ -27,9 +27,9 @@ Rendered from the board HTML with Chromium at 1x. They were not rendered by GPUI
 
 ## Intended differences from the technical clients
 
-- Approvals are a page and a card, answered "Allow once" or "Don't allow"; no permanent allow for changing or deleting files (the core enforces it, not the UI).
+- Approvals are a page and a card, answered "Allow once" or "Don't allow"; no "always allow" for a single request (the serve decision route is one-shot, and Destructive tools are never auto-allowed by the core).
 - Discussions have their own menu: the owner chooses the helpers, or Tole proposes them and the owner confirms before anything runs (a model-started discussion is an approval).
 - Skills and connected tools: trust approval from the app is an open owner decision (#1034); nothing a model says can trust a tool.
-- Automations run while the local serve runs; closing the window does not stop them.
+- Automations run while the local serve runs, if it was started with the cron scheduler (`--cron`); closing the window does not stop them.
 
 See [../../desktop-design.md](../../desktop-design.md) section 0 for the architecture decisions.
