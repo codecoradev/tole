@@ -1,19 +1,48 @@
 # tole-desktop: local and remote over the same serve API (design note, #949)
 
-**Status: DESIGN, nothing here is decided.** Step 7 of epic #941. Every
-decision in the [decision table](#4-decisions-open-for-the-owner) is **OPEN FOR
-THE OWNER**; the "recommended default" column is a proposal, not a record. No
-code follows from this note until the owner answers and the UI stack is
-un-parked (#910 says UI work stays postponed until the owner commands it).
+**Status: DESIGN. The owner un-parked the desktop on 2026-11-20 and answered
+D1 to D4 and D6 (section 0); D5 and D7 to D11 are still open.** Step 7 of epic
+#941. In the [decision table](#4-decisions-open-for-the-owner) the
+"recommended default" column is a proposal, not a record, except where section
+0 says the owner decided otherwise.
 
 Inputs: #949 (this issue), #941 (parity epic), #527 (GPUI desktop), #523 (UI
 stack epic), #561 (UI/UX plan), #910 (gateway), #742 (serve auth),
 [mobile-control.md](mobile-control.md) (the route reference),
 [daemon-design.md](daemon-design.md), [threat-model.md](threat-model.md),
-[faces.md](faces.md). The visual draft (a Design canvas, 11 boards) is not in
-the repository and was not read for this note; the screen mapping below is
-derived from the TUI inventory in #527/#561 and from the routes, and the owner
-should check it against the canvas.
+[faces.md](faces.md). The first version of this note was written without the
+visual draft. The current draft (sixteen boards, S1 to S16) is in the repository
+as images: [design/desktop/README.md](design/desktop/README.md).
+
+## 0. Owner decisions of 2026-11-20
+
+Recorded from the owner's answers in the desktop planning session (issues
+#1028 to #1044, milestone 0.10.0). They replace the "recommended default" of
+the same rows in section 4.
+
+| Row | Decision |
+|---|---|
+| D1 local transport | **A Unix socket (named pipe on Windows) in a `0700` directory**, not loopback TCP. New listener in `serve`: #1043. |
+| D2 serve or in-process host | **Serve for local and remote.** The desktop does not embed the session host and has no blocking GUI approver; approvals come from the serve queue. One typed client for every graphical face: #1040. |
+| D3 desktop starts serve | **Yes.** The desktop attaches to a matching running local serve or starts one as a child with a per-launch credential. Closing the window leaves serve running (automations and running turns continue); "Quit completely" stops it. Supervisor: #1029. |
+| D4 token | A fresh random credential per launch, passed without the command line or environment (inherited descriptor or a `0600` file in the private directory). A saved remote credential goes in the OS keychain where available. |
+| D6 remote TLS | `https://` required for a non-loopback server, unless the owner marks that server as a trusted private network. |
+
+Local first. A remote server (a VPS) is prepared but not the focus: the desktop
+can save remote server entries now; a container image and a compose example
+with a TLS proxy and an unbuffered event stream is #1044 (later). TLS stays out
+of tole itself (D5 still open for confirmation, but the plan assumes (a)).
+
+Still open: D5 (confirmation), D7, **D8** (the design lists several working
+folders; today one serve has one `--workspace` root, so the supervisor needs
+either one serve per folder or a wider root: decide before #1029), D9 (the
+design has no model picker in the first screens), D10 (the design groups past
+sessions by folder), D11.
+
+What stays in the desktop process and never becomes a serve route, each a row
+of [faces.md](faces.md): writing config and profiles, trust approval of skills
+and connected tools (owner decision pending, #1034), the operating system's
+folder dialog.
 
 ## 1. One API, two transports
 
@@ -108,7 +137,17 @@ The acceptance criteria of #949 ask for a screen-to-route mapping. The screens
 below are the TUI-parity components named in #527 and the inventory in #561
 (session list, transcript, editor/composer, footer, approval panel, model
 picker, empty and error states). I did not see the canvas, so this table covers
-those screens only.
+those screens only. The screens added by the current design (boards S5 to S10
+and S14 to S16) need these further routes, tracked in #1042:
+
+| Screen | Needs | Readiness |
+|---|---|---|
+| Discussions (list, report, start, continue, stop) | discussion routes and events | not built (CLI-only, drift #945) |
+| Automations (list, toggle, history) | cron routes | partial: `GET /cron/runs` only |
+| Helpers (profiles), read | profile list with display fields | not built |
+| Skills and connected tools, states | read-only state lists | not built |
+| Settings, helpers, trust | local-only owner actions | by design not a route |
+| Approval wording | action summary on the approval row (#1041) | not built |
 
 | Screen or component | Calls | Readiness |
 |---|---|---|
