@@ -7,8 +7,8 @@
 //!
 //! This first piece has the typed requests and responses of the routes the
 //! desktop needs first (re-exported at the root) and the
-//! [`Transport`] layer. The HTTP framing, the `Client` and the event stream
-//! follow.
+//! [`Transport`] layer, with the HTTP/1.1 framing under it. The `Client` and
+//! the event stream follow.
 //!
 //! # Transports
 //!
@@ -25,13 +25,16 @@
 //!
 //! # Not yet
 //!
-//! The HTTP layer and the `Client`, the live event stream, routes beyond the
+//! The `Client`, the live event stream, routes beyond the
 //! first desktop set (interrupt, detach, fork, tree, compact, name, model,
 //! effort, images, missions, and the discussion, cron and profile routes of
 //! #1042) and the generated JSON Schema. The types derive `Serialize` and
 //! `Deserialize`, so a schema can be added without reshaping them.
 
 mod error;
+// The client that calls into it lands in the next change.
+#[allow(dead_code)]
+mod http;
 pub mod transport;
 mod types;
 
