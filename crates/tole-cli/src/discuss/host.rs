@@ -37,8 +37,8 @@ use std::sync::Arc;
 use serde_json::json;
 use tole_core::advisor::Budget;
 use tole_core::discussion::{
-    self, checker_request, participant_request, scribe_request, Contract, CriterionVerdict, Gate,
-    RoundSummary, MAX_CONTRIBUTION_CHARS, MAX_FALLBACK_REASON_CHARS,
+    self, checker_request, participant_request_with, scribe_request, Background, Contract,
+    CriterionVerdict, Gate, RoundSummary, MAX_CONTRIBUTION_CHARS, MAX_FALLBACK_REASON_CHARS,
 };
 use tole_core::discussion_log::{describe, DiscussionLog, Next, Reserve, State};
 use tole_core::entry::{Entry, EntryType};
@@ -107,6 +107,13 @@ pub struct Voice {
 /// than the room still fit a smaller budget, but never one below the first
 /// call's own reservation.
 pub fn round_floor(c: &Contract) -> u64 {
+    round_floor_with(c, &[])
+}
+
+/// [`round_floor`] when every inline voice also reads `background` (#1038):
+/// the excerpts are part of each participant's request, so they are counted
+/// once per participant.
+pub fn round_floor_with(c: &Contract, background: &[Background]) -> u64 {
     let tokens = |req: Vec<(&'static str, String)>, reply: u64| {
         (req.iter().map(|(_, s)| s.len()).sum::<usize>() / 4) as u64 + reply
     };
@@ -115,7 +122,7 @@ pub fn round_floor(c: &Contract) -> u64 {
         .iter()
         .map(|p| {
             tokens(
-                participant_request(c, 1, p, None, None),
+                participant_request_with(c, 1, p, None, None, background),
                 PARTICIPANT_REPLY_TOKENS,
             )
         })
@@ -461,6 +468,7 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
+        no_unread_background(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -724,12 +732,14 @@ impl Driver {
         let voice = self.voices.get(who).ok_or_else(|| {
             format!("participant `{who}` has no profile here (was it removed from the config?)")
         })?;
-        let mut req = participant_request(
+        no_unread_background(contract)?;
+        let mut req = participant_request_with(
             contract,
             round,
             who,
             st.prior_summary(round),
             st.own_previous(who, round),
+            &[],
         );
         if let Some(persona) = &voice.persona {
             req[0].1 = format!(
@@ -1080,6 +1090,21 @@ fn speakers(cs: &[discussion::Contribution]) -> String {
         .map(|c| c.participant.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A contract that names background files (#1038) needs a host that reads
+/// them; this one does not yet, so a round refuses instead of quietly
+/// sending the voices the names without the excerpts the cost estimate
+/// counts. The loader replaces this check in the change that adds it.
+pub(super) fn no_unread_background(contract: &Contract) -> Result<(), String> {
+    if contract.files.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "this discussion names {} background file(s), and this host cannot read them yet",
+            contract.files.len()
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tole_core::advisor::Budget;
-use tole_core::discussion::{self, Contract, Gate};
+use tole_core::discussion::{self, Background, Contract, Gate};
 use tole_core::discussion_log::{describe, DiscussionLog};
 use tole_core::secrets::SecretSet;
 
@@ -72,9 +72,16 @@ pub fn contract(args: &StartArgs, now: u64, secrets: &SecretSet) -> Result<Contr
 /// calls are the most the contract allows, and the cost of a round grows
 /// with the number of participants ([`host::round_floor`]).
 pub fn cost_plan(c: &Contract) -> String {
+    cost_plan_with(c, &[])
+}
+
+/// [`cost_plan`] for a contract whose inline voices also read `background`:
+/// the excerpts are in every participant's request, so they are in the
+/// estimate and listed.
+pub fn cost_plan_with(c: &Contract, background: &[Background]) -> String {
     let n = c.participants.len();
     let per_round = n + 2;
-    let floor = host::round_floor(c);
+    let floor = host::round_floor_with(c, background);
     let fit = match c.budget_tokens / floor.max(1) {
         0 => format!(
             "This budget does not fit one round of {n} participants (about {floor} tokens \
@@ -86,11 +93,37 @@ pub fn cost_plan(c: &Contract) -> String {
         ),
     };
     let q_chars = c.question.chars().count();
+    let files = if background.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = background
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} ({} characters shown{}{})",
+                    b.path,
+                    b.text.chars().count(),
+                    if b.truncated {
+                        ", cut to the excerpt cap"
+                    } else {
+                        ""
+                    },
+                    if b.redacted { ", values redacted" } else { "" },
+                )
+            })
+            .collect();
+        format!(
+            "Background files, read by every inline participant each round and counted in the \
+             estimate below: {}.\n",
+            list.join("; ")
+        )
+    };
     format!(
         "Discussion `{}`: {} participants ({}), up to {} rounds, up to {} model calls \
          (each round: one per participant, a scribe and a claim-checker).\n\
          Question: {q_chars} characters (about {} tokens), sent with every call and counted \
          in the estimate below.\n\
+         {files}\
          Estimate: a round reserves at least {floor} tokens ({n} participant calls and a \
          claim-checker, plus a scribe for a large round); {fit}\n\
          Budget: {} tokens, a hard cap: a call that does not fit stops the discussion \
@@ -110,10 +143,15 @@ pub fn cost_plan(c: &Contract) -> String {
 /// [`discussion::RECOMMENDED_PARTICIPANTS`], and a warning when the budget
 /// cannot fit one round. Neither refuses the discussion.
 pub fn advice(c: &Contract) -> Vec<String> {
+    advice_with(c, &[])
+}
+
+/// [`advice`] with the background files the voices read counted in the floor.
+pub fn advice_with(c: &Contract, background: &[Background]) -> Vec<String> {
     let mut out: Vec<String> = discussion::participants_advice(c.participants.len())
         .into_iter()
         .collect();
-    let floor = host::round_floor(c);
+    let floor = host::round_floor_with(c, background);
     if c.budget_tokens < floor {
         out.push(format!(
             "the budget ({} tokens) does not fit one round of {} participants (about {floor} \

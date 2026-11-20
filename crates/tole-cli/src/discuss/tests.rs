@@ -587,6 +587,51 @@ fn a_twelve_thousand_character_question_runs_and_the_closing_text_stays_readable
 }
 
 #[test]
+fn the_estimate_counts_background_excerpts_once_per_participant() {
+    // #1038: the excerpts are in every inline participant's request.
+    let s = SecretSet::default();
+    let c = contract(&wide_args(4, 500_000), 1, &s).unwrap();
+    let file = |path: &str, chars: usize| tole_core::discussion::Background {
+        path: path.into(),
+        text: "b".repeat(chars),
+        sha256: tole_core::discussion::sha256_hex(path.as_bytes()),
+        truncated: chars >= 12_000,
+        redacted: path == "keys.md",
+    };
+    let bg = [file("brief.md", 12_000), file("keys.md", 400)];
+    let (plain, with) = (host::round_floor(&c), host::round_floor_with(&c, &bg));
+    // Four participants each read about 12 400 characters (3 100 tokens) more.
+    assert!(with >= plain + 4 * 3_000, "{plain} -> {with}");
+    assert_eq!(host::round_floor_with(&c, &[]), plain);
+    let (a, b) = (cost_plan(&c), cost_plan_with(&c, &bg));
+    assert_eq!(a, cost_plan_with(&c, &[]));
+    assert!(!a.contains("Background files"), "{a}");
+    assert!(
+        b.contains("brief.md (12000 characters shown, cut to the excerpt cap)")
+            && b.contains("keys.md (400 characters shown, values redacted)")
+            && b.contains(&format!("a round reserves at least {with} tokens")),
+        "{b}"
+    );
+    // The budget warning uses the same floor.
+    let tight = contract(&wide_args(4, with - 1), 1, &s).unwrap();
+    assert!(advice(&tight).len() < advice_with(&tight, &bg).len());
+}
+
+#[test]
+fn a_contract_with_background_files_is_refused_until_the_host_reads_them() {
+    // #1038: until the loader exists, naming files must not mean the voices
+    // quietly get the names without the excerpts.
+    let s = SecretSet::default();
+    let plain = contract(&wide_args(2, 100_000), 1, &s).unwrap();
+    assert!(host::no_unread_background(&plain).is_ok());
+    let named = plain
+        .with_files(&["brief.md".to_string()], &["a".repeat(64)])
+        .unwrap();
+    let err = host::no_unread_background(&named).unwrap_err();
+    assert!(err.contains("1 background file(s)"), "{err}");
+}
+
+#[test]
 fn a_round_one_budget_escalation_says_why() {
     let dir = tmp("wide-r1");
     let cfg = wide_config(12);
