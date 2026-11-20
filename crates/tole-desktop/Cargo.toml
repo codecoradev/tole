@@ -1,0 +1,24 @@
+[package]
+name = "tole-desktop"
+description = "Native desktop client for tole (a thin client of a local `tole serve`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not published: the desktop ships as an application, not as a library.
+publish = false
+
+# No tole dependency beyond the desktop's own model crate. When the typed
+# client crate (#1040) is on develop the desktop depends on it and on nothing
+# else from tole: never on `tole-core`, `tole-tui` or `tole-cli` (the session
+# host).
+[dependencies]
+tole-desktop-model = { version = "0.12.0", path = "../tole-desktop-model" }
+
+[lib]
+name = "tole_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tole-desktop"
+path = "src/main.rs"
