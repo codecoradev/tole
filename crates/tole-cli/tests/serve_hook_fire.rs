@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use tole_cli::cron::{self, store, CreateSpec};
