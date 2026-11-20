@@ -10,7 +10,7 @@ use common::TestDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const KEY: &str = "route-key-for-hook-cli-tests-0123";
 
