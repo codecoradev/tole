@@ -1,0 +1,153 @@
+name: Desktop
+
+# The desktop crates (#1028). Kept out of ci.yml so the required checks there
+# do not change; it is NOT a required check unless the owner adds it to the
+# branch protection of `develop` (not done here). If the owner does, require
+# only `Desktop model and guardrails`: the window jobs are skipped on PRs that
+# do not touch the desktop, and a skipped matrix job reports under an
+# unexpanded name that a required context would wait for forever.
+#
+# `cargo test --workspace` builds the crates without the GUI toolkit (the
+# `gpui` feature is off by default), so the model tests also run in the Test
+# job of ci.yml. This workflow adds what that job cannot: the desktop
+# guardrails (scripts/desktop-check.sh) and a build of the window itself.
+#
+# No `paths:` filter on the trigger. The `model` job is cheap and always runs.
+# The GPUI builds compile about 450 crates, so a `changes` job decides whether
+# they run:
+#   - Linux window build: pushes, manual runs, and PRs or merge-queue entries
+#     that touch crates/tole-desktop*, the root Cargo.toml or Cargo.lock, the
+#     desktop scripts or this file;
+#   - macOS and Windows window builds (runner cost): every push to develop or
+#     main (so a lockfile or root manifest change that only the Linux build
+#     saw on its PR is built on both after the merge), manual runs, and PRs or
+#     queue entries that touch crates/tole-desktop* or this file. A PR that
+#     changes only the lockfile or the root manifest does not run them.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main, develop]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  changes:
+    name: Desktop changes
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.diff.outputs.linux }}
+      other_os: ${{ steps.diff.outputs.other_os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT" in
+            push|workflow_dispatch)
+              echo "linux=true" >> "$GITHUB_OUTPUT"
+              echo "other_os=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            pull_request) base="$PR_BASE" ;;
+            merge_group) base="$MQ_BASE" ;;
+            *) base="" ;;
+          esac
+          if [ -z "$base" ] || ! git diff --name-only --no-renames "$base" HEAD > changed.txt; then
+            # Cannot tell: build everything.
+            echo "linux=true" >> "$GITHUB_OUTPUT"
+            echo "other_os=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat changed.txt
+          if grep -qE '^(crates/tole-desktop|Cargo\.toml$|Cargo\.lock$|scripts/(desktop-|test-desktop-)|\.github/workflows/desktop\.yml$)' changed.txt; then
+            echo "linux=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "linux=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '^(crates/tole-desktop|\.github/workflows/desktop\.yml$)' changed.txt; then
+            echo "other_os=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "other_os=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  model:
+    name: Desktop model and guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-model
+      # The guardrails read the resolved dependency graph with `cargo metadata
+      # --offline`, which needs every crate downloaded (no compile).
+      - name: Download crates
+        run: cargo fetch --locked
+      - name: Guardrail script self-test
+        run: bash scripts/test-desktop-check.sh
+      - name: Guardrails (dependency graph and size caps enforced, literals advisory)
+        run: bash scripts/desktop-check.sh all
+      - run: cargo clippy -p tole-desktop-model -p tole-desktop --all-targets -- -D warnings
+      - name: Model tests (no window, no GUI toolkit)
+        run: cargo test -p tole-desktop-model -p tole-desktop
+
+  window-linux:
+    name: Desktop window build (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.linux == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-window-ubuntu-latest
+      - name: Install Linux build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libvulkan-dev \
+            libdrm-dev libgbm-dev libasound2-dev libssl-dev libfreetype-dev
+      # Build only: no display on a runner, so the window is not opened here.
+      - run: cargo clippy -p tole-desktop --features gpui --all-targets -- -D warnings
+      - run: cargo build -p tole-desktop --features gpui
+      - run: cargo test -p tole-desktop --features gpui
+
+  window-other:
+    name: Desktop window build (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.other_os == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-window-${{ matrix.os }}
+      # Build only: no display on a runner, so the window is not opened here.
+      - run: cargo clippy -p tole-desktop --features gpui --all-targets -- -D warnings
+      - run: cargo build -p tole-desktop --features gpui
+      - run: cargo test -p tole-desktop --features gpui

@@ -20,10 +20,10 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `scripts/test-desktop-check.sh` and `scripts/desktop-check.sh` (#1028; see
   [docs/design/desktop/README.md](docs/design/desktop/README.md); run
   `cargo fetch` once first). A broken dependency-graph or size rule makes the
-  script exit 1; the literals check is advisory (it warns, never fails). Nothing in
-  CI runs them yet: a separate `Desktop` workflow (not part of `ci.yml`, not a
-  required check unless the owner adds it to the branch protection) is added by
-  a later change of #1028.
+  script exit 1; the literals check is advisory (it warns, never fails). The separate
+  `Desktop` workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, not
+  a required check unless the owner adds it to the branch protection) runs them
+  and the window build.
 - **Test directories** (#781): a test that needs a scratch directory uses
   `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
   and the `crate::test_dir` module in unit tests), never a hand-built
