@@ -12,8 +12,9 @@
 > authoritative over this doc.
 > Status sync 2026-10-06 (pre-0.6.0): the 0.6.0 train (#168–#185) is
 > fully merged to develop — see the Post-D3 section.
-> Status sync 2026-11-15 (#808): 0.11.0 was released on 2026-11-14 and
-> develop carries the work after it (see "Since 0.11.0"). Every open item
+> Status sync 2026-11-20 (0.12.0 release prep): 0.12.0 is the release
+> cut from develop on 2026-11-20 (see "0.12.0"); 0.11.0 was released on
+> 2026-11-14 (#808 sync of 2026-11-15). Every open item
 > points at an open issue; an idea without an issue is not planned (file
 > the issue first). Shipped detail lives in `CHANGELOG.md`; the code is
 > authoritative over this page.
@@ -254,7 +255,10 @@ Everything below is merged; CHANGELOG entries carry the detail.
   - Automation (epic #577): `tole cron` with time zones, parked and agent-created jobs, signed webhooks with `tole hook`, and outbound signed webhooks (#911, `[webhook_out]`, `tole webhook test`).
   - Collaboration (epics #583, #589): profiles, delegation with budget carve and `tole audit`, the advisor, model routing, skills (approved-hash loading, `skill_propose`, the curator) and multi-round discussion with `tole discuss` and the `discuss` tools. `agent_start` and `agent_poll` are deprecated aliases of `delegate` and `delegate_poll`.
   - Also: built-in `web_search` and `web_fetch` with the nginjen backend (#625), the Streamable HTTP MCP client (#530), the review gate before `git commit` (#534), `tole setup cora` (#535), the serve face for graphical clients (#524, #558), images on every turn (#559, #560) and the TUI polish of #463.
-- **Since 0.11.0 (on develop, unreleased):**
+- **0.12.0 (released 2026-11-20; everything since 0.11.0):**
+  - Epic #941 (one assembly for every face, still open for #949 only): steps 1 to 6 done (#942 to #948): server sessions get the default prompt, approved skills and routing (#945) and the owner's MCP client servers behind the plugin lock (#946), and the face-parity table and test are in (`docs/faces.md`).
+  - Gateway (epic #910): the `turn_finished` outbound webhook event (#962, opt-in) joins the signed delivery of #911; the first decision of an approval is the only one that acts (BREAKING, `POST /approvals/{id}/decision`).
+  - BREAKING: `verify` and `turnend` are sandboxed by default (#748), and the uteke home moves under `CODECORA_HOME`; each has an opt-out in `CHANGELOG.md` under `0.12.0`.
   - Plugins, #600 slice 1 (parts 1 to 6, merged): `plugin list` and `diff` show source, tier, secrets and sandbox state and start nothing the lock would refuse; `revoke` is owner-only and a hand-edited lock cannot revive a revoke; the description scanner; the one-shot probe for unapproved servers; `tole plugin add` with trust tiers (`first-party`, `third-party-verified`, `third-party-unverified`); `tole doctor` warnings for unpinned launchers, unsandboxed third-party servers and broad grants.
   - Plugins, #600 slice 2 (#811): bundle manifests (`tole-plugin.toml`, `tole plugin add --bundle`) and per-plugin secret grants approved one by one, withdrawn one by one (`tole plugin revoke --secret`), pinned to the manifest hash and recorded in the ledger.
   - Sandbox (#601, #748): opt-in bubblewrap sandbox for third-party stdio MCP servers (`[sandbox]`), and for `run_command` and `job_start` (`[sandbox.consumers]`, #748 parts 1 and 2: the built-in `command` profile and rlimits; the mission `--verify` command and the `on_turnend` stop gates as `verify` and `turnend`), with named profiles and per-server bindings (#810: `[sandbox.profiles]`, `[sandbox.servers]`, `tole sandbox list|show|set`, user layer only). Linux only; `tole doctor` says so elsewhere. A CI job runs the real-bubblewrap tests on every pull request (#751). Design: `docs/sandbox-design.md`.
@@ -419,15 +423,15 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | none open: #572, #573, #574 and #575 are done (#571 moved to the gateway track) |
-| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, implemented with provisional owner decisions D1-D10, not merged until confirmed), G1 to G5 in the epic |
+| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, done: merged in 0.12.0, the owner confirmed D1-D10 as the defaults on 2026-11-19), G1 to G5 in the epic |
 | UI stack (epic #523) | #527, #528, #529, #561 (parked) |
 | Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
 | Docs and process | #807 (local Cora review), #808 (this page) |
-| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 done (default prompt, approved skills and model routing for server sessions; #971 routes a new session's model once, at its first prompt); #946 done (the owner's MCP client servers on `serve` and `acp` behind the plugin lock, so the review guidance is active when the cora review tools are configured); #949 has a design note, [docs/desktop-design.md](desktop-design.md), whose decisions D1 to D11 are open for the owner |
+| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 done (default prompt, approved skills and model routing for server sessions; #971 routes a new session's model once, at its first prompt); #946 done (the owner's MCP client servers on `serve` and `acp` behind the plugin lock, so the review guidance is active when the cora review tools are configured); the epic stays open for step 7 only: #949 (desktop over the same serve API) has a design note, [docs/desktop-design.md](desktop-design.md), whose decisions D1 to D11 are open for the owner and no code follows until the owner un-parks the UI stack |
 
 ## Layering and published crates
 
-Published crates (`publish.yml` publishes them in this order, all at the workspace version, 0.11.0 today): `tole-core`, then `tole-tui`, then `tole-cli`. `tole-core` is the platform-agnostic library (embedders build it with `--no-default-features`); `tole-tui` is the inline terminal UI over `tole-core`; `tole-cli` is the `tole` binary and depends on both (`tui` is a default feature). The owner decision of 2026-11-14 (#752) is that the set does not change: no new crates, and `publish.yml`, `release.yml` and the crates.io names stay as they are. Real crate splits stay a future option if compile time or embedder size asks for it.
+Published crates (`publish.yml` publishes them in this order, all at the workspace version, 0.12.0 today): `tole-core`, then `tole-tui`, then `tole-cli`. `tole-core` is the platform-agnostic library (embedders build it with `--no-default-features`); `tole-tui` is the inline terminal UI over `tole-core`; `tole-cli` is the `tole` binary and depends on both (`tui` is a default feature). The owner decision of 2026-11-14 (#752) is that the set does not change: no new crates, and `publish.yml`, `release.yml` and the crates.io names stay as they are. Real crate splits stay a future option if compile time or embedder size asks for it.
 
 Layering rules (#752, closed; details in `docs/architecture.md`):
 

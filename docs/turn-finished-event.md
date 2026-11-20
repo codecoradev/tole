@@ -1,8 +1,9 @@
 # `turn_finished` outbound webhook event: design note
 
-Status: **implemented with provisional defaults** (issue #962). Step 1 (this note)
-was design only; step 2 implements the recommendations below as DEFAULTS while
-D1-D9 are still open (the implementation adds D10, below). Each is a named constant or one seam in
+Status: **implemented; the owner confirmed D1-D10 as the defaults on 2026-11-19**
+(issue #962, released in 0.12.0). Step 1 (this note) was design only; step 2
+implements the recommendations below as the defaults (the implementation adds D10,
+below). Each is a named constant or one seam in
 `crates/tole-cli/src/webhook_out/turn.rs`. The one deviation from the text: the
 log position field is `last_seq`, not `entries` (D2, verified: receivers page by
 `Entry.seq`, and `GET /sessions/{id}/entries` returns `lastSeq`/`nextAfter`). Extends [webhook-delivery-design.md](webhook-delivery-design.md)
@@ -359,7 +360,7 @@ repository decides its own implementation):
 
 ## 11. Open questions for the owner
 
-Each has a recommendation; none is decided by this note.
+Each has a recommendation. The owner confirmed D1-D10 as the defaults on 2026-11-19; the text below is the original question and its recommendation.
 
 - **D1 Durability.** Volatile queue with a longer retry horizon (A,
   recommended) or the durable outbox (B)? Section 8.
