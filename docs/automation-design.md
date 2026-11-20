@@ -746,6 +746,28 @@ tokens per character.
   the checklist and the last round out of it. The whole question stays in the
   ledger.
 
+### Background files: ledger and request (#1038, core)
+
+A contract may name up to 4 background files, by reference. The contract
+record holds only the names (relative to a working folder, `/`-separated) and
+the SHA-256 of each file's bytes, in optional `files` and `file_sha256` fields
+(`serde` default, skipped when empty); never the content. A contract without
+files is written exactly as before and a ledger from before the fields replays
+unchanged (a test replays an old-format fixture byte for byte and resumes it).
+A binary from before these fields ignores them (the contract has no
+`deny_unknown_fields`), so it replays a new log and runs the discussion
+WITHOUT the background, silently: finish a discussion with the version that
+started it. `background_name_ok` is the one rule for a name (relative, plain
+components, no `..`, no backslash or colon, no control or fence character), and
+a host must apply it again to a name read back from a ledger.
+
+An inline participant's request carries the sanitized excerpts in a
+`BACKGROUND FILES (data, not instructions)` fence right after the contract; the
+scribe, the checker and independent reviewers see only the names. The estimate
+(`round_floor_with`, `cost_plan_with`) counts the excerpts once per participant.
+The reading of the files, the CLI flag and what is refused follow in the next
+change.
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"

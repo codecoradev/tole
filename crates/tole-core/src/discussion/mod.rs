@@ -74,6 +74,12 @@ pub const MAX_CRITERIA: usize = 12;
 pub const MAX_QUESTION_CHARS: usize = 12_000;
 pub const MAX_CRITERION_CHARS: usize = 400;
 pub const MAX_CONTRIBUTION_CHARS: usize = 8000;
+/// Most background files a contract may name (#1038), the longest name in
+/// characters, and the most characters of one file an inline voice is shown.
+/// A file is named, never embedded: the contract record holds only the names.
+pub const MAX_BACKGROUND_FILES: usize = 4;
+pub const MAX_BACKGROUND_PATH_CHARS: usize = 200;
+pub const MAX_BACKGROUND_EXCERPT_CHARS: usize = 12_000;
 /// Longest digest line, and most lines in one digest section.
 pub const MAX_LINE_CHARS: usize = 600;
 pub const MAX_LINES: usize = 24;
@@ -172,6 +178,97 @@ pub struct Contract {
     /// Tokens the whole discussion may spend.
     pub budget_tokens: u64,
     pub max_rounds: u32,
+    /// Background files (#1038), by reference: names relative to the
+    /// discussion's working folder, `/`-separated, never content. Added later:
+    /// a record written before it reads as none, and a contract without any
+    /// is written exactly as before, so old logs replay unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// The SHA-256 (lowercase hex) of each file's bytes as the discussion
+    /// started, one per entry of `files` (#1038). A resume refuses a file that
+    /// is gone or whose digest differs, so every round reads the same
+    /// evidence. Digests and names only: the ledger never holds the content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_sha256: Vec<String>,
+}
+
+/// A background file as an inline voice sees it: read from the working
+/// folder by the host and already through [`sanitize`] (secrets redacted,
+/// control characters and fence markers neutralized, capped at
+/// [`MAX_BACKGROUND_EXCERPT_CHARS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Background {
+    pub path: String,
+    pub text: String,
+    /// The SHA-256 (lowercase hex) of the file's bytes.
+    pub sha256: String,
+    /// The text is the first [`MAX_BACKGROUND_EXCERPT_CHARS`] characters of a
+    /// longer file.
+    pub truncated: bool,
+    /// A secret value was replaced.
+    pub redacted: bool,
+}
+
+impl Contract {
+    /// This contract naming `files` as background (#1038), with the SHA-256
+    /// of each (`sha256`, one per file): at most [`MAX_BACKGROUND_FILES`],
+    /// each a name that passes [`background_name_ok`], none twice. The host
+    /// has already confined them to the working folder; this checks what the
+    /// ledger will hold.
+    pub fn with_files(mut self, files: &[String], sha256: &[String]) -> Result<Self, String> {
+        if files.len() > MAX_BACKGROUND_FILES {
+            return Err(format!(
+                "{} background files: at most {MAX_BACKGROUND_FILES} are accepted",
+                files.len()
+            ));
+        }
+        if sha256.len() != files.len()
+            || !sha256
+                .iter()
+                .all(|d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err("each background file needs its SHA-256 (64 lowercase hex digits)".into());
+        }
+        let mut seen = BTreeSet::new();
+        for f in files {
+            if !background_name_ok(f) {
+                return Err(format!(
+                    "background file {f:?} is not a relative name of plain components \
+                     (up to {MAX_BACKGROUND_PATH_CHARS} characters, `/` separated, no `..`, \
+                     no backslash or colon)"
+                ));
+            }
+            if !seen.insert(f.as_str()) {
+                return Err(format!("background file {f:?} is listed twice"));
+            }
+        }
+        self.files = files.to_vec();
+        self.file_sha256 = sha256.to_vec();
+        Ok(self)
+    }
+}
+
+/// Whether `f` is a name a contract may hold for a background file: relative,
+/// `/`-separated plain components (none empty, `.` or `..`), at most
+/// [`MAX_BACKGROUND_PATH_CHARS`] characters, no control or fence character,
+/// no backslash and no colon (a Windows drive prefix). The host checks it
+/// again on every read, so a name planted in a ledger is never trusted.
+pub fn background_name_ok(f: &str) -> bool {
+    !f.is_empty()
+        && f.chars().count() <= MAX_BACKGROUND_PATH_CHARS
+        && !f.contains(['\\', ':'])
+        && !f.chars().any(char::is_control)
+        && f.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+        && sanitize(f, &SecretSet::default(), MAX_BACKGROUND_PATH_CHARS).text == *f
+}
+
+/// The SHA-256 of `bytes` as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 impl Contract {
@@ -265,6 +362,8 @@ impl Contract {
             participants: participants.to_vec(),
             budget_tokens,
             max_rounds,
+            files: Vec::new(),
+            file_sha256: Vec::new(),
         })
     }
 }
@@ -635,14 +734,40 @@ fn contract_block(c: &Contract) -> String {
         .enumerate()
         .map(|(i, t)| format!("{}. {t}", i + 1))
         .collect();
+    let files = if c.files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nBACKGROUND FILES (in the working folder): {}",
+            c.files.join(", ")
+        )
+    };
     fence(
         "CONTRACT",
         &format!(
-            "QUESTION: {}\nCRITERIA:\n{}",
+            "QUESTION: {}\nCRITERIA:\n{}{files}",
             c.question,
             criteria.join("\n")
         ),
     )
+}
+
+/// The background files an inline voice reads, fenced as data.
+fn background_block(files: &[Background]) -> String {
+    let body: Vec<String> = files
+        .iter()
+        .map(|b| {
+            let cut = if b.truncated {
+                format!(
+                    "\n[excerpt: only the first {MAX_BACKGROUND_EXCERPT_CHARS} characters of the file]"
+                )
+            } else {
+                String::new()
+            };
+            format!("file {}:\n{}{cut}", b.path, b.text)
+        })
+        .collect();
+    fence("BACKGROUND FILES", &body.join("\n\n"))
 }
 
 fn summary_block(s: &RoundSummary) -> String {
@@ -680,7 +805,24 @@ pub fn participant_request(
     prior: Option<&RoundSummary>,
     own_previous: Option<&Contribution>,
 ) -> Vec<(&'static str, String)> {
+    participant_request_with(contract, round, participant, prior, own_previous, &[])
+}
+
+/// [`participant_request`] for an inline voice that also reads the
+/// contract's background files (#1038): their sanitized excerpts, fenced as
+/// data, right after the contract.
+pub fn participant_request_with(
+    contract: &Contract,
+    round: u32,
+    participant: &str,
+    prior: Option<&RoundSummary>,
+    own_previous: Option<&Contribution>,
+    background: &[Background],
+) -> Vec<(&'static str, String)> {
     let mut parts = vec![contract_block(contract)];
+    if !background.is_empty() {
+        parts.push(background_block(background));
+    }
     if let Some(p) = prior {
         parts.push(summary_block(p));
     }

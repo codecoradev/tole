@@ -993,3 +993,70 @@ fn a_worst_case_contract_with_the_longest_question_fits_one_record() {
         }
     );
 }
+
+// ------------------------------------------------ background files (#1038)
+
+/// A ledger written before `files` existed: its contract line has no such
+/// key. It folds as a contract with no files, resumes at the same step, and
+/// the next record is appended after it untouched.
+const OLD_LEDGER: &str = concat!(
+    r#"{"seq":1,"t":1,"event":"contract","id":"pick-db","question":"Which database?","criteria":["a choice is named"],"participants":["coder","ops"],"budget_tokens":10000,"max_rounds":3}"#,
+    "\n",
+    r#"{"seq":2,"t":2,"event":"contribution","round":1,"participant":"coder","entry":"e2","text":"use sqlite"}"#,
+    "\n",
+);
+
+#[test]
+fn a_ledger_from_before_background_files_still_replays_and_resumes() {
+    let d = dir("old-format");
+    std::fs::write(d.join("pick-db.jsonl"), OLD_LEDGER).unwrap();
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    let st = l.state().unwrap();
+    let k = st.contract.clone().unwrap();
+    assert!(k.files.is_empty());
+    assert_eq!(k.question, "Which database?");
+    assert_eq!(
+        st.next(),
+        Next::Contribute {
+            round: 1,
+            missing: strs(&["ops"])
+        }
+    );
+    // It resumes: the other voice speaks, and the old lines are byte for byte
+    // what they were.
+    l.contribute(1, "ops", "use postgres", 3).unwrap();
+    let after = std::fs::read_to_string(d.join("pick-db.jsonl")).unwrap();
+    assert!(after.starts_with(OLD_LEDGER), "{after}");
+    assert!(matches!(
+        l.state().unwrap().next(),
+        Next::Summarize { round: 1, .. }
+    ));
+}
+
+#[test]
+fn a_contract_without_files_is_written_as_before_and_one_with_files_replays() {
+    let plain = serde_json::to_string(&Event::Contract(contract(None, 10_000))).unwrap();
+    assert!(!plain.contains("files"), "{plain}");
+    let sum = crate::discussion::sha256_hex(b"the brief");
+    let with = contract(None, 10_000)
+        .with_files(&strs(&["docs/brief.md"]), std::slice::from_ref(&sum))
+        .unwrap();
+    let json = serde_json::to_string(&Event::Contract(with.clone())).unwrap();
+    assert!(json.contains(r#""files":["docs/brief.md"]"#), "{json}");
+    assert!(
+        json.contains(&format!(r#""file_sha256":["{sum}"]"#)),
+        "{json}"
+    );
+    let d = dir("files-replay");
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    l.start(with.clone(), 1).unwrap();
+    let again = DiscussionLog::at(&d, "pick-db").unwrap().state().unwrap();
+    assert_eq!(again.contract, Some(with));
+    // The record holds the name and the digest, never a file's content.
+    let line = std::fs::read_to_string(d.join("pick-db.jsonl")).unwrap();
+    assert!(
+        line.contains("docs/brief.md") && line.contains(&sum),
+        "{line}"
+    );
+    assert!(!line.contains("the brief"), "{line}");
+}
