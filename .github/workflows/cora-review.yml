@@ -2,7 +2,10 @@ name: Cora AI Code Review
 
 on:
   pull_request:
-    branches: [develop, main]
+    # Develop only since #1021 (2026-11-20, owner decision): release syncs
+    # develop -> main are already fully reviewed on develop; requiring a
+    # second Cora pass on each release PR backed up the review queue.
+    branches: [develop]
     types: [opened, synchronize, ready_for_review, reopened]
   # Merge queue (#806): the review was done on the PR head; the job is skipped
   # (reports success) on a queue entry so the required check still reports.

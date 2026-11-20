@@ -68,6 +68,11 @@ continuity, infra facts.
   evidence), CI auto-fix max 3 attempts then escalate. The Cora Review job
   has a 30-min limit; large change-sets (~40+ files or ~850+ lines) can still
   time out — split into ~15–20-file PRs.
+  **Release flow (#1021, 2026-11-20):** PRs into `main` (from `develop` or
+  `chore/release-*`) are exempt from the Cora gate: the work was already
+  reviewed on `develop`, the Cora Review workflow no longer runs on PRs to
+  `main`, and `Cora Review` is not a required check there. Every other
+  required check still gates the release PR.
   **Exception (#914):** a PR whose every file is excluded by `review.exclude`
   in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
   job then skips the review, ends green and writes "Nothing to review" in its
