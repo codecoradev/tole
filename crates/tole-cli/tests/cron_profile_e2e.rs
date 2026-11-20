@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -140,12 +140,10 @@ impl Env {
     }
 
     fn tole(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &self.home, &[]);
         c.args(args)
             .current_dir(&self.work)
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", &self.home)
-            .env("HOME", &self.home)
             .env("TOLE_CRON_DIR", &self.cron)
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("TOLE_STREAM", "0")

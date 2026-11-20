@@ -96,6 +96,15 @@ struct Run {
     stderr: String,
 }
 
+/// The `tole` binary on an otherwise empty environment, plus the shared
+/// hermetic HOME / CODECORA_HOME. The caller sets `PATH` and the rest.
+fn scrubbed_tole(home: &Path) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    c.env_clear();
+    common::apply_hermetic_env(&mut c, home, &[]);
+    c
+}
+
 /// `tole mission --verify <verify>` in `ws` (the process's working directory,
 /// where the verify command runs) with `user_config` as the user config.
 /// `path` is the child's PATH.
@@ -114,17 +123,15 @@ fn mission_in(
 ) -> Run {
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = scrubbed_tole(home)
         .args(["mission", "-s"])
         .arg(sessions)
         .arg("--workspace")
         .arg(ws)
         .args(["--yes", "--verify", verify, "do it"])
         .current_dir(ws)
-        .env_clear()
         .env("PATH", path)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .env("TOLE_BASE_URL", spawn_mock())
         .env("TOLE_MODEL", "mock-model")
         .env("TOLE_API_KEY", "sk-test")
@@ -541,7 +548,7 @@ fn a_launcher_that_cannot_be_spawned_is_a_refusal() {
 fn run_with_gate(ws: &Path, home: &Path, user_config: &str, path: &str, gate: &Path) -> Run {
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = scrubbed_tole(home)
         .args(["run", "-s"])
         .arg(home.join("sessions"))
         .arg("--workspace")
@@ -550,10 +557,8 @@ fn run_with_gate(ws: &Path, home: &Path, user_config: &str, path: &str, gate: &P
         .arg(gate)
         .arg("do it")
         .current_dir(ws)
-        .env_clear()
         .env("PATH", path)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .env("TOLE_BASE_URL", spawn_mock())
         .env("TOLE_MODEL", "mock-model")
         .env("TOLE_API_KEY", "sk-test")
@@ -1106,17 +1111,15 @@ fn the_backend_is_probed_at_start_up_when_a_consumer_is_implicit() {
         );
         std::fs::create_dir_all(home.join("tole")).unwrap();
         std::fs::write(home.join("tole/config.toml"), cfg).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        let out = scrubbed_tole(&home)
             .args(["sessions", "-s"])
             .arg(home.join("sessions"))
             .current_dir(&dir)
-            .env_clear()
             .env(
                 "PATH",
                 format!("{}:{}", fake.display(), path_without_bwrap(&dir)),
             )
             .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", &home)
             .stdin(Stdio::null())
             .output()
             .expect("run tole");

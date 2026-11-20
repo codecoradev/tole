@@ -73,10 +73,9 @@ fn spawn_mock() -> String {
 }
 
 fn cmd(cwd: &Path, url: &str, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.join("home"), &[]);
     c.args(args)
         .current_dir(cwd)
-        .env("CODECORA_HOME", cwd.join("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")

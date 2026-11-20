@@ -9,7 +9,7 @@
 mod common;
 use common::TestDir;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 #[cfg(unix)]
 use serde_json::json;
@@ -24,11 +24,10 @@ fn tmpdir() -> TestDir {
 
 /// `tole` with `extra` env on top of a clean session-free environment.
 fn tole(bin: &Path, cwd: &Path, home: &Path, extra: &[(&str, &str)], args: &[&str]) -> Output {
-    let mut cmd = Command::new(bin);
+    let mut cmd = common::hermetic_command(bin, home, &[]);
     cmd.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .env_remove("TOLE_UNDER_SESSION")
         .env_remove("TOLE_AGENT_DEPTH")
         .stdin(Stdio::null());
