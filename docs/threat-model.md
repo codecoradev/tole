@@ -1316,6 +1316,24 @@ unreachable (a delegated child is not interactive, so those tools are not
 registered). A discussion participant (#704) never asks and never decides: it
 stays read-only.
 
+### Local socket for the desktop (#1043)
+
+`tole serve --socket <path>` replaces the loopback port with a Unix domain socket in a private
+directory, for a desktop that starts or attaches to serve on the same machine (design:
+[desktop-design.md](desktop-design.md) 2.3, decision D1). The routes, the credential check and the
+event stream are the TCP ones (same code path); the listener is the only difference, so every
+residual of "Remote approver trust boundary (#200)" and "Event streams (#524)" stands: the
+credential, token or Basic password, is still approval authority.
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| **Another local user or process connects** (loopback TCP is shared by every user of the machine) | The socket lives in a directory created `0700`; serve refuses a directory that is wider, owned by someone else, a link or not a directory, and sets the socket `0600`. Another user cannot reach the socket, and the credential is still required on every route but `/health` | Root, and any process of the same user, can connect (and read a same-user token). The boundary is the OS user, as for the TUI. The ancestors of the directory are not checked: a writable ancestor owned by another user can still rename the private directory away |
+| **A squatter binds the address first and receives the token** (loopback port) | Nothing outside the owner's `0700` directory can create the socket path, so a client that connects to its own private directory reaches the serve it started. An existing socket is replaced only when nothing answers on it; a live one is never taken over | A same-user process can still squat the path; it is the same user, so the token it could capture is one it could read anyway. A client must connect to a path inside a private directory it made: serve refuses to start on a shared directory such as `/tmp`, but a client that connects to a shared path cannot tell a squatter |
+| **Symlink or file swap** (the path or its directory is a link to somewhere serve then writes or removes) | The directory and the socket path are checked with `lstat`: a link, a non-socket file and a socket of another owner are refused and never removed; only a socket that refuses connections is removed | The check and the removal are two steps; they are not racy against other users because the directory is `0700` and ours, and a same-user attacker has no more power than serve itself |
+| **The per-launch token in the process list or environment** | `--token-fd <n>` reads it once from an inherited descriptor and closes it (not 1, 2 or a terminal, 4 KiB cap, errors never carry it); `--token-file` with a socket must be owned by the user and `0600`. Neither puts it in `ps`, `/proc/<pid>/cmdline` or `/proc/<pid>/environ` (tested on Linux). The token is held as a role secret and redacted on egress as any serve token | `--token` and `TOLE_SERVE_TOKEN` still exist and are visible to the same user; a launcher that wants the boundary must not use them. A token file that outlives the launch is the launcher's to delete |
+| **A client attaches to a serve it does not fit, or to a stale one** | `GET /health` (no auth) returns `protocol` and `version`; a live socket is never removed, so a stale-socket cleanup cannot kill a running serve | `/health` is unauthenticated and tells any peer that can connect the binary version; on a `0700` socket that is the owner's own processes |
+| **Windows** | `--socket` refuses to start on Windows with a message naming the follow-up | A named pipe (with an owner-only ACL) is not built yet; the loopback TCP listener remains the only local transport there |
+
 ### Approval auto mode (#995, proposed, design only)
 
 Design: [approval-auto-mode.md](approval-auto-mode.md). Nothing here is

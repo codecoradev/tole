@@ -102,7 +102,7 @@ unless the status column says otherwise.
 | Session list of past sessions (name, folder, last activity) | `GET /sessions/index?limit&cursor` | exists (#572); `GET /sessions` still lists only sessions live in the server process |
 | Model list, set model, set thinking level | `GET /models`, `POST /sessions/{id}/model`, `POST /sessions/{id}/effort` | exists (#574) |
 | Remove or archive a session | none | not planned in any issue read for this note |
-| Server version or capability probe | none | not planned; `/health` returns only `{"status":"ok"}` |
+| Server version or capability probe | `GET /health` | `/health` returns `protocol` and `version` next to `status` (#1043) |
 | Push notification of a pending approval | none | by design (threat model: "no push endpoint in tole"); webhook delivery (#911) exists for the gateway |
 
 I checked the route table by reading the `route` function and the `handle_conn`
@@ -232,7 +232,7 @@ crash and restart, writer lock) that still holds.
 |---|---|---|
 | Another local user or process reaches the loopback port | The credential is required on every route but `/health` and the webhook routes (which keep their own HMAC gate); failures are limited to 10 a minute per IP and compared in constant time. | Loopback is shared by every local user: anyone who can read the token can approve writes. The token file must be mode `0600` in a directory only the owner can read. `read_plain_file` refuses links and FIFOs but I did not verify that it checks file permissions, so the note does not claim it does. |
 | Another local user reads the token from a process list | `--token` is warned about; `--token-file` and `TOLE_SERVE_TOKEN` are the documented carriers. | An environment variable is readable by the same user's processes and, on some systems, by root only; the desktop should prefer a file. |
-| A port squatter binds the port first | None. The client sends the token to whatever answers. | A desktop that sends the bearer token to a loopback port it did not start can hand it to another local process. Mitigation chosen (D1, section 0): a Unix socket in a `0700` directory with a per-launch token (#1043). |
+| A port squatter binds the port first | None. The client sends the token to whatever answers. | A desktop that sends the bearer token to a loopback port it did not start can hand it to another local process. Mitigation chosen (D1, section 0): a Unix socket in a `0700` directory with a per-launch token (#1043). Built in #1043 for macOS and Linux (`tole serve --socket` with a `--token-fd` credential; the Windows named pipe is a follow-up); see the threat model. |
 
 The unattended side stays the same: `tole serve` calls
 `sandbox::mark_unattended()`, so an `optional` sandbox counts as `required`.

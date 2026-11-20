@@ -13,6 +13,12 @@ use serde::Serialize;
 use tole_core::entry::Entry;
 use tole_core::storage::{JsonlStorage, Storage};
 
+/// The version of the serve wire contract (#1043), reported by `GET /health`
+/// next to the binary version so a client can refuse a serve it does not fit.
+/// Raised only for a change a client written against the previous number
+/// cannot handle; adding a route or a field does not raise it.
+pub const SERVE_PROTOCOL_VERSION: u32 = 1;
+
 /// Entries returned when the client gives no `limit`.
 pub const ENTRIES_DEFAULT_LIMIT: usize = 100;
 /// Hard ceiling on `limit`.

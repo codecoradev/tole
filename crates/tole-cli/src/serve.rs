@@ -22,6 +22,11 @@
 //! - `GET  /sessions/{id}/images/{fnv1a64}` → the bytes of an image recorded
 //!   in that session's log (#558; see `tole_cli::serve_images`)
 //!
+//! `--socket <path>` (#1043) listens on a Unix domain socket in a private (0700)
+//! directory instead of TCP; routes, auth and the event stream are the same
+//! code path (see `tole_cli::serve_support::transport`). `GET /health` also
+//! returns the protocol and binary version.
+//!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`,
 //! `--token-file` or `--token`) or, with `--auth basic`, HTTP Basic against a
@@ -38,11 +43,12 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
+use tole_cli::serve_support::transport::{self, Conn, Listener};
 use tole_cli::session_host::{
     lock_sessions, open_session_with, run_session_turn_with_end, SessionOverrides, Sessions,
     SharedSessions,
@@ -56,6 +62,8 @@ pub mod past_sessions;
 
 pub struct ServeConfig {
     pub bind: String,
+    /// `--socket` (#1043): listen on this Unix socket instead of TCP.
+    pub socket: Option<std::path::PathBuf>,
     pub port: u16,
     /// The one authentication check (#742): bearer token and/or Basic.
     pub auth: tole_cli::auth::Authenticator,
@@ -192,7 +200,8 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         }
         _ => Default::default(),
     };
-    let loopback = tole_cli::auth::is_loopback_bind(&cfg.bind);
+    // A local socket is reachable by the owner's processes only.
+    let loopback = cfg.socket.is_some() || tole_cli::auth::is_loopback_bind(&cfg.bind);
     let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tole_cli::hooks::hold_keys(&hooks);
@@ -206,9 +215,18 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     } else {
         Some(tole_cli::cron::default_dir()?)
     };
-    let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let listener = TcpListener::bind(&addr)
-        .with_context(|| format!("binding {addr} (in use? change --port)"))?;
+    let (listener, shown) = match &cfg.socket {
+        Some(path) => (
+            transport::bind_socket(path).map_err(|e| anyhow::anyhow!("{e}"))?,
+            format!("unix:{}", path.display()),
+        ),
+        None => {
+            let addr = format!("{}:{}", cfg.bind, cfg.port);
+            let l = TcpListener::bind(&addr)
+                .with_context(|| format!("binding {addr} (in use? change --port)"))?;
+            (Listener::Tcp(l), format!("http://{addr}"))
+        }
+    };
     let approvals = tole_cli::approvals::ApprovalQueue::shared();
     let state = Arc::new(State {
         sessions: Arc::new(Mutex::new(sessions_keeping_pending(&approvals))),
@@ -239,7 +257,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         eprintln!("tole serve: webhook routes: {}", names.join(", "));
     }
     eprintln!(
-        "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
+        "tole serve: listening on {shown} ({} allow pattern(s), plan_mode={})",
         cfg.allow_patterns.len(),
         cfg.plan_mode
     );
@@ -273,8 +291,10 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         std::thread::spawn(move || tole_cli::cron::serve_ticker(&dir, queue));
     }
     use std::sync::atomic::Ordering;
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+    loop {
+        let Ok(stream) = listener.accept() else {
+            continue;
+        };
         // Connection cap: refuse when at capacity (thread exhaustion DoS).
         if state.live_connections.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
             drop(stream);
@@ -291,7 +311,6 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
             handle_conn(stream, Arc::clone(&state));
         });
     }
-    Ok(())
 }
 
 /// Largest `--token-file`.
@@ -493,7 +512,7 @@ const MAX_UPLOAD_BYTES: usize = tole_core::image::MAX_IMAGE_BYTES as usize;
 /// remaining time until `deadline` — not just the per-read timeout —
 /// bounds the whole request read.
 struct DeadlineReader<'a> {
-    stream: &'a TcpStream,
+    stream: &'a Conn,
     deadline: Instant,
 }
 
@@ -510,7 +529,7 @@ impl Read for DeadlineReader<'_> {
 }
 
 fn read_request(
-    stream: &TcpStream,
+    stream: &Conn,
     auth: &tole_cli::auth::Authenticator,
     limited: bool,
     hooks: &std::collections::BTreeMap<String, tole_cli::hooks::Route>,
@@ -683,13 +702,13 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
+fn respond(stream: &mut Conn, status: u16, payload: &serde_json::Value) {
     respond_with(stream, status, payload, "");
 }
 
 /// The 401 of every refused request: one body whatever was wrong (no user
 /// or password verdict), and the Basic challenge when Basic is on.
-fn respond_unauthorized(stream: &mut TcpStream, auth: &tole_cli::auth::Authenticator) {
+fn respond_unauthorized(stream: &mut Conn, auth: &tole_cli::auth::Authenticator) {
     let extra = auth
         .challenge()
         .map(|c| format!("WWW-Authenticate: {c}\r\n"))
@@ -698,7 +717,7 @@ fn respond_unauthorized(stream: &mut TcpStream, auth: &tole_cli::auth::Authentic
 }
 
 /// `extra` is zero or more complete `Name: value\r\n` header lines.
-fn respond_with(stream: &mut TcpStream, status: u16, payload: &serde_json::Value, extra: &str) {
+fn respond_with(stream: &mut Conn, status: u16, payload: &serde_json::Value, extra: &str) {
     let body = payload.to_string();
     let reason = reason_phrase(status);
     let head = format!(
@@ -722,9 +741,9 @@ impl Drop for ConnGuard {
     }
 }
 
-fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
+fn handle_conn(mut stream: Conn, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let peer_ip = stream.peer_ip();
     let limited = peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip));
     let req = match read_request(&stream, &state.auth, limited, &state.hooks) {
         Ok(r) => r,
@@ -905,7 +924,7 @@ fn read_image(
 
 /// An image body with a fixed type: the recorded mime, never sniffed by
 /// the client (`nosniff`), never cached by a shared cache.
-fn respond_image(stream: &mut TcpStream, mime: &str, data: &[u8]) {
+fn respond_image(stream: &mut Conn, mime: &str, data: &[u8]) {
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: private, no-store\r\nConnection: close\r\n\r\n",
         data.len()
@@ -922,7 +941,7 @@ fn events_target(path: &str) -> Option<(&str, &str)> {
     (!id.is_empty() && !id.contains('/')).then_some((id, query))
 }
 
-fn write_all(stream: &mut TcpStream, text: &str) -> bool {
+fn write_all(stream: &mut Conn, text: &str) -> bool {
     stream
         .write_all(text.as_bytes())
         .and_then(|()| stream.flush())
@@ -938,7 +957,7 @@ fn write_all(stream: &mut TcpStream, text: &str) -> bool {
 /// the client goes away (a write fails, or the heartbeat finds it dead) or
 /// the session leaves the live map (`closed`).
 fn serve_events(
-    mut stream: TcpStream,
+    mut stream: Conn,
     state: &Arc<State>,
     id: &str,
     query: &str,
@@ -1011,7 +1030,7 @@ fn serve_events(
     // Approval state changes go out BEFORE the durable entries of the same
     // pass, so a decision is announced ahead of the effects it caused.
     // `Some(n)`: n frames written (0 is normal); `None`: the peer is gone.
-    let send_approvals = |stream: &mut TcpStream, approvals: &mut ApprovalWatch| -> Option<usize> {
+    let send_approvals = |stream: &mut Conn, approvals: &mut ApprovalWatch| -> Option<usize> {
         let mut n = 0;
         for (name, data) in approvals.poll(&state.approvals.list(Some(id))) {
             if !write_all(stream, &frame(name, None, &data)) {
@@ -1576,7 +1595,14 @@ fn hook_action(
 
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
-        ("GET", "/health") => (200, json!({"status": "ok"})),
+        ("GET", "/health") => (
+            200,
+            json!({
+                "status": "ok",
+                "protocol": tole_cli::protocol::SERVE_PROTOCOL_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
+        ),
         ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);
@@ -2410,6 +2436,7 @@ fn name_route(state: &State, id: &str, body: &str) -> (u16, serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     /// #682: the token comes from a file first, then the flag, then the
     /// environment; an empty file is an error, and no error shows a token.
@@ -3144,6 +3171,7 @@ mod tests {
             }
         });
         let (server_side, _) = listener.accept().unwrap();
+        let server_side = Conn::Tcp(server_side);
         let mut r = DeadlineReader {
             stream: &server_side,
             deadline: Instant::now() + Duration::from_millis(400),

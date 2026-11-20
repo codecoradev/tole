@@ -596,6 +596,15 @@ enum Command {
         #[arg(long, default_value_t = 7801)]
         port: u16,
 
+        /// Listen on this Unix domain socket instead of TCP (#1043; macOS and
+        /// Linux; a Windows named pipe is not built yet). The directory is
+        /// created 0700; serve refuses a directory that is wider, owned by
+        /// someone else or a link, and a socket path that is a link. REST
+        /// only. A bearer token is still required: pass it with --token-fd
+        /// or --token-file.
+        #[arg(long, conflicts_with_all = ["bind", "port"])]
+        socket: Option<std::path::PathBuf>,
+
         /// Transport: `rest` (default) or `mcp` (Streamable HTTP).
         #[arg(long, default_value = "rest")]
         transport: String,
@@ -615,6 +624,12 @@ enum Command {
         /// 4 KiB, one trailing newline dropped).
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
+
+        /// Read the bearer token from this inherited file descriptor (#1043),
+        /// to the end, then close it: the per-launch credential of a desktop
+        /// that starts serve, in neither the arguments nor the environment.
+        #[arg(long, conflicts_with_all = ["token", "token_file"])]
+        token_fd: Option<i32>,
 
         /// Authentication (#742): `token` (default; the bearer token above)
         /// or `basic` (HTTP Basic, one user, a password hash; the bearer
@@ -1997,10 +2012,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(feature = "shell-tools")]
         Command::Serve {
             port,
+            socket,
             bind,
             transport,
             token,
             token_file,
+            token_fd,
             auth,
             basic_user,
             basic_hash_file,
@@ -2042,6 +2059,24 @@ fn dispatch(cli: Cli) -> Result<()> {
                      process (ps, /proc/<pid>/cmdline); use TOLE_SERVE_TOKEN or --token-file"
                 );
             }
+            if socket.is_some() && transport == "mcp" {
+                bail!("--socket serves the REST transport only; --transport mcp listens on TCP");
+            }
+            // The local socket's own credential rules (#1043): a token file is the
+            // owner's alone, and a descriptor is read (and closed) before anything else.
+            if socket.is_some() {
+                if let Some(f) = &token_file {
+                    tole_cli::serve_support::transport::check_private_token_file(f)
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+            let token = match token_fd {
+                Some(fd) => Some(
+                    tole_cli::serve_support::transport::read_token_fd(fd, 4096)
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                None => token,
+            };
             let env_token = std::env::var("TOLE_SERVE_TOKEN").ok();
             let auth = if auth == "basic" {
                 let basic = tole_cli::auth::resolve_basic(
@@ -2104,6 +2139,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             );
             crate::serve::run_serve(crate::serve::ServeConfig {
                 bind,
+                socket,
                 port,
                 auth,
                 allow_patterns,
