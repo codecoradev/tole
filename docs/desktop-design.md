@@ -1,19 +1,56 @@
 # tole-desktop: local and remote over the same serve API (design note, #949)
 
-**Status: DESIGN, nothing here is decided.** Step 7 of epic #941. Every
-decision in the [decision table](#4-decisions-open-for-the-owner) is **OPEN FOR
-THE OWNER**; the "recommended default" column is a proposal, not a record. No
-code follows from this note until the owner answers and the UI stack is
-un-parked (#910 says UI work stays postponed until the owner commands it).
+**Status: DESIGN. The owner un-parked the desktop on 2026-11-20 and answered
+D1 to D4 and D6 (section 0); D5 and D7 to D11 are still open.** Step 7 of epic
+#941. In the [decision table](#4-decisions-open-for-the-owner) the
+"recommended default" column is a proposal, not a record, except where section
+0 says the owner decided otherwise.
 
 Inputs: #949 (this issue), #941 (parity epic), #527 (GPUI desktop), #523 (UI
 stack epic), #561 (UI/UX plan), #910 (gateway), #742 (serve auth),
 [mobile-control.md](mobile-control.md) (the route reference),
 [daemon-design.md](daemon-design.md), [threat-model.md](threat-model.md),
-[faces.md](faces.md). The visual draft (a Design canvas, 11 boards) is not in
-the repository and was not read for this note; the screen mapping below is
-derived from the TUI inventory in #527/#561 and from the routes, and the owner
-should check it against the canvas.
+[faces.md](faces.md). The first version of this note was written without the
+visual draft. The current draft (sixteen boards, S1 to S16) is in the repository
+as images: [design/desktop/README.md](design/desktop/README.md).
+
+## 0. Owner decisions of 2026-11-20
+
+Recorded from the owner's answers in the desktop planning session (issues
+#1028 to #1044, milestone 0.10.0 except #1044). They replace the "recommended default" of
+the same rows in section 4.
+
+| Row | Decision |
+|---|---|
+| D1 local transport | **A Unix socket in a `0700` directory** (macOS, Linux) or a named pipe (Windows; named pipes have no directory, so the pipe's access control is set separately), not loopback TCP. New listener in `serve`: #1043. |
+| D2 serve or in-process host | **Serve for local and remote.** The desktop does not embed the session host and has no blocking GUI approver; approvals come from the serve queue. One typed client for every graphical face: #1040. |
+| D3 desktop starts serve | **Yes.** The desktop attaches to a matching running local serve or starts one as a child with a per-launch credential. Closing the window leaves serve running (automations and running turns continue); "Quit completely" stops it. Supervisor: #1029. |
+| D4 token | A fresh random credential per launch, passed without the command line or environment (inherited descriptor or a `0600` file in the private directory). A saved remote credential goes in the OS keychain where available. |
+| D6 remote TLS | `https://` required for a non-loopback server, unless the owner marks that server as a trusted private network. |
+
+Local first. A remote server (a VPS) is prepared but not the focus: the desktop
+can save remote server entries now; a container image and a compose example
+with a TLS proxy and an unbuffered event stream is #1044 (later). TLS stays out
+of tole itself (D5 still open for confirmation, but the plan assumes (a)).
+
+Still open: D5 (confirmation), D7, **D8**, D9 (the design has no model picker
+in the first screens), D10 (the design groups past sessions by folder), D11.
+
+D8 in detail, because the design lists several working folders. One serve has
+one `--workspace` root; `POST /sessions {cwd}` accepts a folder equal to the
+root or inside it and answers 403 otherwise (`jail_session_cwd`). Two ways:
+one serve per folder, or one serve rooted at a parent folder. Consequences to
+decide before #1029: sessions are stored under `<cwd>/.tole/sessions` by
+default, while `GET /sessions/index` reads only `<workspace root>/.tole/sessions`
+unless `--sessions-dir` is set, so with a wider root the past-session list
+needs a shared sessions directory; cron is global and the scheduler runs only
+when serve is started with `--cron`, so with several servers exactly one must
+run it, or "automations keep running" does not hold.
+
+What stays in the desktop process and never becomes a serve route: writing
+config and profiles, trust approval of skills and connected tools (owner
+decision pending, #1034), the operating system's folder dialog. Each is to
+become a row of [faces.md](faces.md); #1029 and #1040 carry that work.
 
 ## 1. One API, two transports
 
@@ -34,7 +71,7 @@ uses.
 Note on #527. The #527 text says the default host is the **in-process session
 host** with a remote adapter beside it. This note is written for the serve
 route as the contract for both; whether a local desktop should use serve at all
-or the host as a library is decision D2.
+or the host as a library was decision D2; the owner decided serve (section 0).
 
 ### 1.1 Routes a desktop needs
 
@@ -107,8 +144,18 @@ re-read against `serve.rs`.
 The acceptance criteria of #949 ask for a screen-to-route mapping. The screens
 below are the TUI-parity components named in #527 and the inventory in #561
 (session list, transcript, editor/composer, footer, approval panel, model
-picker, empty and error states). I did not see the canvas, so this table covers
-those screens only.
+picker, empty and error states). The first table below covers those screens.
+The second covers the screens added by the current design (boards S5 to S10 and
+S14 to S16), which need these further routes, tracked in #1042:
+
+| Screen | Needs | Readiness |
+|---|---|---|
+| Discussions (list, report, start, continue, stop) | discussion routes and events; the `discuss` tools are also absent from server sessions today (faces.md row) | not built (CLI-only today) |
+| Automations (list, toggle, history) | cron routes | partial: `GET /cron/runs` only |
+| Helpers (profiles), read | profile list with display fields | not built |
+| Skills and connected tools, states | read-only state lists | not built |
+| Settings, helpers, trust | local-only owner actions | by design not a route |
+| Approval wording | action summary on the approval row (#1041) | not built |
 
 | Screen or component | Calls | Readiness |
 |---|---|---|
@@ -143,7 +190,13 @@ was created in, and `POST /sessions` takes a `cwd` that must canonicalize
 inside the server's workspace root (`--workspace`, default the server's
 working directory).
 
-### 2.2 Proposed local flow (all of it depends on D1 to D4)
+### 2.2 Proposed local flow (the pre-decision text; where it differs, section 0 wins)
+
+Superseded by section 0 on these points: the local endpoint is a Unix socket
+(no fixed port, no second port for a second folder), the credential is created
+per launch and never saved, and closing the window does not stop serve. The
+bullets below keep the original reasoning (attach before start, workspace,
+crash and restart, writer lock) that still holds.
 
 - **Attach first.** The desktop reads its saved endpoint and token and calls
   `GET /health`. If it answers, it attaches. It never starts a second server on
@@ -179,7 +232,7 @@ working directory).
 |---|---|---|
 | Another local user or process reaches the loopback port | The credential is required on every route but `/health` and the webhook routes (which keep their own HMAC gate); failures are limited to 10 a minute per IP and compared in constant time. | Loopback is shared by every local user: anyone who can read the token can approve writes. The token file must be mode `0600` in a directory only the owner can read. `read_plain_file` refuses links and FIFOs but I did not verify that it checks file permissions, so the note does not claim it does. |
 | Another local user reads the token from a process list | `--token` is warned about; `--token-file` and `TOLE_SERVE_TOKEN` are the documented carriers. | An environment variable is readable by the same user's processes and, on some systems, by root only; the desktop should prefer a file. |
-| A port squatter binds the port first | None. The client sends the token to whatever answers. | A desktop that sends the bearer token to a loopback port it did not start can hand it to another local process. Mitigation to decide (D1): a Unix socket in a `0700` directory, or a per-start random port plus a token the child receives. |
+| A port squatter binds the port first | None. The client sends the token to whatever answers. | A desktop that sends the bearer token to a loopback port it did not start can hand it to another local process. Mitigation chosen (D1, section 0): a Unix socket in a `0700` directory with a per-launch token (#1043). |
 
 The unattended side stays the same: `tole serve` calls
 `sandbox::mark_unattended()`, so an `optional` sandbox counts as `required`.
@@ -265,20 +318,21 @@ All checked in the code or in the docs cited:
 | Proxy idle timeout shorter than 15 s of silence | The proxy may cut the stream. | Lower `TOLE_SERVE_HEARTBEAT_SECS` on the server. |
 | Wrong credential repeated | `429` after 10 failures a minute from that IP, for every request including the right one. | Stop retrying with a bad credential; a locked-out client also locks out others behind the same proxy. |
 
-## 4. Decisions open for the owner
+## 4. Decisions for the owner
 
-Every row is **OPEN FOR THE OWNER**. None is decided by this note. The
-recommendation is the default this note would implement if the owner says "go
-with your proposal".
+D1 to D4 and D6 were answered on 2026-11-20: see section 0, which supersedes
+the recommendation column of those rows (marked **DECIDED** below). D5 and D7 to
+D11 are **OPEN FOR THE OWNER**; for those the recommendation is the default this
+note would implement if the owner says "go with your proposal".
 
 | # | Decision | Options and consequence | Recommended default |
 |---|---|---|---|
-| D1 | Local transport | (a) Loopback TCP, as `serve` is today: no new code; any local user or process can connect to the port and a squatter can receive the token. (b) A Unix socket in a `0700` directory: filesystem permissions are the boundary (the reference in [daemon-design.md](daemon-design.md)); needs a new listener in `serve`, a Windows story (the desktop targets Windows too, #527), and a second code path. (c) The session host as a library, no HTTP (the #527 text; #525 postponed a `tole-session` crate "until the GPUI client needs the host as a library"): fastest, but the desktop then has two paths (library locally, HTTP remotely), which is the drift #941 removes, and a local desktop could not share a session with a phone. | (a) loopback TCP over the same API. It keeps one contract for local and remote and needs no change in `serve`. Revisit (b) only if a local-user threat is a stated requirement. |
-| D2 | Does a local desktop use serve at all, or the in-process host? | Same question as D1(c). The in-process host avoids a token and a port; serve gives one code path and lets another device drive the same sessions. | Serve for both, so the remote adapter is the only adapter. Keep the host-as-library path open behind the same interface #527 describes, but do not build it first. |
-| D3 | May the desktop start `tole serve` itself? | (a) Yes, as a child it owns: simple first run; the desktop then owns a process that can run tools, and must find the right `tole` binary. (b) No, the user starts it: the desktop only attaches; more setup, no process ownership, and the user sees what is running. | (a) allowed, with explicit consent on first run, loopback only, token by file, stopped when the desktop quits, and never started when a server already answers `/health`. |
-| D4 | Where the token lives | (a) A `0600` file in the user's codecora config directory, generated by the desktop with a CSPRNG on first run and passed with `--token-file`. (b) The OS keychain, with the desktop writing a temp file only for the child. (c) Prompt each time. | (a) for local; (b) for a saved remote credential, if the GPUI stack gets a keychain binding, else (a). Never `--token` and never logged. |
+| D1 **DECIDED: (b), section 0** | Local transport | (a) Loopback TCP, as `serve` is today: no new code; any local user or process can connect to the port and a squatter can receive the token. (b) A Unix socket in a `0700` directory: filesystem permissions are the boundary (the reference in [daemon-design.md](daemon-design.md)); needs a new listener in `serve`, a Windows story (the desktop targets Windows too, #527), and a second code path. (c) The session host as a library, no HTTP (the #527 text; #525 postponed a `tole-session` crate "until the GPUI client needs the host as a library"): fastest, but the desktop then has two paths (library locally, HTTP remotely), which is the drift #941 removes, and a local desktop could not share a session with a phone. | (a) loopback TCP over the same API. It keeps one contract for local and remote and needs no change in `serve`. Revisit (b) only if a local-user threat is a stated requirement. |
+| D2 **DECIDED: serve, section 0** | Does a local desktop use serve at all, or the in-process host? | Same question as D1(c). The in-process host avoids a token and a port; serve gives one code path and lets another device drive the same sessions. | Serve for both, so the remote adapter is the only adapter. Keep the host-as-library path open behind the same interface #527 describes, but do not build it first. |
+| D3 **DECIDED: yes, serve keeps running after the window closes, section 0** | May the desktop start `tole serve` itself? | (a) Yes, as a child it owns: simple first run; the desktop then owns a process that can run tools, and must find the right `tole` binary. (b) No, the user starts it: the desktop only attaches; more setup, no process ownership, and the user sees what is running. | (a) allowed, with explicit consent on first run, loopback only, token by file, stopped when the desktop quits, and never started when a server already answers `/health`. |
+| D4 **DECIDED: per-launch credential, section 0** | Where the token lives | (a) A `0600` file in the user's codecora config directory, generated by the desktop with a CSPRNG on first run and passed with `--token-file`. (b) The OS keychain, with the desktop writing a temp file only for the child. (c) Prompt each time. | (a) for local; (b) for a saved remote credential, if the GPUI stack gets a keychain binding, else (a). Never `--token` and never logged. |
 | D5 | Remote reach versus the recorded decision | (a) The owner's own means (TLS proxy, VPN, tunnel); tole ships no reach mechanism, only authentication (#742). Consistent with the decision recorded in #941 (see below). (b) Through the gateway (#910) as a relay: not supported by #910 as written (the gateway is a Telegram bot, a client of serve, and relays no serve API); it would be a new relay feature in a separate repository, and it would put the gateway in the path of every approval and every transcript. | (a). Treat (b) as a separate, later epic if ever wanted. Confirm that "private-reach mechanisms are out of scope" also rules out tole shipping a Tailscale integration, a hosted relay and a built-in tunnel, and allows only documentation of the owner's own arrangement. |
-| D6 | Remote TLS expectations | (a) The desktop requires `https://` for any non-loopback host and refuses plain `http://`. (b) Allows `http://` with a warning. (c) Pinning of a self-signed certificate or private CA. | (a), with an explicit "I am on a trusted private network" override per saved server (a VPN already encrypts). Pinning later, if the owner runs a private CA. |
+| D6 **DECIDED: (a) with the trusted-network override, section 0** | Remote TLS expectations | (a) The desktop requires `https://` for any non-loopback host and refuses plain `http://`. (b) Allows `http://` with a warning. (c) Pinning of a self-signed certificate or private CA. | (a), with an explicit "I am on a trusted private network" override per saved server (a VPN already encrypts). Pinning later, if the owner runs a private CA. |
 | D7 | Remote credential type | Static token (exists), Basic (exists, #742 first slice), OIDC and scopes (not built, #742). | Static token or Basic for the first release. Do not start OIDC for the desktop; a read-only credential is the first thing worth adding because the remote desktop is the first client that can be lost. |
 | D8 | One server per workspace or a parent workspace | One `--workspace` root per server (today) versus rooting at a parent folder so one server serves several projects. A parent root widens the jail every session shares. | One server per project folder, started by the desktop (D3). |
 | D9 | Is the model picker part of the first release | Asked in #574. If yes, #574 goes before #527; if no, a fixed model ships. | Fixed model first; keeps #574 off the critical path. |
@@ -307,13 +361,14 @@ backend") without a link, so nothing is cited here.
 
 ## 7. Dependencies and next steps
 
-1. Owner answers D1 to D11 (D1 to D5 gate everything; D6 to D8 gate the remote
-   first run).
+1. D1 to D4 and D6 are answered (section 0). Open: D5 (confirmation), D7 to
+   D11; D8 gates the supervisor (#1029) and D10 the session list.
 2. #572 (session list) and #574 (models) have landed; D9 decides whether the first release uses the model picker.
 3. Add the proposed local and remote rows to the threat model once decided.
 4. Decide whether the first client release needs a read-only credential (#742).
 5. #527 and #561 link to this note; their acceptance wording about the
-   "in-process host" should be reconciled with D1 and D2.
+   "in-process host" still needs to be reconciled with section 0 (the text of
+   #527 is the owner's to change).
 
 ## The "no private reach" decision: where it is recorded
 

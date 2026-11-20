@@ -56,7 +56,7 @@ automation and secrets release:
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
-the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in. The desktop client's local and remote use of that API is a design note with open owner decisions ([docs/desktop-design.md](docs/desktop-design.md)).
+the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in. The desktop client (a thin client of a local `tole serve`, a remote server later) is un-parked and planned in issues #1028 to #1044; the design note with the owner's decisions and the screen drafts is [docs/desktop-design.md](docs/desktop-design.md).
 Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), `tole serve` (REST + multi-session
