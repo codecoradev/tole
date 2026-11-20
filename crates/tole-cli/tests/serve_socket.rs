@@ -545,12 +545,21 @@ fn the_per_launch_token_comes_from_a_descriptor_and_is_not_in_the_process_list_o
     });
     let pid = child.id();
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
-    for (what, bytes) in [("cmdline", &cmdline), ("environ", &environ)] {
-        assert!(
-            !String::from_utf8_lossy(bytes).contains(TOKEN),
-            "the token is in the process {what}"
-        );
+    assert!(
+        !String::from_utf8_lossy(&cmdline).contains(TOKEN),
+        "the token is in the process cmdline"
+    );
+    // serve marks itself non-dumpable (`process_guard`), so for a user that is
+    // not root the kernel makes `/proc/<pid>/environ` unreadable: that is the
+    // stronger property. Root (and a build without the guard) can read it, and
+    // then it must not hold the token either.
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environ) => assert!(
+            !String::from_utf8_lossy(&environ).contains(TOKEN),
+            "the token is in the process environ"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => panic!("reading the process environ failed unexpectedly: {e}"),
     }
     let call = |token: &str| {
         let mut s = UnixStream::connect(&sock).unwrap();
