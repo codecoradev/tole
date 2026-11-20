@@ -10,18 +10,26 @@
 /// C0 controls (incl. ESC, CR, LF, TAB), DEL, C1 controls, line/paragraph
 /// separators, bidi marks/overrides/isolates and zero-width invisibles
 /// (incl. the Arabic letter mark, the Mongolian vowel separator, the word
-/// joiner and the invisible math operators — scan 2026-10-28).
+/// joiner and the invisible math operators — scan 2026-10-28), the soft hyphen,
+/// the Hangul fillers, the braille blank and the tag block (#1041).
 pub(crate) fn is_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061C}'
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
                 | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206F}'
+                | '\u{2800}'
+                | '\u{3164}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 

@@ -29,7 +29,7 @@ use std::path::Path;
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
     "session", "tools", "paths", "secrets",
-    "sanitize", "tool", "approval", "provider", "cancel", "interrupt",
+    "sanitize", "action_summary", "tool", "approval", "provider", "cancel", "interrupt",
     "ledger", "turn", "gate", "hooks", "subprocess", "process_guard", "sandbox", "systemone",
 ];
 #[rustfmt::skip]

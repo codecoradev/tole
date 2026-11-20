@@ -189,6 +189,7 @@ fn call<'a>(tool: &'a str, risk: Risk, input: &'a Value) -> ToolRequest<'a> {
         input,
         description: format!("{tool} src/a.rs"),
         target: Some("src/a.rs".into()),
+        summary: None,
     }
 }
 

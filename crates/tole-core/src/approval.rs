@@ -16,6 +16,7 @@
 //! 2. [`AllowlistApprover`]: `Destructive` ⇒ `Deny`, even on pattern match;
 //! 3. host impls: prompt for Destructive regardless of their patterns.
 
+use crate::action_summary::ActionSummary;
 use crate::tool::Risk;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +55,22 @@ pub struct ToolRequest<'a> {
     /// relative to the canonical jail root, symlinks followed. `None` for
     /// tools that do not report one.
     pub target: Option<String>,
+    /// The structured, code-derived summary of the call (#1041), redacted and
+    /// bounded. `None` when the request was built outside the registry; use
+    /// [`ToolRequest::action_summary`] to always get one. Never an input to
+    /// the allow/deny decision: the risk tier stays the authority.
+    pub summary: Option<ActionSummary>,
+}
+
+impl ToolRequest<'_> {
+    /// The summary every approval surface shows: the registry's, or the
+    /// neutral "use the tool <name>" for a request built without one.
+    pub fn action_summary(&self) -> ActionSummary {
+        self.summary.clone().unwrap_or_else(|| {
+            ActionSummary::unknown_with_description(self.tool, self.input, &self.description)
+                .finalized(&crate::secrets::process_secrets())
+        })
+    }
 }
 
 /// The approval policy engine. The turn loop consults this for every
@@ -603,6 +620,7 @@ mod tests {
             input: &Value::Null,
             description: String::new(),
             target: None,
+            summary: None,
         }
     }
 
@@ -761,6 +779,7 @@ mod tests {
                 input: &input,
                 description: String::new(),
                 target: target.map(str::to_string),
+                summary: None,
             })
         };
         assert_eq!(call(Some("out.md")), Verdict::Allow);
@@ -787,6 +806,7 @@ mod tests {
             input: &input,
             description: String::new(),
             target: None,
+            summary: None,
         };
         let pats: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
         pattern_verdict(&pats, &req)
@@ -870,6 +890,7 @@ mod tests {
             input: &input,
             description: String::new(),
             target: None,
+            summary: None,
         };
         assert_eq!(a.decide(&r), Verdict::Deny);
         // deny_only treats `run_command:` patterns command-wise too.

@@ -249,6 +249,7 @@ mod tests {
             input: &Value::Null,
             description: format!("{tool} description"),
             target: None,
+            summary: None,
         }
     }
 
@@ -378,6 +379,7 @@ mod tests {
                 input,
                 description: String::new(),
                 target: None,
+                summary: None,
             }
         }
         let rm = serde_json::json!({ "command": "rm -rf build" });

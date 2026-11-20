@@ -459,6 +459,7 @@ fn config_patterns_hit_the_destructive_wall_in_approver_and_registry() {
         description: String::new(),
         input: &json!({}),
         target: None,
+        summary: None,
     };
     assert_eq!(
         interactive.decide(&req),
