@@ -27,6 +27,13 @@ pub enum Error {
          otherwise use https"
     )]
     InsecureTransport(String),
+    /// A local socket whose directory or file is not the owner's alone: the
+    /// directory is not `0700`, is not owned by the caller or is a link, or the
+    /// socket is a link, not a socket, or owned by someone else. `reason` says
+    /// which. Not transient: the credential would go to whoever can replace
+    /// the socket, so nothing is sent.
+    #[error("refusing the socket `{path}`: {reason}")]
+    InsecureSocket { path: String, reason: String },
     /// A setting the client cannot honor (a zero timeout). Not transient.
     #[error("invalid client setting: {0}")]
     InvalidConfig(String),
@@ -126,6 +133,12 @@ mod tests {
         assert!(!Error::Protocol("x".into()).is_transient());
         assert!(!Error::InvalidConfig("x".into()).is_transient());
         assert!(!Error::InsecureTransport("x".into()).is_transient());
+        let socket = Error::InsecureSocket {
+            path: "/p".into(),
+            reason: "r".into(),
+        };
+        assert!(!socket.is_transient());
+        assert_eq!(socket.to_string(), "refusing the socket `/p`: r");
         let status = |status| Error::Status {
             status,
             message: String::new(),

@@ -4,23 +4,13 @@
 //! answers one request per connection and closes it). Everything above it,
 //! HTTP framing included, is transport-independent.
 //!
-//! # Extension point: Unix socket / named pipe (#1043)
+//! # Transports
 //!
-//! A local-socket transport is one small type, with no change to the client:
-//!
-//! ```ignore
-//! struct UnixTransport(std::path::PathBuf);
-//! impl Transport for UnixTransport {
-//!     fn connect(&self) -> Result<Box<dyn Connection>> {
-//!         Ok(Box::new(UnixStream::connect(&self.0)?))
-//!     }
-//!     fn host_header(&self) -> String { "localhost".into() }
-//! }
-//! impl Connection for UnixStream { /* set_read_timeout: delegate */ }
-//! ```
-//!
-//! It is added after the serve-side listener lands. An HTTPS transport is the
-//! same shape over a TLS stream (TODO: no TLS stack is a dependency yet).
+//! [`TcpTransport`] is HTTP over TCP. On Unix, `UnixTransport` (in the crate
+//! root) is HTTP over the local socket of `tole serve --socket` (#1067). Each
+//! is a small type behind this trait and the client does not know which it
+//! has. A Windows named pipe (#1051) and an HTTPS transport over a TLS stream
+//! (#1044; no TLS stack is a dependency yet) are the same shape.
 
 use crate::error::{Error, Result};
 use std::io::{self, Read, Write};

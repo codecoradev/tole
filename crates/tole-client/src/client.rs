@@ -6,6 +6,8 @@ use crate::resume::{ReconnectPolicy, ResumingStream};
 use crate::sse::FrameReader;
 use crate::transport::{TcpTransport, Transport};
 use crate::types::*;
+#[cfg(unix)]
+use crate::unix::UnixTransport;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -154,6 +156,19 @@ impl Client {
         trusted_private_network: bool,
     ) -> Result<Self> {
         let mut c = Self::new(TcpTransport::new(url, trusted_private_network)?);
+        c.token = token.map(Secret);
+        Ok(c)
+    }
+
+    /// HTTP over the Unix socket of `tole serve --socket <path>` (macOS,
+    /// Linux). A socket in a directory that is not owner-only is refused
+    /// ([`Error::InsecureSocket`]); see [`UnixTransport::new`].
+    #[cfg(unix)]
+    pub fn connect_unix(
+        path: impl Into<std::path::PathBuf>,
+        token: Option<String>,
+    ) -> Result<Self> {
+        let mut c = Self::new(UnixTransport::new(path)?);
         c.token = token.map(Secret);
         Ok(c)
     }
