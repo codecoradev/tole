@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+use tole_core::action_summary::{ActionEffect, ActionKind, ActionSummary};
 use tole_core::tool::{Risk, Tool};
 
 /// Write a file under a fixed root directory. Inputs:
@@ -103,6 +104,40 @@ impl Tool for WriteFileTool {
         let target = self.jailed(input.get("path")?.as_str()?)?;
         let root = self.root.canonicalize().ok()?;
         relative_target(&target, &root)
+    }
+
+    /// A new file adds; an existing one is replaced with no backup. The path
+    /// is the resolved one (symlinks followed), inside the jail or flagged.
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        let raw = input.get("path").and_then(Value::as_str)?;
+        // The same resolution `execute` makes. Only a path `jailed` refuses is
+        // "refused"; a resolved path whose name is not UTF-8 is shown lossy
+        // (`approval_target` returns None there only to fail closed for
+        // allowlists, which is no reason to say the write is refused).
+        let Some(resolved) = self.jailed(raw) else {
+            return Some(tole_core::action_summary::refused(
+                "write_file",
+                "refused: the path is outside the working folder, write_file will not write it",
+                raw,
+            ));
+        };
+        let rel = self
+            .root
+            .canonicalize()
+            .ok()
+            .and_then(|root| tole_core::action_summary::relative_lossy(&resolved, &root))
+            .unwrap_or_else(|| raw.to_string());
+        let exists = resolved.exists();
+        let (kind, effect) = if exists {
+            (ActionKind::ReplaceFile, ActionEffect::ReplacesNoBackup)
+        } else {
+            (ActionKind::CreateFile, ActionEffect::Adds)
+        };
+        let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+        Some(
+            ActionSummary::new(kind, &rel, effect, true)
+                .with_preview(tole_core::action_summary::diff_lines("", content)),
+        )
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {

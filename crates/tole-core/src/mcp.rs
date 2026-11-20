@@ -28,6 +28,7 @@
 
 mod lazy;
 mod probe;
+use crate::action_summary::{ActionEffect, ActionKind, ActionSummary};
 use crate::subprocess::SUBPROCESS_TIMEOUT;
 use crate::tool::{Risk, Tool};
 pub use lazy::{lazy_tools, register_server_tools_lazy, LazyGuard, LazyServer};
@@ -1080,6 +1081,24 @@ impl Tool for McpTool {
         Risk::Write
     }
 
+    /// Always "use the connected tool <server>.<tool>" (#1041): the kind,
+    /// effect and target come from the configured server name and the tool's
+    /// wire name, never from the server's description, annotations or any
+    /// other metadata (the tier stays [`Risk::Write`] for the same reason).
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        Some(
+            ActionSummary::new(
+                ActionKind::UseConnectedTool,
+                format!("{}.{}", self.server, self.server_tool),
+                ActionEffect::UsesConnectedTool,
+                false,
+            )
+            .with_preview(crate::action_summary::raw_input_lines(
+                input.get("arguments").unwrap_or(&Value::Null),
+            )),
+        )
+    }
+
     fn summary(&self) -> String {
         // Provider-facing text is deliberately unchanged from the
         // pre-`summary()` wire: the server-supplied description in the
@@ -1113,13 +1132,12 @@ impl Tool for McpTool {
             out
         }
         let description = truncate_marked(&sanitize_one_line(&self.description), 200);
-        let args = truncate_marked(
-            &input
-                .get("arguments")
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            200,
-        );
+        // The arguments are what the call sends: never cut, so the approver
+        // (and the summary's "see the full description") has all of them.
+        let args = input
+            .get("arguments")
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         format!(
             "mcp[{}] {} args={}",
             sanitize_one_line(&self.server),

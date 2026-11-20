@@ -20,6 +20,7 @@
 //! the moment anything above them changes. `old_text` must match exactly
 //! once — 0 or 2+ matches are actionable errors, not best-effort guesses.
 
+use crate::action_summary::{diff_lines, refused, ActionEffect, ActionKind, ActionSummary};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -70,6 +71,32 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
         return Err(format!("{tool}: path escapes the jail: {rel}"));
     }
     Ok(canon_target)
+}
+
+/// The `path` input resolved like [`jailed`], relative to the canonical root
+/// and `/`-separated; `None` when it does not resolve inside the jail.
+fn jailed_rel(root: &Path, input: &Value, tool: &str) -> Option<String> {
+    let target = jailed(root, input.get("path")?.as_str()?, tool).ok()?;
+    let root = root.canonicalize().ok()?;
+    let rel = target.strip_prefix(&root).ok()?;
+    let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    let parts = parts?;
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// What an approval summary names: the path `execute` will really touch,
+/// resolved by the same [`jailed`] call and shown relative to the root (lossy
+/// for a name that is not UTF-8, which is still a path `execute` accepts).
+/// `Err` carries the path as sent, only when `jailed` itself refuses it.
+fn summary_target(root: &Path, input: &Value, tool: &str) -> Result<String, String> {
+    let raw = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing path>");
+    let target = jailed(root, raw, tool).map_err(|_| raw.to_string())?;
+    let canon_root = root.canonicalize().map_err(|_| raw.to_string())?;
+    Ok(crate::action_summary::relative_lossy(&target, &canon_root)
+        .unwrap_or_else(|| raw.to_string()))
 }
 
 /// Write `new` content to `target` atomically (temp + rename in the
@@ -230,12 +257,30 @@ impl Tool for EditFileTool {
     /// The resolved target relative to the canonical root (#437): the
     /// same [`jailed`] resolution `execute` uses, symlinks followed.
     fn approval_target(&self, input: &Value) -> Option<String> {
-        let target = jailed(&self.root, input.get("path")?.as_str()?, "edit_file").ok()?;
-        let root = self.root.canonicalize().ok()?;
-        let rel = target.strip_prefix(&root).ok()?;
-        let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
-        let parts = parts?;
-        (!parts.is_empty()).then(|| parts.join("/"))
+        jailed_rel(&self.root, input, "edit_file")
+    }
+
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        let target = match summary_target(&self.root, input, "edit_file") {
+            Ok(t) => t,
+            Err(raw) => {
+                return Some(refused(
+                    "edit_file",
+                    "refused or not found: the path does not resolve to an existing file inside the working folder",
+                    &raw,
+                ))
+            }
+        };
+        let text = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+        Some(
+            ActionSummary::new(
+                ActionKind::ReplaceFile,
+                target,
+                ActionEffect::ReplacesNoBackup,
+                true,
+            )
+            .with_preview(diff_lines(text("old_text"), text("new_text"))),
+        )
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
@@ -331,6 +376,45 @@ impl Tool for DeleteFileTool {
             .and_then(Value::as_str)
             .unwrap_or("<missing path>");
         format!("delete file {path}")
+    }
+
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        let target = match summary_target(&self.root, input, "delete_file") {
+            Ok(t) => t,
+            Err(raw) => {
+                return Some(refused(
+                    "delete_file",
+                    "refused or not found: the path does not resolve to an existing file inside the working folder",
+                    &raw,
+                ))
+            }
+        };
+        let mut summary = ActionSummary::new(
+            ActionKind::DeleteFile,
+            &target,
+            ActionEffect::CannotBeUndone,
+            true,
+        );
+        // `execute` removes the LINK when the path is a symlink, not what it
+        // points to: name the path as sent and say so, instead of showing the
+        // canonical referent.
+        let sent = input.get("path").and_then(Value::as_str);
+        if let Some(sent) = sent {
+            let is_link = std::fs::symlink_metadata(self.root.join(sent))
+                .is_ok_and(|m| m.file_type().is_symlink());
+            if is_link {
+                summary = ActionSummary::new(
+                    ActionKind::DeleteFile,
+                    sent,
+                    ActionEffect::CannotBeUndone,
+                    true,
+                )
+                .with_preview([format!(
+                    "this path is a symbolic link to {target}: only the link is removed, not the file it points to"
+                )]);
+            }
+        }
+        Some(summary)
     }
 
     fn spec(&self) -> Option<Value> {

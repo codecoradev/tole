@@ -410,6 +410,45 @@ pub fn redacted_text(text: &str) -> String {
     process_secrets().redact(text).into_owned()
 }
 
+/// `target` relative to `root`, `/`-separated, for display only: a component
+/// that is not valid UTF-8 is shown lossy and the text says so (the path is
+/// still the real one, never a reason to call the call refused). `.` for the
+/// root itself. `None` only when `target` is not under `root`.
+pub fn relative_lossy(target: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let rel = target.strip_prefix(root).ok()?;
+    let mut lossy = false;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| {
+            let s = c.as_os_str();
+            s.to_str().map_or_else(
+                || {
+                    lossy = true;
+                    s.to_string_lossy().into_owned()
+                },
+                str::to_string,
+            )
+        })
+        .collect();
+    let mut out = if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    };
+    if lossy {
+        out.push_str(" (the name is not valid UTF-8, shown lossy)");
+    }
+    Some(out)
+}
+
+/// A summary for a call the tool will refuse (a path outside the working
+/// folder, one that does not resolve): kind and effect unknown, the reason as
+/// the detail, never a sentence that reads as "this will happen".
+pub fn refused(tool: &str, why: &str, path: &str) -> ActionSummary {
+    ActionSummary::new(ActionKind::Unknown, tool, ActionEffect::Unknown, false)
+        .with_preview([format!("{why}: {path}")])
+}
+
 /// The raw input as preview lines: compact JSON of the input redacted
 /// structure-first (`redact_value`, so JSON escaping cannot hide a secret), or
 /// nothing for no input.
@@ -418,6 +457,41 @@ pub fn raw_input_lines(input: &Value) -> Vec<String> {
         Value::Null => Vec::new(),
         other => vec![process_secrets().redact_value(other).to_string()],
     }
+}
+
+/// Diff-style preview lines: `- ` for each line of `old`, `+ ` for each of
+/// `new`, each side redacted as one text first. Both sides stay visible under
+/// the line cap: when both are present each gets half of it, and a side that
+/// is longer shows its head and a `… (N more lines) …` line. A lone side
+/// (a new file) gets the whole cap.
+pub fn diff_lines(old: &str, new: &str) -> Vec<String> {
+    let old = redacted_text(old);
+    let new = redacted_text(new);
+    let (o, n): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let (bo, bn) = match (o.is_empty(), n.is_empty()) {
+        (false, false) => (MAX_PREVIEW_LINES / 2, MAX_PREVIEW_LINES / 2),
+        (false, true) => (MAX_PREVIEW_LINES, 0),
+        (true, _) => (0, MAX_PREVIEW_LINES),
+    };
+    let mut out = side_lines('-', &o, bo);
+    out.extend(side_lines('+', &n, bn));
+    out
+}
+
+fn side_lines(mark: char, lines: &[&str], budget: usize) -> Vec<String> {
+    if lines.len() <= budget {
+        return lines.iter().map(|l| format!("{mark} {l}")).collect();
+    }
+    let keep = budget.saturating_sub(1);
+    let mut out: Vec<String> = lines[..keep]
+        .iter()
+        .map(|l| format!("{mark} {l}"))
+        .collect();
+    out.push(format!(
+        "{mark} … ({} more lines, {SEE_FULL}) …",
+        lines.len() - keep
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -613,6 +687,33 @@ mod tests {
         }
         let row: Row = serde_json::from_value(json!({"id":"apr-1","tool":"write_file"})).unwrap();
         assert!(row.summary.is_none());
+    }
+
+    #[test]
+    fn diff_lines_mark_each_side() {
+        assert_eq!(diff_lines("a\nb", "c"), vec!["- a", "- b", "+ c"]);
+        assert!(diff_lines("", "").is_empty());
+        assert_eq!(diff_lines("", "x\ny"), vec!["+ x", "+ y"]);
+        assert_eq!(diff_lines("x", ""), vec!["- x"]);
+    }
+
+    /// A long removed block cannot push the new text out of the preview.
+    #[test]
+    fn a_long_old_side_leaves_the_new_side_visible() {
+        let old: String = (0..30).map(|i| format!("old {i}\n")).collect();
+        let lines = diff_lines(&old, "new one\nnew two\nrm -rf /\n");
+        assert!(lines.len() <= MAX_PREVIEW_LINES, "{lines:?}");
+        assert!(lines.iter().any(|l| l == "- old 0"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("- … (")), "{lines:?}");
+        for want in ["+ new one", "+ new two", "+ rm -rf /"] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
+        }
+        // Both sides long: each keeps its head and says how much is missing.
+        let new: String = (0..40).map(|i| format!("new {i}\n")).collect();
+        let lines = diff_lines(&old, &new);
+        assert!(lines.len() <= MAX_PREVIEW_LINES, "{lines:?}");
+        assert!(lines.iter().any(|l| l == "+ new 0"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("+ … (")), "{lines:?}");
     }
 
     /// A cut says where the whole text is, and every cut sets a flag.

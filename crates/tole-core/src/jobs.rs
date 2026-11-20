@@ -20,6 +20,7 @@
 //! `read_file` covers the observed workflows; add only with a real use
 //! case.
 
+use crate::action_summary::ActionSummary;
 use crate::run_command::RunCommandTool;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -267,6 +268,15 @@ impl Tool for JobStartTool {
         // Spawns arbitrary processes: at least Write, like run_command.
         // Destructive stays reserved for explicit delete-like tools.
         Risk::Write
+    }
+
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        // The same program summary as `run_command`, plus the one fact that
+        // makes it different: it starts detached and outlives this turn.
+        let mut s = crate::run_command::command_summary(input);
+        s.preview
+            .push("STARTS A BACKGROUND JOB: it keeps running after this turn".into());
+        Some(s)
     }
 
     fn summary(&self) -> String {
