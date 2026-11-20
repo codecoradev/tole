@@ -9,7 +9,7 @@ use common::TestDir;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -101,10 +101,9 @@ fn setup(tag: &str, port: u16) -> TestDir {
 }
 
 fn tole(base: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[])
         .args(args)
         .current_dir(base.join("proj"))
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TOLE_WEBHOOK_TEST_KEY_VAR", KEY)
         .env("TZDIR", "/nonexistent")
@@ -232,10 +231,9 @@ fn a_name_with_control_characters_cannot_forge_a_line() {
 fn a_missing_secret_is_reported_without_sending() {
     let (port, rx) = receiver(200);
     let base = setup("nokey", port);
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[])
         .args(["webhook", "test", "gateway"])
         .current_dir(base.join("proj"))
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env_remove("TOLE_WEBHOOK_TEST_KEY_VAR")
         .env("TZDIR", "/nonexistent")

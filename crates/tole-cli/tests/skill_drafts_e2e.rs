@@ -7,7 +7,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use tole_core::secrets::SecretSet;
 use tole_core::skill_draft::{gate, Dedup, DraftStore, HostContext, Proposal, Trigger};
 
@@ -16,12 +16,10 @@ fn tmpdir() -> TestDir {
 }
 
 fn tole(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[])
         .args(args)
         .current_dir(home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
         .stdin(Stdio::null())
         .output()
         .unwrap()

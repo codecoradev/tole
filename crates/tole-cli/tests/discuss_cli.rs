@@ -7,7 +7,7 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 const SECRET: &str = "discuss-cli-secret-0123456789";
@@ -80,10 +80,8 @@ fn spawn_mock() -> String {
 }
 
 fn run(home: &std::path::Path, base: Option<&str>, args: &[&str]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("DISCUSS_CLI_TOKEN", SECRET)
         .env_remove("TOLE_BASE_URL")

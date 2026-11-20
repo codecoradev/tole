@@ -4,7 +4,6 @@
 
 mod common;
 use common::TestDir;
-use std::process::Command;
 
 use tole_cli::ledger_file::FileStore;
 use tole_core::delegation::{Budget, Delegation, Goal};
@@ -40,11 +39,10 @@ fn tole_audit_reads_the_workspace_log_from_the_data_dir() {
     .unwrap();
     let before = std::fs::read(&log).unwrap();
     let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .arg("--workspace")
             .arg(&ws)
             .args(args)
-            .env("CODECORA_HOME", &home)
             .env("AUDIT_CLI_TOKEN", secret)
             .env("TOLE_NO_UPDATE_CHECK", "1")
             .output()

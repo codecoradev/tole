@@ -10,7 +10,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn tmp(tag: &str) -> TestDir {
     let d = TestDir::new(&format!("tole-mcp-unseen-{tag}"));
@@ -30,10 +30,9 @@ fn spy(dir: &Path) -> String {
 }
 
 fn run(dir: &Path, spec: &str) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), dir.join("home").as_path(), &[])
         .args(["run", "--mcp-server", spec, "hi"])
         .current_dir(dir.join("ws"))
-        .env("CODECORA_HOME", dir.join("home"))
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
@@ -112,19 +111,19 @@ fn a_changed_server_offers_no_prompts_in_chat() {
     );
     lock.save(&d.join("home/tole").join(tole_core::plugin_lock::LOCK_FILE))
         .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
-        .args(["chat", "--mcp-server", &spec])
-        .current_dir(d.join("ws"))
-        .env("CODECORA_HOME", d.join("home"))
-        .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
-        .env("TOLE_MODEL", "m")
-        .env("TOLE_API_KEY", "k")
-        .env("TOLE_NO_UPDATE_CHECK", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run tole chat");
+    let mut child =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), d.join("home").as_path(), &[])
+            .args(["chat", "--mcp-server", &spec])
+            .current_dir(d.join("ws"))
+            .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run tole chat");
     child
         .stdin
         .take()

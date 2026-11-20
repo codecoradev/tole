@@ -9,7 +9,7 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 fn tmp(tag: &str) -> TestDir {
@@ -94,7 +94,7 @@ fn home(tag: &str, user_config: &str) -> TestDir {
 }
 
 fn discuss(home: &std::path::Path, base: &str, timeout_env: Option<&str>) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args([
         "discuss",
         "start",
@@ -111,8 +111,6 @@ fn discuss(home: &std::path::Path, base: &str, timeout_env: Option<&str>) -> Out
         "--max-rounds",
         "1",
     ])
-    .env("CODECORA_HOME", home)
-    .env("HOME", home)
     .env("TOLE_NO_UPDATE_CHECK", "1")
     .env("TOLE_BASE_URL", base)
     .env("TOLE_MODEL", "mock")
