@@ -39,9 +39,9 @@ See [../../desktop-design.md](../../desktop-design.md) section 0 for the archite
 The desktop is two workspace members, so the compiler, not a text search, keeps the toolkit out of the logic:
 
 - `crates/tole-desktop-model`: view state, actions and reducers (tested without a window), `tokens` (colours, sizes and fonts: the dark palette above) and `strings` (every word the window shows). It has no GUI toolkit and no tole dependency, directly or through another crate; today it has no dependency at all.
-- `crates/tole-desktop`: the `tole-desktop` binary and the `ui` module that renders the model. Once the window lands, only `src/ui/adapter.rs` may name the toolkit (the text check enforces it). It does not depend on `tole-core`, `tole-tui` or `tole-cli` (the session host lives there): it is a thin client of `tole serve`, and will depend on the typed client crate (#1040) once that is on `develop` (an allowlist entry in `scripts/desktop-lint.py`, off now).
+- `crates/tole-desktop`: the `tole-desktop` binary and the `ui` module that renders the model. Only `src/ui/adapter.rs` names the toolkit (the text check enforces it). It does not depend on `tole-core`, `tole-tui` or `tole-cli` (the session host lives there): it is a thin client of `tole serve`, and will depend on the typed client crate (#1040) once that is on `develop` (an allowlist entry in `scripts/desktop-lint.py`, off now).
 
-Neither crate is published. `cargo test --workspace` stays light because the GUI toolkit will be behind a `gpui` cargo feature that is off by default (the window is a later change; today `tole-desktop` has no toolkit dependency). `default-members` was not used: `--workspace` ignores it, so it would not have helped, and it would change what a bare `cargo build` does.
+Neither crate is published. `cargo test --workspace` stays light because the GUI toolkit is behind the `gpui` cargo feature, which is off by default. `default-members` was not used: `--workspace` ignores it, so it would not have helped, and it would change what a bare `cargo build` does.
 
 `scripts/desktop-check.sh [deps|size|literals|all]` (self-test: `scripts/test-desktop-check.sh`; run `cargo fetch` once first, `deps` reads the dependency graph with `cargo metadata` and `cargo tree`, both `--offline`). "Script exits 1" is all the gate means: CI runs it in the `Desktop` workflow, which is not a required check unless the owner makes it one.
 
@@ -52,3 +52,24 @@ Neither crate is published. `cargo test --workspace` stays light because the GUI
 | literals | advisory | warns, never fails: in `src/ui`, numeric colours and sizes (`rgb(0x..)`, `0xRRGGBB`, `px(..)`, `len(8.0)`) and string literals handed to text (`.child("..")`, `.label("..")`, `String::from("..")`, `"..".into()`, `.font_family("..")`) |
 
 The script fails closed: if python3 or cargo is missing, `cargo metadata` fails, a file is unreadable or not UTF-8, there is a dangling symlink, or the helper crashes, it exits 2 with a message and never reports `ok`. The literals check is a pattern match over comment-stripped source and cannot see a literal first bound to a `let`, `const` or `static` and used later, a literal made by a macro or a helper, a number reaching a size through arithmetic on a non-token constant, or text assembled at run time; review still reads the diff. Both scripts belong in the pre-commit list of AGENTS.md section 3 for a change to the crates. The `Desktop` workflow (`.github/workflows/desktop.yml`) runs them, but it is separate from `ci.yml` and a required check only if the owner adds it to the branch protection of `develop`; if so, require only `Desktop model and guardrails`. Its guardrail job always runs; the Linux window build runs when a desktop crate, the root manifest, the lockfile, the desktop scripts or the workflow change; the macOS and Windows window builds run on every push to `develop` or `main`, on manual runs, and on changes to a desktop crate or the workflow (a PR that changes only the lockfile runs the Linux build, and the other two after the merge).
+
+### Building the window
+
+The window needs the `gpui` feature: `cargo run -p tole-desktop --features gpui`. Without it the binary exits with a message and `cargo test --workspace` builds no GUI toolkit. The window is a preview: nothing connects to a `tole serve` yet, so the status reads "Not connected (preview)" (no green dot) and the folders are labelled as sample data until the typed client (#1040) feeds the model.
+
+Pins (all from crates.io, exact, optional, in `crates/tole-desktop/Cargo.toml`; only `src/ui/adapter.rs` names them): `gpui-component =0.9.1`, which itself depends on `gpui-pre =0.3.12` (a crates.io snapshot of Zed's GPUI whose library is named `gpui`), and `gpui-pre-platform =0.3.12` (`gpui_platform`, the OS backends). The plain `gpui` crate on crates.io (0.2.2, October 2025) is an older snapshot that `gpui-component` 0.9.1 does not use, so it is not the pin. An upgrade is a change of that block and of the adapter. The first build compiles about 450 more crates (the lockfile grows accordingly).
+
+Linux build packages (Debian and Ubuntu names): `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libvulkan-dev libdrm-dev libgbm-dev libasound2-dev libssl-dev libfreetype-dev`. macOS needs the Xcode command line tools; Windows needs the MSVC build tools.
+
+Checked: the window opens and renders the shell under X11 (Xvfb, software GL) on Linux. Not checked: Wayland, macOS, Windows (the acceptance of #1028 for those needs a person on a real machine).
+
+### Supply chain
+
+Adding the `gpui` feature changes `Cargo.lock` for every build, even one without the feature, because the lockfile lists the optional dependencies too. Facts, from the lockfile and the crates.io metadata at the time of writing:
+
+- `gpui-pre` and `gpui-pre-platform` (and their `gpui-pre-*` siblings) are crates.io snapshots of `zed@d2a4fb6` (repository `zed-industries/zed`). `gpui-component` (and `gpui-base`, `gpui-kit-assets`) come from `longbridge/gpui-kit`. Who owns these crates.io names was not verified.
+- The lockfile grows from 324 to 775 package names. New crates include pre-releases and forks: `ropey 2.0.0-beta.1`, `zed-font-kit`, `zed-scap`, `zed-xim`, `core-graphics-helmer-fork` and `gpui-pre-reqwest` (a fork of `reqwest`).
+- Existing crates that the default `tole-cli` build also uses moved to newer versions: `icu_*` 2.3.x to 2.4.0, and `tinystr`, `yoke`, `zerovec`, `zerovec-derive`.
+- `cargo audit` and the Trivy scan of `security.yml` read the whole lockfile, so an advisory in the new tree would fail them for every PR. `cargo audit` was not available where this was authored; the `Cargo Audit` job of CI is the first run on this lockfile.
+
+The owner accepted this supply chain on 2026-11-20 (the pins above, optional behind the `gpui` feature). No dependency was changed to reduce it.
