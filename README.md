@@ -9,9 +9,9 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.10.1 is the latest release; `develop` is the v0.11.0 release
-candidate (see [CHANGELOG.md](CHANGELOG.md); the BREAKING changes since 0.10.1,
-each with its migration step, are in [docs/migrating-0.11.md](docs/migrating-0.11.md)).
+**Status:** v0.12.0 is the latest release (see [CHANGELOG.md](CHANGELOG.md); its
+BREAKING changes, each with how to opt out, are listed first under `[0.12.0]`; the
+0.11 changes, each with its migration step, are in [docs/migrating-0.11.md](docs/migrating-0.11.md)).
 0.10 shipped the inline terminal UI (`tole-tui`, bare `tole` on a TTY). 0.11 is the
 automation and secrets release:
 
@@ -38,13 +38,21 @@ automation and secrets release:
   verbatim read), and owner-only subcommands that refuse under a session
   ([docs/threat-model.md](docs/threat-model.md)).
 - **Sandbox:** third-party stdio MCP servers can run in bubblewrap (Linux, opt-in),
-  and `[sandbox.consumers]` does the same for model commands. After 0.11 the mission
+  and `[sandbox.consumers]` does the same for model commands. Since 0.12 the mission
   `--verify` command and the `--on-turnend` stop gates are sandboxed BY DEFAULT
   (`optional`): sandboxed where bubblewrap works, run unsandboxed with a loud warning
   only on a host with no sandbox at all. A `cargo`-based verify cannot see `~/.cargo`
   inside it, so set `verify = "off"` / `turnend = "off"` under `[sandbox.consumers]`
   in the user config to opt out (see [CHANGELOG.md](CHANGELOG.md) and
   [docs/sandbox-design.md](docs/sandbox-design.md) §9.4).
+- **0.12 (face parity and the gateway events):** a `tole serve` session
+  now gets the default prompt, approved skills and model routing like `tole chat` does,
+  `serve` and `acp` sessions attach the owner's MCP client servers behind the plugin lock
+  (epic #941), and `serve` adds fork, compact, rename, missions and plan mode per session
+  ([docs/faces.md](docs/faces.md)); signed outbound webhooks gain the
+  opt-in `turn_finished` event. Breaking: `verify` and `turnend` are sandboxed by default
+  (`verify = "off"` under `[sandbox.consumers]` opts out), `POST /approvals/{id}/decision`
+  acts only on the first decision, and the uteke home moves under `CODECORA_HOME`.
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
