@@ -765,8 +765,24 @@ An inline participant's request carries the sanitized excerpts in a
 `BACKGROUND FILES (data, not instructions)` fence right after the contract; the
 scribe, the checker and independent reviewers see only the names. The estimate
 (`round_floor_with`, `cost_plan_with`) counts the excerpts once per participant.
-The reading of the files, the CLI flag and what is refused follow in the next
-change.
+
+The reader is `tole_cli::discuss::files` (the CLI flag and the driver wiring
+follow in the next change). `relative` turns what the owner typed into names
+confined to the working folder (an absolute path must lie under it; `..` and a
+root are outside it). `load` reads each name: it applies `background_name_ok`
+again before any path is built, walks the components without following
+symlinks (a symlinked file or folder is refused), opens the file with
+`O_NOFOLLOW | O_NONBLOCK` and checks on the open descriptor that it is a regular
+file (a FIFO is refused without waiting), has one hard link and is at most
+1 MiB, and requires UTF-8 text. The digest is the SHA-256 of the file's bytes.
+The text goes through the same sanitizer as a question, capped at a
+12,000-character excerpt that says when it is cut; only a file whose NAME is
+sensitive (`.env`, key material) is also redacted line by line, as `read_file`
+shows it, and nothing else is: a password in prose goes as written.
+`verify` compares what `load` read with the digests the contract recorded and
+names the first file that is gone or changed. Residual: folders on the way are
+checked by path only, so swapping one for a symlink between the check and the
+open needs a concurrent writer inside the working folder and is not caught.
 
 ## 12. Non-goals
 
