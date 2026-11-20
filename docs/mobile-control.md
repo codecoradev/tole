@@ -339,6 +339,80 @@ dedicated OS user, keep `--allow`/`--trust` minimal on the serve
 process, and treat the token as a revocable secret (rotate = restart
 serve).
 
+## Local socket and per-launch credential (#1043)
+
+`tole serve --socket <path>` listens on a Unix domain socket (macOS, Linux) instead of TCP.
+It is for a client on the same machine, the desktop, and it answers exactly what the TCP listener
+answers: the same routes, the same bearer token (or Basic) check, the same per-peer auth-failure
+limiter (every socket peer shares one bucket) and the same event stream. Only the listener
+differs. `--socket` replaces `--bind` and `--port` (giving both is an error) and serves the REST
+transport only (`--transport mcp` stays on TCP). A Windows named pipe is not implemented yet:
+`--socket` there says so and exits; use the loopback TCP listener until it lands.
+
+```bash
+# A launcher makes a fresh token per start and hands it over a pipe (here: stdin is the pipe).
+printf '%s' "$TOKEN" | tole serve --socket "$XDG_RUNTIME_DIR/tole/serve.sock" --token-fd 0
+curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
+```
+
+- **The directory is the boundary.** The socket's parent directory is created `0700`. Serve
+  refuses to start when that directory is a link, is not a directory, is owned by someone else
+  or has any group or other permission (so `/tmp` itself is refused: use a private
+  subdirectory), when the socket path is a link or any file that is not a socket, and when the path
+  is longer than a socket address holds (103 bytes on macOS, 107 on Linux). The socket file is
+  set to `0600`. Serve has no signal handler: a stop by Ctrl-C, SIGTERM or `kill` leaves the
+  socket file behind (it is removed only if serve returns on its own, and then only the file it
+  bound). The next start removes it, as below.
+- **One serve per socket path.** A start takes an exclusive `flock` on `<socket>.lock` in the
+  same private directory and holds it for the life of the process (the kernel drops it when
+  the process ends, however it ends; the lock file itself stays). A second start on the same
+  path is refused with "already runs on it or is starting", naming the version when the
+  running serve answers `/health`. Two starts at once cannot delete each other's socket.
+- **Stale sockets.** Under that lock, an existing socket is removed only when nothing answers
+  on it (`connection refused`). A socket that answers is never taken over, so a second desktop
+  window or a CLI client attaches to the running serve (`GET /health`, below) instead of
+  starting another.
+- **The token is still required**, on every route but `/health`. The socket narrows who can
+  reach serve; it does not replace the credential. The per-launch token reaches serve in one of
+  two ways, never on the command line and never in the environment:
+  - `--token-fd <n>`: read to the end from an inherited file descriptor (at most 4 KiB, then the
+    descriptor is closed). Not a terminal, not 1 or 2. The parent writes the token into a pipe,
+    closes the write end and passes the read end. The token lives as long as that serve process.
+  - `--token-file <path>`: as always (a regular file, no link or FIFO, at most 4 KiB). With
+    `--socket` the file must also be owned by the current user and have no group or other
+    permission (`0600`), ideally inside the same private directory.
+  `--token` (visible in the process list) and `TOLE_SERVE_TOKEN` (the environment) still work
+  where they did, but a launcher that wants the local boundary should use neither.
+  The descriptor keeps the token from other users and from the argument list and environment;
+  it does not hide it from other processes of the same user (they can read the launcher's
+  memory, or connect to the socket themselves and need only the token to act).
+  `--token-fd` waits at most 5 seconds for the writer to close its end, then fails with an
+  error that does not contain the token.
+- **Webhook routes** (`/hooks/...`) keep their own gate. A socket peer counts as a loopback
+  client, so a route the owner configured as `insecure_loopback` (unsigned, loopback only)
+  loads with `--socket` too and lets any process of the same user fire its job over the socket
+  without the per-launch token. That route is the owner's explicit choice; do not configure
+  one on a serve whose token is meant to separate the desktop from the user's other processes.
+- **Failed-auth limiter.** Every socket peer shares one bucket (a socket has no peer address):
+  10 wrong tokens in 60 s answer `429` to everything else for the rest of the window, including
+  the right token. `GET /health` is exempt on the socket (it needs no token), so a client can
+  still see that serve is up. A same-user process holding a stale token can therefore lock the
+  desktop out of the authenticated routes for the window. TCP is unchanged (per source IP,
+  `/health` limited too).
+
+### `GET /health`
+
+No auth. Besides `{"status":"ok"}` it reports what a client needs to decide whether to attach:
+
+```json
+{"status":"ok","protocol":1,"version":"0.12.0"}
+```
+
+`protocol` is the version of the serve wire contract (`SERVE_PROTOCOL_VERSION`); it is raised
+only for a change a client written against the previous number cannot handle, never for a new
+route or field. `version` is the `tole` binary's version. A client refuses a serve whose
+`protocol` it does not know. The fields are on both listeners.
+
 ## HTTP Basic auth (#742, first slice)
 
 `tole serve --auth basic` authenticates with HTTP Basic instead of (or next to) the

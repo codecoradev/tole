@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `tole serve --socket <path>` (#1043): listen on a Unix domain socket (macOS, Linux) instead of TCP, for a client on the same machine. The routes, auth and event stream are the TCP ones. The socket's directory is created `0700`; serve refuses one that is wider, owned by someone else or a link, a socket path that is a link, and removes an existing socket only when nothing answers on it. `--token-fd <n>` reads the bearer token from an inherited descriptor (so it is in neither the arguments nor the environment); with `--socket` a `--token-file` must be `0600`. `GET /health` now also returns `protocol` and `version`. A Windows named pipe is not implemented yet.
+
 ## [0.12.0] — 2026-11-20
 
 ### BREAKING
