@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::common;
@@ -32,6 +32,15 @@ pub fn workspace_dir_at(nanos: u128) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!("tole-entries-{}-{n}-{nanos:x}", std::process::id()))
+}
+
+/// The HOME and CODECORA_HOME of the serve process over `dir`: a sibling of
+/// the workspace, so the workspace listing is unchanged and a restart over the
+/// same `dir` finds the same home. A test's own `CODECORA_HOME` in `env` wins.
+pub fn home_of(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut name = dir.file_name().unwrap().to_os_string();
+    name.push("-home");
+    dir.with_file_name(name)
 }
 
 pub struct Serve {
@@ -86,7 +95,7 @@ impl Serve {
         args: &[&str],
     ) -> Self {
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home_of(&dir), &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .args(["--workspace", dir.to_str().unwrap()])
                 .args(args)
@@ -173,6 +182,7 @@ impl Drop for Serve {
         self.kill();
         if self.own_dir {
             let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(home_of(&self.dir));
         }
     }
 }

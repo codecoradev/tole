@@ -49,7 +49,21 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   and clears the XDG overrides; `extra_env` is applied last, so a test that
   wants a shim or a decoy overrides there. Without it a test passes in CI and
   fails, or writes real state, on a machine that has those tools and a
-  `~/.codecora`. Unconverted files are tracked in #993.
+  `~/.codecora`.
+
+  ```rust
+  let home = dir.join("home");
+  let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[
+      ("TOLE_BASE_URL", base.as_str()),
+  ]);
+  cmd.args(["run", "hello"]).current_dir(&dir);
+  ```
+
+  To harden a `Command` built elsewhere, call `common::apply_hermetic_env(&mut cmd,
+  &home, &extra)`. The exception is a test that runs agent code in the test
+  process (`cron_agent.rs`, `child_handoff_e2e.rs`): there is no child to
+  configure, and it must not mutate the process environment to fake one;
+  see #993 for the options. Unconverted files are tracked in #993.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 
