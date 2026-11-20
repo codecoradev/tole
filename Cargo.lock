@@ -2506,6 +2506,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tole-client",
  "tole-core",
  "tole-tui",
  "toml",
