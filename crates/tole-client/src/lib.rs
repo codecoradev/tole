@@ -41,8 +41,22 @@
 //! A [`Transport`] opens the byte connection; HTTP and SSE framing sit above
 //! it. Today: HTTP over TCP ([`TcpTransport`]), plain `http://` only to
 //! loopback, or to a private-network address or host when the caller sets
-//! `trusted_private_network` (a public IP is never accepted). A Unix socket
-//! (after #1043) and HTTPS (#1044) are the same trait; see [`transport`].
+//! `trusted_private_network` (a public IP is never accepted). On macOS and
+//! Linux a Unix socket (`UnixTransport`, for `tole serve --socket`) is the
+//! local transport of the desktop; it refuses a socket in a directory that is
+//! not owner-only. HTTPS (#1044) and the Windows named pipe (#1051) are the
+//! same trait; see [`transport`]. A transport is chosen when the [`Client`] is
+//! built; nothing else in it depends on which one:
+//!
+//! ```no_run
+//! # #[cfg(unix)] {
+//! use tole_client::Client;
+//!
+//! let client = Client::connect_unix("/run/user/1000/tole/serve.sock", Some("token".into()))?;
+//! println!("{:?}", client.health()?);
+//! # }
+//! # Ok::<(), tole_client::Error>(())
+//! ```
 //!
 //! # Secrets
 //!
@@ -64,6 +78,8 @@ mod resume;
 mod sse;
 pub mod transport;
 mod types;
+#[cfg(unix)]
+mod unix;
 
 pub use client::{Client, IndexQuery, Route};
 pub use error::{Error, Result};
@@ -72,3 +88,5 @@ pub use resume::{ReconnectPolicy, ResumingStream, StreamItem};
 pub use sse::{Event, Frame, FrameReader, Ready, SseItem, SseParser};
 pub use transport::{Connection, TcpTransport, Transport};
 pub use types::*;
+#[cfg(unix)]
+pub use unix::UnixTransport;

@@ -7278,6 +7278,7 @@ dependencies = [
 name = "tole-client"
 version = "0.12.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
