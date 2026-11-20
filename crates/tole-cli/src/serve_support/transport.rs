@@ -48,6 +48,15 @@ impl Conn {
         }
     }
 
+    /// True for a connection on the local socket.
+    pub fn is_local_socket(&self) -> bool {
+        match self {
+            Conn::Tcp(_) => false,
+            #[cfg(unix)]
+            Conn::Unix(_) => true,
+        }
+    }
+
     /// The key of the failed-auth limiter and the "is this client local" test of
     /// an unsigned webhook. A socket peer has no address: it is a process of the
     /// owner (the directory is `0700`), so it counts as loopback and all of them
@@ -122,22 +131,93 @@ impl Listener {
     }
 }
 
-/// A bound Unix socket. The socket file is removed when this is dropped (a
-/// process that is killed leaves it behind; the next start removes a stale one).
+/// A bound Unix socket. It holds the start-up lock (see [`bind_socket`]) for as
+/// long as it lives. Dropping it removes the socket file, but only the one this
+/// process bound (same device and inode): it never unlinks another serve's
+/// socket. `run_serve` has no signal handler and never returns normally, so a
+/// stop by signal leaves the file behind; the next start removes it (under the
+/// lock) once nothing answers on it.
 #[cfg(unix)]
 pub struct UnixSocket {
     listener: std::os::unix::net::UnixListener,
     path: std::path::PathBuf,
+    /// `(dev, ino)` of the socket file right after `bind`.
+    identity: (u64, u64),
+    /// The exclusive `flock` on `<socket>.lock`, released when the process ends.
+    _lock: std::fs::File,
 }
 
 #[cfg(unix)]
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        use std::os::unix::fs::FileTypeExt;
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_socket()) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| m.file_type().is_socket() && (m.dev(), m.ino()) == self.identity);
+        if ours {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Take the start-up lock of `socket`: an exclusive, non-blocking `flock` on
+/// `<socket>.lock` in the private directory, held for the whole life of the
+/// serve process (the kernel drops it when the process ends, however it ends).
+/// It serialises two starts of the owner's own processes, so the stale-socket
+/// check and removal cannot delete a socket another start has just bound. The
+/// lock file is never removed (removing it would reopen the race).
+#[cfg(unix)]
+fn lock_socket_dir(socket: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut name = socket.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let lock_path = socket.with_file_name(name);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|e| {
+            format!(
+                "--socket {}: cannot open the lock file {}: {e}",
+                socket.display(),
+                lock_path.display()
+            )
+        })?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("--socket {}: {e}", socket.display()))?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "--socket {}: the lock file {} is not a regular file of this user",
+            socket.display(),
+            lock_path.display()
+        ));
+    }
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            let who = std::os::unix::net::UnixStream::connect(socket)
+                .ok()
+                .and_then(probe_stream)
+                .and_then(|h| h["version"].as_str().map(|v| format!(" (tole {v})")))
+                .unwrap_or_default();
+            return Err(format!(
+                "--socket {}: another tole serve already runs on it or is starting{who}; \
+                 attach to it instead of starting another",
+                socket.display()
+            ));
+        }
+        return Err(format!(
+            "--socket {}: cannot lock {}: {e}",
+            socket.display(),
+            lock_path.display()
+        ));
+    }
+    Ok(f)
 }
 
 /// Longest socket path `bind` accepts (`sun_path`, one byte kept for the NUL).
@@ -157,7 +237,9 @@ const SOCKET_PATH_MAX: usize = 107;
 ///   removed only when nothing answers on it (a live serve is a refusal that
 ///   names its version when it answers `/health`).
 ///
-/// The socket file itself is set to `0600`.
+/// A second start on the same path fails on the start-up lock (`flock` on
+/// `<socket>.lock`, held until the process ends), so two starts cannot remove
+/// each other's socket. The socket file itself is set to `0600`.
 #[cfg(unix)]
 pub fn bind_socket(socket: &Path) -> Result<Listener, String> {
     use std::os::unix::ffi::OsStrExt;
@@ -182,6 +264,7 @@ pub fn bind_socket(socket: &Path) -> Result<Listener, String> {
         _ => Path::new("."),
     };
     check_private_dir(dir).map_err(|e| format!("--socket {}: {e}", socket.display()))?;
+    let lock = lock_socket_dir(socket)?;
     let me = unsafe { libc::geteuid() };
 
     match std::fs::symlink_metadata(socket) {
@@ -247,9 +330,14 @@ pub fn bind_socket(socket: &Path) -> Result<Listener, String> {
             socket.display()
         ));
     }
+    let identity = std::fs::symlink_metadata(socket)
+        .map(|m| (m.dev(), m.ino()))
+        .map_err(|e| format!("--socket {}: {e}", socket.display()))?;
     Ok(Listener::Unix(UnixSocket {
         listener,
         path: socket.to_path_buf(),
+        identity,
+        _lock: lock,
     }))
 }
 
@@ -342,12 +430,22 @@ pub fn check_private_token_file(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How long `--token-fd` waits for the writer to finish and close its end.
+#[cfg(unix)]
+const TOKEN_FD_WAIT: Duration = Duration::from_secs(5);
+
 /// The bearer token from an inherited file descriptor (`--token-fd`): read to
 /// the end (at most `cap` bytes), then closed. The parent writes the token into
 /// a pipe and passes the read end, so the token is in neither the arguments nor
-/// the environment of this process. Errors never carry the token.
+/// the environment of this process. A parent that leaves the write end open
+/// gets an error after a few seconds, not a hang. Errors never carry the token.
 #[cfg(unix)]
 pub fn read_token_fd(fd: i32, cap: u64) -> Result<String, String> {
+    read_token_fd_within(fd, cap, TOKEN_FD_WAIT)
+}
+
+#[cfg(unix)]
+fn read_token_fd_within(fd: i32, cap: u64, wait: Duration) -> Result<String, String> {
     use std::os::fd::FromRawFd;
     if fd < 0 || fd == 1 || fd == 2 {
         return Err(format!("--token-fd {fd}: not a usable descriptor"));
@@ -361,13 +459,46 @@ pub fn read_token_fd(fd: i32, cap: u64) -> Result<String, String> {
         ));
     }
     // Ownership of the descriptor moves here: it is closed when `f` drops.
-    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let deadline = std::time::Instant::now() + wait;
     let mut buf = Vec::new();
-    f.take(cap + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("--token-fd {fd}: cannot be read: {e}"))?;
-    if buf.len() as u64 > cap {
-        return Err(format!("--token-fd {fd}: larger than {} KiB", cap / 1024));
+    let mut chunk = [0u8; 1024];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        let r = unsafe { libc::poll(&mut p, 1, ms) };
+        if r < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!(
+                "--token-fd {fd}: cannot be read: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if r == 0 {
+            return Err(format!(
+                "--token-fd {fd}: no end of input within {} s (does the launcher close its \
+                 write end after writing the token?)",
+                wait.as_secs().max(1)
+            ));
+        }
+        // Readable (data, or end of input): this read does not block.
+        let n = f
+            .read(&mut chunk)
+            .map_err(|e| format!("--token-fd {fd}: cannot be read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() as u64 > cap {
+            return Err(format!("--token-fd {fd}: larger than {} KiB", cap / 1024));
+        }
     }
     let text =
         String::from_utf8(buf).map_err(|_| format!("--token-fd {fd}: the token is not UTF-8"))?;
@@ -385,15 +516,9 @@ pub fn read_token_fd(fd: i32, _cap: u64) -> Result<String, String> {
     ))
 }
 
-/// `GET /health` over the socket at `path`: the parsed answer of a serve that is
-/// running there, or `None` when nothing (or nothing speaking tole) answers. A
-/// second desktop window or a CLI client uses it to attach to a running serve
-/// instead of starting another, and to refuse one whose version does not fit.
-#[cfg(unix)]
-pub fn probe_health(path: &Path) -> Option<serde_json::Value> {
-    probe_stream(std::os::unix::net::UnixStream::connect(path).ok()?)
-}
-
+/// `GET /health` on an open socket stream: the parsed answer of a serve, or
+/// `None` when the peer does not answer like one. Used to name the version of
+/// the serve that already runs on a socket.
 #[cfg(unix)]
 fn probe_stream(mut s: std::os::unix::net::UnixStream) -> Option<serde_json::Value> {
     let limit = Some(Duration::from_secs(2));
@@ -526,9 +651,47 @@ mod tests {
         let live = bind_socket(&sock).unwrap();
         // The same path again while it is live: refused, and still there.
         let e = err(bind_socket(&sock));
-        assert!(e.contains("already answers"), "{e}");
+        assert!(e.contains("already runs on it"), "{e}");
         assert!(sock.exists());
         drop(live);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropping_a_listener_never_unlinks_a_socket_it_did_not_bind() {
+        let root = scratch("ino");
+        let sock = root.join("s.sock");
+        let first = bind_socket(&sock).unwrap();
+        // Someone replaces the file at the path with another live socket.
+        std::fs::remove_file(&sock).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(first);
+        assert!(sock.exists(), "a socket this listener did not bind stays");
+        drop(other);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_starts_leave_exactly_one_serving_socket() {
+        let root = scratch("race");
+        let sock = root.join("s.sock");
+        // A stale socket, then many starts at once: one wins, the rest are
+        // refused on the lock, and the winner's socket is never unlinked.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let results: Vec<Result<Listener, String>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| bind_socket(&sock))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let refusals: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(results.len() - refusals.len(), 1, "{refusals:?}");
+        for e in refusals {
+            assert!(e.contains("already runs on it"), "{e}");
+        }
+        assert!(
+            std::os::unix::net::UnixStream::connect(&sock).is_ok(),
+            "the winner's socket is reachable"
+        );
+        drop(results);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -570,6 +733,22 @@ mod tests {
             -1,
             "the descriptor is closed after the read"
         );
+    }
+
+    #[test]
+    fn a_writer_that_never_closes_gets_an_error_not_a_hang() {
+        // Data written, but the write end stays open: no end of input ever comes.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let secret = b"never-echoed-token";
+        let n = unsafe { libc::write(fds[1], secret.as_ptr().cast(), secret.len()) };
+        assert_eq!(n as usize, secret.len());
+        let started = std::time::Instant::now();
+        let e = read_token_fd_within(fds[0], 4096, Duration::from_millis(300)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(e.contains("no end of input"), "{e}");
+        assert!(!e.contains("never-echoed-token"), "{e}");
+        unsafe { libc::close(fds[1]) };
     }
 
     #[test]

@@ -360,11 +360,18 @@ curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
   or has any group or other permission (so `/tmp` itself is refused: use a private
   subdirectory), when the socket path is a link or any file that is not a socket, and when the path
   is longer than a socket address holds (103 bytes on macOS, 107 on Linux). The socket file is
-  set to `0600`. It is removed when serve exits normally; a killed serve leaves it behind.
-- **Stale and live sockets.** An existing socket is removed only when nothing answers on it
-  (`connection refused`). A socket that answers is never taken over: serve refuses, naming the
-  version when the peer answers `/health`, so a second desktop window or a CLI client attaches
-  to the running serve (`GET /health`, below) instead of starting another.
+  set to `0600`. Serve has no signal handler: a stop by Ctrl-C, SIGTERM or `kill` leaves the
+  socket file behind (it is removed only if serve returns on its own, and then only the file it
+  bound). The next start removes it, as below.
+- **One serve per socket path.** A start takes an exclusive `flock` on `<socket>.lock` in the
+  same private directory and holds it for the life of the process (the kernel drops it when
+  the process ends, however it ends; the lock file itself stays). A second start on the same
+  path is refused with "already runs on it or is starting", naming the version when the
+  running serve answers `/health`. Two starts at once cannot delete each other's socket.
+- **Stale sockets.** Under that lock, an existing socket is removed only when nothing answers
+  on it (`connection refused`). A socket that answers is never taken over, so a second desktop
+  window or a CLI client attaches to the running serve (`GET /health`, below) instead of
+  starting another.
 - **The token is still required**, on every route but `/health`. The socket narrows who can
   reach serve; it does not replace the credential. The per-launch token reaches serve in one of
   two ways, never on the command line and never in the environment:
@@ -376,8 +383,22 @@ curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
     permission (`0600`), ideally inside the same private directory.
   `--token` (visible in the process list) and `TOLE_SERVE_TOKEN` (the environment) still work
   where they did, but a launcher that wants the local boundary should use neither.
-- **Webhook routes** (`/hooks/...`) keep their own HMAC gate. A socket peer counts as a loopback
-  client for an unsigned route, which only loads on a loopback bind or a socket.
+  The descriptor keeps the token from other users and from the argument list and environment;
+  it does not hide it from other processes of the same user (they can read the launcher's
+  memory, or connect to the socket themselves and need only the token to act).
+  `--token-fd` waits at most 5 seconds for the writer to close its end, then fails with an
+  error that does not contain the token.
+- **Webhook routes** (`/hooks/...`) keep their own gate. A socket peer counts as a loopback
+  client, so a route the owner configured as `insecure_loopback` (unsigned, loopback only)
+  loads with `--socket` too and lets any process of the same user fire its job over the socket
+  without the per-launch token. That route is the owner's explicit choice; do not configure
+  one on a serve whose token is meant to separate the desktop from the user's other processes.
+- **Failed-auth limiter.** Every socket peer shares one bucket (a socket has no peer address):
+  10 wrong tokens in 60 s answer `429` to everything else for the rest of the window, including
+  the right token. `GET /health` is exempt on the socket (it needs no token), so a client can
+  still see that serve is up. A same-user process holding a stale token can therefore lock the
+  desktop out of the authenticated routes for the window. TCP is unchanged (per source IP,
+  `/health` limited too).
 
 ### `GET /health`
 

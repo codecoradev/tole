@@ -797,8 +797,12 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // information — it is a liveness probe). Failed auths are rate-limited
     // per source IP (CodeCora scan-3 Wave-2: brute-force hardening).
 
-    // Rate-limit: refuse when this IP has too many recent auth failures.
-    if limited {
+    // Rate-limit: refuse when this IP has too many recent auth failures. On the
+    // local socket every peer shares one bucket, so the unauthenticated liveness
+    // probe is exempt there: a client with a stale token must not be able to make
+    // a running serve look dead to the one that attaches (TCP is unchanged).
+    let socket_probe = stream.is_local_socket() && req.method == "GET" && req.path == "/health";
+    if limited && !socket_probe {
         respond(
             &mut stream,
             429,

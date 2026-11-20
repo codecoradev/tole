@@ -285,6 +285,14 @@ fn repeated_wrong_tokens_are_rate_limited(s: &Server) {
     assert_eq!(last, 429);
     // The limiter keys the peer: even the right token waits out the window.
     assert_eq!(s.get("/sessions").code, 429);
+    // The liveness probe: on the socket every peer shares the bucket, so
+    // `/health` stays reachable (an attaching client must be able to see a
+    // running serve); on TCP it is limited as before.
+    let health = s.http("GET", "/health", None, None).code;
+    match s.transport {
+        Transport::Socket => assert_eq!(health, 200),
+        Transport::Tcp => assert_eq!(health, 429),
+    }
 }
 
 macro_rules! on_both {
@@ -492,7 +500,7 @@ fn a_stale_socket_is_replaced_and_a_live_one_is_not_taken_over() {
         &dir,
         &[os("--socket"), sock.as_os_str(), os("--token"), os("t")],
     );
-    assert!(err.contains("already answers"), "{err}");
+    assert!(err.contains("already runs on it"), "{err}");
     assert!(
         err.contains(&format!("tole {}", env!("CARGO_PKG_VERSION"))),
         "{err}"
