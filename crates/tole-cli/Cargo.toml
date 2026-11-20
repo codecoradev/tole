@@ -76,6 +76,11 @@ nginjen-lite = { version = "0.1.0", features = ["robots"], optional = true }
 # Already in the tree through nginjen-lite; named for its link resolver.
 url = { version = "2", optional = true }
 
+[dev-dependencies]
+# The typed client's contract test (tests/client_contract.rs) drives a real
+# `tole serve` through it. Test-only: tole-client never depends on this crate.
+tole-client = { path = "../tole-client" }
+
 # Offline trace replay scorer (issue #107, gated behind the `replay`
 # feature since #118). Lives under evals/ and is operator-built for
 # eval use — it is NOT part of the shipped tole binary and NOT built

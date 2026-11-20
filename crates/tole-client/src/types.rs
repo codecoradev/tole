@@ -20,9 +20,16 @@ macro_rules! wire {
 }
 
 wire! {
-    /// `GET /health`.
+    /// `GET /health`: `status`, and since serve reports its protocol and
+    /// binary version (#1043) also `protocol` and `version`. Both are
+    /// optional so a server that predates them still decodes, and a decoded
+    /// answer serializes back to the JSON the server sent.
     pub struct Health {
         pub status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub version: Option<String>,
     }
 
     /// One live session in `GET /sessions`.
