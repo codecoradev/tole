@@ -8,7 +8,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn tmpdir(tag: &str) -> TestDir {
     TestDir::new(&format!("tole-setup-{tag}"))
