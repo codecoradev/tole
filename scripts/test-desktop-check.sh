@@ -245,6 +245,40 @@ gpui = { package = "gpui-pre", registry = "x", version = "=0.3.12", optional = t
 TOML
 expect "alternative registry fails closed (cannot resolve)" deps 2 "could not finish"
 
+# ---- deps: the text check of the desktop crate ----------------------------------
+new_ws; put crates/tole-desktop/src/lib.rs 'use gpui::App;'
+expect "gpui in the crate root" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; put crates/tole-desktop/src/lib.rs 'use ::gpui as g;
+fn f(_: g::App) {}'
+expect "use ::gpui as g" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; put crates/tole-desktop/src/lib.rs 'use {gpui as g};'
+expect "use {gpui as g}" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; ui 'use gpui_platform::application;'
+expect "gpui_platform in a view" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; put crates/tole-desktop/tests/t.rs 'use gpui::App;'
+expect "gpui in tests/" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; put crates/tole-desktop/build.rs 'fn main() { let _ = gpui_component::init; }'
+expect "gpui in build.rs" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; put crates/tole-desktop/src/lib.rs '#[path = "../../leak.rs"]
+mod leak;'
+expect "#[path]" deps 1 "path. attribute"
+
+new_ws; put crates/tole-desktop/src/lib.rs 'include!("../../leak.rs");'
+expect "include!" deps 1 "include!"
+
+new_ws; put crates/tole-desktop/src/lib.rs '// gpui::App only in a comment
+/* and gpui_platform::application() in a block */
+const S: &str = "gpui::App in a string";
+#[cfg(feature = "gpui")]
+fn f() {}'
+expect_clean "comments, strings and the feature name are not toolkit use" deps
+
 # ---- the one walker: where the checks look ------------------------------------------
 big() { seq 1 "${2:-600}" | sed 's/.*/\/\/ line/' > "$1"; }
 
@@ -253,11 +287,17 @@ big() { seq 1 "${2:-600}" | sed 's/.*/\/\/ line/' > "$1"; }
 ws_saved="$ws"; ws="$tmp/parent/target/ws"
 new_ws; big "$ws/crates/tole-desktop/src/big.rs"
 expect "workspace under a parent directory named target: size is checked" size 1 "cap 500 per file"
+new_ws; put crates/tole-desktop/src/lib.rs 'use gpui::App;'
+expect "workspace under a parent directory named target: text check runs" deps 1 "outside src/ui/adapter.rs"
 ws="$ws_saved"
 
 # A source directory named `target` inside a crate is scanned...
 new_ws; mkdir -p "$ws/crates/tole-desktop/src/target"; big "$ws/crates/tole-desktop/src/target/big.rs"
 expect "src/target/ module directory: size is checked" size 1 "cap 500 per file"
+new_ws; put crates/tole-desktop/src/target/leak.rs 'use gpui::App;'
+expect "src/target/ module directory: gpui outside the adapter" deps 1 "outside src/ui/adapter.rs"
+new_ws; put crates/tole-desktop/src/ui/target/view.rs 'fn v() { let _ = div().child("New task"); }'
+expect "src/ui/target/ module directory: literals are scanned" literals 0 "^warning: "
 
 # ...and only the crate's own top-level target/ (cargo's output) is skipped.
 new_ws; mkdir -p "$ws/crates/tole-desktop/target"; big "$ws/crates/tole-desktop/target/generated.rs"
@@ -267,6 +307,8 @@ expect "the crate's own target/ is skipped" size 0 "ok \(enforced rules\)"
 new_ws; mkdir -p "$tmp/outside"; big "$tmp/outside/linked.rs"
 ln -s "$tmp/outside/linked.rs" "$ws/crates/tole-desktop/src/linked.rs"
 expect "symlinked .rs file is counted" size 1 "cap 500 per file"
+new_ws; printf 'use gpui::App;\n' > "$tmp/outside/leak.rs"; ln -s "$tmp/outside/leak.rs" "$ws/crates/tole-desktop/src/leak.rs"
+expect "symlinked .rs file is scanned" deps 1 "outside src/ui/adapter.rs"
 new_ws; mkdir -p "$tmp/outside/dir"; ln -s "$tmp/outside/dir" "$ws/crates/tole-desktop/src/linked_dir"
 expect "symlinked directory is refused" size 2 "could not finish"
 
@@ -277,6 +319,8 @@ new_ws; rm -r "$ws/crates/tole-desktop-model/src"
 expect "model crate without src/" size 2 "no src/"
 new_ws; rm -r "$ws/crates/tole-desktop/src"
 expect "desktop crate without src/" deps 2 "could not finish"
+new_ws; rm -r "$ws/crates/tole-desktop/src/ui"
+expect "desktop crate without src/ui for the literals check" literals 2 "no .rs files under src/ui"
 
 # ---- an unreadable directory is an error, not a skipped subtree ------------------------
 # Run as a user that cannot read the directory: root bypasses file modes, so as
@@ -357,9 +401,38 @@ helper = { path = "../helper", features = ["x"] }
 TOML
 expect "the same feature switched on by the desktop is counted" deps 1 "tole-core"
 
+# ---- deps: text check, hiding tricks ----------------------------------------------------
+new_ws; put crates/tole-desktop/src/lib.rs '#[cfg_attr(all(), path = "../../leak.rs")]
+mod leak;'
+expect "path attribute inside cfg_attr" deps 1 "path. attribute"
+
+new_ws; put crates/tole-desktop/src/lib.rs '#![cfg_attr(unix, path = "x.rs")]'
+expect "inner path attribute inside cfg_attr" deps 1 "path. attribute"
+
+new_ws; ui 'fn f() { let _ = br"\"; }
+use gpui::App;
+fn g() { let _ = "q"; }'
+expect "gpui after a br raw string ending in a backslash" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; ui 'fn f() { let _ = cr#"x\"#; }
+use gpui::App;'
+expect "gpui after a cr raw string" deps 1 "outside src/ui/adapter.rs"
+
+new_ws; ui 'const A: &[u8] = b"gpui::App";
+const B: &[u8] = br"gpui::App";
+const C: &[u8] = br#"gpui::App "quoted""#;
+const D: &str = r"gpui::App";'
+expect_clean "gpui inside byte and raw strings is not toolkit use" deps
+
 # ---- fail closed ------------------------------------------------------------------
+new_ws; ln -s missing-target.rs "$ws/crates/tole-desktop/src/dangling.rs"
+expect "dangling symlink" deps 2 "could not finish"
 
+new_ws; printf '\377\376 not utf-8 \200\n' > "$ws/crates/tole-desktop/src/bad.rs"
+expect "non-UTF-8 source file" deps 2 "could not finish"
 
+new_ws; ln -s missing-target.rs "$ws/crates/tole-desktop/src/ui/dangling.rs"
+expect "dangling symlink in ui, literals" literals 2 "could not finish"
 
 new_ws; rm "$ws/crates/tole-desktop/Cargo.toml"
 expect "missing manifest" deps 2 "could not finish"
@@ -373,6 +446,9 @@ if [ "$got" = 2 ] && grep -q "could not finish" <<< "$out"; then echo "ok   unca
 printf 'import sys\nsys.exit(1)\n' > "$tmp/scripts-copy/desktop-lint.py"
 got=0; out=$(bash "$tmp/scripts-copy/desktop-check.sh" deps "$ws" 2>&1) || got=$?
 if [ "$got" = 2 ]; then echo "ok   helper exits 1 without a finding"; else echo "FAIL helper exits 1 without a finding: exit $got"; echo "$out"; fails=$((fails + 1)); fi
+printf 'import sys\nsys.exit(7)\n' > "$tmp/scripts-copy/desktop-lint.py"
+got=0; out=$(bash "$tmp/scripts-copy/desktop-check.sh" literals "$ws" 2>&1) || got=$?
+if [ "$got" = 2 ]; then echo "ok   helper exits with another code"; else echo "FAIL helper exits with another code: exit $got"; echo "$out"; fails=$((fails + 1)); fi
 
 # python3 missing: a PATH with the tools the script needs, but no python3.
 shim="$tmp/shim"; mkdir -p "$shim"
@@ -389,6 +465,42 @@ expect "desktop crate over 2000 lines" size 1 "cap 2000 per crate"
 
 new_ws; fake other other; seq 1 600 | sed 's/.*/\/\/ line/' > "$ws/crates/other/src/lib.rs"
 expect "other crates only warn" size 0 "warning: .*other"
+
+# ---- literals: advisory, warn and never fail --------------------------------------
+new_ws
+expect_clean "clean ui: no warning" literals
+
+lit() { # lit <name> <source>: the finding is a warning and the run still passes
+  new_ws; ui "$2"; expect "$1" literals 0 "^warning: "
+}
+lit "numeric rgb" 'fn v() { let _ = adapter::rgb(0x5CC8B0); }'
+lit "hex literal with underscores" 'const C: u32 = 0x5C_C8_B0;'
+lit "hex string" 'const C: &str = "#5CC8B0";'
+lit "Hsla built from fields" 'fn v() { let _ = Hsla { h: 0.1, s: 0.2, l: 0.3, a: 1.0 }; }'
+lit "numeric px" 'fn v() { let _ = div().w(px(264.0)); }'
+lit "numeric len(..), the real size helper" 'fn v() { let _ = div().w(adapter::len(264.0)); }'
+lit "string literal child" 'fn v() { let _ = div().child("New task"); }'
+lit "string literal child, split over lines" 'fn v() {
+    let _ = div().child(
+        "New task",
+    );
+}'
+lit "raw string child" 'fn v() { let _ = div().child(r#"New task"#); }'
+lit "font family literal" 'fn v() { let _ = div().font_family("Inter"); }'
+lit "String::from literal" 'fn v() { let _ = div().child(String::from("New task")); }'
+lit "literal .into()" 'fn v() { let _ = div().child("New task".into()); }'
+
+new_ws; ui 'fn v() { let _ = div().child(strings::TITLE); } // .child("x") in a comment, #5CC8B0
+/* rgb(0x5CC8B0) and .child("y")
+   in a block comment */
+const S: &str = "//";
+fn w() { let _ = div().child(strings::BODY); }'
+expect_clean "comments are ignored, and \"//\" does not hide code" literals
+
+# The enforced gate does not fail on a literal.
+new_ws; ui 'fn v() { let _ = div().child("New task"); }'
+expect "all: a literal warns but does not fail" all 0 "ok \(enforced rules; literals are advisory\)"
+expect "literals mode does not claim an enforced rule ran" literals 0 "advisory only, no enforced rule ran"
 
 if [ "$fails" -gt 0 ]; then echo "$fails case(s) failed"; exit 1; fi
 echo "all desktop-check cases passed"
