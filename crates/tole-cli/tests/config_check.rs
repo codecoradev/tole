@@ -6,18 +6,17 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn tmpdir() -> TestDir {
     TestDir::new("tole-cfg-e2e")
 }
 
 fn tole(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), tmpdir().path(), &[])
         .args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", tmpdir())
         .output()
         .unwrap()
 }

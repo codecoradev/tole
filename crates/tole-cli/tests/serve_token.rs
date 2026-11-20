@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 mod common;
@@ -40,12 +40,12 @@ fn the_token_is_read_from_a_file_and_never_from_the_arguments() {
     let file = d.join("token");
     std::fs::write(&file, format!("{TOKEN}\n")).unwrap();
     let (mut child, port) = common::spawn_listening(|port| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd =
+            common::hermetic_command(env!("CARGO_BIN_EXE_tole"), d.join("home").as_path(), &[]);
         cmd.args(["serve", "--port", &port.to_string(), "--token-file"])
             .arg(&file)
             .args(["-s"])
             .arg(d.join("sessions"))
-            .env("CODECORA_HOME", d.join("home"))
             .env_remove("TOLE_SERVE_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
@@ -69,9 +69,8 @@ fn the_token_is_read_from_a_file_and_never_from_the_arguments() {
 fn the_argument_form_warns_and_a_bad_file_stops_the_server() {
     let d = dir("warn");
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), d.join("home").as_path(), &[])
             .args(args)
-            .env("CODECORA_HOME", d.join("home"))
             .env_remove("TOLE_SERVE_TOKEN")
             .stdin(Stdio::null())
             .output()

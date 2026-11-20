@@ -10,7 +10,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn tmp(tag: &str) -> TestDir {
     let d = TestDir::new(&format!("tole-plugin-add-{tag}"));
@@ -29,10 +29,10 @@ fn spy(dir: &Path) -> String {
 }
 
 fn tole(dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), dir.join("home").as_path(), &[]);
     c.args(args)
         .current_dir(dir.join("ws"))
-        .env("CODECORA_HOME", dir.join("home"))
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env_remove("TOLE_UNDER_SESSION")
         .env_remove("TOLE_AGENT_DEPTH")

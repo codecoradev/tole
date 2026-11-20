@@ -8,7 +8,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const REQUIRED: &str = "[sandbox]\nmode = \"required\"\n";
 
@@ -21,10 +21,10 @@ fn setup(tag: &str) -> TestDir {
 }
 
 fn tole(base: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c =
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[]);
     c.args(args)
         .current_dir(base.join("proj"))
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env_remove("TOLE_AGENT_DEPTH")
         .env_remove("TOLE_UNDER_SESSION")

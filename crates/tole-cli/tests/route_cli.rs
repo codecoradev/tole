@@ -4,7 +4,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const USER: &str = r#"
 [router]
@@ -36,11 +36,9 @@ fn setup(tag: &str, user: &str) -> TestDir {
 }
 
 fn tole(base: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[])
         .args(args)
         .current_dir(base.join("cwd"))
-        .env("CODECORA_HOME", base.join("home"))
-        .env("HOME", base.join("home"))
         // A provider that would refuse any connection: the dry run must
         // not need one.
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")

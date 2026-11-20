@@ -5,7 +5,7 @@
 mod common;
 use common::TestDir;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const USER: &str = "# my settings\nmodel = \"m\"\n\n[sandbox]\nmode = \"required\"\n\
     # keep this comment\n\n[sandbox.profiles.net]\nnetwork = \"host\"\n";
@@ -21,10 +21,9 @@ fn setup(tag: &str, user: &str) -> TestDir {
 }
 
 fn tole(base: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[])
         .args(args)
         .current_dir(base.join("proj"))
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env_remove("TOLE_UNDER_SESSION")
         .env_remove("TOLE_AGENT_DEPTH")
@@ -118,10 +117,9 @@ fn set_creates_the_user_config_when_there_is_none() {
 #[test]
 fn set_refuses_under_an_agent_session() {
     let b = setup("session", USER);
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), b.join("home").as_path(), &[])
         .args(["sandbox", "set", "gh", "--profile", "strict"])
         .current_dir(b.join("proj"))
-        .env("CODECORA_HOME", b.join("home"))
         .env("TOLE_UNDER_SESSION", "1")
         .output()
         .unwrap();
