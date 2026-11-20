@@ -4,21 +4,14 @@
 //! `CODECORA_HOME`), so this file holds a single test that owns the
 //! environment for the whole process.
 
+mod common;
+use common::TestDir;
 use tole_cli::session_host::create_session;
 use tole_cli::session_index;
 use tole_core::storage::Storage;
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-create-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-create-{tag}"))
 }
 
 #[test]

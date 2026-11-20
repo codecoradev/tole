@@ -141,8 +141,10 @@ feed the live display: the log gets the assembled message in one entry, so a
 value split across two chunks is whole there and redacted. The TUI
 `/export` (tole has no separate export command) renders these entries, and the memory-loop summary is built from
 them (and redacted again before its length cap), so neither carries a known
-secret. Old logs load unchanged; nothing is rewritten. Residuals: a value
-tole never knew needs the shape detector (#597), and register cells
+secret. Old logs load unchanged; nothing is rewritten. Since #597 a value
+tole never knew is masked by the shared shape detector (`uteke-privacy`,
+after the known-value pass, same sinks). Residuals: a secret of a shape the
+detector does not know, and register cells
 (control state such as the model, mission and pending intent) are stored as
 they are.
 

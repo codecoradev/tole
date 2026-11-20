@@ -503,6 +503,12 @@ create` may carry one, any other job is `blocked` with `delivery_untrusted`), an
 so uteke-mobile or any client can read results. Telegram/Slack-style targets
 plug into the same `delivery` record later without changing the core.
 
+**Outbound signed webhook target (#911, design only):** a push target for cron
+results and approval requests, so a chat gateway need not hold SSE streams or
+poll. Named destinations in the user config, v2 HMAC signing like the inbound
+gate, at-least-once with a durable outbox for cron results. Full design:
+[webhook-delivery-design.md](webhook-delivery-design.md).
+
 ## 10. Phasing (1 issue = 1 branch = 1 PR, ≲ 20 files each)
 
 1. **Core fold + cron parser + claim/recovery** in `tole-core`, with the
@@ -560,7 +566,10 @@ built-in or owner-overridden roles.
 
 1. `tole discuss start|resume|list|show` (owner-only, depth 0, read-only
    inline participants; `--dry-run` shows the cost, `resume` continues after
-   a crash).
+   a crash). The number of participants is advice (8 recommended, #856), not
+   a limit: only a measured technical ceiling (16, the most voices whose
+   worst-case round fits one ledger record) refuses a contract, and the
+   budget, which is a hard cap, bounds the cost.
 2. The model-facing tools `discuss`, `discuss_status` and `discuss_stop`
    (`tole_cli::discuss_tool`), under exactly the rules of `delegate`:
    - all three are `Risk::Write`, approved or allowlisted like `delegate`;
@@ -572,7 +581,7 @@ built-in or owner-overridden roles.
      delegation tree (`budget_tokens`, or half of what is left, never more),
      recorded as a running `consult` node; the tree is charged what the
      ledger counted when the discussion ends, and a crash is charged the
-     whole carve; at most two discussions run at once per process;
+     whole carve (so is a call that ended in a timeout, below); at most two discussions run at once per process;
    - participants are user-config profiles whose allow patterns the caller's
      own allow list covers (a refusal, where `delegate` trims), never a
      built-in role; they are inline voices with no tools and no process, so
@@ -608,17 +617,143 @@ built-in or owner-overridden roles.
      approve a Write) and `TOLE_DISCUSSION_PARTICIPANT=1`; its only Write
      tool is `delegate_report` (one capped file: its contribution);
    - **a Write it wants is denied (fail closed), never routed to the
-     caller's allowlist.** The owner's approval surface for a delegated
-     child does not exist yet (a headless child has no approver, and the
-     `/approvals` queue belongs to serve sessions), so until #714 builds it
-     a reviewer cannot write at all. This is stricter than the decision
-     above, not weaker;
+     caller's allowlist.** A reviewer has no Write tool at all (plan mode)
+     and never asks for one: the owner decided (#714) that reviewers stay
+     read-only permanently, so the approval queue that now exists for
+     `delegate` and `execute` children (a durable queue with escalation up
+     the delegation chain, [delegation-approvals-design.md](delegation-approvals-design.md))
+     never carries a reviewer's request, and the `delegate_pending` and
+     `delegate_decide` tools are never registered for a participant.
+     This is stricter than the decision above, not weaker;
    - no nested discussions: a session with the participant marker gets no
      delegation host (`Delegator::for_session`), so neither `discuss` nor
      `delegate` is registered for it, at any depth;
    - unknown fields are still refused; the opt-in is `modes` only.
 
+### Discussion request timeout (#786)
+
+Discussions do not stream (the whole reply must land before the ledger entry
+is written), so one call is as long as the model's whole generation, and a
+reasoning model on a growing shared context can pass the provider's 120 s
+default. The timeout is therefore a knob, with the house precedence
+(`TOLE_CONTEXT_WINDOW` > config > default, #440): env
+`TOLE_DISCUSSION_TIMEOUT_SECS` > user config `[discussions]
+request_timeout_secs` > 120 (unchanged), a whole number of seconds from 1 to
+3600. `discussion_host::factory` hands it to the provider's `with_timeout`.
+What it covers: the provider's global request timeout, i.e. connect, send and
+reading the entire response of ONE call; it is not an idle timeout and not a
+bound on the discussion, which stays bounded by its budget and `max_rounds`.
+The key is user-layer only (a cloned repository must not stretch how long a
+call may hold a discussion open; `config check` prints the project's value as
+IGNORED), and an invalid env value is a startup error naming the variable,
+never a silent fall back to 120 s. `tole config check` and `tole doctor` show
+the effective value and where it came from. The advisor's provider keeps its
+own 120 s.
+
+### Owner-only entry point, enforced (#813 item 2)
+
+`tole discuss start` and `tole discuss resume` refuse under an agent session
+exactly like the other owner-only writes (`tole cron create|resume|edit`,
+`plugin add|approve|revoke`, `skills approve`, `config trust`; #684): the
+same `owner_only::refuse_under_session` guard, which looks at
+`TOLE_UNDER_SESSION` and `TOLE_AGENT_DEPTH >= 1`, runs before a provider is
+configured or the discussion ledger is touched. Why: both spend the owner's
+token budget and write a ledger, and the contract (question, criteria,
+participants, budget) must be what the owner typed, not what a session's
+text steered; the model-facing `discuss` tools remain the way an agent opens
+one, under `delegate`'s rules. `--dry-run` is exempt: it calls no model and
+writes nothing. `list` and `show` are read-only and stay open.
+
+### Discussion timeout floor: decided (#813 item 4)
+
+Decided by the owner on 2026-11-15 ("follow best practice"): the floor of
+the user-config key `[discussions] request_timeout_secs` is 10 seconds.
+
+| | Floor 10 s (decided) |
+|---|---|
+| A typo or a unit slip (`5` meant as minutes) | refused at startup and by `tole config check`, naming `discussions.request_timeout_secs` and the floor; before, every call timed out and, since #756 and #804, each timeout is retried once and charged its reserved estimate, so the discussion burned its budget on nothing |
+| Tests of the timeout path | keep 1 s through `TOLE_DISCUSSION_TIMEOUT_SECS` only |
+| Real models | no effect: none answers a non-streaming discussion call in under 10 s |
+
+Bounds: config 10 to 3600 s (values 1 to 9 are an error), env
+`TOLE_DISCUSSION_TIMEOUT_SECS` 1 to 3600 s (the env stays unbounded below
+the config floor on purpose: it is the documented test hook, not a setting
+to rely on). Default 120 s and the upper bound are unchanged.
+`discussion_timeout_bounds()` names the floor and the hook;
+`discussion_timeout_env_bounds()` is the env's wording.
+
+### A timed-out call is charged its estimate (#804)
+
+The discussion budget is a hard cap, so the ledger must not undercount a call
+whose cost it cannot see. A call that fails with no usage reported used to
+settle at 0, yet after a timeout the provider may have generated, and billed,
+most of the reply before the client gave up, and the retry of #756 doubles the
+exposure. The rule is now the one a crash already had:
+
+- a call that fails with no reported usage, after the request may have left,
+  settles at its reserved estimate (the call's own carve, never more) and the
+  settle record says why: `charged: "timeout"` for the transport timeout,
+  `charged: "unreported"` for any other such failure. A call that reported
+  usage settles at that usage, as before; a call that succeeded without usage
+  keeps its estimate, as before;
+- a failure that provably came before the request left (a refused connection,
+  DNS, a rejected URL, the TLS handshake, a `timeout: connect`) stays at 0.
+  The classifier (`tole_core::failover::request_may_have_been_sent`) is a
+  closed list of anchored prefixes of the transport's own error text: any
+  other text, an unknown one included, and any failover chain (an earlier link
+  may have sent) is charged. When it cannot tell, it charges;
+- the retry still goes through `admit`: two timeouts cost two estimates, and
+  the second retry or the next resume that no longer fits is the existing
+  budget escalation, so the discussion stops at the cap instead of running past
+  it. The goal's pot (the delegation tree) is charged the same amount;
+- the settle record is final (`settle` of a settled call is refused and the
+  fold ignores a second one), so a resume after a timeout never charges a
+  settled call again; only an unsettled reservation is counted at its
+  estimate, as before;
+- the ledger format is unchanged for old readers and files: `charged` is an
+  optional field of the `settle` event, skipped when absent. `tole audit
+  --discussion` lists every round that has a call, not only one with a
+  contribution or a gate, and shows its retries and charged calls (text and
+  `--json`, `charged: [{call, why, tokens}]`).
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"
 mode; wake word / voice; computer-use; multi-tenant org model.
+
+## 13. Delegation approvals, as built (#714)
+
+A delegated child (a `tole mission` the `delegate` tool started) used to be
+denied at once at a Write its allow list does not cover, with the result going
+nowhere the owner sees. Built in six parts, all behind `[delegation] approvals
+= "off" | "owner" | "chain"` (user config only; **default `off`**, which is
+today's behavior exactly):
+
+1. `tole_core::delegation_approvals`: the append-only `approvals.jsonl` next to
+   the delegation log (records `request`, `escalate`, `decide`, `consume`,
+   `expire`) and its fold, which re-validates every record against the
+   delegation tree (first valid decision wins, a decision and a consume bind
+   to a SHA-256 fingerprint, consume is one-shot and written before the call
+   runs, no answer is a denial).
+2. The request builder (display capped at 2 KiB, stored input at 16 KiB, one
+   open request per node and 32 per goal) and the child's `DelegatedApprover`:
+   it parks in `decide` (in process, no exit and resume), polling the log, for
+   at most `approval_secs` (default 900, cap 3600) and never past the node's
+   deadline; `interactive()` is false, so Destructive tools are not registered.
+3. `tole delegation approvals list|show|allow|deny` for the owner, and an
+   approvals section in `tole audit`.
+4. `/approvals` in `tole serve` lists and decides the same requests
+   (`dap-*` ids), next to serve's own in-memory queue, which is unchanged.
+5. Agent levels (`chain` mode): `delegate_pending` and `delegate_decide`, only
+   where `delegate` exists and only for a level whose own allow list holds a
+   `delegate_decide` grant; a level decides only what its own allow list would
+   allow, only while it is the request's current level, and never an
+   always-owner request; `escalate` moves it one level up.
+6. `tole doctor` shows the mode, the user guide
+   ([approving-delegated-work.md](approving-delegated-work.md)), the threat
+   model rows and an end-to-end test against the real binary.
+
+Not built, left for later: the `awaiting_approval` count in `delegate_poll`, a
+`fact/approval_<id>` register on the child's own session, an SSE event frame
+for serve, rotation of the approvals log, and exit-and-resume for waits longer
+than an hour.

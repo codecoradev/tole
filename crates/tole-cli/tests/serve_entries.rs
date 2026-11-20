@@ -112,15 +112,10 @@ fn the_transcript_is_readable_while_a_turn_is_running() {
     });
 
     // Wait until the turn is really running.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    common::wait_until(common::WAIT, "the turn to become busy", || {
         let (_, list) = serve.http("GET", "/sessions", None);
-        if list["sessions"][0]["busy"] == json!(true) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn never became busy");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        list["sessions"][0]["busy"] == json!(true)
+    });
     let started = Instant::now();
     let (code, page) = serve.http("GET", &format!("/sessions/{id}/entries"), None);
     assert_eq!(code, 200, "{page}");
@@ -217,11 +212,9 @@ fn resuming_a_live_session_is_a_no_op_even_mid_turn() {
         let _ = s.read_to_string(&mut out);
         out
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while serve.http("GET", "/sessions", None).1["sessions"][0]["busy"] != json!(true) {
-        assert!(Instant::now() < deadline, "turn never became busy");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    common::wait_until(common::WAIT, "the turn to become busy", || {
+        serve.http("GET", "/sessions", None).1["sessions"][0]["busy"] == json!(true)
+    });
     let (code, body) = serve.http("POST", "/sessions", Some(&resume));
     assert_eq!(code, 200, "{body}");
     assert_eq!(
@@ -268,4 +261,29 @@ fn resume_refuses_bad_ids_unknown_sessions_other_dirs_and_a_held_lock() {
     assert_eq!(post(&second, json!({"resume": id, "cwd": sub})).0, 404);
 
     assert_eq!(post(&second, json!({"resume": id})).0, 200);
+}
+
+/// #915: every test of this binary starts a serve at the same moment, in one
+/// process, and each owns (and removes on drop) its workspace directory. Two
+/// of them must never get the same one, whatever the clock reads.
+#[test]
+fn concurrent_serves_never_share_a_workspace_directory() {
+    let names: Vec<std::path::PathBuf> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..200)
+                    .map(|_| serve_harness::workspace_dir_at(42))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let unique: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "a directory name was handed out twice"
+    );
 }

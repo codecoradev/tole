@@ -16,8 +16,11 @@
 //! 4. APPROVAL INTERACTION MATRIX — allow/deny × risk tier × fresh/crashed
 //!    verdicts (the #68 semantics as a table).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use test_dir::TestDir;
 
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::{EntryType, NewEntry};
@@ -34,11 +37,8 @@ use tole_core::turn::{resume_turn, run_turn, TurnOutcome};
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-evals-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-evals-{name}"))
 }
 
 struct EchoTool;

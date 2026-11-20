@@ -3,10 +3,12 @@
 //! 50,000-char file is read in 3 chunks by following `next_offset`, and
 //! the mission concludes. No network.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 /// Scripted mock: while the latest tool result carries `"next_offset":N`
@@ -127,14 +129,7 @@ fn spawn_mock(offsets: Arc<Mutex<Vec<u64>>>) -> String {
 fn mission_reads_a_50k_char_file_in_three_chunks() {
     let offsets = Arc::new(Mutex::new(Vec::new()));
     let base = spawn_mock(offsets.clone());
-    let dir = std::env::temp_dir().join(format!(
-        "tole-readfile-e2e-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = TestDir::new("tole-readfile-e2e");
     let ws = dir.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     // 50,000 chars including multibyte ones (so bytes != chars).
@@ -142,7 +137,7 @@ fn mission_reads_a_50k_char_file_in_three_chunks() {
     assert_eq!(text.chars().count(), 50_000);
     std::fs::write(ws.join("big.txt"), &text).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.join("home"), &[])
         .args([
             "--workspace",
             ws.to_str().unwrap(),

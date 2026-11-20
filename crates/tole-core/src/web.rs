@@ -99,9 +99,30 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 )
             };
             // ::/96 IPv4-compatible (legacy) and 64:ff9b::/96 NAT64 both
-            // carry the embedded v4 in segments 6-7.
-            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0, 0x0064, 0xff9b, 0, 0, 0] {
+            // carry the embedded v4 in segments 6-7. The NAT64 prefix is the
+            // segments 0064:ff9b then four zeros (a first segment of 0 here
+            // matched nothing, so 64:ff9b::a9fe:a9fe, the metadata address,
+            // was let through).
+            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
                 return v4_is_private(&v4_from(seg[6], seg[7]));
+            }
+            // IPv4-translated ::ffff:0:0:0/96 (SIIT, RFC 2765/6145): four zero
+            // segments, 0xffff, 0, then the v4 in segments 6-7. It is not the
+            // IPv4-mapped form (0xffff in segment 5), so `to_ipv4_mapped` above
+            // does not see it. No other form below can match it (segment 0 is 0).
+            if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+                return v4_is_private(&v4_from(seg[6], seg[7]));
+            }
+            // ISATAP: an interface id of 0000:5efe or 0200:5efe (segments 4-5)
+            // under ANY prefix, then the v4 in segments 6-7. A private embedded
+            // v4 refuses the address; a public one does NOT clear it, because the
+            // prefix may be a 6to4 or Teredo one that embeds a private v4, so the
+            // checks below still run.
+            if (seg[4] == 0 || seg[4] == 0x0200)
+                && seg[5] == 0x5efe
+                && v4_is_private(&v4_from(seg[6], seg[7]))
+            {
+                return true;
             }
             // 6to4: 2002:AABB:CCDD::/48 embeds the v4 in segments 1-2.
             if seg[0] == 0x2002 {
@@ -181,7 +202,18 @@ fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
 /// re-vetted against its own resolution.
 #[derive(Debug)]
 struct SsrfResolver {
-    opt_out: bool,
+    vetting: Vetting,
+}
+
+/// How a resolver vets the addresses it resolved.
+#[derive(Debug, Clone, Copy)]
+enum Vetting {
+    /// `web_fetch` and the built-in web tools: private and loopback refused
+    /// unless `opt_out` (`TOLE_WEB_ALLOW_PRIVATE=1`); a refusal is printed.
+    Fetch { opt_out: bool },
+    /// [`vetted_post`]: a per-destination policy, no environment opt-out;
+    /// nothing is printed and the error says refusal from DNS failure.
+    Post(AddrPolicy),
 }
 
 impl ureq::unversioned::resolver::Resolver for SsrfResolver {
@@ -212,9 +244,18 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
         if addrs.is_empty() {
             return Err(ureq::Error::HostNotFound);
         }
-        if let Err(e) = vet_addrs(&host, &addrs, self.opt_out) {
-            eprintln!("{e}");
-            return Err(ureq::Error::HostNotFound);
+        match self.vetting {
+            Vetting::Fetch { opt_out } => {
+                if let Err(e) = vet_addrs(&host, &addrs, opt_out) {
+                    eprintln!("{e}");
+                    return Err(ureq::Error::HostNotFound);
+                }
+            }
+            Vetting::Post(policy) => {
+                if !policy.allows(&host, &addrs) {
+                    return Err(post::refused_address_error());
+                }
+            }
         }
         let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
@@ -255,10 +296,18 @@ fn fetch_agent_vetted() -> ureq::Agent {
         vetted_config(ureq::Agent::config_builder()),
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
-            opt_out: ssrf_opt_out(),
+            vetting: Vetting::Fetch {
+                opt_out: ssrf_opt_out(),
+            },
         },
     )
 }
+
+mod post;
+pub use post::{
+    check_destination_url, vetted_post, AddrPolicy, PostError, PostParams, PostResponse,
+    MAX_POST_BODY,
+};
 
 /// One GET of a host-side HTTP client (#625, the built-in web tools): no
 /// redirect is followed (the caller sees the 3xx and decides), and the
@@ -333,7 +382,9 @@ pub fn vetted_get(hop: &Hop<'_>) -> Result<HopResponse, HopError> {
         config,
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
-            opt_out: hop.allow_private,
+            vetting: Vetting::Fetch {
+                opt_out: hop.allow_private,
+            },
         },
     );
     let mut req = agent.get(hop.url);
@@ -588,7 +639,8 @@ fn refuse_secret_url(secrets: &SecretSet, url: &str) -> Result<(), String> {
     match secrets.redact(url) {
         std::borrow::Cow::Borrowed(_) => Ok(()),
         std::borrow::Cow::Owned(r) => Err(format!(
-            "web_fetch: refused, the URL contains a known secret value: {r}"
+            "web_fetch: refused, the URL holds a known secret value or looks like a secret \
+             (`redaction_allowlist` keeps a false positive): {r}"
         )),
     }
 }
@@ -1762,6 +1814,12 @@ mod tests {
             "198.20.0.0",
             "223.255.255.255",
             "2606:2800:220:1::1",
+            // NAT64 (64:ff9b::/96) embedding 8.8.8.8
+            "64:ff9b::808:808",
+            // IPv4-translated (::ffff:0:0:0/96) and ISATAP embedding 8.8.8.8
+            "::ffff:0:808:808",
+            "::5efe:808:808",
+            "2001:db8::200:5efe:808:808",
             // 6to4 embedding 8.8.8.8
             "2002:808:808::1",
             // Teredo: server 8.8.8.8, client 1.2.3.4 (NOT = fefd:fcfb)
@@ -1789,6 +1847,27 @@ mod tests {
             "ff02::1",
             "fec0::1",
             "feff::1",
+            // NAT64 (64:ff9b::/96) embedding 10.0.0.1 / 169.254.169.254 /
+            // 127.0.0.1 / 100.64.0.1
+            "64:ff9b::a00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b::6440:1",
+            // IPv4-translated (::ffff:0:0:0/96, RFC 2765/6145) embedding
+            // 169.254.169.254 / 10.0.0.1 / 127.0.0.1
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:a00:1",
+            "::ffff:0:7f00:1",
+            // ISATAP (`<any /64 prefix>:0:5efe:<v4>` or `:200:5efe:<v4>`)
+            "::5efe:a9fe:a9fe",
+            "::5efe:a00:1",
+            "2001:db8::5efe:a9fe:a9fe",
+            "2001:db8::200:5efe:a9fe:a9fe",
+            "fd00::200:5efe:7f00:1",
+            // ISATAP-shaped tail with a PUBLIC v4, but a 6to4 / Teredo prefix
+            // that embeds a private one: the other forms must still be checked
+            "2002:a00:1::5efe:808:808",
+            "2001:0:a00:1::5efe:808:808",
             // 6to4 embedding 10.0.0.1 / 169.254.169.254 / 100.64.0.1
             "2002:a00:1::1",
             "2002:a9fe:a9fe::1",

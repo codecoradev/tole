@@ -7,10 +7,41 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::common;
+
+/// A new workspace directory for one `Serve`. The six tests of a binary run as
+/// threads of ONE process and each starts a serve at once, so a name built from
+/// the pid and the clock alone can repeat (a coarse clock, as on a virtualised CI
+/// host, gives equal readings), and then one test's `Drop` removes the directory
+/// another test is still using (#915: `No such file or directory` from
+/// `GET /sessions/{id}/entries` and `workspace root` on resume). The counter
+/// makes a repeat impossible within a process.
+pub fn workspace_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    workspace_dir_at(nanos)
+}
+
+/// [`workspace_dir`] for a given clock reading (the test pins it).
+pub fn workspace_dir_at(nanos: u128) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tole-entries-{}-{n}-{nanos:x}", std::process::id()))
+}
+
+/// The HOME and CODECORA_HOME of the serve process over `dir`: a sibling of
+/// the workspace, so the workspace listing is unchanged and a restart over the
+/// same `dir` finds the same home. A test's own `CODECORA_HOME` in `env` wins.
+pub fn home_of(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut name = dir.file_name().unwrap().to_os_string();
+    name.push("-home");
+    dir.with_file_name(name)
+}
 
 pub struct Serve {
     pub child: Child,
@@ -22,14 +53,7 @@ pub struct Serve {
 
 impl Serve {
     pub fn spawn(base: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-entries-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = workspace_dir();
         std::fs::create_dir_all(&dir).unwrap();
         Self::spawn_in(base, dir, true)
     }
@@ -42,16 +66,16 @@ impl Serve {
 
     /// A fresh workspace with extra environment for the serve process.
     pub fn spawn_with_env(base: &str, env: &[(&str, &str)]) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-entries-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = workspace_dir();
         std::fs::create_dir_all(&dir).unwrap();
         Self::spawn_in_env(base, dir, true, env)
+    }
+
+    /// A fresh workspace with extra command-line arguments for `tole serve`.
+    pub fn spawn_with_args(base: &str, args: &[&str]) -> Self {
+        let dir = workspace_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        Self::spawn_in_env_args(base, dir, true, &[], args)
     }
 
     pub fn spawn_in_env(
@@ -60,10 +84,21 @@ impl Serve {
         own_dir: bool,
         env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_in_env_args(base, dir, own_dir, env, &[])
+    }
+
+    pub fn spawn_in_env_args(
+        base: &str,
+        dir: std::path::PathBuf,
+        own_dir: bool,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Self {
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home_of(&dir), &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .args(["--workspace", dir.to_str().unwrap()])
+                .args(args)
                 .current_dir(&dir)
                 .env("TOLE_BASE_URL", base)
                 .env("TOLE_MODEL", "mock-model")
@@ -147,13 +182,16 @@ impl Drop for Serve {
         self.kill();
         if self.own_dir {
             let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(home_of(&self.dir));
         }
     }
 }
 
 /// Provider mock: answers every call with a short final text; a request
 /// mentioning "slow" is answered after `slow_ms`; a conversation with
-/// "TOOL_MISSION" asks for a `write_file` (needs approval).
+/// "TOOL_MISSION" asks for a `write_file` (needs approval). #571 outcome
+/// triggers: "UNKNOWN_TOOL" asks for an unregistered tool, "LOOP_TOOL"
+/// repeats one identical read-only call, "PROVIDER_FAIL" answers HTTP 400.
 pub fn spawn_mock(slow_ms: u64) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -192,8 +230,29 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                 // follows the last user message (after a denial the last user
                 // message is the denial note, so the call is repeated for the
                 // approved replay, then answered once a result is in).
-                let wants_tool = !has_tool_result && body.to_string().contains("TOOL_MISSION");
-                let tool_args = "{\"path\":\"approved.txt\",\"content\":\"remote ok\"}";
+                let all = body.to_string();
+                let (tool_name, tool_args, wants_tool) = if all.contains("UNKNOWN_TOOL") {
+                    ("no_such_tool", "{}", true)
+                } else if all.contains("LOOP_TOOL") {
+                    ("read_file", "{\"path\":\"loop.txt\"}", true)
+                } else {
+                    (
+                        "write_file",
+                        "{\"path\":\"approved.txt\",\"content\":\"remote ok\"}",
+                        !has_tool_result && all.contains("TOOL_MISSION"),
+                    )
+                };
+                if all.contains("PROVIDER_FAIL") {
+                    let data = "{\"error\":{\"message\":\"scripted failure\"}}";
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                            data.len()
+                        )
+                        .as_bytes(),
+                    );
+                    return;
+                }
                 let resp = if streamed {
                     let mut out = String::new();
                     if wants_tool {
@@ -201,7 +260,7 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                             "data: {}\n\n",
                             json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                                 {"index": 0, "id": "call_1", "function": {
-                                    "name": "write_file", "arguments": tool_args}}]},
+                                    "name": tool_name, "arguments": tool_args}}]},
                                 "finish_reason": null}]})
                         ));
                     } else {
@@ -224,7 +283,7 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                     let message = if wants_tool {
                         json!({"role": "assistant", "content": null,
                             "tool_calls": [{"id": "call_1", "type": "function",
-                                "function": {"name": "write_file", "arguments": tool_args}}]})
+                                "function": {"name": tool_name, "arguments": tool_args}}]})
                     } else {
                         json!({"role": "assistant", "content": text})
                     };

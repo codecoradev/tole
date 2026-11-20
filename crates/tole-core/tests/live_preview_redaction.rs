@@ -4,8 +4,11 @@
 //! turn was redacted (#596). The turn loop now redacts every observer event
 //! with the session's own secret set, before the preview is cut.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use test_dir::TestDir;
 use tole_core::entry::Entry;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::secrets::SecretSet;
@@ -83,9 +86,7 @@ impl Provider for Reasoning {
 
 #[test]
 fn every_live_observer_event_is_redacted_like_the_log() {
-    let dir = std::env::temp_dir().join(format!("tole-live-preview-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-live-preview");
     let mut st = JsonlStorage::create(&dir, "s", None).unwrap();
     st.set_secrets(set());
     let mut p = Reasoning(tole_core::mock::MockProvider::scripted(vec![

@@ -4,27 +4,18 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+mod common;
+use common::TestDir;
+use std::path::Path;
+use std::process::Stdio;
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-doctor-eco-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-doctor-eco-{tag}"))
 }
 
 fn fake_bin(dir: &Path, name: &str, version_line: &str) {
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&p, format!("#!/bin/sh\necho '{version_line}'\n"));
 }
 
 #[test]
@@ -33,10 +24,9 @@ fn doctor_reports_old_and_missing_siblings_without_blocking() {
     let home = tmpdir("home");
     fake_bin(&bin, "cora", "cora 0.18.0");
     // No uteke on PATH at all.
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["doctor", "--tier", "offline", "--no-ledger"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
@@ -76,10 +66,8 @@ fn doctor_names_the_advisor_profiles_but_not_their_models() {
          standard = \"m\"\nadvisor = \"wise-model\"\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["doctor", "--tier", "offline", "--no-ledger"])
-        .env("PATH", "/usr/bin:/bin")
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
@@ -101,9 +89,8 @@ fn doctor_names_the_advisor_profiles_but_not_their_models() {
 #[test]
 fn doctor_reports_the_process_guard() {
     let home = tmpdir("guard");
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["doctor", "--tier", "offline", "--no-ledger"])
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
         .env("TOLE_MODEL", "m")
@@ -114,4 +101,38 @@ fn doctor_reports_the_process_guard() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("process guard: ✓ non-dumpable"), "{stdout}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_warns_when_codecora_home_leaves_an_existing_uteke_home_behind() {
+    let bin = tmpdir("move-bin");
+    let real_home = tmpdir("move-home");
+    let cc = tmpdir("move-cc");
+    std::fs::create_dir_all(real_home.join(".codecora/uteke")).unwrap();
+    let run = |cc_home: &Path| {
+        let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &real_home, &[])
+            .args(["doctor", "--tier", "offline", "--no-ledger"])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("CODECORA_HOME", cc_home)
+            .env_remove("UTEKE_HOME")
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run tole doctor");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let warned = run(&cc);
+    assert!(
+        warned.contains("! uteke: CODECORA_HOME is set") && warned.contains("export UTEKE_HOME="),
+        "{warned}"
+    );
+    std::fs::create_dir_all(cc.join("uteke")).unwrap();
+    assert!(
+        !run(&cc).contains("! uteke: CODECORA_HOME"),
+        "new home exists: no warning"
+    );
 }

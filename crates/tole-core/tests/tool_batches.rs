@@ -2,9 +2,12 @@
 //! several tool calls runs them in model order as consecutive effect
 //! sandwiches, inside ONE model step.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::cancel::CancelToken;
 use tole_core::entry::Entry;
@@ -100,13 +103,8 @@ fn extra(tool: &str, input: Value) -> (String, Value) {
     (tool.into(), input)
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("tole-batch-{name}-{}-{n:x}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-batch-{name}"))
 }
 
 fn registry() -> ToolRegistry {

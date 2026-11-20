@@ -8,13 +8,14 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tole_core::webhook;
 
 mod common;
+use common::TestDir;
 
 const KEY: &str = "hook-key-for-tests-0123456789abcdef";
 
@@ -31,19 +32,17 @@ impl Drop for Serve {
 }
 
 /// A private home (user config) and cron dir.
-fn setup(tag: &str, hooks: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-hooks-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str, hooks: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-hooks-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::write(base.join("home/tole/config.toml"), hooks).unwrap();
     base
 }
 
 fn command(base: &Path, port: u16, bind: &str) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &base.join("home"), &[]);
     cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
         .args(["--bind", bind])
-        .env("CODECORA_HOME", base.join("home"))
         .env("TOLE_CRON_DIR", base.join("cron"))
         .env("TOLE_TEST_HOOK_KEY", KEY)
         .stdin(Stdio::null())
@@ -234,18 +233,11 @@ fn a_route_without_a_key_or_an_open_route_off_loopback_refuses_to_start() {
             .spawn()
             .unwrap();
         // A server that starts anyway must fail the test, not hang it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(s) = child.try_wait().unwrap() {
-                break Some(s);
-            }
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = common::wait_exit(&mut child, common::WAIT);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let mut err = String::new();
         if let Some(mut e) = child.stderr.take() {
             let _ = e.read_to_string(&mut err);

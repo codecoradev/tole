@@ -35,7 +35,7 @@ pub fn tole_data_dir() -> Option<PathBuf> {
 
 /// `p` made absolute and symlink-free as far as it exists: the longest
 /// existing ancestor is canonicalized and the rest appended.
-fn canon_lenient(p: &std::path::Path) -> PathBuf {
+pub(crate) fn canon_lenient(p: &std::path::Path) -> PathBuf {
     let mut tail = Vec::new();
     let mut cur = p;
     loop {
@@ -75,6 +75,52 @@ fn resolve_root(
     root.is_absolute().then_some(root)
 }
 
+/// The home directory of the account this process runs as, from the passwd
+/// database, NOT from `$HOME`: a process started by a sandboxed command can
+/// inherit a `HOME` pointing at state that command wrote. The `git` tool uses
+/// it for the owner's global git config (`~/.gitconfig`) and the sandbox plan
+/// refuses to grant a directory that holds it ([`crate::sandbox::check_grant`]).
+/// `None` when the account has no passwd entry, and on non-unix hosts (the
+/// command sandbox is Linux only, so no consumer is on there).
+#[cfg(unix)]
+pub fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: `pwd` and `buf` outlive the call; getpwuid_r writes only
+        // into them and sets `result` to null or to `&mut pwd`.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            let n = buf.len() * 2;
+            buf.resize(n, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        return dir.is_absolute().then(|| dir.to_path_buf());
+    }
+}
+
+/// See the unix version: no passwd lookup here, and no command sandbox.
+#[cfg(not(unix))]
+pub fn account_home() -> Option<PathBuf> {
+    None
+}
+
 /// Serializes tests that touch the process environment (CODECORA_HOME /
 /// HOME / USERPROFILE) and restores the previous values afterwards.
 #[cfg(test)]
@@ -112,6 +158,7 @@ pub(crate) fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn p(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
     }
@@ -184,7 +231,7 @@ mod tests {
     /// refused; a sibling directory is not.
     #[test]
     fn jail_overlap_with_the_data_dir() {
-        let base = std::env::temp_dir().join(format!("tole-paths-jail-{}", std::process::id()));
+        let base = crate::test_dir::TestDir::new("tole-paths-jail");
         let data = base.join(".codecora").join("tole");
         std::fs::create_dir_all(&data).unwrap();
         let project = base.join("project");

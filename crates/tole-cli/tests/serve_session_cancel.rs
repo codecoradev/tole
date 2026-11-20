@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,22 +22,23 @@ struct ServeProcess {
     child: Child,
     addr: String,
     token: String,
+    /// Dropped after `Drop::drop` has killed `child`.
+    _cwd: common::TestDir,
+    /// Hermetic HOME (#993), dropped after `Drop::drop` has killed `child`.
+    _home: common::TestDir,
 }
 
 impl ServeProcess {
     fn spawn(base_url: &str) -> Arc<Self> {
-        let cwd = std::env::temp_dir().join(format!(
-            "tole-serve-cancel-{}-{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&cwd).unwrap();
+        Self::spawn_with(base_url, &[])
+    }
+
+    fn spawn_with(base_url: &str, env: &[(&str, &str)]) -> Arc<Self> {
+        let cwd = common::TestDir::new("tole-serve-cancel");
+        let home = common::TestDir::new("tole-serve-cancel-home");
         let token = "test-token-123".to_string();
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args([
                 "serve",
                 "--port",
@@ -54,22 +55,23 @@ impl ServeProcess {
             cmd.env("TOLE_MODEL", "mock-model");
             cmd.env("TOLE_API_KEY", "sk-test");
             cmd.env("TOLE_SERVE_TOKEN", &token);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
             cmd
         });
         let proc = Arc::new(Self {
             child,
             addr: format!("127.0.0.1:{port}"),
             token,
+            _cwd: cwd,
+            _home: home,
         });
         // The listener is up; also confirm the HTTP face answers.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if let Some((200, _)) = proc.request("GET", "/health", "") {
-                return proc;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("serve did not become healthy");
+        common::wait_until(common::WAIT, "serve to become healthy", || {
+            matches!(proc.request("GET", "/health", ""), Some((200, _)))
+        });
+        proc
     }
 
     /// One HTTP request; returns (status, parsed JSON body). Handles
@@ -118,6 +120,13 @@ impl ServeProcess {
     }
 }
 
+impl ServeProcess {
+    /// The server's workspace (its cwd), where its sessions are kept.
+    fn dir(&self) -> &std::path::Path {
+        &self._cwd
+    }
+}
+
 impl Drop for ServeProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -125,8 +134,8 @@ impl Drop for ServeProcess {
     }
 }
 
-// Mock provider: a `DELAYED` prompt answers after 2 s; anything else
-// answers immediately (fast follow-up turn).
+// Mock provider: a `DELAYED` prompt is held at a `Gate` until the test
+// opens it; anything else answers immediately (fast follow-up turn).
 //
 // Convert a plain chat-completion reply into an SSE stream body
 // (issue #196 phase 3 mocks).
@@ -194,11 +203,14 @@ fn sse_response(reply: &Value, streamed: bool) -> String {
     }
 }
 
-fn spawn_mock() -> String {
+fn spawn_mock() -> (String, Arc<common::Gate>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let gate = common::Gate::new();
+    let held = gate.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let gate = held.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -231,7 +243,7 @@ fn spawn_mock() -> String {
                     .unwrap_or("")
                     .to_string();
                 if last_user.contains("DELAYED") {
-                    std::thread::sleep(Duration::from_secs(2));
+                    gate.hold();
                 }
                 // #377: a transcript carrying the owner's soft interrupt
                 // is answered differently, so the test can see the
@@ -253,12 +265,12 @@ fn spawn_mock() -> String {
             });
         }
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), gate)
 }
 
 #[test]
 fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
-    let base = spawn_mock();
+    let (base, gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
 
     // Create a session (workspace defaults to the server cwd).
@@ -272,8 +284,8 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
     let (code, _) = serve.request("POST", "/sessions/nope/cancel", "").unwrap();
     assert_eq!(code, 404);
 
-    // Start the DELAYED prompt on a background thread; it blocks for
-    // ~2 s at the provider.
+    // Start the DELAYED prompt on a background thread; it blocks at the
+    // provider until the gate opens.
     let thread_serve = Arc::clone(&serve);
     let sid_clone = sid.clone();
     let prompt_thread = std::thread::spawn(move || {
@@ -284,12 +296,13 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
         )
     });
     // Cancel while the provider call is in flight.
-    std::thread::sleep(Duration::from_millis(500));
+    gate.wait_entered();
     let (code, ack) = serve
         .request("POST", &format!("/sessions/{sid}/cancel"), "")
         .expect("cancel");
     assert_eq!(code, 200, "{ack}");
     assert_eq!(ack["cancelled"], json!(true));
+    gate.open();
 
     // The blocked prompt settles "cancelled".
     let (pcode, presp) = prompt_thread.join().unwrap().expect("prompt response");
@@ -314,7 +327,7 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
 /// steered answer. Idle / unknown / malformed requests are refused.
 #[test]
 fn serve_soft_interrupt_steers_the_running_turn() {
-    let base = spawn_mock();
+    let (base, gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
     let (code, created) = serve.request("POST", "/sessions", "{}").expect("create");
     assert_eq!(code, 200, "{created}");
@@ -333,7 +346,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
     let (code, _) = serve.request("POST", &path, r#"{"nope":1}"#).unwrap();
     assert_eq!(code, 400);
 
-    // A running turn (the first provider call takes ~2 s).
+    // A running turn (the first provider call is held at the gate).
     let thread_serve = Arc::clone(&serve);
     let sid_clone = sid.clone();
     let prompt = std::thread::spawn(move || {
@@ -343,7 +356,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
             r#"{"text": "DELAYED mission"}"#,
         )
     });
-    std::thread::sleep(Duration::from_millis(500));
+    gate.wait_entered();
     let (code, _) = serve.request("POST", &path, r#"{"text":"   "}"#).unwrap();
     assert_eq!(code, 400, "blank text is refused, not queued");
     let (code, ack) = serve
@@ -352,6 +365,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
     assert_eq!(code, 202, "{ack}");
     assert_eq!(ack["queued"], json!(true));
     assert_eq!(ack["urgent"], json!(false));
+    gate.open();
 
     let (pcode, presp) = prompt.join().unwrap().expect("prompt response");
     assert_eq!(pcode, 200, "{presp}");
@@ -365,7 +379,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
 /// provider's per-step wire split is there.
 #[test]
 fn serve_status_json_has_additive_usage_report() {
-    let base = spawn_mock();
+    let (base, _gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
     let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
     let sid = created["sessionId"].as_str().unwrap().to_string();
@@ -400,4 +414,138 @@ fn serve_status_json_has_additive_usage_report() {
     assert!(first["history_chars"].as_u64().unwrap() > 0, "{st}");
     assert!(first["prefix_chars"].as_u64().unwrap() > 0, "{st}");
     assert_eq!(r["wire"]["history_growth_per_step"], Value::Null, "{st}");
+}
+
+/// #573: `GET /sessions/{id}/status` carries model, effort, context window
+/// and name, and they are what `tole status` shows for the same session.
+#[test]
+fn serve_status_fields_equal_tole_status() {
+    let (base, _gate) = spawn_mock();
+    let serve = ServeProcess::spawn_with(&base, &[("TOLE_CONTEXT_WINDOW", "128000")]);
+    let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let path = |a: &str| format!("/sessions/{sid}/{a}");
+
+    // Idle and untouched: model known, everything else unknown (null).
+    let (code, st) = serve.request("GET", &path("status"), "").unwrap();
+    assert_eq!(code, 200, "{st}");
+    assert_eq!(st["model"], json!("mock-model"), "{st}");
+    assert_eq!(st["effort"], Value::Null, "{st}");
+    assert_eq!(st["name"], Value::Null, "{st}");
+    assert_eq!(st["stale"], json!(false), "{st}");
+    assert!(st["snapshotAt"].as_u64().is_some(), "{st}");
+
+    let (c, _) = serve
+        .request("POST", &path("effort"), r#"{"effort":"high"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+    let (c, _) = serve
+        .request("POST", &path("name"), r#"{"name":"nightly"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+    let (c, _) = serve
+        .request("POST", &path("prompt"), r#"{"text":"quick"}"#)
+        .unwrap();
+    assert_eq!(c, 200);
+
+    let (_, st) = serve.request("GET", &path("status"), "").unwrap();
+    assert_eq!(st["model"], json!("mock-model"), "{st}");
+    assert_eq!(st["effort"], json!("high"), "{st}");
+    assert_eq!(st["name"], json!("nightly"), "{st}");
+    assert_eq!(st["contextWindow"], json!(128000), "{st}");
+    assert_eq!(st["contextUsed"], json!(1), "{st}");
+    assert_eq!(st["stale"], json!(false), "{st}");
+
+    // The same session through `tole status`.
+    let home = common::TestDir::new("tole-serve-cancel-status-home");
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
+        .args(["status", "-s"])
+        .arg(serve.dir().join(".tole/sessions"))
+        .arg(&sid)
+        .env("TOLE_BASE_URL", &base)
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", "sk-test")
+        .env("TOLE_CONTEXT_WINDOW", "128000")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{text}");
+    let snap = tole_cli::status::SessionStatus {
+        model: st["model"].as_str().map(str::to_string),
+        effort: st["effort"].as_str().map(str::to_string),
+        last_prompt_tokens: st["contextUsed"].as_u64().unwrap(),
+        window: st["contextWindow"].as_u64(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        compactions: 0,
+    };
+    for line in [
+        "model:   mock-model",
+        "effort:  high",
+        snap.context_line().as_str(),
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "`tole status` lacks {line:?}:\n{text}"
+        );
+    }
+}
+
+/// #573: while a turn is held at the provider, the status route answers
+/// promptly from the last-known snapshot and says so (`stale`), instead of
+/// going blank; once the turn settles it is live again.
+#[test]
+fn serve_status_answers_from_a_snapshot_while_a_turn_runs() {
+    let (base, gate) = spawn_mock();
+    let serve = ServeProcess::spawn_with(&base, &[("TOLE_CONTEXT_WINDOW", "64000")]);
+    let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let status = format!("/sessions/{sid}/status");
+    let (c, _) = serve
+        .request(
+            "POST",
+            &format!("/sessions/{sid}/effort"),
+            r#"{"effort":"low"}"#,
+        )
+        .unwrap();
+    assert_eq!(c, 200);
+
+    let thread_serve = Arc::clone(&serve);
+    let sid_clone = sid.clone();
+    let prompt = std::thread::spawn(move || {
+        thread_serve.request(
+            "POST",
+            &format!("/sessions/{sid_clone}/prompt"),
+            r#"{"text": "DELAYED mission"}"#,
+        )
+    });
+    gate.wait_entered();
+
+    // The turn is parked at the provider and holds the session. Every poll
+    // answers within a second (the gate stays shut for the whole loop).
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (code, st) = serve.request("GET", &status, "").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "status blocked on the turn"
+        );
+        assert_eq!(code, 200, "{st}");
+        assert_eq!(st["busy"], json!(true), "{st}");
+        assert_eq!(st["stale"], json!(true), "{st}");
+        assert_eq!(st["entries"], Value::Null, "{st}");
+        assert_eq!(st["model"], json!("mock-model"), "{st}");
+        assert_eq!(st["effort"], json!("low"), "{st}");
+        assert_eq!(st["contextWindow"], json!(64000), "{st}");
+        assert!(st["snapshotAt"].as_u64().is_some(), "{st}");
+    }
+    gate.open();
+    let (pcode, _) = prompt.join().unwrap().expect("prompt response");
+    assert_eq!(pcode, 200);
+
+    let (_, st) = serve.request("GET", &status, "").unwrap();
+    assert_eq!(st["stale"], json!(false), "{st}");
+    assert_eq!(st["busy"], json!(false), "{st}");
+    assert_eq!(st["contextUsed"], json!(1), "{st}");
 }

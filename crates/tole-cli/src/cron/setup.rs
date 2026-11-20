@@ -134,12 +134,22 @@ pub fn pin_profile(profile: &Profile, workdir: &Path) -> Result<BTreeMap<String,
 
 /// The user config (`None` when there is none).
 pub fn user_config() -> Result<Option<Config>, String> {
-    match crate::config::user_config_path().filter(|p| p.exists()) {
-        Some(path) => crate::config::load(&path)
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        None => Ok(None),
+    user_config_at(crate::config::user_config_path().as_deref())
+}
+
+/// [`user_config`] for a given path. Only a plainly absent file is none: one
+/// that cannot be inspected is an error (#864) with the path on one line and
+/// the ways out, as everywhere else.
+fn user_config_at(path: Option<&Path>) -> Result<Option<Config>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !crate::config::user_config_present(path)? {
+        return Ok(None);
     }
+    crate::config::load(path)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve profile `name` from the user config, the way `--profile` does.
@@ -162,8 +172,22 @@ pub struct AgentSetup {
 /// approval setting (`TOLE_SKILL_APPROVAL`). The error is the `blocked`
 /// reason code and its detail.
 pub fn resolve(job: &Job) -> Result<AgentSetup, (&'static str, String)> {
-    let (gate, _) = crate::skill_approve::gate_from_env().map_err(|e| ("skill_not_approved", e))?;
-    resolve_with(job, &gate)
+    let (gate, notes) =
+        crate::skill_approve::gate_from_env().map_err(|e| ("skill_not_approved", e))?;
+    resolve_with(job, &gate).map_err(|e| with_ledger_fault(e, &notes))
+}
+
+/// A skill ledger that fails its checkpoint (#879) blocks every approval, so
+/// the job is `skill_not_approved`; the `ERROR:` gate note names the real
+/// cause and goes into the recorded detail (the run log, never stderr).
+fn with_ledger_fault(
+    (code, detail): (&'static str, String),
+    notes: &[String],
+) -> (&'static str, String) {
+    match notes.iter().find(|n| n.starts_with("ERROR: ")) {
+        Some(n) if code == "skill_not_approved" => (code, format!("{detail}; {n}")),
+        _ => (code, detail),
+    }
 }
 
 /// [`resolve`] with an explicit approval gate.
@@ -295,11 +319,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-cron-setup-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+    #[test]
+    fn a_ledger_fault_note_joins_the_not_approved_detail_only() {
+        let note = "ERROR: skill ledger x does not match the checkpoint".to_string();
+        let notes = [note.clone()];
+        let e = with_ledger_fault(("skill_not_approved", "d".into()), &notes);
+        assert_eq!(e.1, format!("d; {note}"));
+        let e = with_ledger_fault(("skill_changed", "d".into()), &notes);
+        assert_eq!(e.1, "d");
+        let e = with_ledger_fault(("skill_not_approved", "d".into()), &[]);
+        assert_eq!(e.1, "d");
+    }
+
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-cron-setup-{tag}"))
+    }
+
+    /// #864: the cron reader of the user config fails closed on a path it
+    /// cannot inspect, with a one-line path and the ways out (a newline in
+    /// `CODECORA_HOME` must not forge a stderr line); a missing file is none.
+    #[test]
+    fn user_config_at_fails_closed_with_a_single_line_path() {
+        let d = tmp("ucfg");
+        assert_eq!(user_config_at(None), Ok(None));
+        assert_eq!(user_config_at(Some(&d.join("absent.toml"))), Ok(None));
+        let file = d.join("evil\nforged: line");
+        std::fs::write(&file, "x").unwrap();
+        let e = user_config_at(Some(&file.join("config.toml"))).unwrap_err();
+        assert_eq!(e.lines().count(), 1, "{e:?}");
+        assert!(
+            e.contains("cannot inspect the user config")
+                && e.contains("--no-config")
+                && e.contains("CODECORA_HOME")
+                && e.contains("evil\\nforged"),
+            "{e}"
+        );
     }
 
     fn skill(root: &Path, name: &str, body: &str) -> PathBuf {

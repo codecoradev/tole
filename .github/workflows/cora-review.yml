@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [develop, main]
     types: [opened, synchronize, ready_for_review, reopened]
+  # Merge queue (#806): the review was done on the PR head; the job is skipped
+  # (reports success) on a queue entry so the required check still reports.
+  merge_group:
 
 concurrency:
   group: cora-review-${{ github.ref }}
@@ -18,6 +21,7 @@ permissions:
 jobs:
   cora-review:
     name: Cora Review
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     # PRs of 850+ lines need ~16 min of review; 10 min cancelled them
     # mid-review with no verdict.
@@ -124,7 +128,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # #914: a PR whose every file is excluded by `review.exclude` leaves
+      # Cora an empty diff, and it answers "Review could not complete". Skip
+      # the review step for that case only. The script and the patterns both
+      # come from the BASE branch, so a PR can neither edit the check nor widen
+      # the exclusion to dodge its own review; if the base has no script yet,
+      # or anything is unclear, the review runs.
+      - name: Is the whole diff excluded from the review?
+        id: scope
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git show "origin/$BASE_REF:scripts/cora-all-excluded.sh" > "$RUNNER_TEMP/cora-all-excluded.sh" \
+            && bash "$RUNNER_TEMP/cora-all-excluded.sh" "origin/$BASE_REF"; then
+            echo "all_excluded=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Cora review"
+              echo "Nothing to review: every changed file is excluded by \`review.exclude\` in \`.cora.yaml\` (as on \`$BASE_REF\`)."
+              echo "No Cora verdict exists for this PR; see AGENTS.md section 2 for the evidence a merge needs then."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "all_excluded=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Cora AI Code Review
+        if: steps.scope.outputs.all_excluded != 'true'
         uses: codecoradev/cora-review-action@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}

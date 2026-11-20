@@ -4,7 +4,10 @@ on:
   pull_request:
     branches: [develop, main]
   push:
-    branches: [main]
+    branches: [main, develop]
+  # Merge queue (#806): the same jobs run on the merge result a queue builds.
+  # Inert until the owner enables a merge queue; no job or check name changes.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +49,12 @@ jobs:
           cargo clippy -p tole-cli --no-default-features --features shell-tools -- -D warnings
           cargo test -p tole-cli --no-default-features --features shell-tools
           cargo check -p tole-core --no-default-features --tests
+          # Lint every target (tests, benches) in the profiles the default
+          # Clippy job does not cover (#829).
+          cargo clippy -p tole-core --no-default-features --all-targets -- -D warnings
+          cargo clippy -p tole-cli --no-default-features --all-targets -- -D warnings
+          cargo clippy -p tole-cli --no-default-features --features shell-tools --all-targets -- -D warnings
+          cargo clippy -p tole-tui --no-default-features --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -56,6 +65,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - name: Cora scope script self-test (#914)
+        run: bash scripts/test-cora-all-excluded.sh
 
   clippy:
     name: Clippy
@@ -75,7 +86,28 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # #781: the suites must not leave directories behind. The tests run
+      # with a fresh, private TMPDIR (the cargo step only), and the job fails
+      # when a `tole-*` or `cora-*` entry is still there afterwards, in it or
+      # in cargo's target/tmp (where the integration tests keep theirs).
+      # Process-wide fixtures use fixed `shared-*` names and are not counted.
+      # The directory is under /tmp, not RUNNER_TEMP: that one sits inside
+      # $HOME, and the sandbox tests rightly refuse a workspace under it.
+      - name: Prepare a private TMPDIR
+        run: |
+          rm -rf target/tmp
+          echo "TOLE_TEST_TMP=$(mktemp -d /tmp/tole-test-tmp.XXXXXX)" >> "$GITHUB_ENV"
       - run: cargo test --workspace
+        env:
+          TMPDIR: ${{ env.TOLE_TEST_TMP }}
+      - name: No test directory left behind
+        run: |
+          left=$(find "$TOLE_TEST_TMP" target/tmp -mindepth 1 -maxdepth 1 \( -name 'tole-*' -o -name 'cora-*' \) 2>/dev/null | sort)
+          if [ -n "$left" ]; then
+            echo "::error::the test suites left $(echo "$left" | wc -l) tole-*/cora-* entries behind (#781)"
+            echo "$left" | head -50
+            exit 1
+          fi
 
   # Compile the release profile — catches optimizer-only errors that the
   # dev-profile Check job misses (uteke parity; required check on main).
@@ -100,12 +132,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # iOS is off for now: the macos-14 runner is not available to
-          # this repository ("configuration macos-14-arm64-us-default is not
-          # supported"), so the job was cancelled on every run. Re-enable
-          # when an Apple runner is available.
-          # - os: macos-14
-          #   target: aarch64-apple-ios
+          # iOS: macos-14 is not served to this repository (the job was
+          # cancelled before getting a runner, #566); macos-latest is, as
+          # the OS Check job above shows. Check-only, no link, no device.
+          - os: macos-latest
+            target: aarch64-apple-ios
           - os: ubuntu-latest
             target: aarch64-linux-android
     steps:
@@ -123,3 +154,108 @@ jobs:
           echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
       - run: cargo check -p tole-core --target ${{ matrix.target }} --no-default-features
+
+  # v0.11.0 shipped a Windows build break (an ungated std::os::unix use)
+  # that nothing on the PR path compiled. Mirror the release matrix's
+  # native targets (windows-latest / macos-latest, default features,
+  # same toolchain action) so a green PR check means a green release
+  # build. Check-only (no link, no release profile) to keep runner cost
+  # low; the test targets are compiled but not run.
+  os-check:
+    name: OS Check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: os-check-${{ matrix.target }}
+      - run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+      - run: cargo test -p tole-core --no-run --target ${{ matrix.target }}
+
+  # Issue #749: the sandbox integration tests (#601) need a working
+  # bubblewrap; without one they print `SKIPPED:` and pass, so the
+  # hardening (no network, no data dir, no $HOME, read-only workspace,
+  # CapEff 0, per-session binds, server lifecycle) was only exercised on
+  # developer machines. This job installs bubblewrap and sets
+  # TOLE_REQUIRE_BWRAP=1, which turns a skip into a failure. Only the three
+  # sandbox test targets run (the full suite is the Test job).
+  #
+  # Ubuntu 24.04 runners ship AppArmor's
+  # kernel.apparmor_restrict_unprivileged_userns=1, which denies bwrap the
+  # user namespace it needs. The relaxation below is scoped to this job's
+  # ephemeral VM (sysctl -w is not persistent and the runner is discarded);
+  # it changes nothing outside the job. No secrets are used.
+  sandbox-bwrap:
+    name: Sandbox (bubblewrap)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TOLE_REQUIRE_BWRAP: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-bwrap
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+      - name: Allow unprivileged user namespaces (job-local)
+        run: |
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
+            echo "before: $k=$(sysctl -n "$k" 2>/dev/null || echo '<absent>')"
+          done
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null)" = "0" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone; do
+            echo "after: $k=$(sysctl -n "$k" 2>/dev/null || echo '<absent>')"
+          done
+          bwrap --unshare-all --unshare-user --disable-userns --ro-bind / / true && echo "bwrap works"
+      - name: Sandbox tests
+        run: |
+          set -o pipefail
+          cargo test -p tole-core --features mcp \
+            --test mcp_sandbox --test mcp_sandbox_lifecycle --test mcp_sandbox_idle \
+            --test command_sandbox --test stopgate_sandbox \
+            --test command_sandbox_sessions --test command_sandbox_sessions_refused \
+            -- --nocapture --test-threads=1 2>&1 | tee sandbox.log
+          # Belt and braces: TOLE_REQUIRE_BWRAP already fails a skip, and the
+          # tests must really have run (not zero tests, no SKIPPED line).
+          if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 7 ] || { echo "expected 7 test targets with passing tests"; exit 1; }
+      # The mission verify command, the stop gates and cron scripts and deliveries end to end with the
+      # real binary (#748): a sandboxed verify cannot write .git/hooks.
+      - name: Sandbox tests (mission verify, stop gates, cron)
+        run: |
+          set -o pipefail
+          cargo test -p tole-cli --test verify_sandbox --test sessions_default_dir_e2e --test cron_sandbox \
+            -- --nocapture --test-threads=1 2>&1 | tee sandbox-cli.log
+          if grep -n "SKIPPED" sandbox-cli.log; then echo "a sandbox test was skipped"; exit 1; fi
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox-cli.log)" -eq 3 ] || { echo "expected the verify_sandbox, sessions_default_dir_e2e and cron_sandbox targets to pass"; exit 1; }
+      - name: Lazy-start roster test (tole-cli)
+        run: |
+          set -o pipefail
+          cargo test -p tole-cli --test plugin_gate_roster_lazy \
+            -- --nocapture --test-threads=1 2>&1 | tee roster-lazy.log
+          # It skips without bwrap (TOLE_REQUIRE_BWRAP turns that into a
+          # failure); it must really have run.
+          if grep -n "SKIPPED" roster-lazy.log; then echo "the roster lazy test was skipped"; exit 1; fi
+          [ "$(grep -c '^test result: ok\. 1 passed' roster-lazy.log)" -eq 1 ] || { echo "expected the roster lazy test to pass"; exit 1; }

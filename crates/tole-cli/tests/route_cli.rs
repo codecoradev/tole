@@ -1,8 +1,10 @@
 //! `tole route` (#586) on the real binary: a dry run that names the tier
 //! and model `[router]` would pick, calls no provider, and redacts.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+mod common;
+use common::TestDir;
+use std::path::Path;
+use std::process::Output;
 
 const USER: &str = r#"
 [router]
@@ -25,9 +27,8 @@ heavy = "coder-big"
 default = "heavy"
 "#;
 
-fn setup(tag: &str, user: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-route-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str, user: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-route-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::create_dir_all(base.join("cwd")).unwrap();
     std::fs::write(base.join("home/tole/config.toml"), user).unwrap();
@@ -35,11 +36,9 @@ fn setup(tag: &str, user: &str) -> PathBuf {
 }
 
 fn tole(base: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), base.join("home").as_path(), &[])
         .args(args)
         .current_dir(base.join("cwd"))
-        .env("CODECORA_HOME", base.join("home"))
-        .env("HOME", base.join("home"))
         // A provider that would refuse any connection: the dry run must
         // not need one.
         .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")

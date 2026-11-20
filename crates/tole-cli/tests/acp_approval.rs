@@ -7,10 +7,12 @@
 // with the `shell-tools` feature (#349): the bare profile has no such face.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -101,6 +103,8 @@ enum Policy {
 
 struct AcpProcess {
     child: Child,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: TestDir,
     rx: mpsc::Receiver<String>,
     stdin: Arc<Mutex<ChildStdin>>,
     /// How many session/request_permission requests arrived.
@@ -114,7 +118,8 @@ struct AcpProcess {
 
 impl AcpProcess {
     fn spawn_with(env: &[(&str, &str)], policy: Policy) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let home = TestDir::new("tole-acp-home");
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home.path(), &[]);
         cmd.arg("acp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -191,6 +196,7 @@ impl AcpProcess {
         });
         Self {
             child,
+            _home: home,
             rx,
             stdin,
             permission_count,
@@ -269,18 +275,8 @@ impl Drop for AcpProcess {
     }
 }
 
-fn temp_cwd(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-acp-appr-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_cwd(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-acp-appr-{tag}"))
 }
 
 // ---------------------------------------------------------------------------

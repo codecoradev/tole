@@ -50,11 +50,7 @@ pub fn fallback_config(
 /// `role: model @ host` with URL credentials stripped (recorded in
 /// `tole_route`, so it must never carry a secret).
 pub fn label(role: &str, cfg: &OpenAiConfig) -> String {
-    format!(
-        "{role}: {} @ {}",
-        cfg.model,
-        crate::doctor::redact_url(&cfg.base_url)
-    )
+    format!("{role}: {} @ {}", cfg.model, redact_url(&cfg.base_url))
 }
 
 /// The known secrets of this process (#595): every secret-named env var
@@ -115,6 +111,21 @@ pub fn build(
         },
     ];
     Ok(Box::new(FailoverProvider::new(chain)))
+}
+
+/// Strip URL credentials, query and fragment from a base url for display.
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (format!("{s}://"), r),
+        None => (String::new(), url),
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or("");
+    format!("{scheme}{host}{path}")
 }
 
 #[cfg(test)]

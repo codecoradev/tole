@@ -1,0 +1,59 @@
+name: Nightly stress
+
+# #812: the workspace tests on a CPU-starved machine. Tests that wait with a
+# fixed sleep or a short deadline pass on a quiet runner and fail when the
+# machine is busy (#702, #712, #738); a CI run on two or four CPUs hides
+# them. Here the whole test run is pinned to one CPU and keeps eight test
+# threads, so tests, mocks and child `tole` processes all compete for it.
+#
+# Not a required check and not part of any pull request: it only runs on a
+# schedule (on the default branch) or by hand, so a red night is a signal
+# to fix a test, never a blocker for a merge. A new flake shows up here
+# within a day instead of in somebody's local run.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  tests-one-cpu:
+    name: Tests on one CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-stress
+      # Build with every CPU: only the test run is starved.
+      - run: cargo test --workspace --no-run
+      # The same private TMPDIR as the Test job, so the leak check applies.
+      - name: Prepare a private TMPDIR
+        run: |
+          rm -rf target/tmp
+          echo "TOLE_TEST_TMP=$(mktemp -d /tmp/tole-test-tmp.XXXXXX)" >> "$GITHUB_ENV"
+      # `taskset -c 0` leaves one CPU, and the test harness sizes its thread
+      # pool from the CPUs it may use, so RUST_TEST_THREADS keeps the
+      # concurrency a normal run has.
+      - name: Workspace tests pinned to CPU 0
+        run: taskset -c 0 cargo test --workspace
+        env:
+          TMPDIR: ${{ env.TOLE_TEST_TMP }}
+          RUST_TEST_THREADS: "8"
+      - name: No test directory left behind
+        run: |
+          left=$(find "$TOLE_TEST_TMP" target/tmp -mindepth 1 -maxdepth 1 \( -name 'tole-*' -o -name 'cora-*' \) 2>/dev/null | sort)
+          if [ -n "$left" ]; then
+            echo "::error::the test suites left $(echo "$left" | wc -l) tole-*/cora-* entries behind (#781)"
+            echo "$left" | head -50
+            exit 1
+          fi

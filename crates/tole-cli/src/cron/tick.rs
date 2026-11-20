@@ -20,7 +20,6 @@
 //! secrets and web-header secrets) before it is written to disk.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -49,6 +48,11 @@ pub struct TickOptions {
     /// `cron.daily_token_cap` (user config): tokens all agent runs of one
     /// UTC day may spend.
     pub daily_token_cap: Option<u64>,
+    /// The `[webhook_out]` destinations the host loaded at start (#911), so
+    /// a `webhook:<name>` target can be checked without reading the config
+    /// under the host lock. `None`: none loaded, a webhook target is refused.
+    /// A long-running `tole serve` keeps the map it loaded until restart.
+    pub webhooks: Option<Arc<crate::webhook_out::Destinations>>,
 }
 
 impl TickOptions {
@@ -58,6 +62,7 @@ impl TickOptions {
             max_concurrent,
             approvals: None,
             daily_token_cap: None,
+            webhooks: None,
         }
     }
 }
@@ -151,6 +156,8 @@ pub struct ClaimCtx {
     used_today: u64,
     /// The cron dir (an agent run's jail must not hold it, #581).
     dir: std::path::PathBuf,
+    /// The loaded webhook destinations (#911).
+    webhooks: Option<Arc<crate::webhook_out::Destinations>>,
 }
 
 impl ClaimCtx {
@@ -165,6 +172,7 @@ impl ClaimCtx {
             cap: opts.daily_token_cap,
             used_today: tokens_since(l.state(), day_start(now)),
             dir: dir.to_path_buf(),
+            webhooks: opts.webhooks.clone(),
         }
     }
 }
@@ -186,7 +194,7 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
         // it may deliver to: both before the provider.
         let invalid = if let Err(e) = super::trust::check(job, &ctx.dir) {
             Some(e)
-        } else if let Err(e) = deliver::check(job) {
+        } else if let Err(e) = deliver::check(job, ctx.webhooks.as_deref()) {
             Some(e)
         } else if agent && !ctx.provider_ready {
             Some((
@@ -262,6 +270,19 @@ pub fn parked_pc(path: &Path) -> Result<tole_core::state::Pc, String> {
         .ok_or_else(|| "the session file has no state".to_string())
 }
 
+/// True when an unresumed parked run has `session_id`. Takes the ledger's
+/// exclusive lock (and creates the directory), like every ledger access; an
+/// error is the caller's to handle, never read as "no".
+pub fn has_parked(dir: &Path, session_id: &str) -> anyhow::Result<bool> {
+    store::with_lock(dir, |l| {
+        Ok(l.state()
+            .dones()
+            .filter(|d| d.session_id.as_deref() == Some(session_id))
+            .filter(|d| d.status == RunStatus::AwaitingApproval)
+            .any(|d| l.state().resumed_by(&d.fire_id).is_none()))
+    })
+}
+
 /// After an `/approvals` allow (#581): continues the parked agent run whose
 /// session is `session_id`, under a new `resume` claim (once per parked
 /// run), through the same execute / settle / deliver path as a tick. The
@@ -319,7 +340,7 @@ pub fn resume_parked(
         if !ctx.provider_ready {
             anyhow::bail!("{}", crate::turn_runner::MISSING_PROVIDER_CONFIG);
         }
-        if let Err((code, detail)) = deliver::check(&job) {
+        if let Err((code, detail)) = deliver::check(&job, opts.webhooks.as_deref()) {
             anyhow::bail!("{code}: {detail}");
         }
         let setup = super::setup::resolve(&job)
@@ -377,7 +398,7 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
     });
     let started = Instant::now();
     let mut r = if mode(&c.job) == "script" {
-        let out = run_script(&c.job, &cancel);
+        let out = run_script(&c.job, dir, &cancel);
         RunResult {
             status: out.status,
             session_id: None,
@@ -386,6 +407,8 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
                 "exit_code": out.exit_code,
                 "duration_ms": out.duration_ms,
                 "error": out.error,
+                "sandboxed": out.sandboxed,
+                "sandbox_refused": out.refused,
             }),
             output: out.stdout,
         }
@@ -503,6 +526,7 @@ pub fn run_claimed(
     for (c, r) in &settled {
         let _ = std::fs::remove_file(cancel_path(dir, &c.fire.fire_id));
         let info = RunInfo {
+            cron_dir: dir,
             job: &c.job,
             fire_id: &c.fire.fire_id,
             scheduled_for: c.fire.scheduled_for,
@@ -511,12 +535,45 @@ pub fn run_claimed(
         };
         // Checked before the claim; an error here means a hand-edited log.
         for t in deliver::targets(&c.job).unwrap_or_default() {
+            // A webhook target is queued, not sent here: the producer only
+            // appends to the outbox, and the sender writes the ledger row when
+            // the event settles (a refusal or a silent run is recorded now).
+            if let deliver::Target::Webhook(name) = &t {
+                let facts = super::webhook::RunFacts {
+                    job: &c.job,
+                    fire_id: &c.fire.fire_id,
+                    scheduled_for: c.fire.scheduled_for,
+                    status: r.status,
+                    output: &r.output,
+                    session_id: r.session_id.as_deref(),
+                    finished_at: end,
+                };
+                let made = super::webhook::enqueue_run(
+                    dir,
+                    opts.webhooks.as_deref(),
+                    name,
+                    &facts,
+                    &secrets,
+                );
+                if let Some((status, error)) = super::webhook::immediate(&made) {
+                    records.push((c.fire.fire_id.clone(), t.spec(), status, error));
+                }
+                continue;
+            }
             let (status, error) = deliver::deliver(&t, &info, &secrets);
             records.push((c.fire.fire_id.clone(), t.spec(), status, error));
         }
     }
     store::with_lock(dir, |l| {
         for (fire_id, target, status, error) in records {
+            // A webhook row is written once per run and destination, by whoever
+            // gets there first (the reconcile pass may have recorded it while
+            // this tick was still delivering to a slow command target).
+            if target.starts_with("webhook:")
+                && l.state().deliveries(&fire_id).any(|d| d.target == target)
+            {
+                continue;
+            }
             if let Err(e) = l.deliver(&fire_id, &target, status, error, end) {
                 first_err.get_or_insert(e.into());
             }
@@ -537,12 +594,17 @@ pub struct ScriptOutput {
     pub exit_code: Option<i32>,
     pub duration_ms: u128,
     pub error: Option<String>,
+    /// The script ran inside the sandbox (`[sandbox.consumers] cron`).
+    pub sandboxed: bool,
+    /// The sandbox refused the run (or its launcher failed): the script did
+    /// not run, or did not end, and the status is `error` whatever happened.
+    pub refused: bool,
 }
 
 /// Runs a script job: argv (no shell), cwd = the job's workdir, the
 /// secret-shaped environment scrubbed, a hard timeout, killed when
 /// `cancel` is set. Zero tokens.
-pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
+pub fn run_script(job: &Job, cron_dir: &Path, cancel: &CancelToken) -> ScriptOutput {
     let start = Instant::now();
     let fail = |status: RunStatus, error: String| ScriptOutput {
         status,
@@ -550,6 +612,8 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
         exit_code: None,
         duration_ms: start.elapsed().as_millis(),
         error: Some(error),
+        sandboxed: false,
+        refused: false,
     };
     let line = field(job, "script").unwrap_or_default();
     let argv = match tole_core::run_command::RunCommandTool::split_argv(line) {
@@ -566,19 +630,23 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
         .get("timeout_secs")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(w) = field(job, "workdir") {
-        cmd.current_dir(w);
-    }
-    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
+    // The one launcher (#748 slice 3): plain, or in the sandbox when
+    // `[sandbox.consumers] cron` is on. A refusal is a failed run that says so.
+    let mut prepared = match super::launch::prepare(job, &argv, cron_dir) {
+        Ok(p) => p,
+        Err(why) => return refuse(why, start),
+    };
+    let sandboxed = prepared.sandboxed();
     let ran = tole_core::subprocess::run_with_timeout_or_cancel(
-        &mut cmd,
+        &mut prepared.cmd,
         Duration::from_secs(timeout),
         cancel,
     );
     match ran {
         Ok(out) => {
+            if let Some(why) = prepared.launcher_failure(&out) {
+                return refuse(why, start);
+            }
             let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             if stdout.len() > MAX_OUTPUT {
                 let mut cut = MAX_OUTPUT;
@@ -598,10 +666,32 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
                 exit_code: out.status.code(),
                 duration_ms: start.elapsed().as_millis(),
                 error: None,
+                sandboxed,
+                refused: false,
             }
         }
         Err(e) if e == tole_core::subprocess::CANCELLED => fail(RunStatus::Cancelled, e),
+        // The launcher could not even be started: nothing ran.
+        Err(e) if sandboxed && e.starts_with(tole_core::subprocess::SPAWN_FAILED) => {
+            refuse(prepared.spawn_failure(e), start)
+        }
         Err(e) => fail(RunStatus::Error, e),
+    }
+}
+
+/// A script run that never ran because the sandbox refused it (or its
+/// launcher failed): an `error` run whose output and `usage.error` carry the
+/// reason, so `tole cron runs`, `GET /cron/runs` and the delivery targets show
+/// it. Never an `ok`.
+fn refuse(why: String, start: Instant) -> ScriptOutput {
+    ScriptOutput {
+        status: RunStatus::Error,
+        stdout: format!("{why}\n"),
+        exit_code: None,
+        duration_ms: start.elapsed().as_millis(),
+        error: Some(why),
+        sandboxed: false,
+        refused: true,
     }
 }
 

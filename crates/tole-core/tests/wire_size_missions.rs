@@ -47,6 +47,8 @@
 //!   missions only ever CALL synthetic tools, so results have a fixed,
 //!   configurable size.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -54,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use test_dir::TestDir;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::entry::Entry;
 use tole_core::openai::{wire_stats, OpenAiConfig, OpenAiProvider, WireStats};
@@ -388,11 +391,8 @@ struct MissionRun {
     max_result_chars: u64,
 }
 
-fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-wsm-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-wsm-{name}"))
 }
 
 fn provider(url: String, system: &str, reg: &ToolRegistry) -> OpenAiProvider {

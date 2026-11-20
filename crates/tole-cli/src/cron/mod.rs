@@ -21,12 +21,14 @@
 
 pub mod agent;
 pub mod deliver;
+pub mod launch;
 pub mod setup;
 pub mod status;
 pub use crate::ledger_file as store;
 pub mod tick;
 pub mod tool;
 pub mod trust;
+pub mod webhook;
 
 use std::path::{Path, PathBuf};
 
@@ -101,8 +103,9 @@ pub enum CronAction {
         #[arg(long)]
         max_tokens: Option<u64>,
         /// Delivery target, repeatable: `log`, `session`, `file:PATH`
-        /// (inside the workdir) or `command:ARGV` (output on stdin)
-        /// [default: session for agent jobs, log for scripts].
+        /// (inside the workdir), `command:ARGV` (output on stdin) or
+        /// `webhook:NAME` (a `[webhook_out.NAME]` destination of the user
+        /// config) [default: session for agent jobs, log for scripts].
         #[arg(long = "deliver")]
         deliver: Vec<String>,
         /// Save the job paused.
@@ -338,6 +341,46 @@ fn cron_config() -> Option<crate::config::CronConfig> {
             eprintln!("tole cron: user config not applied: {e}");
             None
         }
+    }
+}
+
+/// The `[webhook_out]` destinations this process loaded (#911): the ones
+/// `tole serve` installed at start, else the user config's, loaded and
+/// installed on first use. A config that does not load is reported and means
+/// none, so a `webhook:` target is refused (`delivery_invalid`), never sent
+/// somewhere guessed.
+pub fn webhooks() -> Option<std::sync::Arc<crate::webhook_out::Destinations>> {
+    if let Some(d) = crate::webhook_out::loaded() {
+        return Some(d);
+    }
+    match crate::webhook_out::load_user() {
+        Ok(d) => Some(crate::webhook_out::install(d)),
+        Err(e) => {
+            eprintln!("tole cron: webhook destinations not loaded: {e}");
+            None
+        }
+    }
+}
+
+/// How long a standalone `tole cron tick` or `run` spends sending webhook
+/// events after it ran its jobs. Whatever is still pending (a retry waiting
+/// minutes) is left on disk for the next tick or a `tole serve` sender.
+const STANDALONE_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Sends the outbox for a bounded time (#911). Failure is reported, never an
+/// error of the tick: the events are on disk and the next drain retries them.
+fn drain_webhooks(dir: &Path, opts: &TickOptions) {
+    let Some(dests) = opts.webhooks.as_deref().filter(|d| !d.is_empty()) else {
+        return;
+    };
+    // First close what a crash left between the ledger and the outbox (a
+    // short-lived tick may be the only thing that ever runs), then send.
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    if let Err(e) = webhook::reconcile(dir, dests, now(), &secrets) {
+        eprintln!("tole cron: webhook reconcile: {e}");
+    }
+    if let Err(e) = webhook::drain(dir, dests, STANDALONE_DRAIN) {
+        eprintln!("tole cron: webhook send: {e}");
     }
 }
 
@@ -1093,9 +1136,11 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
         CronAction::Run { job } => {
             let opts = TickOptions {
                 daily_token_cap: daily_token_cap(),
+                webhooks: webhooks(),
                 ..TickOptions::standalone(1)
             };
             print_report("run", &run_now(&dir, &job, t, &opts)?);
+            drain_webhooks(&dir, &opts);
         }
         CronAction::Cancel { job } => {
             for f in cancel(&dir, &job)? {
@@ -1107,9 +1152,11 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
         } => {
             let opts = TickOptions {
                 daily_token_cap: daily_token_cap(),
+                webhooks: webhooks(),
                 ..TickOptions::standalone(max_concurrent(flag))
             };
             print_report("tick", &tick(&dir, t, &opts)?);
+            drain_webhooks(&dir, &opts);
         }
     }
     Ok(())
@@ -1127,12 +1174,21 @@ pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::Appr
             max_concurrent: max_concurrent(None),
             approvals: Some(std::sync::Arc::clone(&approvals)),
             daily_token_cap: daily_token_cap(),
+            webhooks: webhooks(),
         };
         let dir = dir.to_path_buf();
         std::thread::spawn(move || pass(&dir, &opts));
         let wait = 60 - now().rem_euclid(60) + 1;
         std::thread::sleep(std::time::Duration::from_secs(wait as u64));
     }
+}
+
+/// True when an unresumed cron run is parked on `session_id`'s approval: the
+/// one case where an Allow for a session `tole serve` does not host resumes
+/// anything. Reads the ledger under its lock; an `Err` means "could not
+/// tell" and must not be taken as "no".
+pub fn has_parked_run(session_id: &str) -> anyhow::Result<bool> {
+    tick::has_parked(&default_dir()?, session_id)
 }
 
 /// `/approvals` allow on a cron run's session (#581, serve route): resumes
@@ -1145,6 +1201,7 @@ pub fn resume_after_approval(
         max_concurrent: 1,
         approvals: Some(approvals),
         daily_token_cap: daily_token_cap(),
+        webhooks: webhooks(),
     };
     tick::resume_parked(&default_dir()?, session_id, now(), &opts)
 }

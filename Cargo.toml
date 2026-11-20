@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tole-core", "crates/tole-cli", "crates/tole-tui"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/codecoradev/tole"
@@ -14,12 +14,20 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-uuid = { version = "1", features = ["v7"] }
 anyhow = "1"
 ureq = { version = "3", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 
-# Size-focused release profile (default release was 16.7 MB, this ~9 MB).
+# Size-conscious release profile. The "16.7 MB, now ~9 MB" figure from #482 is
+# stale. Measured 2026-11-19 at 70cffd7 (one machine: x86_64 Linux, 4 cores),
+# `cargo build --release -p tole-cli` (default features): 23.8 MB stripped
+# (34.5 MB unstripped), 9.8 MB as a local tar.gz. docs/perf.md's 2026-11-13
+# table lists 19.5 MB for the same command, so the binary grew about 4.3 MB
+# (+22%) in six days; the cause is not bisected. The published v0.11.0 Linux
+# x86_64 asset is 8.4 MB (tar.gz; the gap to the local 9.8 MB is unexplained).
+# `--no-default-features`: 10.2 MB. Tried, not adopted: lto = "fat" 21.5 MB
+# (-9%) for 2.2x the build time; opt-level = "s" 18.3 MB (-23%), not
+# benchmarked here, expected to trade hot-path speed. See docs/perf.md.
 # panic = "abort" is deliberately NOT set: tole relies on unwinding (Mutex
 # poison recovery via `lock().unwrap_or_else(|p| p.into_inner())`, turns run on
 # threads / spawn_blocking), and abort would kill every session of a

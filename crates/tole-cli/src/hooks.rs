@@ -183,6 +183,12 @@ pub fn hold_keys(routes: &BTreeMap<String, Route>) {
     }
 }
 
+/// [`read_key_file`] for the other secret-file readers of this crate
+/// (outbound webhook destinations use the same rules).
+pub(crate) fn read_secret_file(path: &str) -> Result<Vec<u8>, String> {
+    read_key_file(path)
+}
+
 /// The key file: a regular file (no link, no FIFO), at most
 /// [`MAX_KEY_FILE`] bytes, one trailing newline dropped.
 fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
@@ -211,11 +217,9 @@ mod tests {
         (k == "HOOK_KEY").then(|| KEY.to_string())
     }
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-hooks-unit-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-hooks-unit-{tag}"))
     }
 
     #[test]
@@ -263,6 +267,7 @@ mod tests {
         std::fs::write(&short, "too-short\n").unwrap();
         let big = d.join("big");
         std::fs::write(&big, "k".repeat(5_000)).unwrap();
+        #[cfg(unix)]
         let link = d.join("link");
         std::fs::write(d.join("real"), KEY).unwrap();
         #[cfg(unix)]
@@ -271,6 +276,7 @@ mod tests {
             hmac_key_file: Some(p.display().to_string()),
             ..HookConfig::default()
         };
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![
             (HookConfig::default(), "no key"),
             (

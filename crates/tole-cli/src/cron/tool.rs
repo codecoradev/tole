@@ -96,7 +96,7 @@ impl Tool for CronCreateTool {
                 "max_steps": {"type": "integer", "minimum": 1},
                 "max_minutes": {"type": "integer", "minimum": 1},
                 "max_tokens": {"type": "integer", "minimum": 1},
-                "deliver": {"type": "array", "items": {"type": "string"}, "description": "`session` (default), `log` or `file:PATH` inside the workspace"}
+                "deliver": {"type": "array", "items": {"type": "string"}, "description": "`session` (default), `log`, `file:PATH` inside the workspace, or `webhook:NAME` for a destination the owner already declared in the user config (only one that allows agent jobs; you cannot name a URL)"}
             },
             "required": ["schedule", "prompt"],
             "additionalProperties": false

@@ -215,11 +215,9 @@ fn a_project_lock_only_narrows_the_user_lock() {
     );
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-plugin-lock-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-plugin-lock-{tag}"))
 }
 
 #[test]
@@ -332,4 +330,603 @@ fn a_snapshot_redacts_before_it_caps_and_stays_under_the_lock_cap() {
         Lockfile::load(&dir.join(LOCK_FILE)).unwrap().version,
         LOCK_VERSION
     );
+}
+
+#[test]
+fn a_first_party_claim_needs_the_owners_list() {
+    let fp: Vec<String> = DEFAULT_FIRST_PARTY.iter().map(|s| s.to_string()).collect();
+    let claimed = LockEntry {
+        tier: Some(Tier::FirstParty),
+        ..Default::default()
+    };
+    assert_eq!(tier_of("cora", None, &fp), Tier::FirstParty);
+    assert_eq!(
+        tier_of("evil", Some(&claimed), &fp),
+        Tier::ThirdPartyUnverified
+    );
+    assert_eq!(tier_of("evil", None, &fp), Tier::ThirdPartyUnverified);
+    let verified = LockEntry {
+        tier: Some(Tier::ThirdPartyVerified),
+        ..Default::default()
+    };
+    assert_eq!(tier_of("x", Some(&verified), &fp), Tier::ThirdPartyVerified);
+    assert_eq!(
+        tier_of("x", Some(&verified), &["x".to_string()]),
+        Tier::FirstParty
+    );
+}
+
+#[test]
+fn the_tier_round_trips_in_the_lock_as_kebab_case() {
+    let mut l = Lockfile::default();
+    l.servers.insert(
+        "s".into(),
+        LockEntry {
+            tier: Some(Tier::ThirdPartyUnverified),
+            ..Default::default()
+        },
+    );
+    let json = serde_json::to_string(&l).unwrap();
+    assert!(
+        json.contains("\"tier\":\"third-party-unverified\""),
+        "{json}"
+    );
+    let back: Lockfile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, l);
+    let none = serde_json::to_string(&Lockfile::default()).unwrap();
+    assert!(!none.contains("tier"));
+}
+
+#[test]
+fn admit_unseen_decides_without_the_tool_list() {
+    let e = LockEntry {
+        source: "stdio:srv a".into(),
+        integrity: "sha256:aa".into(),
+        ..Default::default()
+    };
+    let mut lock = BTreeMap::new();
+    lock.insert("s".to_string(), e.clone());
+    lock.insert("r".to_string(), LockEntry { revoked: true, ..e });
+    let go = |n: &str, src: &str, int: &str| admit_unseen(&lock, n, src, int);
+    assert_eq!(go("none", "x", ""), Some(Admission::Unlocked));
+    assert_eq!(
+        go("r", "stdio:srv a", "sha256:aa"),
+        Some(Admission::Revoked)
+    );
+    assert_eq!(go("s", "stdio:srv b", "sha256:aa"), Some(Admission::Moved));
+    assert_eq!(
+        go("s", "stdio:srv a", "sha256:bb"),
+        Some(Admission::Rebuilt)
+    );
+    assert_eq!(go("s", "stdio:srv a", "sha256:aa"), None);
+}
+
+#[test]
+fn the_ledger_blocks_a_lock_edited_back_or_re_pinned() {
+    let entry = |h: &str, revoked| LockEntry {
+        manifest_hash: h.into(),
+        revoked,
+        ..Default::default()
+    };
+    let line = |ev: &str, s: &str, h: &str| ledger_line(ev, s, h, 1);
+    let ledger = [
+        line("approve", "a", "sha256:1"),
+        line("revoke", "a", "sha256:1"),
+        line("approve", "b", "sha256:2"),
+        line("manifest_change", "b", "sha256:9"),
+        line("approve", "c", "sha256:3"),
+        "not json\n".to_string(),
+        "{\"kind\":\"other\",\"event\":\"revoke\",\"server\":\"d\"}\n".to_string(),
+    ]
+    .concat();
+    let mut lock = BTreeMap::new();
+    lock.insert("a".to_string(), entry("sha256:1", false)); // edited back
+    lock.insert("b".to_string(), entry("sha256:2", false)); // fine
+    lock.insert("c".to_string(), entry("sha256:evil", false)); // re-pinned
+    lock.insert("d".to_string(), entry("sha256:4", false)); // never recorded
+    lock.insert("e".to_string(), entry("sha256:5", true)); // already revoked
+    let c = check_against_ledger(&lock, &ledger);
+    let blocked: Vec<&str> = c.blocked.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(blocked, vec!["a", "c"]);
+    assert_eq!(c.unrecorded, vec!["d".to_string()]);
+    // An approve after the revoke lifts it.
+    let again = format!("{ledger}{}", line("approve", "a", "sha256:1"));
+    assert!(!check_against_ledger(&lock, &again)
+        .blocked
+        .iter()
+        .any(|(n, _)| n == "a"));
+    // No ledger lines at all: nothing to compare.
+    assert_eq!(check_against_ledger(&lock, ""), LedgerCheck::default());
+}
+
+fn bundle_lock(secrets: &[&str]) -> BTreeMap<String, LockEntry> {
+    let mut m = locked(&base());
+    let e = m.get_mut("cora").unwrap();
+    e.secrets = secrets.iter().map(|s| s.to_string()).collect();
+    e.bundle = Some(BundleRef {
+        plugin: "acme".into(),
+        version: "1".into(),
+        hash: "sha256:b1".into(),
+        path: "/p/tole-plugin.toml".into(),
+    });
+    m
+}
+
+#[test]
+fn a_bundle_entry_needs_its_manifest_file_unchanged_and_readable() {
+    let lock = bundle_lock(&[]);
+    assert_eq!(bundle_admission(&lock, "cora", "sha256:b1"), None);
+    for live in ["sha256:b2", ""] {
+        assert_eq!(
+            bundle_admission(&lock, "cora", live),
+            Some(Admission::BundleChanged),
+            "{live:?}: fail closed"
+        );
+    }
+    // No bundle record, no such server: nothing to compare.
+    assert_eq!(bundle_admission(&locked(&base()), "cora", ""), None);
+    assert_eq!(bundle_admission(&lock, "other", ""), None);
+}
+
+#[test]
+fn the_bundle_record_round_trips_and_an_old_lock_loads_without_it() {
+    let dir = tmp("bundle-rt");
+    let path = dir.join("plugins.lock");
+    let lock = Lockfile {
+        servers: bundle_lock(&["A_TOKEN"]),
+        ..Default::default()
+    };
+    lock.save(&path).unwrap();
+    assert_eq!(Lockfile::load(&path).unwrap().servers, lock.servers);
+    std::fs::write(
+        &path,
+        r#"{"version":2,"servers":{"s":{"source":"stdio:s","manifest_hash":"sha256:1"}}}"#,
+    )
+    .unwrap();
+    assert!(Lockfile::load(&path).unwrap().servers["s"].bundle.is_none());
+}
+
+#[test]
+fn the_ledger_ties_secret_grants_and_the_bundle_hash_to_the_owners_decisions() {
+    let h = manifest_hash(&base());
+    let mut ledger = String::new();
+    let mut add = |l: String| ledger.push_str(&l);
+    add(bundle_ledger_line("approve", "cora", &h, "sha256:b1", 1));
+    add(secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    add(secret_ledger_line("secret_grant", "cora", "B_KEY", 1));
+    let blocked = |secrets: &[&str], ledger: &str| {
+        check_against_ledger(&bundle_lock(secrets), ledger).blocked
+    };
+    assert!(blocked(&["A_TOKEN", "B_KEY"], &ledger).is_empty());
+    assert!(blocked(&[], &ledger).is_empty(), "fewer grants are fine");
+    // A grant the ledger never saw.
+    assert_eq!(blocked(&["C_TOKEN"], &ledger).len(), 1);
+    // A revoked grant put back.
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "B_KEY", 2));
+    assert_eq!(blocked(&["A_TOKEN", "B_KEY"], &after).len(), 1);
+    assert!(blocked(&["A_TOKEN"], &after).is_empty());
+    // A new approval starts from nothing: earlier grants do not carry over.
+    after.push_str(&bundle_ledger_line("approve", "cora", &h, "sha256:b1", 3));
+    assert_eq!(blocked(&["A_TOKEN"], &after).len(), 1);
+    // A re-pinned manifest hash.
+    let mut lock = bundle_lock(&[]);
+    lock.get_mut("cora").unwrap().bundle.as_mut().unwrap().hash = "sha256:evil".into();
+    assert_eq!(check_against_ledger(&lock, &ledger).blocked.len(), 1);
+    // The audit lines carry names and hashes, never a value.
+    assert!(!ledger.contains("secret\":\"sk"));
+}
+
+#[test]
+fn the_ledger_is_authoritative_when_the_lock_drops_or_invents_bundle_state() {
+    let h = manifest_hash(&base());
+    let mut ledger = bundle_ledger_line("approve", "cora", &h, "sha256:b1", 1);
+    ledger.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    let n =
+        |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l).blocked.len();
+    // The honest lock passes.
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &ledger), 0);
+    // Bundle removed + a hand-added secret.
+    let mut l = bundle_lock(&["A_TOKEN", "EVIL_KEY"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed + the granted secret kept: the manifest pin is gone.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed, no secrets: still not what was approved.
+    let mut l = bundle_lock(&[]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // A revoked grant restored (with the bundle intact).
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "A_TOKEN", 2));
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &after), 1);
+    // ... and with the bundle also removed.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &after), 1);
+    // A bundle record invented on an entry whose ledger approval is plain.
+    let plain = ledger_line("approve", "cora", &h, 1);
+    assert_eq!(n(&bundle_lock(&[]), &plain), 1, "bundle record invented");
+    // A plain entry's own secrets (#679) are not ledger-tracked and stay.
+    let mut l = locked(&base());
+    l.get_mut("cora").unwrap().secrets = vec!["A_TOKEN".into()];
+    assert_eq!(n(&l, &plain), 0);
+    // A bundle record with no approval line for the server at all.
+    let other = ledger_line("approve", "zzz", "h", 1);
+    assert_eq!(n(&bundle_lock(&[]), &other), 1);
+    assert_eq!(
+        n(&locked(&base()), &other),
+        0,
+        "a plain pre-ledger entry stays unblocked"
+    );
+}
+
+#[test]
+fn a_plain_approval_ties_its_secrets_to_the_ledger_and_an_old_one_is_only_reported() {
+    let h = manifest_hash(&base());
+    let plain = |secrets: &[&str]| {
+        let mut l = locked(&base());
+        l.get_mut("cora").unwrap().secrets = secrets.iter().map(|s| s.to_string()).collect();
+        l
+    };
+    let n = |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l);
+    // A new-style approval with one recorded grant.
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    assert!(n(&plain(&["A_TOKEN"]), &ledger).blocked.is_empty());
+    assert!(n(&plain(&["A_TOKEN"]), &ledger)
+        .secrets_unrecorded
+        .is_empty());
+    // A hand-added grant is not trusted.
+    assert_eq!(
+        n(&plain(&["A_TOKEN", "EVIL_KEY"]), &ledger).blocked.len(),
+        1
+    );
+    // Also on an approval that granted nothing (marker, no grant lines).
+    let none = plain_ledger_line("cora", &h, 1);
+    assert!(n(&plain(&[]), &none).blocked.is_empty());
+    assert_eq!(n(&plain(&["EVIL_KEY"]), &none).blocked.len(), 1);
+    // A revoked grant put back; a re-approval starts from nothing.
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "A_TOKEN", 2));
+    assert_eq!(n(&plain(&["A_TOKEN"]), &after).blocked.len(), 1);
+    assert!(n(&plain(&[]), &after).blocked.is_empty());
+    after.push_str(&plain_ledger_line("cora", &h, 3));
+    assert_eq!(n(&plain(&["A_TOKEN"]), &after).blocked.len(), 1);
+    // Migration: an approval from before the marker is reported, not blocked,
+    // and so is one with only a (#811-era) revoke line after it.
+    let old = ledger_line("approve", "cora", &h, 1);
+    let c = n(&plain(&["A_TOKEN"]), &old);
+    assert!(c.blocked.is_empty() && c.secrets_unrecorded == vec!["cora".to_string()]);
+    let mut old_revoke = old.clone();
+    old_revoke.push_str(&secret_ledger_line("secret_revoke", "cora", "B_KEY", 2));
+    let c = n(&plain(&["A_TOKEN"]), &old_revoke);
+    assert!(c.blocked.is_empty() && !c.secrets_unrecorded.is_empty());
+    // An old entry without secrets has nothing to report.
+    assert!(n(&plain(&[]), &old).secrets_unrecorded.is_empty());
+    // Once a grant line follows, the entry is ledger-tracked.
+    let mut adopted = old.clone();
+    adopted.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 2));
+    assert!(n(&plain(&["A_TOKEN"]), &adopted).blocked.is_empty());
+    assert_eq!(
+        n(&plain(&["A_TOKEN", "EVIL_KEY"]), &adopted).blocked.len(),
+        1
+    );
+    // The helper agrees.
+    assert!(secrets_recorded(&ledger, "cora") && secrets_recorded(&adopted, "cora"));
+    assert!(!secrets_recorded(&old, "cora") && !secrets_recorded(&old_revoke, "cora"));
+    assert!(!secrets_recorded(&ledger, "other"));
+}
+
+// ---- the sandbox profile in the entry and the ledger (#750) ----
+
+fn id(name: &str, hash: &str) -> crate::sandbox::identity::ProfileId {
+    crate::sandbox::identity::ProfileId {
+        name: name.into(),
+        hash: hash.into(),
+    }
+}
+
+fn with_profile(name: Option<&str>, hash: Option<&str>) -> BTreeMap<String, LockEntry> {
+    let mut l = locked(&base());
+    let e = l.get_mut("cora").unwrap();
+    e.sandbox = name.map(str::to_string);
+    e.sandbox_hash = hash.map(str::to_string);
+    l
+}
+
+#[test]
+fn profile_admission_compares_name_and_hash_exactly() {
+    let l = with_profile(Some("server"), Some("sha256:aa"));
+    let ok = id("server", "sha256:aa");
+    assert_eq!(profile_admission(&l, "cora", Some(&ok)), None);
+    for live in [
+        Some(id("server", "sha256:bb")),
+        Some(id("other", "sha256:aa")),
+        None, // no sandbox applies now: a loosening
+    ] {
+        assert_eq!(
+            profile_admission(&l, "cora", live.as_ref()),
+            Some(Admission::ProfileChanged)
+        );
+    }
+    // Nothing recorded (old or unsandboxed approval): nothing to compare.
+    let none = with_profile(Some("server"), None);
+    assert_eq!(profile_admission(&none, "cora", None), None);
+    assert_eq!(profile_admission(&l, "unknown", None), None);
+}
+
+#[test]
+fn a_version_3_lock_without_a_profile_hash_still_loads() {
+    let raw = r#"{"version":3,"servers":{"cora":{"source":"stdio:cora mcp","manifest_hash":"sha256:1","sandbox":"server"}}}"#;
+    let lock: Lockfile = serde_json::from_str(raw).unwrap();
+    assert_eq!(lock.servers["cora"].sandbox_hash, None);
+    assert_eq!(LOCK_VERSION, 4);
+}
+
+#[test]
+fn the_ledger_is_the_authority_for_the_profile_in_both_directions() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        1,
+    ));
+    let c = |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l);
+    let good = with_profile(Some("server"), Some("sha256:aa"));
+    let r = c(&good, &ledger);
+    assert!(r.blocked.is_empty() && r.profile_unrecorded.is_empty());
+    // A hash edited in the lock, a name edited, the record dropped, and a
+    // hash removed are all blocked.
+    for edited in [
+        with_profile(Some("server"), Some("sha256:bb")),
+        with_profile(Some("net"), Some("sha256:aa")),
+        with_profile(None, None),
+        with_profile(Some("server"), None),
+    ] {
+        assert_eq!(c(&edited, &ledger).blocked.len(), 1, "{edited:?}");
+    }
+    // An approval recorded as unsandboxed: a record added by hand is blocked.
+    let mut unsandboxed = plain_ledger_line("cora", &h, 1);
+    unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));
+    assert!(c(&with_profile(None, None), &unsandboxed)
+        .blocked
+        .is_empty());
+    assert_eq!(c(&good, &unsandboxed).blocked.len(), 1);
+    // A re-approval starts over: the old profile line no longer counts.
+    let mut again = ledger.clone();
+    again.push_str(&plain_ledger_line("cora", &h, 2));
+    assert_eq!(c(&good, &again).blocked.len(), 1);
+    again.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        2,
+    ));
+    assert!(c(&good, &again).blocked.is_empty());
+    // Migration: an approval without a profile line is reported (stdio
+    // entries), not blocked, and a lock hash it never recorded is not trusted.
+    let old = plain_ledger_line("cora", &h, 1);
+    let r = c(&with_profile(Some("server"), None), &old);
+    assert!(r.blocked.is_empty() && r.profile_unrecorded == vec!["cora".to_string()]);
+    assert_eq!(c(&good, &old).blocked.len(), 1);
+}
+
+#[test]
+fn a_project_pin_of_another_profile_makes_the_server_unavailable_and_a_blank_one_loosens_nothing() {
+    let user = Lockfile {
+        servers: with_profile(Some("server"), Some("sha256:aa")),
+        ..Default::default()
+    };
+    let project = |name: Option<&str>, hash: Option<&str>| Lockfile {
+        servers: with_profile(name, hash),
+        ..Default::default()
+    };
+    let (eff, notes) = effective(&user, &project(Some("server"), Some("sha256:aa")));
+    assert!(!eff["cora"].revoked && notes.is_empty());
+    let (eff, notes) = effective(&user, &project(Some("server"), Some("sha256:ff")));
+    assert!(eff["cora"].revoked && notes.len() == 1);
+    let (eff, notes) = effective(&user, &project(None, None));
+    assert!(!eff["cora"].revoked && notes.is_empty());
+    assert_eq!(eff["cora"].sandbox_hash.as_deref(), Some("sha256:aa"));
+}
+
+#[test]
+fn profile_moved_is_decided_by_the_ledger_and_a_lock_mismatch_is_a_move() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        1,
+    ));
+    let ok = id("server", "sha256:aa");
+    let wide = id("server", "sha256:bb");
+    let good = with_profile(Some("server"), Some("sha256:aa"));
+    let forged = with_profile(Some("server"), Some("sha256:bb"));
+    assert!(!profile_moved(&good, Some(&ledger), "cora", Some(&ok)));
+    assert!(profile_moved(&good, Some(&ledger), "cora", Some(&wide)));
+    // The lock edited to match the widened live profile: the raw lock says
+    // "unchanged", the ledger says moved.
+    assert_eq!(profile_admission(&forged, "cora", Some(&wide)), None);
+    assert!(profile_moved(&forged, Some(&ledger), "cora", Some(&wide)));
+    // A lock hash the ledger never recorded is a move too.
+    let old = plain_ledger_line("cora", &h, 1);
+    assert!(profile_moved(&good, Some(&old), "cora", Some(&ok)));
+    // No ledger at all, or an unrecorded approval without a hash: the lock's
+    // own record (migration).
+    assert!(!profile_moved(&good, None, "cora", Some(&ok)));
+    assert!(profile_moved(&good, None, "cora", Some(&wide)));
+    let none = with_profile(Some("server"), None);
+    assert!(!profile_moved(&none, Some(&old), "cora", Some(&wide)));
+    // No lock entry: the ledger's record alone decides (#847).
+    let empty = BTreeMap::new();
+    assert!(!profile_moved(&empty, Some(&ledger), "cora", Some(&ok)));
+    assert!(profile_moved(&empty, Some(&ledger), "cora", Some(&wide)));
+    assert!(profile_moved(&empty, Some(&ledger), "cora", None));
+    assert!(!profile_moved(&empty, Some(&old), "cora", Some(&wide)));
+    assert!(!profile_moved(&empty, None, "cora", Some(&wide)));
+    assert!(!profile_moved(&empty, Some(&ledger), "other", Some(&wide)));
+    // A revoked sandboxed server is moved in every arm: entry kept, entry
+    // deleted, or the lock's profile fields dropped, unchanged profile too.
+    let mut revoked = ledger.clone();
+    revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    for live in [&ok, &wide] {
+        assert!(profile_moved(&empty, Some(&revoked), "cora", Some(live)));
+        assert!(profile_moved(&good, Some(&revoked), "cora", Some(live)));
+        let bare = with_profile(None, None);
+        assert!(profile_moved(&bare, Some(&revoked), "cora", Some(live)));
+    }
+    assert!(profile_moved(&empty, Some(&revoked), "cora", None));
+    // A re-approval ends it: the new approval's own record decides.
+    let mut again = revoked.clone();
+    again.push_str(&plain_ledger_line("cora", &h, 3));
+    assert!(!profile_moved(&empty, Some(&again), "cora", Some(&wide)));
+    again.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        3,
+    ));
+    assert!(!profile_moved(&empty, Some(&again), "cora", Some(&ok)));
+    assert!(profile_moved(&empty, Some(&again), "cora", Some(&wide)));
+    // A revoked approval with no profile line (older) or an unsandboxed one
+    // promised nothing: a script may re-approve it.
+    let mut old_revoked = old.clone();
+    old_revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    assert!(!profile_moved(
+        &empty,
+        Some(&old_revoked),
+        "cora",
+        Some(&wide)
+    ));
+    let mut unsb_revoked = plain_ledger_line("cora", &h, 1);
+    unsb_revoked.push_str(&profile_ledger_line("cora", None, None, 1));
+    unsb_revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    assert!(!profile_moved(
+        &empty,
+        Some(&unsb_revoked),
+        "cora",
+        Some(&wide)
+    ));
+    assert!(!profile_moved(
+        &with_profile(None, None),
+        Some(&unsb_revoked),
+        "cora",
+        Some(&wide)
+    ));
+    // An unsandboxed approval promised nothing.
+    let mut unsandboxed = plain_ledger_line("cora", &h, 1);
+    unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));
+    assert!(!profile_moved(
+        &with_profile(None, None),
+        Some(&unsandboxed),
+        "cora",
+        Some(&wide)
+    ));
+}
+
+#[test]
+fn ledger_bundle_is_the_last_approval_and_survives_a_revoke() {
+    let h = manifest_hash(&[]);
+    assert_eq!(ledger_bundle("", "a"), None);
+    let mut l = plain_ledger_line("a", &h, 1);
+    assert_eq!(ledger_bundle(&l, "a"), Some(None));
+    assert_eq!(ledger_bundle(&l, "b"), None);
+    l.push_str(&bundle_ledger_line("approve", "a", &h, "sha256:b1", 2));
+    l.push_str(&ledger_line("revoke", "a", &h, 3));
+    assert_eq!(ledger_bundle(&l, "a"), Some(Some("sha256:b1".to_string())));
+    l.push_str(&plain_ledger_line("a", &h, 4));
+    assert_eq!(ledger_bundle(&l, "a"), Some(None));
+}
+
+#[test]
+fn a_fallback_line_is_one_json_line_with_names_a_hash_and_a_one_line_reason() {
+    let line = fallback_ledger_line(
+        "files",
+        "server",
+        "sha256:aa",
+        "bubblewrap (bwrap) is not on PATH",
+        7,
+    );
+    assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["kind"], "plugin");
+    assert_eq!(v["event"], "sandbox_fallback");
+    assert_eq!(v["server"], "files");
+    assert_eq!(v["profile"], "server");
+    assert_eq!(v["profile_hash"], "sha256:aa");
+    assert_eq!(v["reason"], "bubblewrap (bwrap) is not on PATH");
+    assert_eq!(v["at"], 7);
+    // A reason with control characters stays on one line, shown escaped,
+    // and a long one is cut.
+    let line = fallback_ledger_line("s", "p", "h", "a\nb\x1b[2Jc", 1);
+    assert_eq!(line.matches('\n').count(), 1);
+    assert!(!line.contains('\x1b'));
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["reason"], "a\\u{a}b\\u{1b}[2Jc");
+    let long = fallback_ledger_line("s", "p", "h", &"x".repeat(5000), 1);
+    let v: serde_json::Value = serde_json::from_str(long.trim_end()).unwrap();
+    assert_eq!(v["reason"].as_str().unwrap().len(), 300);
+}
+
+#[test]
+fn a_fallback_line_changes_no_decision_the_ledger_makes() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line("cora", None, None, 1));
+    let lock = with_profile(None, None);
+    let before = (
+        check_against_ledger(&lock, &ledger).blocked,
+        ledger_profile(&ledger, "cora"),
+        secrets_recorded(&ledger, "cora"),
+        ledger_bundle(&ledger, "cora"),
+    );
+    // Fallback lines at any point (between the approval and its profile
+    // line included) are neither an approval, a revoke nor a profile.
+    let mut with_fallback = plain_ledger_line("cora", &h, 1);
+    with_fallback.push_str(&fallback_ledger_line("cora", "server", "sha256:aa", "x", 2));
+    with_fallback.push_str(&profile_ledger_line("cora", None, None, 1));
+    with_fallback.push_str(&fallback_ledger_line("cora", "server", "sha256:aa", "x", 3));
+    let after = (
+        check_against_ledger(&lock, &with_fallback).blocked,
+        ledger_profile(&with_fallback, "cora"),
+        secrets_recorded(&with_fallback, "cora"),
+        ledger_bundle(&with_fallback, "cora"),
+    );
+    assert_eq!(before, after);
+    assert!(after.0.is_empty());
+}
+
+/// #748: the default flip's fallback line names the consumer and one reason,
+/// is kind `sandbox` (so no plugin fold reads it), and changes no decision.
+#[test]
+fn a_consumer_fallback_line_is_a_sandbox_line_no_plugin_fold_reads() {
+    let line = consumer_fallback_ledger_line("verify", "no bwrap\n\x1b[2J", 9);
+    assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+    assert!(!line.contains('\x1b'));
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["kind"], "sandbox");
+    assert_eq!(v["event"], "sandbox_fallback");
+    assert_eq!(v["consumer"], "verify");
+    assert_eq!(v["default"], true);
+    assert_eq!(v["at"], 9);
+    assert_eq!(v["reason"], "no bwrap\\u{a}\\u{1b}[2J");
+    assert!(v.get("server").is_none(), "never a plugin server's line");
+    let long = consumer_fallback_ledger_line("turnend", &"x".repeat(5000), 1);
+    let v: serde_json::Value = serde_json::from_str(long.trim_end()).unwrap();
+    assert_eq!(v["reason"].as_str().unwrap().len(), 300);
+    // The audit of a server named like the consumer does not pick it up.
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("verify", &h, 1);
+    let before = check_against_ledger(&with_profile(None, None), &ledger).blocked;
+    ledger.push_str(&line);
+    let after = check_against_ledger(&with_profile(None, None), &ledger).blocked;
+    assert_eq!(before, after);
 }

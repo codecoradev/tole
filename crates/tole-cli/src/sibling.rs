@@ -135,8 +135,7 @@ mod tests {
 
     #[test]
     fn the_watcher_turns_a_sibling_write_into_a_queued_notice() {
-        let dir = std::env::temp_dir().join(format!("tole-sibwire-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dir::TestDir::new("tole-sibwire");
         let log = dir.join("tole-agents").join("touch.log");
         let mine = Tracking {
             agent: "a-1".into(),
@@ -150,12 +149,11 @@ mod tests {
         me.record(Op::Read, "src/lib.rs").unwrap();
         sib.record(Op::Write, "src/lib.rs").unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
-        while got.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-            got = cancel.interrupts().drain();
-        }
+        crate::test_dir::wait_until(crate::test_dir::WAIT, "the sibling notice", || {
+            got.extend(cancel.interrupts().drain());
+            !got.is_empty()
+        });
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].source, tole_core::interrupt::Source::Notice);
         assert!(got[0].text.contains("child agent a-2"), "{}", got[0].text);

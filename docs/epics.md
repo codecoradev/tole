@@ -12,6 +12,12 @@
 > authoritative over this doc.
 > Status sync 2026-10-06 (pre-0.6.0): the 0.6.0 train (#168–#185) is
 > fully merged to develop — see the Post-D3 section.
+> Status sync 2026-11-20 (0.12.0 release prep): 0.12.0 is the release
+> cut from develop on 2026-11-20 (see "0.12.0"); 0.11.0 was released on
+> 2026-11-14 (#808 sync of 2026-11-15). Every open item
+> points at an open issue; an idea without an issue is not planned (file
+> the issue first). Shipped detail lives in `CHANGELOG.md`; the code is
+> authoritative over this page.
 
 ## Identity recap (PRD v1.1)
 
@@ -138,7 +144,7 @@ routing via `session_id`. Est: M–L.
 
 ---
 
-## Post-D3 — shipped on develop (synced 2026-10-16)
+## Post-D3 — shipped on develop (synced 2026-11-15)
 
 Everything below is merged; CHANGELOG entries carry the detail.
 
@@ -243,9 +249,25 @@ Everything below is merged; CHANGELOG entries carry the detail.
     import, `tole import-claude` (#381, import only).
 - **0.10.0 (released 2026-11-04; 0.10.1 the same day):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
   reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463). Shipped: skeleton (#459) and the MVP (#460: streaming transcript, editor, footer, inline approvals, Esc cancel), the model picker, thinking level and slash-command menu (#461), and steering, the follow-up queue, collapsible output, `@file` and markdown/diff styling (#462), and #463's `/export` `/copy`, `/fork` `/tree` and the color themes (`default` / `light` / `mono`, `NO_COLOR`, user-config color overrides). The keybinding config (`[tui.keys]`, user config only) is the last #463 part, so #463 is done.
-- **UI epic #523 (started 2026-11-10):** core seams first, then clients. #524 (serve face for graphical clients) ships in three PRs: the paginated transcript read `GET /sessions/{id}/entries` (done), `POST /sessions {"resume": "<id>"}` (done), and the SSE event stream `GET /sessions/{id}/events` with its own stream cap of 8 (done; #524 is complete). Then #525 (one session-host module, done as a module inside `tole-cli` rather than a new crate until a second consumer exists, sync API; part 1 moves tool registration out of `session_host.rs` (done), part 2 consolidates `TuiSession` with the server host as shared primitives, not a literal merge: session create + index registration (done), one turn runner (done), the register settings (done)), #526 (`tole-tui` split: UI-neutral input seam done, `TuiHost` collapsed to `footer`/`run_turn`/`apply` done, approval-as-state done; rendering split into a `render` module done), #527 GPUI desktop, #528 Flutter client, #529 web client. Images (#559, done): any chat/TUI-host turn can carry images (`/image` in `chat`, pending images on `TuiSession`), ACP accepts `image` content blocks and advertises `promptCapabilities.image`; no model-callable image tool by decision. Image input for graphical clients on the serve face (#558: upload, `images` on a prompt, recorded-image read, quotas) is done. The TUI's own paste and `/image` (#560, done): bracketed paste inserts a block as one edit, `/image` and a pasted image path/data URL attach to the next message; no OS clipboard images by decision. #463 (later TUI polish, in four parts; done): part 1 `/export [path]` (HTML/JSONL) and `/copy` (OSC 52, no native clipboard) is done; part 2 `/fork` and `/tree` (a UI over the #210 session forks; in-file branching stays open) is done; part 3 themes (`default` / `light` / `mono`, `NO_COLOR`, color overrides) is done; part 4 the keybinding config (`[tui.keys]` in the user config: ten rebindable convenience actions, the approval keys, Esc, Ctrl+C, Enter and typing are not rebindable, an invalid keymap falls back to the default with one note) is done. #463 is complete (#567 fork/tree, #568 export/copy, #569 themes, keybindings).
-- **Open backlog:** in-file session branching (#210 follow-up), MCP prompts/resources as quick commands (#213), background detach (#217; serve/MCP faces + job-completion nudge shipped, Ctrl-B/chat key waits for the TUI),
-  attaching to a *running* Claude Code process (#381 remainder); the multi-client daemon note ([#382](daemon-design.md)) is parked.
+- **0.11.0 (released 2026-11-14):** the security and automation release; every BREAKING entry has a migration step (`docs/migrating-0.11.md`).
+  - Secrets: `SecretSet` redaction at every sink, widened to more encodings (#595, #681, #682), live tool events redacted (#677), the redacted session log (#596), the shared secret-shape detector (#597), scoped release with no secrets for `run_command`, `job_start` and cron scripts by default (#598), more files count as sensitive (#683), non-dumpable processes (#675) and owner-only records refused under a session (#684).
+  - Plugins: the plugin lock and rug-pull guard for MCP servers, bound to source, binary and secrets, with refused servers never started (#599, #679, #680), and `tole plugin list|diff|approve|revoke`.
+  - Automation (epic #577): `tole cron` with time zones, parked and agent-created jobs, signed webhooks with `tole hook`, and outbound signed webhooks (#911, `[webhook_out]`, `tole webhook test`).
+  - Collaboration (epics #583, #589): profiles, delegation with budget carve and `tole audit`, the advisor, model routing, skills (approved-hash loading, `skill_propose`, the curator) and multi-round discussion with `tole discuss` and the `discuss` tools. `agent_start` and `agent_poll` are deprecated aliases of `delegate` and `delegate_poll`.
+  - Also: built-in `web_search` and `web_fetch` with the nginjen backend (#625), the Streamable HTTP MCP client (#530), the review gate before `git commit` (#534), `tole setup cora` (#535), the serve face for graphical clients (#524, #558), images on every turn (#559, #560) and the TUI polish of #463.
+- **0.12.0 (released 2026-11-20; everything since 0.11.0):**
+  - Epic #941 (one assembly for every face, still open for #949 only): steps 1 to 6 done (#942 to #948): server sessions get the default prompt, approved skills and routing (#945) and the owner's MCP client servers behind the plugin lock (#946), and the face-parity table and test are in (`docs/faces.md`).
+  - Gateway (epic #910): the `turn_finished` outbound webhook event (#962, opt-in) joins the signed delivery of #911; the first decision of an approval is the only one that acts (BREAKING, `POST /approvals/{id}/decision`).
+  - BREAKING: `verify` and `turnend` are sandboxed by default (#748), and the uteke home moves under `CODECORA_HOME`; each has an opt-out in `CHANGELOG.md` under `0.12.0`.
+  - Plugins, #600 slice 1 (parts 1 to 6, merged): `plugin list` and `diff` show source, tier, secrets and sandbox state and start nothing the lock would refuse; `revoke` is owner-only and a hand-edited lock cannot revive a revoke; the description scanner; the one-shot probe for unapproved servers; `tole plugin add` with trust tiers (`first-party`, `third-party-verified`, `third-party-unverified`); `tole doctor` warnings for unpinned launchers, unsandboxed third-party servers and broad grants.
+  - Plugins, #600 slice 2 (#811): bundle manifests (`tole-plugin.toml`, `tole plugin add --bundle`) and per-plugin secret grants approved one by one, withdrawn one by one (`tole plugin revoke --secret`), pinned to the manifest hash and recorded in the ledger.
+  - Sandbox (#601, #748): opt-in bubblewrap sandbox for third-party stdio MCP servers (`[sandbox]`), and for `run_command` and `job_start` (`[sandbox.consumers]`, #748 parts 1 and 2: the built-in `command` profile and rlimits; the mission `--verify` command and the `on_turnend` stop gates as `verify` and `turnend`), with named profiles and per-server bindings (#810: `[sandbox.profiles]`, `[sandbox.servers]`, `tole sandbox list|show|set`, user layer only). Linux only; `tole doctor` says so elsewhere. A CI job runs the real-bubblewrap tests on every pull request (#751). Design: `docs/sandbox-design.md`.
+  - Delegation approvals (#714, closed, six parts): the durable `approvals.jsonl` queue, a delegated child that parks at an approval and is denied on timeout, `tole delegation approvals`, `/approvals` decisions on `tole serve`, `delegate_pending` and `delegate_decide` for agent levels, and the guide `docs/approving-delegated-work.md`. Off by default (`[delegation] approvals = "off"`; `owner` and `chain` opt in).
+  - Discussion: configurable provider timeout (#786), one retry after a timeout (#756), a timed-out call is charged its reserved estimate (#804).
+  - Module restructuring (#752, closed, parts 0 to 20): see "Layering and published crates" below.
+  - Tests and CI: `TestDir` and `CARGO_TARGET_TMPDIR` stop the suites leaking temp directories (#781, parts 1 to 9 merged, the issue is still open), tests wait for conditions with the shared `wait_until` helper instead of fixed sleeps (#812, part 1; the CPU-limited nightly job is part 2), the `verify_package` mock server binds port 0 (#801), CI builds and tests develop after every merge (#762) and compiles Windows and macOS on every pull request (#729).
+- **UI epic #523 (started 2026-11-10):** core seams first, then clients. #524 (serve face for graphical clients) ships in three PRs: the paginated transcript read `GET /sessions/{id}/entries` (done), `POST /sessions {"resume": "<id>"}` (done), and the SSE event stream `GET /sessions/{id}/events` with its own stream cap of 8 (done; #524 is complete). Then #525 (one session-host module, done as a module inside `tole-cli` rather than a new crate until a second consumer exists, sync API; part 1 moves tool registration out of `session_host.rs` (done), part 2 consolidates `TuiSession` with the server host as shared primitives, not a literal merge: session create + index registration (done), one turn runner (done), the register settings (done)), #526 (`tole-tui` split: UI-neutral input seam done, `TuiHost` collapsed to `footer`/`run_turn`/`apply` done, approval-as-state done; rendering split into a `render` module done), #527 GPUI desktop, #528 Flutter client, #529 web client. Images (#559, done): any chat/TUI-host turn can carry images (`/image` in `chat`, pending images on `TuiSession`), ACP accepts `image` content blocks and advertises `promptCapabilities.image`; no model-callable image tool by decision. Image input for graphical clients on the serve face (#558: upload, `images` on a prompt, recorded-image read, quotas) is done. The TUI's own paste and `/image` (#560, done): bracketed paste inserts a block as one edit, `/image` and a pasted image path/data URL attach to the next message; no OS clipboard images by decision. #463 (later TUI polish, in four parts; done): part 1 `/export [path]` (HTML/JSONL) and `/copy` (OSC 52, no native clipboard) is done; part 2 `/fork` and `/tree` (a UI over the #210 session forks; in-file branching stays open) is done; part 3 themes (`default` / `light` / `mono`, `NO_COLOR`, color overrides) is done; part 4 the keybinding config (`[tui.keys]` in the user config: ten rebindable convenience actions, the approval keys, Esc, Ctrl+C, Enter and typing are not rebindable, an invalid keymap falls back to the default with one note) is done. #463 is complete (#567 fork/tree, #568 export/copy, #569 themes, keybindings). Status 2026-11-15: #524, #525 and #526 are closed. The epic #523 stays open for #527 (GPUI desktop), #528 (Flutter), #529 (web, low priority, framework undecided), #561 (the shared UI/UX plan) and the serve items a graphical client needs: #572 (list past sessions), #573 (model, effort and context in the status), #574 (list and set models) and #575 (rename and compact). The graphical clients are parked, see "Parked and owner decisions".
+- **Open backlog:** nothing from the 0.10 era is left: #210 (forks), #213 (MCP prompts and resources), #217 (detach) and #381 (Claude Code import) are closed. Ideas that never got an issue (in-file session branching, attaching to a *running* Claude Code process, the multi-client daemon of `docs/daemon-design.md`, #382 closed as a note) are not planned; each needs an issue with a user story first. The open work is in Track E and in "Parked and owner decisions".
 
 ## Track E — Agentic automation (approved 2026-11-11)
 
@@ -255,7 +277,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
 `docs/skills-registry-design.md`, `docs/secrets-integrations-design.md`,
 `docs/third-party-plugins-design.md`. 1 issue = 1 branch = 1 PR.
 
-- **E1 — Automation, epic #577:** ledger core (#578), `tole cron` (#579),
+- **E1 — Automation, epic #577 (closed; #578 to #582 all done):** ledger core (#578), `tole cron` (#579),
   time zones (#580), unattended approvals (#581), webhooks on `tole serve`
   (#582). The scheduler lives inside tole. Status: the ledger core is in
   `tole-core` (`cron`, `ledger`: cron/`@every` parser, append-only
@@ -316,10 +338,14 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     `discuss`, `discuss_status` and `discuss_stop` under the rules of
     `delegate` (the owner chose both entry points, see `automation-design.md`
     "Entry point"); independent child participants for agents (#704) are in
-    as read-only reviewers whose Write is denied; routing a participant's
-    Write to the owner's approval surface is #714);
+    as read-only reviewers that stay read-only; the owner's approval surface
+    for delegated children is #714, built in six parts behind
+    `[delegation] approvals` (default `off`), see
+    `delegation-approvals-design.md` and `approving-delegated-work.md`);
+    #714 is done and closed, so every phase of the epic is done; the epic
+    issue #583 is still open with its #714 box unchecked and needs closing;
   - `uteke_document` parent (#576; done).
-- **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
+- **E3 — Skills, epic #589 (closed; #590 to #593 all done):** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with
   meaning dedup (#592), curator on by default (#593). Status: #590's seam,
   adapters, selection, `skill_search` and `tole skills` are in, opt-in by
@@ -338,14 +364,14 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   schedule` (a weekly script job) and a doctor line; part 3b records run
   outcomes (success or failure of `run` and `mission`, per loaded skill and
   as the skill-less baseline). LLM-judged merge proposals and chat, serve
-  and cron outcomes are later work.
+  and cron outcomes are not planned (no open issue).
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`
     done, widened in #681 and #682; live tool events in #677; export,
     handoff, digests and skill drafts reuse it as they land);
   - redacted session log (#596; done);
-  - shared ruleset with uteke (#597; open);
+  - shared ruleset with uteke (#597; done: `uteke-privacy` 0.24.1 wired into `SecretSet::redact` after the known-value pass, same sinks, `[REDACTED:<kind>]`, `redaction_allowlist` for false positives; the uteke-side issue codecoradev/uteke#1732 is closed);
   - scoped release, with no secrets for `run_command` (#598, breaking; done,
     with sensitive files and `read_file_raw`, #676 for verify and stop gates,
     #683 for the wider file list);
@@ -354,14 +380,85 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     unstarted refused servers of #680);
   - owner-only records and the tole binary refused under a session (#684;
     done) and the non-dumpable process guard (#675; done);
-  - `tole plugin add`, the description scanner, grants and trust tiers (#600; open: only `list|diff|approve|revoke` shipped, under #599);
-  - external sandbox wrapper and lazy start (#601; open).
+  - `tole plugin` commands, scanner, trust tiers and grants (#600; open). Slice 1
+    is done (list and diff, owner-only revoke, the description scanner, the
+    one-shot probe, `tole plugin add`, trust tiers, doctor warnings). Slice 2
+    (#811, bundle manifests and per-plugin secret grants) is done. Slice 3a
+    is done: the skills pin (stated source, append-only skill ledger, refusal of
+    a drifted or ledger-revoked skill) and, in #879, the ledger checkpoint in the approvals
+    file with `tole skills adopt|recheckpoint`; `tole plugin audit` (slice 3b) is done too. MCP
+    Registry namespace verification is skipped (owner decision); fetching skills
+    from the uteke registry is a later slice with no issue yet;
+  - external sandbox wrapper and lazy start (#601; open; design and owner
+    decisions in `docs/sandbox-design.md`; first slice done: opt-in
+    bubblewrap sandbox for third-party stdio MCP servers on Linux, with a
+    doctor line; opt-in `[sandbox.consumers]` for `run_command` and
+    `job_start` with rlimits, #748 first slice done; `verify` and `turnend`,
+    second slice done; cron scripts and `command:` deliveries, third slice
+    done; the default flip of `verify` and `turnend` to `optional`, owner
+    decision 2026-11-16, is on `develop` for the next minor, `docs/sandbox-design.md`
+    §9.4). Open: the `git` tool hardening
+    (#873); the #748 cgroup limits are evaluated and deferred (`docs/sandbox-design.md`
+    §12.1), and #750 for the operability
+    pieces: the doctor listing of sensitive grants and startup logging (#809),
+    per-server and named profiles with the CLI (#810, done), the profile
+    name and hash in the plugin lock entry with re-approval on change (#750,
+    done), the profile hash in the startup line, the `sandbox_fallback`
+    ledger line of an `optional` fallback, `TOLE_VERBOSE=1` launch logging and
+    the wider credential list of the doctor listing (#750, done), and lazy start
+    with tool retrieval by meaning (no slice issue yet));
 
-Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
-E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.
+Order that was followed: E4 #595 first (other epics reuse it), then E1,
+E2 and E3. Remaining order: #809 and #810 (under #750),
+and the rest of #748 (#597 is done).
 Cross-repo in uteke OSS: document similarity (codecoradev/uteke#1730), personal
 skill library (codecoradev/uteke#1731), shared secret-detector crate
-(codecoradev/uteke#1732).
+(codecoradev/uteke#1732, closed).
+
+## Open work by area (2026-11-15)
+
+| Area | Open issues |
+|------|-------------|
+| Secrets and plugins (epic #594) | #600 plugin commands (slice 2: #811, slice 3a skills pin and 3b audit: done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
+| Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
+| Collaboration (epic #583) | none; the epic issue only needs closing |
+| Serve for graphical clients | none open: #572, #573, #574 and #575 are done (#571 moved to the gateway track) |
+| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, done: merged in 0.12.0, the owner confirmed D1-D10 as the defaults on 2026-11-19), G1 to G5 in the epic |
+| UI stack (epic #523) | #527, #528, #529, #561 (parked) |
+| Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
+| Docs and process | #807 (local Cora review), #808 (this page) |
+| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 done (default prompt, approved skills and model routing for server sessions; #971 routes a new session's model once, at its first prompt); #946 done (the owner's MCP client servers on `serve` and `acp` behind the plugin lock, so the review guidance is active when the cora review tools are configured); the epic stays open for step 7 only: #949 (desktop over the same serve API) has a design note, [docs/desktop-design.md](desktop-design.md), whose decisions D1 to D11 are open for the owner and no code follows until the owner un-parks the UI stack |
+
+## Layering and published crates
+
+Published crates (`publish.yml` publishes them in this order, all at the workspace version, 0.12.0 today): `tole-core`, then `tole-tui`, then `tole-cli`. `tole-core` is the platform-agnostic library (embedders build it with `--no-default-features`); `tole-tui` is the inline terminal UI over `tole-core`; `tole-cli` is the `tole` binary and depends on both (`tui` is a default feature). The owner decision of 2026-11-14 (#752) is that the set does not change: no new crates, and `publish.yml`, `release.yml` and the crates.io names stay as they are. Real crate splits stay a future option if compile time or embedder size asks for it.
+
+Layering rules (#752, closed; details in `docs/architecture.md`):
+
+- Each of `tole-core` and `tole-cli` groups its top-level modules into three levels: kernel (session model, storage, secrets, provider seam, ledger, approval, turn loop in the core; config and trust, profiles, routing and hooks in the CLI), engines (delegation, discussion, router, advisor, skills, web, MCP client, children and the shell and vcs tools in the core; delegation, discuss, skill, cron, plugin and the session host in the CLI) and faces (`mcp_server`, `update_check`; the diagnostics and hook commands, and the binary-only `acp`, `mcp_http`, `mission`, `serve`, `setup` and `upgrade`).
+- An import may point down or sideways, never up. `crates/tole-core/tests/layering.rs` and `crates/tole-cli/tests/layering.rs` scan `crate::<module>` paths and fail on a lower level importing a higher one (`cargo test -p tole-core --test layering`, `cargo test -p tole-cli --test layering`).
+- Known violations sit in a `BASELINE` list with a reason, and the list only shrinks: `tole-core` has four entries, `tole-cli` none. New violations are not allowed; fix the dependency instead of extending the baseline.
+- A new top-level module must be added to one of the level lists. A moved module stays reachable at its old path through a `pub use` alias, so public paths do not change.
+- Moves are pure (`git mv` plus `pub use`), one subsystem per pull request, and never touch a file an open PR is changing.
+
+## Parked and owner decisions
+
+Parked means: an issue exists and is open, and nobody works on it until the owner decides.
+
+| Item | Why it is parked |
+|------|------------------|
+| #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
+| #742 serve auth providers: OIDC (and scopes) | Basic is done (owner decisions of 2026-11-17: Basic first, single user with many devices, no session bound to an identity, TLS at a reverse proxy; `tole serve --auth basic`, `tole serve-hash`, `docs/mobile-control.md`). OIDC and the read-only / full scopes remain, parked until the owner picks the next slice |
+| #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the owner (the core seams #524 to #526 and #558 to #560 and the serve items #572 to #575 are done; #571 moved to the gateway track, epic #910). #529 is low priority and its framework (Svelte or React) is undecided |
+| #382 multi-client daemon | Closed as a design note (`docs/daemon-design.md`); no build without a user story |
+
+Owner decisions still open:
+
+- #813: decided 2026-11-15: `[delegation] approvals` stays `off` with a `tole doctor` hint when delegation is in use and the key is unset; `tole discuss start|resume` refuse under a session; an unreadable plugin ledger blocks `plugin add` and `plugin approve`; the user-config floor of the discussion timeout is 10 s (the env hook still goes down to 1 s).
+- #748: decided 2026-11-16 and 2026-11-17: `verify` and `turnend` are sandboxed by default as `optional` in the next minor (never `required` by default: a sandboxed verify cannot see `~/.cargo`); the implicit default runs unsandboxed with a loud, ledgered warning only on a host with no sandbox backend, an explicit `optional` or `required` never does. Landed on `develop`; the release is the owner's. Whether a later release moves the default to `required` where a backend exists is not decided.
+- #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
+- #705: Cora Review failing or running 12 minutes and more on larger PRs: cora-code 0.21 chunks the diff and adds `review.exclude` (cora-code#720); the exclude is configured in `.cora.yaml` (closed with that change).
+- #741 (the open question in the table above) and #742 (Basic built, decided 2026-11-17: Basic first, single user with many devices, sessions not bound to an identity, TLS stays at a reverse proxy; OIDC and scopes remain). #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); `tole sessions` shows each session's profile and `tole doctor` lists the serve profiles by name, so #740 is fully done.
 
 ---
 

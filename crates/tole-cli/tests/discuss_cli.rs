@@ -2,20 +2,18 @@
 //! starts a discussion from typed arguments against a mock provider, shows
 //! the cost, lists and shows it, and refuses what the owner may not ask.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 const SECRET: &str = "discuss-cli-secret-0123456789";
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-discuss-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-discuss-cli-{tag}"))
 }
 
 /// A provider that answers participants with text and meets the checker's
@@ -81,11 +79,9 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn run(home: &PathBuf, base: Option<&str>, args: &[&str]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+fn run(home: &std::path::Path, base: Option<&str>, args: &[&str]) -> Output {
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("DISCUSS_CLI_TOKEN", SECRET)
         .env_remove("TOLE_BASE_URL")
@@ -108,7 +104,7 @@ fn out(o: &Output) -> String {
     )
 }
 
-fn home_with_profiles(tag: &str) -> PathBuf {
+fn home_with_profiles(tag: &str) -> TestDir {
     let home = tmp(tag);
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(

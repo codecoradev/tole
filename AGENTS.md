@@ -11,6 +11,9 @@ continuity, infra facts.
 - `crates/tole-core` — platform-agnostic library (state machine, JSONL
   storage, `Tool`/`Approver`/`Storage`/`Provider` traits, tools, provider).
   Published to crates.io; embedders build `--no-default-features`.
+- `crates/tole-tui` — inline terminal UI over `tole-core` (presentation and
+  event loop). Published to crates.io; `tole-cli` depends on it (default
+  `tui` feature).
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
   `./target/release/tole`, never a PATH-resolved one.
@@ -18,6 +21,8 @@ continuity, infra facts.
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
   missions, Tier 3 baselines).
+- `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
+  branch before a PR).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
   ignores.
@@ -63,6 +68,14 @@ continuity, infra facts.
   evidence), CI auto-fix max 3 attempts then escalate. The Cora Review job
   has a 30-min limit; large change-sets (~40+ files or ~850+ lines) can still
   time out — split into ~15–20-file PRs.
+  **Exception (#914):** a PR whose every file is excluded by `review.exclude`
+  in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
+  job then skips the review, ends green and writes "Nothing to review" in its
+  summary, and there is no Cora comment. For such a PR the evidence is green CI
+  plus an independent read-only review of the text, named in the PR **Testing**
+  section. The skip is decided by `scripts/cora-all-excluded.sh` as it is on the
+  base branch and fails closed: any file Cora would review, any lockfile, or any doubt runs
+  the review as before.
 
 ## 3. Mandatory pre-commit checks
 
@@ -75,6 +88,21 @@ cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 
 
 CI enforces the same set. There is no pre-commit hook installed by default —
 run these yourself.
+
+**Before opening a PR** (agents: mandatory) run Cora on your whole branch, not
+just the staged diff, and fix real findings first:
+
+```bash
+scripts/review-local.sh        # git diff origin/develop...HEAD, split by crate/dir, findings only
+```
+
+The script splits a large diff into chunks of at most 600 changed lines
+(`--max-lines`), so each Cora call stays small; exit 0 means no findings, 2
+means findings, 1 means Cora errored or ran without an LLM (not a pass). State
+the result in the PR **Testing** section (for example "scripts/review-local.sh:
+no findings" or the findings and how each was handled). Without an LLM key, use
+`cora mcp` (`review_prepare` / `review_finalize`) so you are the reviewer. This
+only moves feedback earlier: the CI Cora Review job stays the merge gate.
 
 ## 4. Tooling — cora & team memory first
 
@@ -92,8 +120,17 @@ of reinventing or brute-forcing:
 - `cora query "main -> *"` / `cora trace <sym>` / `cora arch` — structure
   and path questions without reading whole files.
 - `cora dead-code` — after removals; `cora debt` — trend checks.
-- `cora review --staged` before every commit (mandatory, see §3);
-  `cora scan` after significant or security-adjacent changes.
+- `cora review --staged` before every commit and `scripts/review-local.sh`
+  before every PR (mandatory, see §3); `cora scan` after significant or
+  security-adjacent changes.
+- Run the code-intelligence commands (`cora callers` / `cora impact` /
+  `cora affected`) before: moving, renaming or removing a public item
+  (anything `pub` in a published crate); changing a ledger, session, lock or
+  config file format; touching the sandbox, approval, allowlist or secret
+  redaction paths. Put what they showed (callers, tests to rerun) in the PR
+  description. On Rust these commands are noisy (calls resolve by bare name,
+  macro bodies are not parsed; #669): treat the output as a pointer and verify
+  every caller and test with grep before acting on it.
 
 **Team knowledge rooms (semantic memory) — continuity across sessions:**
 
@@ -136,6 +173,12 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   layers (registry / `AllowlistApprover` / host prompt).
 - MCP tools are always `Risk::Write`. Server-supplied metadata is never
   trusted for risk classification.
+- One capability, every face: a new capability goes into the shared assembly
+  (`session::assemble`, `tool_roster`, `turn_runner`), not into one face's
+  code. Ask in review: "does this exist on one face only?" If it must, it is
+  a row in [docs/faces.md](docs/faces.md) with its reason, and
+  `cargo test -p tole-cli --test face_parity` passes (it fails on a
+  difference with no row).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
 
@@ -163,6 +206,17 @@ that makes them stale. This regression has happened twice (#33 and again
   release ranges (v0.9.0: 87 files, ~14.7k lines). The release PR was
   reviewed instead with `cora mcp` `review_prepare` / `review_finalize`
   (agent as reviewer) over ~4k-line chunks, with the verdict posted on the PR.
+- **2026-11-17:** cora-code **0.21.1** is released. The CI action
+  (`codecoradev/cora-review-action@v1`, `cora-version: latest`) therefore
+  runs it: it chunks a large diff (`review.max_chunk_chars`, default 48,000
+  characters), retries an unanswered review in smaller pieces, honours
+  `review.exclude` (set in `.cora.yaml`, #705) and exits 1 on an incomplete
+  review (`review.fail_on_incomplete`). A cora binary can be installed in a
+  container without a build: `CORA_VERSION=v0.21.1 CORA_INSTALL_DIR=<dir> sh
+  install.sh` from the cora-code repository (the `/releases/latest` lookup
+  gets a 403 through the container proxy, so pin the version; checksum-only
+  without cosign). Without an LLM key `cora review --staged --no-llm` runs the
+  deterministic checks only; the agent-as-reviewer path is `cora mcp`.
 - **2026-09-18:** cora 0.13.0 no longer reads the legacy `~/.cora/auth.toml`
   / `~/.cora/config.yaml`. Until re-provisioned with `cora auth login`,
   exports are required: `CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`

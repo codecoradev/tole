@@ -7,12 +7,14 @@
 //!   block is spilled and recorded, an image-only prompt runs, other non-text
 //!   blocks stay ignored, and an empty or bad prompt is refused.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 #[cfg(feature = "shell-tools")]
 use std::io::BufRead;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(feature = "shell-tools")]
 use std::sync::mpsc;
@@ -115,28 +117,17 @@ fn spawn_mock() -> (String, Bodies) {
     (format!("http://{addr}/v1"), bodies)
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-img-turn-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-img-turn-{tag}"))
 }
 
 fn base_cmd(url: &str, home: &Path, cwd: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     cmd.current_dir(cwd)
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("PATH", "/usr/bin:/bin")
         .env_remove("TOLE_VISION")
         .env_remove("TOLE_MODELS")
         .env_remove("TOLE_FALLBACK_BASE_URL")
@@ -386,7 +377,7 @@ fn acp_image_blocks_are_spilled_recorded_and_image_only_prompts_run() {
     assert_eq!(users[0]["text"], "");
     let img = &users[0]["images"][0];
     assert_eq!(img["mime"], "image/png", "sniffed, not the declared jpeg");
-    let spilled = PathBuf::from(img["path"].as_str().unwrap());
+    let spilled = std::path::PathBuf::from(img["path"].as_str().unwrap());
     assert!(spilled.starts_with(home.join("tole/images")), "{spilled:?}");
     assert_eq!(std::fs::read(&spilled).unwrap(), PNG);
     assert_eq!(users[1]["text"], "and now?");

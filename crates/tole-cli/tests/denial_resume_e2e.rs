@@ -2,10 +2,12 @@
 //! `--on-pretool` exit 2) `resume <id> "<prompt>"` runs a new turn whose
 //! request carries the denial, instead of being refused with rc 1.
 
+mod common;
+use common::WorkDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -90,18 +92,16 @@ fn spawn_mock(reqs: Arc<Mutex<Vec<Value>>>) -> String {
 }
 
 fn run(cwd: &Path, url: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    // Home outside the workspace: a jail that holds the data dir has no file
+    // writers (#684).
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &cwd.with_extension("home"), &[])
         .args(args)
         .current_dir(cwd)
-        // Outside the workspace: a jail that holds the data dir has no file
-        // writers (#684).
-        .env("CODECORA_HOME", cwd.with_extension("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_NO_SESSION_INDEX", "1")
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .output()
         .unwrap()
@@ -111,11 +111,8 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).to_string()
 }
 
-fn workdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-denial-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn workdir(tag: &str) -> WorkDir {
+    WorkDir::new(&format!("tole-denial-e2e-{tag}"))
 }
 
 fn session_id(cwd: &Path) -> String {
@@ -138,7 +135,7 @@ fn session_id(cwd: &Path) -> String {
 fn denied_first_run(
     tag: &str,
     first_args: &dyn Fn(&Path) -> Vec<String>,
-) -> (Arc<Mutex<Vec<Value>>>, String, PathBuf) {
+) -> (Arc<Mutex<Vec<Value>>>, String, WorkDir) {
     for attempt in 1..=3 {
         let reqs = Arc::new(Mutex::new(Vec::new()));
         let url = spawn_mock(reqs.clone());

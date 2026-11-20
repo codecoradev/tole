@@ -55,6 +55,50 @@ fn new_job_id() -> String {
     format!("j-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
+/// Direct children of `parent`, from `/proc` (Linux; empty elsewhere).
+fn children_of(parent: u32) -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            // `pid (comm) state ppid ...`: comm may hold spaces and parens,
+            // so split after the LAST `)`.
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    let rest = s.rsplit_once(')')?.1.to_owned();
+                    rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                == Some(parent)
+        })
+        .collect()
+}
+
+/// Stops a job that was just spawned detached (its own process group) and
+/// reaps it, with what it started: the group, and on Linux the direct
+/// children of the first process too. A sandboxed job (`bwrap`, #748) has a
+/// first process that is only the launcher: its child is the sandbox's init,
+/// in a session of its own, and the death of the init takes every process of
+/// the PID namespace with it, while killing the launcher alone would leave
+/// them all running (a job's sandbox does not die with its parent).
+pub fn kill_detached(mut child: std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        for c in children_of(pid) {
+            // SAFETY: kill takes two integers.
+            unsafe { libc::kill(c as libc::pid_t, libc::SIGKILL) };
+        }
+        // SAFETY: killpg takes two integers; the child's pid is its group id
+        // because the job was spawned with `process_group(0)`.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Read-only introspection of a detached job: running? log tail?
 pub struct JobPollTool {
     root: PathBuf,
@@ -226,8 +270,13 @@ impl Tool for JobStartTool {
     }
 
     fn summary(&self) -> String {
-        "Start a long-running command as a background job; returns a job id to poll with job_poll."
-            .into()
+        let mut s = String::from(
+            "Start a long-running command as a background job; returns a job id to poll with job_poll.",
+        );
+        if crate::sandbox::command::consumers().job_start != crate::sandbox::Mode::Off {
+            s.push_str(crate::run_command::GIT_NOTE);
+        }
+        s
     }
 
     fn describe(&self, input: &Value) -> String {
@@ -279,6 +328,18 @@ impl Tool for JobStartTool {
         // session marker.
         crate::session_guard::check_session_argv(&argv, &self.root)?;
 
+        // The plain command, or `bwrap ... -- command` when the owner opted
+        // in (`[sandbox.consumers] job_start`, #748). Decided before anything
+        // is created, so a refusal leaves no job directory behind. A job
+        // outlives the call by design: its sandbox does not die with tole.
+        let mut cmd = crate::sandbox::command::command_for(
+            crate::sandbox::command::Consumer::JobStart,
+            &self.root,
+            program,
+            &argv[1..],
+        )
+        .map_err(|e| format!("job_start: {e}"))?;
+
         let id = new_job_id();
         let dir = jobs_root(&self.root).join(&id);
         std::fs::create_dir_all(&dir)
@@ -303,12 +364,10 @@ impl Tool for JobStartTool {
             .try_clone()
             .map_err(|e| format!("job_start: log: {e}"))?;
 
-        let mut cmd = Command::new(program);
         // Secret env never reaches children (threat-model ENV-1).
         crate::subprocess::scrub_env_for(&mut cmd, "job_start");
         crate::session_guard::mark(&mut cmd);
-        cmd.args(&argv[1..])
-            .current_dir(&self.root)
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
             .stderr(Stdio::from(log_err));
@@ -328,9 +387,7 @@ impl Tool for JobStartTool {
             // Without the pid file the job is untrackable — a spawn that
             // reports failure must not leave a live orphan behind
             // (CodeCora scan 2026-09-18).
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_detached(child);
             return Err(format!("job_start: pid file: {e}"));
         }
         if let Some(q) = self.notify.clone() {
@@ -360,11 +417,9 @@ impl Tool for JobStartTool {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-jobs-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmpdir(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-jobs-{name}"))
     }
 
     #[test]
@@ -378,7 +433,7 @@ mod tests {
         let blob = "x".repeat(10 * 1024 * 1024 + 4096);
         std::fs::write(job_dir.join("log"), blob).unwrap();
 
-        let poll = JobPollTool::new(dir.clone());
+        let poll = JobPollTool::new(dir.to_path_buf());
         let out = poll.execute(json!({ "job": "j-logcap-test" })).unwrap();
         assert_eq!(out["running"], json!(true));
         // job_poll is Risk::ReadOnly: the bounded tail read must NOT
@@ -398,20 +453,21 @@ mod tests {
     #[test]
     fn start_then_poll_completes_with_log() {
         let dir = tmpdir("cycle");
-        let start = JobStartTool::new(dir.clone());
+        let start = JobStartTool::new(dir.to_path_buf());
         let out = start
             .execute(json!({ "command": "sh -c 'echo job-done; sleep 0.4'" }))
             .unwrap();
         let job = out["job"].as_str().unwrap().to_string();
         assert!(out["pid"].is_u64(), "spawn must return the pid");
         // Poll immediately: whatever the state, the shape must hold.
-        let poll = JobPollTool::new(dir.clone());
+        let poll = JobPollTool::new(dir.to_path_buf());
         let first = poll.execute(json!({ "job": job })).unwrap();
         assert_eq!(first["job"], json!(job));
-        // Give the job time to finish, then: not running, log captured.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        let second = poll.execute(json!({ "job": job })).unwrap();
-        assert_eq!(second["running"], json!(false));
+        // Wait for the job to finish, then: not running, log captured.
+        let second = crate::test_dir::wait_for(crate::test_dir::WAIT, "the job to finish", || {
+            let r = poll.execute(json!({ "job": job })).unwrap();
+            (r["running"] == json!(false)).then_some(r)
+        });
         assert!(second["log_tail"].as_str().unwrap().contains("job-done"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -419,7 +475,7 @@ mod tests {
     #[test]
     fn start_rejects_unspawnable_program() {
         let dir = tmpdir("badprog");
-        let start = JobStartTool::new(dir);
+        let start = JobStartTool::new(dir.to_path_buf());
         let err = start
             .execute(json!({ "command": "definitely-not-a-program-xyz --flag" }))
             .unwrap_err();
@@ -429,7 +485,7 @@ mod tests {
     #[test]
     fn poll_rejects_unknown_job() {
         let dir = tmpdir("unknown");
-        let poll = JobPollTool::new(dir);
+        let poll = JobPollTool::new(dir.to_path_buf());
         let err = poll.execute(json!({ "job": "j-nope" })).unwrap_err();
         assert!(err.contains("unknown job"));
     }
@@ -437,7 +493,7 @@ mod tests {
     #[test]
     fn poll_rejects_path_tricks() {
         let dir = tmpdir("tricks");
-        let poll = JobPollTool::new(dir);
+        let poll = JobPollTool::new(dir.to_path_buf());
         assert!(poll.execute(json!({ "job": "../escape" })).is_err());
         assert!(poll.execute(json!({ "job": "j/BAD" })).is_err());
         assert!(poll.execute(json!({ "job": "" })).is_err());
@@ -446,32 +502,31 @@ mod tests {
     #[test]
     fn start_rejects_empty_command() {
         let dir = tmpdir("empty");
-        let start = JobStartTool::new(dir);
+        let start = JobStartTool::new(dir.to_path_buf());
         assert!(start.execute(json!({ "command": "   " })).is_err());
     }
 
     #[test]
     fn start_is_write_and_poll_is_read_only() {
         let dir = tmpdir("risk");
-        assert_eq!(JobStartTool::new(dir.clone()).risk(), Risk::Write);
-        assert_eq!(JobPollTool::new(dir).risk(), Risk::ReadOnly);
+        assert_eq!(JobStartTool::new(dir.to_path_buf()).risk(), Risk::Write);
+        assert_eq!(JobPollTool::new(dir.to_path_buf()).risk(), Risk::ReadOnly);
     }
 
     #[test]
     fn completion_notice_is_queued_when_the_job_exits() {
         let dir = tmpdir("notice");
         let q = crate::interrupt::InterruptQueue::default();
-        let start = JobStartTool::new(dir.clone()).with_completion_notice(q.clone());
+        let start = JobStartTool::new(dir.to_path_buf()).with_completion_notice(q.clone());
         let out = start
             .execute(json!({ "command": "sh -c 'sleep 0.3'" }))
             .unwrap();
         let job = out["job"].as_str().unwrap().to_string();
         // Nothing yet: the job is still running.
         assert!(q.is_empty());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while q.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        crate::test_dir::wait_until(crate::test_dir::WAIT, "the completion notice", || {
+            !q.is_empty()
+        });
         let got = q.drain();
         assert_eq!(got.len(), 1, "exactly one notice per job");
         assert_eq!(got[0].source, crate::interrupt::Source::Notice);
@@ -485,7 +540,7 @@ mod tests {
     #[test]
     fn job_start_refuses_tole_and_marks_jobs() {
         let dir = tmpdir("owner-684");
-        let start = JobStartTool::new(dir.clone());
+        let start = JobStartTool::new(dir.to_path_buf());
         for line in ["tole cron resume job-1", "nohup tole config trust --yes"] {
             let err = start
                 .execute(json!({ "command": line }))
@@ -498,14 +553,9 @@ mod tests {
             .unwrap();
         let id = r["job"].as_str().unwrap().to_string();
         let log = dir.join(JOBS_DIR).join(&id).join("log");
-        let mut text = String::new();
-        for _ in 0..50 {
-            text = std::fs::read_to_string(&log).unwrap_or_default();
-            if !text.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        let text = crate::test_dir::wait_for(crate::test_dir::WAIT, "the job's log", || {
+            std::fs::read_to_string(&log).ok().filter(|t| !t.is_empty())
+        });
         assert!(text.lines().any(|l| l == "TOLE_UNDER_SESSION=1"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }

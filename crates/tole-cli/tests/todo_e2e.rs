@@ -2,10 +2,12 @@
 //! run` writes a task list, a SECOND process (`tole resume`) reads it
 //! back — hydration from the replayed transcript is the whole point.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Content-driven mock: TODO_MISSION → todo_write; READ_MISSION →
 /// todo_read; the step after a tool result → final quoting the result.
@@ -136,8 +138,8 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+fn run_tole(home: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -161,15 +163,8 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
 #[test]
 fn todo_list_survives_process_boundary_via_resume() {
     let base = spawn_mock();
-    let dir = std::env::temp_dir().join(format!(
-        "tole-todo-e2e-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-todo-e2e");
+    let home = dir.join("home");
     let env = [
         ("TOLE_BASE_URL".to_string(), base.clone()),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
@@ -182,6 +177,7 @@ fn todo_list_survives_process_boundary_via_resume() {
     // Turn 1: write the list (auto-approved via --trust internal, which
     // covers todo_write — the documented preset contract).
     let (out1, err1, code1) = run_tole(
+        &home,
         &env_ref,
         &[
             "run",
@@ -201,6 +197,7 @@ fn todo_list_survives_process_boundary_via_resume() {
 
     // Turn 2 in a FRESH process: todo_read must return the hydrated list.
     let (out2, err2, code2) = run_tole(
+        &home,
         &env_ref,
         &[
             "resume",

@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{run_turn_with_images, TurnOutcome};
+use tole_core::turn::TurnOutcome;
 
 /// The completion marker the mission system prompt pins: a final
 /// message containing this line declares the goal fully achieved.
@@ -79,6 +79,9 @@ impl BudgetTier {
 
 /// Resolved mission parameters.
 pub struct MissionConfig {
+    /// The session's cancel token: the turns and a parked delegated approver
+    /// (#714) watch the same one.
+    pub cancel: tole_core::cancel::CancelToken,
     /// The goal, verbatim from the operator.
     pub goal: String,
     /// Total provider steps across all chained turns.
@@ -92,6 +95,10 @@ pub struct MissionConfig {
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
     pub resume_id: Option<String>,
+    /// The id of a FRESH mission session, when the caller must know it
+    /// before the loop runs (`tole serve` answers with it up front). `None`
+    /// mints one, as the CLI does. Ignored with `resume_id`.
+    pub fresh_id: Option<String>,
     /// Per-run timeout of the `--verify` command (seconds). Default 300
     /// — `cargo test`-class suites are the advertised use.
     pub verify_timeout_secs: u64,
@@ -201,20 +208,38 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
     )
 }
 
-/// Run the `--verify` command (sh -c, operator-budgeted timeout).
-/// Returns Ok(()) on exit-0, Err(output tail) otherwise.
+/// Run the `--verify` command (sh -c, operator-budgeted timeout) and say what
+/// it came to: passed (exit 0), failed (output tail for the model) or refused.
 ///
 /// The command is the owner's, but what it runs is usually code the agent
 /// just wrote (`cargo test` runs build scripts and tests), with no
 /// approval: it gets the ENV-1 scrub as its own consumer, which receives no
 /// secret unless a `[secrets]` entry grants one to `verify` (#676).
-fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
-    let mut c = std::process::Command::new("sh");
-    c.arg("-c").arg(cmd);
+///
+/// With `[sandbox.consumers] verify` on (#748) the same `sh -c` runs in the
+/// `command` profile instead. A mission is an unattended run, so `optional`
+/// counts as `required`, and a sandbox that is required but missing is a
+/// [`Verify::Refused`], never a pass. So is a sandbox that is there but fails
+/// to start the command (the launcher failing is not the command failing, and
+/// the model must not be told to fix it): a spawn error of the launcher, or a
+/// non-zero exit for which `bwrap` reported no exit code of the command.
+fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
+    use tole_core::sandbox::command::{command_in_cwd, Consumer, Launched};
+    let Launched { cmd: mut c, report } =
+        match command_in_cwd(Consumer::Verify, "sh", &["-c".to_string(), cmd.into()]) {
+            Ok(l) => l,
+            Err(why) => return Verify::Refused(why),
+        };
     tole_core::subprocess::scrub_env_for(&mut c, tole_core::secret_release::VERIFY);
-    let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
+    let out = match run_with_timeout(&mut c, timeout) {
+        Ok(o) => o,
+        Err(e) if report.is_some() && e.starts_with(tole_core::subprocess::SPAWN_FAILED) => {
+            return Verify::Refused(format!("verify: not run, the sandbox did not start ({e})"))
+        }
+        Err(e) => return Verify::Failed(verify_run_error(&e, timeout)),
+    };
     if out.status.success() {
-        return Ok(());
+        return Verify::Passed;
     }
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -223,11 +248,34 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
         let start = chars.len().saturating_sub(800);
         chars[start..].iter().collect()
     };
-    Err(format!(
+    if let (Some(report), Some(code)) = (report, out.status.code()) {
+        if report.command_exit_code() != Some(code) {
+            return Verify::Refused(format!(
+                "verify: not run, the sandbox failed before or while starting the command \
+                 (bwrap exit {code}): {}",
+                tail.trim()
+            ));
+        }
+    }
+    Verify::Failed(format!(
         "verify FAILED (exit {}):\n{}",
         out.status.code().unwrap_or(-1),
         tail
     ))
+}
+
+/// What running the `--verify` command came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Verify {
+    /// Exit 0.
+    Passed,
+    /// Ran and failed, or did not complete: the output tail goes back to the
+    /// model, which can fix its cause.
+    Failed(String),
+    /// Not run: the sandbox the owner requires is not available (#748). The
+    /// model cannot fix that, so it is not retried and never counts as a
+    /// pass: the mission ends `verify_refused`.
+    Refused(String),
 }
 
 /// Snapshot the durable usage ledger (provider steps so far).
@@ -248,11 +296,58 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
 /// operator's flags — Destructive stays structurally un-allowable.
 pub fn run_mission(
     cfg: MissionConfig,
-    mut registry: ToolRegistry,
+    registry: ToolRegistry,
     sessions_dir: &std::path::Path,
     // Model routing (#586) of a fresh mission, before its provider exists.
     route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
 ) -> Result<()> {
+    let done = run_mission_outcome(cfg, registry, sessions_dir, route)?;
+    println!("mission: {}", done.session_id);
+    println!("status: {}", done.status);
+    println!(
+        "turns: {}  steps: {}  verify failures: {}  wall: {}s",
+        done.turns, done.steps, done.verify_failures, done.wall_secs
+    );
+    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
+    // that did NOT complete successfully must exit NONZERO so scripts
+    // and the agent loop can branch on it. `complete` (and only a
+    // verified completion) exits 0. (CI cora round on #253: the first
+    // cut compared against a nonexistent "done" — every mission,
+    // including successful ones, exited nonzero. Caught by the
+    // mission_e2e suite.)
+    if done.status != "complete" {
+        anyhow::bail!("mission ended with status: {}", done.status);
+    }
+    Ok(())
+}
+
+/// How a mission ended: what [`run_mission_outcome`] hands back instead of
+/// printing and exiting, so a face other than the CLI (`tole serve`) can
+/// report it. `summary` is the `fact/mission` register that was written.
+#[derive(Debug, Clone)]
+// `tokens` and `summary` are read by `tole serve`, which needs `shell-tools`.
+#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))]
+pub struct MissionOutcome {
+    pub session_id: String,
+    pub status: &'static str,
+    pub turns: u64,
+    pub steps: u64,
+    pub tokens: u64,
+    pub verify_failures: u32,
+    pub wall_secs: u64,
+    pub summary: Value,
+}
+
+/// [`run_mission`] without the console report or the nonzero exit: runs the
+/// loop, writes the durable summary and returns how it ended. An `Err` is a
+/// failure before or while writing the session; a mission that merely did
+/// not complete is an `Ok` outcome with its `status`.
+pub fn run_mission_outcome(
+    cfg: MissionConfig,
+    mut registry: ToolRegistry,
+    sessions_dir: &std::path::Path,
+    route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
+) -> Result<MissionOutcome> {
     let started = std::time::Instant::now();
     let deadline = started + max_minutes_duration(cfg.max_minutes);
     // Resolve provider config BEFORE the session file exists — a config
@@ -270,7 +365,13 @@ pub fn run_mission(
             (storage, id.clone(), None)
         }
         None => {
-            let session_id = tole_cli::session_host::new_session_id("mission");
+            let session_id = match &cfg.fresh_id {
+                Some(id) => {
+                    validate_session_id(id)?;
+                    id.clone()
+                }
+                None => tole_cli::session_host::new_session_id("mission"),
+            };
             // The mission system prompt pins the completion-marker
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
@@ -327,6 +428,7 @@ pub fn run_mission(
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
         tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
+    let turn_cfg = provider_cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         provider_cfg,
         &storage,
@@ -388,6 +490,17 @@ pub fn run_mission(
             status = "exhausted_time";
             break;
         }
+        // A verify the sandbox cannot run is known now: stop before a model turn
+        // is spent on a mission that cannot be verified.
+        if turns == 0 && cfg.verify.is_some() {
+            if let Err(why) = tole_core::sandbox::command::preflight(
+                tole_core::sandbox::command::Consumer::Verify,
+            ) {
+                eprintln!("mission: verify refused before the first turn: {why}");
+                status = "verify_refused";
+                break;
+            }
+        }
         let Some(prompt) = continuation.take() else {
             // No continuation queued and no completion declared: a logic
             // bug upstream — settle loudly, the summary records it.
@@ -402,20 +515,19 @@ pub fn run_mission(
         } else {
             &[]
         };
-        let outcome = match run_turn_with_images(
+        let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg.clone(), &registry, &cfg.cancel);
+        let outcome = match tole_cli::turn_runner::run_turn_with_images(
             &mut storage,
             &mut provider,
-            &registry,
+            &plan,
             &prompt,
             first_images,
-            &tole_core::cancel::CancelToken::default(),
-            None,
         ) {
             Ok(o) => o,
             Err(e) => {
                 // Storage-class failure: still summarize (the "either
                 // way" contract), then surface the error.
-                eprintln!("mission: turn storage error: {e}");
+                eprintln!("mission: turn storage error: {}", e.into_message());
                 status = "error";
                 break;
             }
@@ -446,7 +558,15 @@ pub fn run_mission(
                         cmd,
                         std::time::Duration::from_secs(cfg.verify_timeout_secs),
                     ) {
-                        Ok(()) => {
+                        Verify::Refused(why) => {
+                            // Fail closed: no ground truth, so no completion
+                            // and no turn spent on a problem the model
+                            // cannot fix. The session stays resumable.
+                            eprintln!("mission: verify refused: {why}");
+                            status = "verify_refused";
+                            break;
+                        }
+                        Verify::Passed => {
                             if declares {
                                 status = "complete";
                                 break;
@@ -457,7 +577,7 @@ pub fn run_mission(
                                  work toward the goal, then declare it."
                             ));
                         }
-                        Err(output) => {
+                        Verify::Failed(output) => {
                             verify_failures += 1;
                             eprintln!(
                                 "mission: verify failed ({verify_failures}/{VERIFY_FAILURE_CAP})"
@@ -559,25 +679,18 @@ pub fn run_mission(
             )
             .map_err(|e| anyhow::anyhow!("writing mission summary: {e}"))?;
     }
-    println!("mission: {session_id}");
     // How the mission ended, for the skill curator (#593).
     tole_cli::skill_outcome::record_mission(status);
-    println!("status: {status}");
-    println!(
-        "turns: {turns}  steps: {}  verify failures: {verify_failures}  wall: {wall_secs}s",
-        steps_used(&storage)
-    );
-    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
-    // that did NOT complete successfully must exit NONZERO so scripts
-    // and the agent loop can branch on it. `complete` (and only a
-    // verified completion) exits 0. (CI cora round on #253: the first
-    // cut compared against a nonexistent "done" — every mission,
-    // including successful ones, exited nonzero. Caught by the
-    // mission_e2e suite.)
-    if status != "complete" {
-        anyhow::bail!("mission ended with status: {status}");
-    }
-    Ok(())
+    Ok(MissionOutcome {
+        session_id,
+        status,
+        turns,
+        steps: steps_used(&storage),
+        tokens: tokens_used(&storage),
+        verify_failures,
+        wall_secs,
+        summary,
+    })
 }
 
 #[cfg(test)]
@@ -607,15 +720,7 @@ mod budget_tests {
     }
 
     fn store(tag: &str) -> JsonlStorage {
-        let d = std::env::temp_dir().join(format!(
-            "tole-budget-{tag}-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_dir::TestDir::new(&format!("tole-budget-{tag}"));
         JsonlStorage::create(&d, "b", None).unwrap()
     }
 
@@ -744,16 +849,7 @@ mod verify_error_tests {
     #[test]
     fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
         use tole_core::openai::{OpenAiConfig, OpenAiProvider};
-        let d = std::env::temp_dir().join(format!(
-            "tole-mission-sys-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_dir::TestDir::new("tole-mission-sys");
         let sys = format!("base{}", mission_prompt("ship it", None));
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
         // One handle at a time: a writable open holds the session lock, and
@@ -807,7 +903,22 @@ mod verify_error_tests {
 
     #[test]
     fn a_real_timeout_still_says_so() {
-        let e = run_verify("sleep 5", Duration::from_secs(1)).unwrap_err();
+        let Verify::Failed(e) = run_verify("sleep 5", Duration::from_secs(1)) else {
+            panic!("a timeout is a failure the model sees, not a pass or a refusal");
+        };
         assert!(e.contains("timed out after 1s"), "{e}");
+    }
+
+    #[test]
+    fn exit_status_decides_pass_or_fail_with_the_output_tail() {
+        let t = Duration::from_secs(20);
+        assert_eq!(run_verify("exit 0", t), Verify::Passed);
+        let Verify::Failed(e) = run_verify("echo boom; exit 3", t) else {
+            panic!("a non-zero exit is a failure");
+        };
+        assert!(
+            e.starts_with("verify FAILED (exit 3):") && e.contains("boom"),
+            "{e}"
+        );
     }
 }

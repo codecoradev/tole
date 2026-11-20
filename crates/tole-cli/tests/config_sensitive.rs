@@ -9,22 +9,18 @@
 //! private directory plus `/usr/bin:/bin` (no `cora` auto-preset unless a
 //! test installs a fake one).
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-sens-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-sens-e2e")
 }
 
 const SCRUBBED: [&str; 12] = [
@@ -49,7 +45,7 @@ fn text(b: &[u8]) -> String {
 /// [`project_raw`], minus the `no_auto_mcp` line in a build without the
 /// `mcp` feature (there the key is a startup error, tested separately):
 /// lets the same scenario run in every feature profile.
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     if cfg!(feature = "mcp") {
         project_raw(content)
     } else {
@@ -59,7 +55,7 @@ fn project(content: &str) -> (PathBuf, PathBuf) {
 
 /// A project dir with `.tole/config.toml` = `content`, a fresh home, and the
 /// config already trusted.
-fn project_raw(content: &str) -> (PathBuf, PathBuf) {
+fn project_raw(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), content).unwrap();
@@ -71,12 +67,23 @@ fn project_raw(content: &str) -> (PathBuf, PathBuf) {
     (d, home)
 }
 
+/// A user config that opts `verify` and `turnend` out of the sandbox (#748:
+/// they are sandboxed by default now). For the tests that exercise config
+/// plumbing with a gate script outside the workspace, not the sandbox.
+fn gates_unsandboxed(home: &Path) {
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n",
+    )
+    .unwrap();
+}
+
 fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         // No cora / uteke / gh on the path: nothing auto-attaches.
         .env("PATH", format!("{}:/usr/bin:/bin", tmpdir().display()))
         .stdin(Stdio::null());
@@ -90,17 +97,11 @@ fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
 fn finish(mut c: Command) -> Output {
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
-    let start = Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if start.elapsed() > Duration::from_secs(60) {
-            let _ = child.kill();
-            panic!("child did not finish in 60s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    if common::wait_exit(&mut child, common::WAIT).is_none() {
+        let _ = child.kill();
+        panic!("child did not finish in {:?}", common::WAIT);
     }
+    child.wait_with_output().unwrap()
 }
 
 // ----------------------------------------------------------------- mock
@@ -478,10 +479,8 @@ fn config_patterns_hit_the_destructive_wall_in_approver_and_registry() {
 #[cfg(unix)]
 #[allow(dead_code)] // only the shell-tools / mcp tests use it
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&p, format!("#!/bin/sh\n{body}\n"));
     p
 }
 
@@ -540,6 +539,7 @@ fn on_posttool_and_on_turnend_from_config_run() {
         end_hook.display(),
         end.display()
     ));
+    gates_unsandboxed(&home);
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(o.status.success(), "{}", text(&o.stderr));
     let requests = seen.lock().unwrap().len();
@@ -635,7 +635,7 @@ fn no_auto_mcp_from_config_suppresses_the_cora_preset() {
 
 // ------------------------------------------------------- skill / no_skills
 
-fn skill_project(config: &str) -> (PathBuf, PathBuf) {
+fn skill_project(config: &str) -> (TestDir, TestDir) {
     let (d, home) = project(config);
     std::fs::create_dir_all(d.join("skills/demo")).unwrap();
     std::fs::write(
@@ -705,6 +705,7 @@ fn mission_verify_from_config_runs_and_the_flag_overrides_it() {
         "no_auto_mcp = true\n[mission]\nverify = \"touch {}\"\n",
         m_cfg.display()
     ));
+    gates_unsandboxed(&home);
     let o = finish(with_provider(
         base_cmd(&d, &home, &["mission", "goal"]),
         &url,
@@ -760,6 +761,9 @@ fn mission_verify_timeout_from_config_is_used() {
 // ------------------------------------------------------- face refusals
 
 const NO_CONFIG_HINT: &str = "use --no-config to ignore the config files";
+/// `serve`, `acp` and `mcp` refuse `--no-config` (#855): the way out there
+/// is to edit the config file.
+const EDIT_CONFIG_HINT: &str = "remove it from that config file";
 
 /// The refused command must exit non-zero, print the flag's message plus
 /// the hint, and never have started (no stdout, no provider contact).
@@ -769,7 +773,15 @@ fn assert_refused_with_hint(config: &str, args: &[&str], needle: &str) {
     let err = text(&o.stderr);
     assert!(!o.status.success(), "{args:?} must fail: {err}");
     assert!(err.contains(needle), "{args:?}: want {needle:?} in {err}");
-    assert!(err.contains(NO_CONFIG_HINT), "{args:?}: no hint in {err}");
+    let unattended = matches!(args[0], "serve" | "acp" | "mcp");
+    if unattended {
+        assert!(
+            err.contains(EDIT_CONFIG_HINT) && !err.contains(NO_CONFIG_HINT),
+            "{args:?}: want the edit-the-config hint in {err}"
+        );
+    } else {
+        assert!(err.contains(NO_CONFIG_HINT), "{args:?}: no hint in {err}");
+    }
     assert_eq!(
         text(&o.stdout),
         "",
@@ -778,13 +790,18 @@ fn assert_refused_with_hint(config: &str, args: &[&str], needle: &str) {
     assert!(!err.contains("missing provider config"), "{err}");
     // `--no-config` drops the keys: the same command line no longer trips
     // the refusal (it fails later, if at all, for unrelated reasons).
-    // (`serve` would start listening, so its control is skipped.)
-    if args[0] == "serve" {
-        return;
-    }
+    // The unattended faces refuse the flag itself (#855).
     let mut with_flag = vec!["--no-config"];
     with_flag.extend_from_slice(args);
     let o = finish(base_cmd(&d, &home, &with_flag));
+    if unattended {
+        assert!(
+            !o.status.success() && text(&o.stderr).contains("--no-config is refused for"),
+            "--no-config on {args:?}: {}",
+            text(&o.stderr)
+        );
+        return;
+    }
     assert!(
         !text(&o.stderr).contains(needle),
         "--no-config: {}",
@@ -806,21 +823,19 @@ fn serve_refuses_config_hooks_like_the_flag() {
         &serve,
         "--on-pretool/--on-posttool are not supported by `tole serve`",
     );
+    // A skill file the PROJECT config names is not content-bound (#945): refused.
     assert_refused_with_hint(
         "skill = [\"s/SKILL.md\"]\n",
         &serve,
-        "--skill is not supported by `tole serve`",
+        "--skill from the project config is not supported by `tole serve`",
     );
-    assert_refused_with_hint(
-        "no_skills = true\n",
-        &serve,
-        "--no-skills is not supported by `tole serve`",
-    );
+    // `no_skills` only turns skills off, and is no longer refused: serve
+    // sessions load skills (#945). `tole mcp` and `tole mission` still refuse.
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
         &serve,
-        "--mcp-server is not supported by `tole serve`",
+        "an MCP server specification from the project config is not supported by `tole serve`",
     );
 }
 
@@ -835,13 +850,13 @@ fn acp_refuses_config_hooks_skills_and_mcp_servers_like_the_flag() {
     assert_refused_with_hint(
         "skill = [\"s\"]\n",
         &["acp"],
-        "--skill is not supported by `tole acp`",
+        "--skill from the project config is not supported by `tole acp`",
     );
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
         &["acp"],
-        "--mcp-server is not supported by `tole acp`",
+        "an MCP server specification from the project config is not supported by `tole acp`",
     );
 }
 
@@ -1063,22 +1078,63 @@ fn tole_skill_env_loads_skills_and_the_flag_replaces_it() {
     );
 }
 
-/// An exported TOLE_SKILL on a server face is refused like `--skill`, and
-/// the message names the variable instead of a flag nobody typed.
-#[cfg(feature = "shell-tools")]
+/// An exported TOLE_SKILL on a face that hosts no skill-loading session
+/// (`tole mcp`; `serve` and `acp` load skills since #945) is refused like
+/// `--skill`, and the message names the variable instead of a flag nobody
+/// typed.
+#[cfg(all(feature = "shell-tools", feature = "mcp"))]
 #[test]
 fn server_faces_name_tole_skill_in_the_refusal() {
     let (d, home) = skill_project("");
     let o = finish(with_env(
-        base_cmd(&d, &home, &["acp"]),
+        base_cmd(&d, &home, &["mcp"]),
         "TOLE_SKILL",
         d.join("skills/demo/SKILL.md").to_str().unwrap(),
     ));
     let err = text(&o.stderr);
     assert!(!o.status.success(), "{err}");
     assert!(
-        err.contains("--skill is not supported by `tole acp`"),
+        err.contains("--skill is not supported by `tole mcp`"),
         "{err}"
     );
     assert!(err.contains("the value comes from TOLE_SKILL"), "{err}");
+}
+
+/// #945: on `serve` and `acp` the owner's `--skill`, `TOLE_SKILL` and user
+/// config `skill` pass the face check (they reach the startup validation of
+/// the file, which fails here because the file is missing); the project
+/// config's does not.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn server_faces_accept_the_owners_skill_sources_but_not_the_project_config() {
+    let refusal = "is not supported by";
+    for face in [&["serve", "--port", "0", "--token", "t"][..], &["acp"][..]] {
+        let startup_failure = |o: &Output| {
+            let err = text(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("--skill") && err.contains("nope"), "{err}");
+            assert!(!err.contains(refusal), "{err}");
+        };
+        // Flag.
+        let (d, home) = project("");
+        let mut args = vec!["--skill", "nope/SKILL.md"];
+        args.extend_from_slice(face);
+        startup_failure(&finish(base_cmd(&d, &home, &args)));
+        // TOLE_SKILL.
+        let o = finish(with_env(
+            base_cmd(&d, &home, face),
+            "TOLE_SKILL",
+            "nope/SKILL.md",
+        ));
+        startup_failure(&o);
+        // User config.
+        let (d, home) = project("");
+        std::fs::create_dir_all(home.join("tole")).unwrap();
+        std::fs::write(
+            home.join("tole/config.toml"),
+            "skill = [\"nope/SKILL.md\"]\n",
+        )
+        .unwrap();
+        startup_failure(&finish(base_cmd(&d, &home, face)));
+    }
 }

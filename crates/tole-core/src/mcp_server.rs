@@ -808,8 +808,7 @@ mod tests {
     /// are affected, in the stricter direction.
     #[test]
     fn gate_char_mcp_pre_hooks_are_enforced_via_the_gate() {
-        let dir = std::env::temp_dir().join(format!("tole-gate-char-mcp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-gate-char-mcp");
         let marker = dir.join("hook-ran");
         let _ = std::fs::remove_file(&marker);
         let script = dir.join("deny.sh");
@@ -864,8 +863,7 @@ mod tests {
     /// leaves the authorization outcome unchanged and runs no hook here.
     #[test]
     fn server_face_hook_wiring_has_no_pre_hooks_and_does_not_affect_gate() {
-        let dir = std::env::temp_dir().join(format!("tole-gate-mcp-te-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-gate-mcp-te");
         let marker = dir.join("turnend-ran");
         let _ = std::fs::remove_file(&marker);
         let mut hooks = crate::hooks::ToolHooks::from_cli(&[], &[]);

@@ -4,29 +4,22 @@
 //!
 //! Hermetic: `CODECORA_HOME` and `HOME` point at a temp dir on the child.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TestDir;
+use std::path::Path;
+use std::process::{Output, Stdio};
 use tole_core::secrets::SecretSet;
 use tole_core::skill_draft::{gate, Dedup, DraftStore, HostContext, Proposal, Trigger};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-drafts-e2e-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-drafts-e2e")
 }
 
 fn tole(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
+    common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[])
         .args(args)
         .current_dir(home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
         .stdin(Stdio::null())
         .output()
         .unwrap()

@@ -5,16 +5,16 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use test_dir::TestDir;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::storage::{Commit, JsonlStorage, Storage};
 
-fn base(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-dirswap-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn base(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-dirswap-{tag}"))
 }
 
 fn msg(n: u64) -> NewEntry {

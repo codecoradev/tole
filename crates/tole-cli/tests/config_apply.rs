@@ -3,29 +3,16 @@
 //! keys' precedence and the "no config => nothing changes" invariant.
 //! `CODECORA_HOME` (and every provider variable) is set on the CHILD only.
 
+mod common;
+use common::TestDir;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    // A pid is reused and these directories are never removed, so a stale
-    // one of an earlier run (a trusted project, a populated home) can carry
-    // the same pid and counter: the clock makes the name unique (#702).
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let d = std::env::temp_dir().join(format!(
-        "tole-apply-e2e-{}-{n}-{stamp:x}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-apply-e2e")
 }
 
 const SCRUBBED: [&str; 13] = [
@@ -45,11 +32,10 @@ const SCRUBBED: [&str; 13] = [
 ];
 
 fn cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home, &[]);
     c.args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
         .stdin(Stdio::null());
     for k in SCRUBBED {
         c.env_remove(k);
@@ -66,7 +52,7 @@ fn text(b: &[u8]) -> String {
 }
 
 /// A project dir with `.tole/config.toml` = `content`, and a fresh home.
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), content).unwrap();
@@ -92,10 +78,18 @@ fn a_no_config_changes_nothing() {
         .env_remove("HOME")
         .env_remove("USERPROFILE")
         .env_remove("CODECORA_HOME")
+        .env("PATH", common::path_without_sibling_binaries())
         .stdin(Stdio::null());
     let plain = c.output().unwrap();
     assert!(plain.status.success(), "{}", text(&plain.stderr));
-    assert_eq!(text(&plain.stderr), "", "nothing extra on stderr");
+    // Only the #864 notice: with no resolvable data directory the user config
+    // cannot be read, and that is said once. No project-config chatter.
+    let err = text(&plain.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(
+        err.starts_with("tole: cannot resolve the tole data directory"),
+        "{err}"
+    );
     assert!(
         text(&plain.stdout).contains("no sessions in .tole/sessions"),
         "{}",
@@ -107,7 +101,9 @@ fn a_no_config_changes_nothing() {
     assert_eq!(plain.stdout, nc.stdout);
     assert_eq!(nc.stderr, b"");
     // `status` of an unknown id keeps today's failure and message.
-    let st = tole(&d, &home, &["status", "nope"]);
+    // (`--no-config` keeps stderr exactly as it was; without it, the home here is
+    // a `CODECORA_HOME` override with no user config, announced first, #864.)
+    let st = tole(&d, &home, &["--no-config", "status", "nope"]);
     assert!(!st.status.success());
     assert_eq!(
         text(&st.stderr),
@@ -121,7 +117,13 @@ fn a_empty_tole_dir_without_config_toml_is_still_no_config() {
     std::fs::create_dir_all(d.join(".tole/sessions")).unwrap();
     let o = tole(&d, &tmpdir(), &["sessions"]);
     assert!(o.status.success());
-    assert_eq!(text(&o.stderr), "");
+    // No project config: nothing about one. The home here is a
+    // `CODECORA_HOME` override with no user config, which is announced (#864).
+    let err = text(&o.stderr);
+    assert!(
+        err.starts_with("tole: no user config at ") && err.lines().count() == 1,
+        "{err}"
+    );
 }
 
 // ---------------------------------------------- (b) untrusted + non-tty
@@ -162,11 +164,14 @@ fn c_trusted_config_is_used_and_sessions_dir_is_honored_everywhere() {
     let o = tole(&d, &home, &["sessions"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     let err = text(&o.stderr);
-    assert_eq!(err.lines().count(), 1, "{err}");
+    // The project line, then the #864 notice (the test home is a
+    // `CODECORA_HOME` override with no user config).
+    assert_eq!(err.lines().count(), 2, "{err}");
     assert!(
         err.starts_with("tole: using config ") && err.contains(".tole/config.toml"),
         "{err}"
     );
+    assert!(err.contains("tole: no user config at "), "{err}");
     assert!(text(&o.stdout).contains("no sessions in cfg-sessions"));
     // `status` looks in the same directory as `sessions`.
     let o = tole(&d, &home, &["status", "nope"]);
@@ -220,9 +225,10 @@ fn e_explicit_config_runs_without_a_trust_record_or_store() {
     // consulted for an explicit path.
     let mut c = cmd(
         &d,
-        Path::new("/nonexistent-tole-home"),
+        &d.join("hermetic-home"),
         &["--config", "custom.toml", "sessions"],
     );
+    c.env("CODECORA_HOME", "/nonexistent-tole-home");
     c.env_remove("HOME");
     let o = c.output().unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -268,6 +274,7 @@ fn f_modifying_the_trusted_file_fails_closed_again() {
 
 // ------------------------------------------- (g) server faces never hang
 
+#[cfg(feature = "shell-tools")]
 fn assert_fails_fast_untrusted(args: &[&str]) {
     let (d, home) = project("model = \"m\"\n");
     // Piped (never closed by us) stdin: a prompt would block forever.
@@ -277,16 +284,9 @@ fn assert_fails_fast_untrusted(args: &[&str]) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            let _ = child.kill();
-            panic!("{args:?} hung instead of failing closed");
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    let Some(status) = common::wait_exit(&mut child, common::WAIT) else {
+        let _ = child.kill();
+        panic!("{args:?} hung instead of failing closed");
     };
     assert!(!status.success(), "{args:?}");
     let mut err = String::new();
@@ -514,7 +514,7 @@ fn config_check_shows_effective_values_and_sources() {
 // ------------------------------------------------------- user config (#433)
 
 /// A home whose user config (`<home>/tole/config.toml`) is `content`.
-fn user_home(content: &str) -> PathBuf {
+fn user_home(content: &str) -> TestDir {
     let home = tmpdir();
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(home.join("tole/config.toml"), content).unwrap();

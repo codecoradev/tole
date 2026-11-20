@@ -2,9 +2,12 @@
 //! holds an advisory lock on a sidecar `<id>.jsonl.lock` for its whole
 //! lifetime; a second writer is refused instead of corrupting the file.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use test_dir::TestDir;
 
 use serde_json::json;
 
@@ -15,11 +18,8 @@ const CHILD_ENV: &str = "TOLE_LOCK_CHILD";
 const DIR_ENV: &str = "TOLE_LOCK_DIR";
 const TEST_NAME: &str = "child_holder";
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-lock-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-lock-{tag}"))
 }
 
 fn msg(text: &str) -> Commit {
@@ -49,7 +49,7 @@ fn child_holder() {
     drop(s);
 }
 
-fn spawn_holder(dir: &PathBuf, mode: &str) -> Child {
+fn spawn_holder(dir: &std::path::Path, mode: &str) -> Child {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST_NAME, "--nocapture"])
         .env(CHILD_ENV, mode)
@@ -63,14 +63,17 @@ fn spawn_holder(dir: &PathBuf, mode: &str) -> Child {
     loop {
         line.clear();
         assert!(out.read_line(&mut line).unwrap() > 0, "child died early");
-        if line.trim() == "ready" {
+        // libtest prints `test child_holder ... ` (no newline) on the same
+        // stdout before the test runs, so on a starved CPU the marker can
+        // trail that prefix instead of sitting on a line of its own.
+        if line.trim().ends_with("ready") {
             break;
         }
     }
     child
 }
 
-fn open_err(path: &PathBuf) -> StorageError {
+fn open_err(path: &std::path::Path) -> StorageError {
     match JsonlStorage::open(path) {
         Ok(_) => panic!("second writer must be refused"),
         Err(e) => e,
@@ -229,9 +232,9 @@ fn hold_as_duplicate(dir: &std::path::Path, id: &str, ms: u64) -> std::thread::J
             .unwrap();
         // Children forked by other tests of this binary can still hold a
         // duplicate of the lock `create` just released: wait for it.
-        while f.try_lock().is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        test_dir::wait_until(test_dir::WAIT, "the duplicate lock to be released", || {
+            f.try_lock().is_ok()
+        });
         f.set_len(0).unwrap();
         write!(f, "{}", std::process::id()).unwrap();
         tx.send(()).unwrap();

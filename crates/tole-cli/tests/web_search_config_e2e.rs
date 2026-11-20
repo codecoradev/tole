@@ -1,16 +1,15 @@
 //! #436: a malformed `TOLE_WEB_SEARCH_*` config fails startup loudly with
 //! the REAL binary, naming the variable and never the header value.
 
-use std::process::Command;
+mod common;
+use common::TestDir;
 
 #[test]
 fn a_malformed_search_config_fails_startup_without_echoing_values() {
-    let home = std::env::temp_dir().join(format!("tole-web-search-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let home = TestDir::new("tole-web-search-e2e");
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["run", "hi"])
         .current_dir(&home)
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9")
         .env("TOLE_MODEL", "m")
@@ -33,10 +32,9 @@ fn a_malformed_search_config_fails_startup_without_echoing_values() {
         "{err}"
     );
     // A bad header with a set secret: the error names the header only.
-    let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let o = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
         .args(["run", "hi"])
         .current_dir(&home)
-        .env("CODECORA_HOME", &home)
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", "http://127.0.0.1:9")
         .env("TOLE_MODEL", "m")

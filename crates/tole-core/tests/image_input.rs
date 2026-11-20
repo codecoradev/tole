@@ -1,8 +1,10 @@
 //! #212: images ride on the user message as durable references (never the
 //! blob), survive replay, and reach the wire as `image_url` parts.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
-use std::path::PathBuf;
+use test_dir::TestDir;
 use tole_core::cancel::CancelToken;
 use tole_core::image::{self, ImageRef};
 use tole_core::mock::MockProvider;
@@ -17,18 +19,15 @@ const PNG: &[u8] = &[
     1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89,
 ];
 
-fn ws(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-img-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn ws(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-img-{tag}"))
 }
 
 #[test]
 fn user_message_records_the_reference_not_the_blob_and_replays() {
     let w = ws("turn");
     std::fs::write(w.join("shot.png"), PNG).unwrap();
-    let r: ImageRef = image::resolve("shot.png", std::slice::from_ref(&w), None).unwrap();
+    let r: ImageRef = image::resolve("shot.png", &[w.to_path_buf()], None).unwrap();
     std::fs::create_dir_all(w.join("sess")).unwrap();
     let mut s = JsonlStorage::create(w.join("sess"), "s", None).unwrap();
     let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "ok".into() }]);
@@ -61,7 +60,7 @@ fn user_message_records_the_reference_not_the_blob_and_replays() {
 
     // The wire built from the replayed transcript carries the image part.
     let prov = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"))
-        .with_image_roots(vec![w]);
+        .with_image_roots(vec![w.to_path_buf()]);
     let body = prov.request_body(s.entries());
     let content = &body["messages"][0]["content"];
     assert_eq!(content[0], json!({"type": "text", "text": "what is this?"}));
@@ -76,12 +75,12 @@ fn user_message_records_the_reference_not_the_blob_and_replays() {
 fn a_non_vision_model_with_images_is_a_loud_capability_error() {
     let w = ws("cap");
     std::fs::write(w.join("a.png"), PNG).unwrap();
-    let r = image::resolve("a.png", std::slice::from_ref(&w), None).unwrap();
+    let r = image::resolve("a.png", &[w.to_path_buf()], None).unwrap();
     std::fs::create_dir_all(w.join("sess")).unwrap();
     let mut s = JsonlStorage::create(w.join("sess"), "s", None).unwrap();
     // Nothing is listening: the capability check must fail BEFORE any request.
     let mut prov = OpenAiProvider::new(OpenAiConfig::new("http://127.0.0.1:1/v1", "m", "k"))
-        .with_image_roots(vec![w])
+        .with_image_roots(vec![w.to_path_buf()])
         .with_vision(false);
     let _ = run_turn_with_images(
         &mut s,
