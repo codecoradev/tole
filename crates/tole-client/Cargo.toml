@@ -23,3 +23,9 @@ thiserror = { workspace = true }
 # tole-cli, so no new package enters the tree.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Test-only: derives the committed JSON Schema (src/schema.rs, #1068).
+# Already in the lockfile through rmcp; never a normal dependency, so no
+# build of a published crate reaches it through this crate.
+schemars = "1"

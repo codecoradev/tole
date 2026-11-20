@@ -4,8 +4,8 @@
 //! `sessionId` are camelCase, `plan_mode` and `usage_report` are snake_case),
 //! and each rename below mirrors what the server emits. Every type both
 //! serializes and deserializes, so the contract test can prove a response is
-//! decoded without loss (re-serialized JSON equals the server's JSON) and a
-//! JSON Schema can be derived from these types next.
+//! decoded without loss (re-serialized JSON equals the server's JSON), and the
+//! committed JSON Schema is derived from these types (`schema/`, #1068).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -15,6 +15,7 @@ pub use tole_core::entry::Entry;
 macro_rules! wire {
     ($($item:item)*) => {$(
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[cfg_attr(test, derive(schemars::JsonSchema))]
         $item
     )*};
 }
@@ -159,6 +160,7 @@ wire! {
     #[serde(rename_all = "camelCase")]
     pub struct EntriesPage {
         pub id: String,
+        #[cfg_attr(test, schemars(with = "Vec<crate::schema::EntrySchema>"))]
         pub entries: Vec<Entry>,
         pub next_after: u64,
         pub has_more: bool,
@@ -222,6 +224,7 @@ wire! {
 
 /// The verdict of `POST /approvals/{id}/decision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Allow,
