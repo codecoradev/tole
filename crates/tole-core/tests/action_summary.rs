@@ -2,10 +2,12 @@
 //! summary of its own is neutral and keeps its own description, with the raw
 //! input redacted; the tier is never changed by it.
 
+#[cfg(feature = "shell-tools")]
 #[path = "support/test_dir.rs"]
 mod test_dir;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "shell-tools")]
 use test_dir::TestDir;
 use tole_core::action_summary::{ActionEffect, ActionKind, ActionSummary};
 use tole_core::approval::{Approver, ToolRequest, Verdict};
@@ -37,6 +39,7 @@ fn summary_of(tool: Box<dyn Tool>, input: Value) -> (Risk, ActionSummary) {
     (risk, s)
 }
 
+#[cfg(feature = "shell-tools")]
 fn workspace() -> TestDir {
     let dir = TestDir::new("tole-summary");
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
