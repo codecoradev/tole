@@ -824,8 +824,7 @@ working folder (the folder `tole discuss` is run in) instead.
 
 A discussion's helpers cannot look anything up today: inline voices hold no
 tools and an independent reviewer runs in plan mode. This section is the
-design of a per-discussion tool allowance; what exists is listed under "Built
-so far", the rest under "Not built yet".
+design of a per-discussion tool allowance and how it is built.
 
 **Owner decision (2026-11-20): one approval per tool per discussion.** The
 allowance is set only by the owner when the discussion starts, never by model
@@ -835,7 +834,7 @@ this discussion" is a rule bound to that discussion and that tool. It ends
 when the discussion closes or is stopped, is never allow-always, is never
 `Destructive`, and is never carried to another discussion or session.
 
-Built so far:
+How it works:
 
 - **The allowance is in the contract.** `Contract.tools` holds up to 8 registry
   names of connected (MCP) tools (`mcp_<server>_<tool>`, at most 64 characters),
@@ -861,10 +860,16 @@ Built so far:
   contract does not allow all get nothing.
 - **Shown.** `tole discuss show` and `tole audit --discussion` print the
   allowance and each decision (text and JSON).
-- **Refused until the host exists.** A host that does not yet run helpers with
-  tools refuses a contract that allows some (`Driver::start` and `Driver::run`),
-  loudly, instead of running its helpers inline with no tools.
-
+- **Refused where it cannot run.** A driver whose participants are not all
+  seated as independent helpers refuses a contract that allows tools
+  (`Driver::start`, and `Driver::run` while a step can still start a helper),
+  loudly, instead of running inline voices that would have no tools. A stop, a
+  close and the outcome of a finished discussion start no helper, so they need
+  no delegation host and no approvals queue (`helper_tools::needs_helpers`):
+  `tole serve` can stop and show a discussion the terminal started with
+  `--tool`, and `tole discuss resume` of a finished one works after
+  `[delegation] approvals` was turned off. Resuming one that is still open
+  needs the host and the queue, so it is refused over `serve`.
 - **The helper child keeps the named tools, and only those.** An independent
   helper (a `consult` child, #704) runs in plan mode, which removes every
   `Write` tool. When the host launches it with a scope
@@ -912,11 +917,52 @@ Built so far:
   except one carrying the participant marker, which the host sets and which only
   removes tools.
 
-Not built yet: the discussion driver recording the owner's decisions in the
-ledger and passing the grants to each helper, running every helper of a
-discussion that has an allowance as an independent child, and the
-`tole discuss start --tool` flag. A contract that allows tools is therefore
-still refused by the driver.
+- **The owner starts it with `--tool`.** `tole discuss start --tool
+  <server>.<tool>` (repeat, at most 8) names connected tools; the server must be
+  one a helper can resolve: the `mcp_server` list of the config or the cora
+  preset. A helper is a separate `tole mission` process that does not receive
+  the `--mcp-server` flag of the command, so a server given only by that flag
+  is refused (it would be accepted and silently missing in the helper). The
+  name is turned into the registry name by the one function MCP registration
+  uses (`discussion::mcp_registry_name`), and the command prints the name each
+  spelling allows. That function is not one-to-one (a character a provider
+  rejects becomes `_`, the whole is cut at 64 bytes), so a spelling it would
+  change is refused rather than allowed under a name that could also be another
+  tool of the server: a tool name must be letters, digits, `_` and `-`, and fit.
+  `[delegation] approvals` must be
+  `owner` or `chain`: with it off every call would be denied, so the start is
+  refused before anything is written (the dry run says the same). The
+  model-facing `discuss` tool takes no `tools` field (it is refused like any
+  unknown field): the allowance is the owner's alone.
+- **Every helper is an independent child.** With an allowance, the driver seats
+  every participant as an independent read-only child of a delegation host the
+  command builds at the owner's depth 0 (one root goal in the working folder,
+  no allow patterns of its own); the carve, depth and live-process caps, leases
+  and machine guard of `delegate` apply, and each turn is reserved at least
+  20 000 tokens (the dry run and the advice say so). A driver without that host
+  or with an inline participant refuses a contract that allows tools, loudly.
+- **The driver writes the owner's answers into the ledger.** While it polls a
+  helper it reads the approvals queue for that helper's node and records each
+  decision once (`allow`, `deny`, or `expired` for a request that ended
+  unanswered), by queue request id, through `DiscussionLog::tool_approval`. Each
+  helper is started with the tools the ledger says are granted at that moment
+  (`State::tool_grants`), so a later helper, a later round and a resumed
+  discussion do not ask again for an approved tool, and a denied or expired one
+  is asked again. A stop or a close ends the grants because nothing is started
+  after it. On a helper's last poll a failure to read or record its answers is
+  retried once and then stops the discussion with an error before the helper is
+  settled: the ledger stays resumable and the bound helper is polled again, so
+  an approved use is never missing from the ledger. While it runs, a failure is
+  one redacted note.
+
+Residual, stated so nobody assumes more: a helper already running when the
+owner stops the discussion keeps the grants it started with until it ends (its
+own minutes budget bounds it); a denial is not remembered for the discussion,
+so each later helper that wants the tool asks the owner again; the grant is for
+a tool, not for its arguments (the owner approves "this tool in this
+discussion", and the prompt shows the first call); and a tool of a configured
+server that does not start or does not list that tool is simply absent from the
+helper's registry, which the driver cannot see.
 
 ## 12. Non-goals
 

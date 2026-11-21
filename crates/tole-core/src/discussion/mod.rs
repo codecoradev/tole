@@ -231,6 +231,33 @@ pub struct ToolApproval {
     pub verdict: ToolVerdict,
 }
 
+/// The registry name a connected tool gets: `mcp_<server>_<tool>`, with every
+/// character a provider rejects in a function name replaced by `_` and the
+/// whole cut to 64 characters. MCP registration names its tools with this, and
+/// the owner's `--tool <server>.<tool>` is turned into the same name, so what
+/// the owner typed is what the helper's registry holds (#1039).
+pub fn mcp_registry_name(server: &str, tool: &str) -> String {
+    let sanitized: String = tool
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut name = format!("mcp_{server}_{sanitized}");
+    // A byte limit, cut on a character boundary: a server name that is not
+    // ASCII must not make `truncate` panic.
+    let mut end = name.len().min(MAX_TOOL_NAME_CHARS);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
+}
+
 /// Whether `name` is a registry name of a connected tool a contract may
 /// allow: `mcp_` and then letters, digits, `_` and `-`, at most
 /// [`MAX_TOOL_NAME_CHARS`]. Only connected tools qualify: they are always

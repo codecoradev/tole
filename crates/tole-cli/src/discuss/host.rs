@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use tole_core::advisor::Budget;
+use tole_core::child_env::DiscussionScope;
 use tole_core::discussion::{
     self, checker_request, participant_request_with, scribe_request, Background, Contract,
     CriterionVerdict, Gate, RoundSummary, MAX_CONTRIBUTION_CHARS, MAX_FALLBACK_REASON_CHARS,
@@ -45,6 +46,7 @@ use tole_core::entry::{Entry, EntryType};
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::secrets::SecretSet;
 
+use super::helper_tools::{self, ToolDecision};
 use crate::config::Config;
 use crate::discussion_roles::{self, Role};
 
@@ -130,22 +132,6 @@ pub fn round_floor_with(c: &Contract, background: &[Background]) -> u64 {
     voices + tokens(checker_request(c, &[]), CHECKER_REPLY_TOKENS)
 }
 
-/// A contract that allows helper tools needs independent helpers and the
-/// approval wiring (#1039), which this host does not have yet: refuse it
-/// loudly rather than run its helpers inline, where they would silently get
-/// no tools at all.
-fn refuse_tools(c: &Contract) -> Result<(), String> {
-    if c.tools.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "discussion `{}` allows helper tools ({}), which this host cannot run yet: its helpers \
-         would run without them",
-        c.id,
-        c.tools.join(", ")
-    ))
-}
-
 /// Longest part of the question the closing text repeats, in characters.
 const REPORT_QUESTION_CHARS: usize = 600;
 
@@ -202,6 +188,24 @@ pub trait Independent: Send + Sync {
     fn find(&self, key: &str) -> Result<Option<String>, String>;
     /// `None` while it runs; once ended, its contribution and what it spent.
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String>;
+    /// [`start`](Independent::start) for a helper whose owner allowed it the
+    /// connected tools of `scope` (#1039). A runner that cannot give a helper
+    /// tools refuses, never starts it without them.
+    fn start_scoped(
+        &self,
+        _who: &str,
+        _task: &str,
+        _tokens: u64,
+        _key: &str,
+        _scope: &DiscussionScope,
+    ) -> Result<String, String> {
+        Err("this runner cannot give a helper tools".into())
+    }
+    /// What the owner decided about the helper's tool requests so far
+    /// (#1039); none for a runner that has no approvals.
+    fn decisions(&self, _handle: &str) -> Result<Vec<ToolDecision>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Independent participants as delegated `consult` children (#585): the
@@ -217,6 +221,28 @@ impl Independent for DelegateIndependent {
             &format!("{}\n\n{task}", call_marker(key)),
             tokens,
             None,
+        )
+    }
+    fn start_scoped(
+        &self,
+        who: &str,
+        task: &str,
+        tokens: u64,
+        key: &str,
+        scope: &DiscussionScope,
+    ) -> Result<String, String> {
+        self.0.consult_participant(
+            who,
+            &format!("{}\n\n{task}", call_marker(key)),
+            tokens,
+            Some(scope),
+        )
+    }
+    fn decisions(&self, handle: &str) -> Result<Vec<ToolDecision>, String> {
+        helper_tools::decisions(
+            &self.0.approvals_store(),
+            handle,
+            crate::delegated_approver::real_now(),
         )
     }
     fn find(&self, key: &str) -> Result<Option<String>, String> {
@@ -556,7 +582,7 @@ impl Driver {
     /// Records the contract: its participants must be this driver's
     /// voices, and its budget must fit what is left in the pot.
     pub fn start(&self, contract: Contract) -> Result<(), String> {
-        refuse_tools(&contract)?;
+        self.check_tools(&contract)?;
         if let Some(p) = contract
             .participants
             .iter()
@@ -584,9 +610,14 @@ impl Driver {
     pub fn run(&self) -> Result<Outcome, String> {
         // Before any step: the background files are the contract's, or nothing
         // runs (a no-op without files, cached after the first check).
-        if let Some(c) = self.log.state()?.contract {
-            refuse_tools(&c)?;
-            self.check_files(&c)?;
+        let st = self.log.state()?;
+        if let Some(c) = &st.contract {
+            // Helpers are needed only while a step can still start one: the
+            // stop, the close and a finished discussion's outcome run without.
+            if helper_tools::needs_helpers(&st.next()) {
+                self.check_tools(c)?;
+            }
+            self.check_files(c)?;
         }
         loop {
             let st = self.log.state()?;
@@ -670,10 +701,20 @@ impl Driver {
     ) -> Result<Option<String>, String> {
         let what = format!("participant-{who}");
         let id = st.contract.as_ref().map_or("", |c| c.id.as_str());
+        // The owner's allowance, if any (#1039): what this helper may ask for,
+        // from the ledger as it stands now.
+        let scope = st
+            .contract
+            .as_ref()
+            .filter(|c| !c.tools.is_empty())
+            .map(|c| helper_tools::scope(st, c));
         let (call, handle) = match st.open_call(round, &what) {
             Some((call, Some(handle))) => (call, handle),
             open => {
-                let task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
+                let mut task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
+                if let Some(s) = &scope {
+                    task = format!("{task}\n\n{}", helper_tools::task_note(&s.tools));
+                }
                 let (call, need) = match open {
                     Some((call, None)) => {
                         let need = st.reservations.get(&call).map_or(0, |r| r.tokens);
@@ -691,7 +732,10 @@ impl Driver {
                 let found = runner.find(&key)?;
                 let handle = match found {
                     Some(h) => Ok(h),
-                    None => runner.start(who, &task, need, &key),
+                    None => match &scope {
+                        Some(s) => runner.start_scoped(who, &task, need, &key, s),
+                        None => runner.start(who, &task, need, &key),
+                    },
                 }
                 .map_err(|e| {
                     format!(
@@ -704,12 +748,87 @@ impl Driver {
             }
         };
         loop {
-            if let Some((text, spent)) = runner.poll(&handle)? {
+            let ended = runner.poll(&handle)?;
+            if scope.is_some() {
+                let mut recorded = self.record_decisions(runner, &handle);
+                if ended.is_some() && recorded.is_err() {
+                    // The last poll is the last time the answers can be read,
+                    // so it is tried once more.
+                    recorded = self.record_decisions(runner, &handle);
+                }
+                if let Err(e) = recorded {
+                    let text = discussion::sanitize(&e, &self.secrets, 300).text;
+                    if ended.is_some() {
+                        // Settling now would lose an approved use for good:
+                        // the helper stays bound and unsettled, so a resume
+                        // polls it again and records what is still there.
+                        return Err(format!(
+                            "{who}'s tool approvals in round {round} were not recorded in the \
+                             ledger: {text}"
+                        ));
+                    }
+                    // Still running: the answers are read again on the next
+                    // poll. One note, however long it lasts.
+                    self.note_once(text);
+                }
+            }
+            if let Some((text, spent)) = ended {
                 self.log.settle(&call, spent, (self.now)())?;
                 self.pot.charge(spent);
                 return Ok(Some(text));
             }
             std::thread::sleep(self.poll_every);
+        }
+    }
+
+    /// Copies the owner's answers about helper `handle`'s tool requests into
+    /// the ledger, once per request (#1039). Every answer is tried; the first
+    /// failure is returned. The caller decides what it means: while the helper
+    /// runs the answers are read again on the next poll, and on its last poll
+    /// the discussion stops there (resumable) rather than settle the helper
+    /// without them.
+    fn record_decisions(&self, runner: &dyn Independent, handle: &str) -> Result<(), String> {
+        let found = runner
+            .decisions(handle)
+            .map_err(|e| format!("tool approvals could not be read: {e}"))?;
+        let mut first = None;
+        for d in found {
+            if let Err(e) = self
+                .log
+                .tool_approval(&d.req, &d.tool, d.verdict, (self.now)())
+            {
+                first.get_or_insert(format!("tool approval {} was not recorded: {e}", d.req));
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// A contract that allows helper tools needs every participant seated as
+    /// an independent helper (inline voices have no tools): refused loudly
+    /// otherwise, rather than run without them, and a name no connected tool
+    /// can have is refused too (#1039).
+    fn check_tools(&self, c: &Contract) -> Result<(), String> {
+        if c.tools.is_empty() {
+            return Ok(());
+        }
+        if let Some(t) = c.tools.iter().find(|t| !discussion::tool_name_ok(t)) {
+            return Err(format!(
+                "discussion `{}` allows {t:?}, which is not a connected tool name",
+                c.id
+            ));
+        }
+        match c
+            .participants
+            .iter()
+            .find(|p| !self.independent.contains_key(*p))
+        {
+            None => Ok(()),
+            Some(p) => Err(format!(
+                "discussion `{}` allows helper tools ({}), but participant `{p}` is not seated as \
+                 an independent helper here: it would run without them",
+                c.id,
+                c.tools.join(", ")
+            )),
         }
     }
 
@@ -1025,6 +1144,15 @@ impl Driver {
     fn note(&self, n: String) {
         if let Ok(mut v) = self.notes.lock() {
             v.push(n);
+        }
+    }
+
+    /// [`note`](Driver::note), unless the same note is already there.
+    fn note_once(&self, n: String) {
+        if let Ok(mut v) = self.notes.lock() {
+            if !v.contains(&n) {
+                v.push(n);
+            }
         }
     }
 
