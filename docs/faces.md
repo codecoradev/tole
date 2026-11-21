@@ -2,9 +2,12 @@
 
 tole runs a session through several **faces**: the CLI commands (`run`,
 `chat`, `resume`, `mission`) and the TUI, `tole serve`, `tole acp`, `tole mcp`
-(stdio) and the MCP-over-HTTP host, and cron. A capability must not exist on
-one face only by accident: a desktop client or a chat gateway talking to
-`tole serve` should get the agent `tole chat` gives in the same repository.
+(stdio) and the MCP-over-HTTP host, and cron. The desktop and mobile apps are
+faces too, but thin ones: each is a client of `tole serve` and runs no session
+of its own (see [The desktop and mobile faces](#the-desktop-and-mobile-faces)).
+A capability must not exist on one face only by accident: a desktop client or a
+chat gateway talking to `tole serve` should get the agent `tole chat` gives in
+the same repository.
 This page is the record of what differs on purpose. It exists because the
 drift happened before (#536 closed after only `mission` got the review
 guidance); epic #941 moves the assembly into one place and this page, with the
@@ -75,6 +78,27 @@ true; the status column says where the work is.
 | Sandbox profile for process tools | yes | yes | yes | yes | one path |
 | Graceful shutdown on SIGTERM and SIGINT (#1014: running turns detached through `detach_running_turns`, a bounded grace, exit 0 when drained) | no (a terminal turn ends with Ctrl+C as before) | yes, `serve` (REST) and the MCP-over-HTTP host share one drain (`serve_support::shutdown`); `tole acp` and `tole mcp` (stdio) end when their parent closes the pipe | n/a | no | policy (only the long-running daemons are stopped by a process manager with a signal; a mission is hosted by `serve` only, so only `serve` cancels one at shutdown) |
 
+## The desktop and mobile faces
+
+Neither app hosts a session. `tole-desktop` (a thin client built on the typed
+`tole-client`, #1040) and the mobile app (uteke-mobile, a separate repository)
+talk to `tole serve`, so the session they drive is a server session: its tools
+and default prompt are the `server-session` column of the table above, and
+neither app can add or remove a tool. That is why the parity table has no
+column for them; a tool that a desktop or mobile session gained or lost would
+show as a `server-session` difference and need a row there. What can differ is
+how the app reaches serve and what the app itself does on the owner's machine.
+Each difference is on purpose:
+
+| Difference | Desktop | Mobile | Why |
+|---|---|---|---|
+| Transport and credential | A Unix socket in a `0700` directory (macOS, Linux; the Windows named pipe is #1051) with a per-launch credential for a local serve, or `https://` to a remote one | TCP to a serve the owner exposes, with a bearer token or HTTP Basic (`--auth basic`) | Identity and authentication is an allowed difference (table at the top). The routes are the same on every transport; the desktop adds no route only it uses. |
+| Starting and stopping the server | Attaches to a matching local serve or starts one as a child; "Quit completely" stops it (owner decisions D3, #1029) | Never; the server is already running on the owner's machine | A phone cannot host the owner's workspace. Serve itself is the same process either way. |
+| Choosing a folder with the operating system's dialog | Yes, in the desktop process | No dialog; a folder is one the server already allows | The dialog is a window on the client's own machine. The server only checks that a folder lies inside its workspace (`jail_session_cwd`), so a client can never name one outside it. |
+| A file panel that reads the workspace folder directly (`@file`, a file tree) | Only if the desktop is on the same machine as the server, and then read-only display | No | Serve has no file listing, search or read route on purpose (the tool jail and the approval gate are in front of every file the agent touches). A client that reads the folder itself is the owner's own process on the owner's own files and does not go through either, so it must never write there; every write stays an approved tool call. A remote desktop and a phone have no such access. Exposing the workspace tree as a route would be an owner decision (#1042), not part of this row. |
+| Push notification of a pending approval | None from tole; the desktop shows the approvals queue while it is open | The app owns its push channel (ntfy, UnifiedPush or FCM) | There is no push endpoint in tole by design (threat model); webhook delivery (#911) is how a gateway is told. |
+| Owner actions that are not serve routes | Local only; the desktop shows them but a token holder cannot do them | Not available | See the next section; the rows there hold for both apps. |
+
 ## Owner actions that are not serve routes
 
 `tole serve` is also the interface of the desktop and of mobile clients (#1042), so every read a person needs and
@@ -89,6 +113,7 @@ design, section 0) or a design rule, not a gap:
 | Change the allow list | the owner's config and `--allow` | An approval answers one call; the standing allow list is configuration. |
 | Create or edit a cron job | `tole cron create`, `tole cron edit` | A job carries a prompt, an allow list and, for a script job, a command run with the owner's authority. Stays local-only unless the owner decides otherwise (#1042). |
 | Choose a folder with the operating system's dialog | the desktop process | It is a window on the client's machine; the server only checks that a folder is inside its workspace. |
+| Read the workspace folder from the client (a file panel) | the desktop process, on the same machine as the server | Serve has no file route on purpose. A client that reads the folder itself bypasses the tool jail and the approval gate, so it is display only and never writes; mobile and a remote desktop cannot do it. |
 
 ## Adding or changing a face capability
 

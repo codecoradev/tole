@@ -49,8 +49,9 @@ run it, or "automations keep running" does not hold.
 
 What stays in the desktop process and never becomes a serve route: writing
 config and profiles, trust approval of skills and connected tools (owner
-decision pending, #1034), the operating system's folder dialog. Each is to
-become a row of [faces.md](faces.md); #1029 and #1040 carry that work.
+decision pending, #1034), the operating system's folder dialog. Each is a row
+of [faces.md](faces.md) (#1070), which also records the desktop and mobile
+faces and a file panel that reads the folder directly.
 
 ## 1. One API, two transports
 
