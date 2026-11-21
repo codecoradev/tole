@@ -147,6 +147,7 @@ mod tests {
 
     #[test]
     fn the_token_reaches_the_child_on_stdin_and_not_in_its_arguments_or_environment() {
+        let _turn = crate::supervisor::fake::spawn_guard();
         let dir = std::env::temp_dir().join(format!("tdproc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
