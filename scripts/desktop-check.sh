@@ -34,8 +34,9 @@
 #             - secondary, by text: in the tole-desktop crate (every .rs file,
 #               tests and build scripts included) only src/ui/adapter.rs names
 #               gpui*, and `#[path]` and `include!` are not used.
-# size      At most 500 lines per .rs file and 12,000 per crate (owner rule D1,
-#           2026-11-20 set 4,000; raised to 12,000 by the owner on 2026-11-21)
+# size      At most 500 lines per .rs file and 50,000 per crate (owner rule D1,
+#           2026-11-20 set 4,000; raised to 12,000 and then to 50,000 by the
+#           owner on 2026-11-21)
 #           in each desktop
 #           crate. Other crates are only reported, as warnings: the cap is for
 #           the desktop alone. Every check walks a crate the same way: paths

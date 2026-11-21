@@ -101,7 +101,7 @@ cargo test --workspace
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
 # only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
 scripts/test-desktop-check.sh # self-test of the guardrail script
-scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 12,000 per crate). ADVISORY (warns only): literals in the ui layer
+scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 50,000 per crate). ADVISORY (warns only): literals in the ui layer
 scripts/desktop-render.sh <dir> # a desktop UI change: render the real window offscreen, one PNG per screen and state, and compare with the board (not a gate; see docs/design/desktop/README.md)
 ```
 
@@ -204,6 +204,12 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   difference with no row).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
+- Desktop crates are modular monoliths (owner rule D1; the crate cap is 50,000
+  lines, the file cap 500): one small module per page or capability, shared
+  pieces (text cleaning, badges, caps, strings, tokens) in their own reusable
+  modules and not copied, a module directory with small files instead of one
+  growing file, a new page as a new module with its own tests. A crate that
+  grows toward the cap is split along those module lines first.
 
 ## 7. Docs sync
 

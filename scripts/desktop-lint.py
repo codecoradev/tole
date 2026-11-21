@@ -48,10 +48,11 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 EXACT_REQ = re.compile(r"=\d+\.\d+\.\d+(-[0-9A-Za-z.\-]+)?")
 MAX_FILE_LINES = 500
 # Owner rule D1 (2026-11-20) set a hard ceiling of 4,000 lines per crate; the
-# owner raised it to 12,000 on 2026-11-21 because the pages of #1030 to #1037
-# need more than that in one crate. The 500-line per-file cap is unchanged and
-# is what keeps the modules small.
-MAX_CRATE_LINES = 12000
+# owner raised it to 12,000 and then to 50,000 on 2026-11-21 because the pages
+# of #1030 to #1037 need more than that in one crate. The 500-line per-file cap
+# is unchanged and is what keeps the modules small: a crate this size is a
+# modular monolith, one small module per page or capability, not one big file.
+MAX_CRATE_LINES = 50000
 
 findings = []  # (severity, text)
 

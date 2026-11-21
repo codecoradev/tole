@@ -544,10 +544,13 @@ if [ "$got" = 2 ] && grep -q "python3 is needed" <<< "$out"; then echo "ok   pyt
 new_ws; seq 1 501 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop-model/src/big.rs"
 expect "model file over 500 lines" size 1 "cap 500 per file"
 
-new_ws; for i in $(seq 1 27); do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
-expect "desktop crate over 12000 lines" size 1 "cap 12000 per crate"
+new_ws; for i in $(seq 1 112); do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
+expect "desktop crate over 50000 lines" size 1 "cap 50000 per crate"
 
-# Above the earlier cap of 4000 and under the current one (12000, the owner on 2026-11-21): allowed.
+# Above the earlier caps of 4000 and 12000 and under the current one (50000, the owner on 2026-11-21): allowed.
+new_ws; for i in $(seq 1 27); do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
+expect "desktop crate of 12150 lines is under the cap" size 0 "ok \(enforced rules\)"
+
 new_ws; for i in 1 2 3 4 5 6 7 8 9; do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
 expect "desktop crate of 4050 lines is under the cap" size 0 "ok \(enforced rules\)"
 
