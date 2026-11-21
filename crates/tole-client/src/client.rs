@@ -43,10 +43,14 @@ pub enum Route {
     StartDiscussion,
     ResumeDiscussion,
     StopDiscussion,
+    CronJobs,
+    PauseCronJob,
+    ResumeCronJob,
+    CronRuns,
 }
 
 impl Route {
-    pub const ALL: [Route; 18] = [
+    pub const ALL: [Route; 22] = [
         Route::Health,
         Route::Sessions,
         Route::SessionIndex,
@@ -65,6 +69,10 @@ impl Route {
         Route::StartDiscussion,
         Route::ResumeDiscussion,
         Route::StopDiscussion,
+        Route::CronJobs,
+        Route::PauseCronJob,
+        Route::ResumeCronJob,
+        Route::CronRuns,
     ];
 
     pub fn method(self) -> &'static str {
@@ -76,7 +84,9 @@ impl Route {
             | Route::DiscussionEstimate
             | Route::StartDiscussion
             | Route::ResumeDiscussion
-            | Route::StopDiscussion => "POST",
+            | Route::StopDiscussion
+            | Route::PauseCronJob
+            | Route::ResumeCronJob => "POST",
             _ => "GET",
         }
     }
@@ -102,6 +112,10 @@ impl Route {
             Route::StartDiscussion => "/discussions",
             Route::ResumeDiscussion => "/discussions/{id}/resume",
             Route::StopDiscussion => "/discussions/{id}/stop",
+            Route::CronJobs => "/cron/jobs",
+            Route::PauseCronJob => "/cron/jobs/{id}/pause",
+            Route::ResumeCronJob => "/cron/jobs/{id}/resume",
+            Route::CronRuns => "/cron/runs",
         }
     }
 }
@@ -467,6 +481,35 @@ impl Client {
     /// Stop a discussion: it closes with the ledger's escalation.
     pub fn stop_discussion(&self, id: &str) -> Result<DiscussionStopped> {
         self.call(Route::StopDiscussion, Some(id), "", None)
+    }
+
+    /// The cron jobs with their schedule, next run and last result, and
+    /// whether a scheduler is alive. Creating or editing a job is not a route.
+    pub fn cron_jobs(&self) -> Result<CronJobs> {
+        self.call(Route::CronJobs, None, "", None)
+    }
+
+    /// Pause a job (by its id). Always allowed.
+    pub fn pause_cron_job(&self, id: &str) -> Result<CronJobState> {
+        self.call(Route::PauseCronJob, Some(id), "", None)
+    }
+
+    /// Resume a job (by its id). A `403` ([`Error::Status`]) means the owner
+    /// has not reviewed it: that is done at a terminal with `tole cron resume`.
+    pub fn resume_cron_job(&self, id: &str) -> Result<CronJobState> {
+        self.call(Route::ResumeCronJob, Some(id), "", None)
+    }
+
+    /// Run history, newest first: all jobs, or one job's, at most `limit`.
+    pub fn cron_runs(&self, job: Option<&str>, limit: Option<usize>) -> Result<CronRuns> {
+        let mut query = Vec::new();
+        if let Some(j) = job {
+            query.push(format!("job={}", pct(j)));
+        }
+        if let Some(l) = limit {
+            query.push(format!("limit={l}"));
+        }
+        self.call(Route::CronRuns, None, &query.join("&"), None)
     }
 }
 

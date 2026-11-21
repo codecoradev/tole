@@ -55,6 +55,78 @@
       "required": ["id"],
       "type": "object"
     },
+    "CronJob": {
+      "description": "One job of `GET /cron/jobs`. `created_by` is `cli` (its owner) or\n`agent`; `awaiting_review` is true for an agent's job the owner has not\nenabled, which cannot be resumed over serve.",
+      "properties": {
+        "awaiting_review": {"type":"boolean"},
+        "blocked": {"format":"uint64","minimum":0,"type":"integer"},
+        "created_by": {"type":"string"},
+        "id": {"type":"string"},
+        "last": {"description":"The last run's status: `ok`, `error`, `cancelled`, `budget`,\n`awaiting_approval` or `interrupted`.","type":["string","null"]},
+        "missed": {"format":"uint64","minimum":0,"type":"integer"},
+        "mode": {"type":"string"},
+        "name": {"type":"string"},
+        "next": {"type":"string"},
+        "next_run": {"description":"Unix seconds of the next run, `null` while paused.","format":"int64","type":["integer","null"]},
+        "schedule": {"type":"string"},
+        "state": {"description":"`active` or `paused`.","type":"string"},
+        "timezone": {"type":"string"}
+      },
+      "required": ["id","name","schedule","timezone","mode","state","next","missed","blocked","created_by","awaiting_review"],
+      "type": "object"
+    },
+    "CronJobState": {
+      "description": "The answer to pausing or resuming a job.",
+      "properties": {
+        "id": {"type":"string"},
+        "state": {"type":"string"}
+      },
+      "required": ["id","state"],
+      "type": "object"
+    },
+    "CronJobs": {
+      "description": "`GET /cron/jobs`.",
+      "properties": {
+        "jobs": {"items":{"$ref":"#/$defs/CronJob"},"type":"array"},
+        "scheduler": {"$ref":"#/$defs/CronScheduler"}
+      },
+      "required": ["jobs","scheduler"],
+      "type": "object"
+    },
+    "CronRun": {
+      "description": "One run of `GET /cron/runs`; `output` is capped by the server.",
+      "properties": {
+        "deliveries": {"items":true,"type":"array"},
+        "fire_id": {"type":"string"},
+        "job_id": {"type":"string"},
+        "output": {"type":"string"},
+        "output_truncated": {"type":"boolean"},
+        "scheduled_for": {"format":"int64","type":"integer"},
+        "session_id": {"type":["string","null"]},
+        "status": {"description":"`null` while the run is going.","type":["string","null"]},
+        "usage": true
+      },
+      "required": ["fire_id","job_id","scheduled_for","deliveries","output","output_truncated"],
+      "type": "object"
+    },
+    "CronRuns": {
+      "description": "`GET /cron/runs`.",
+      "properties": {
+        "runs": {"items":{"$ref":"#/$defs/CronRun"},"type":"array"}
+      },
+      "required": ["runs"],
+      "type": "object"
+    },
+    "CronScheduler": {
+      "description": "Whether a ticker is alive to run the jobs, and where it runs.",
+      "properties": {
+        "age_seconds": {"format":"int64","type":["integer","null"]},
+        "alive": {"type":"boolean"},
+        "host": {"description":"`serve` (`tole serve --cron`) or `tick` (`tole cron tick`).","type":["string","null"]}
+      },
+      "required": ["alive"],
+      "type": "object"
+    },
     "Decision": {
       "description": "The verdict of `POST /approvals/{id}/decision`.",
       "enum": ["allow","deny"],
@@ -437,6 +509,9 @@
       "properties": {
         "ApprovalList": {"$ref":"#/$defs/ApprovalList"},
         "CancelReply": {"$ref":"#/$defs/CancelReply"},
+        "CronJobState": {"$ref":"#/$defs/CronJobState"},
+        "CronJobs": {"$ref":"#/$defs/CronJobs"},
+        "CronRuns": {"$ref":"#/$defs/CronRuns"},
         "DecisionReply": {"$ref":"#/$defs/DecisionReply"},
         "Discussion": {"$ref":"#/$defs/Discussion"},
         "DiscussionEstimate": {"$ref":"#/$defs/DiscussionEstimate"},
@@ -453,7 +528,7 @@
         "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
         "SessionStatus": {"$ref":"#/$defs/SessionStatus"}
       },
-      "required": ["ApprovalList","CancelReply","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
+      "required": ["ApprovalList","CancelReply","CronJobState","CronJobs","CronRuns","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
       "type": "object"
     }
   },
@@ -603,6 +678,38 @@
       "query": [],
       "request": null,
       "response": "DiscussionStopped",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/cron/jobs",
+      "query": [],
+      "request": null,
+      "response": "CronJobs",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/cron/jobs/{id}/pause",
+      "query": [],
+      "request": null,
+      "response": "CronJobState",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/cron/jobs/{id}/resume",
+      "query": [],
+      "request": null,
+      "response": "CronJobState",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/cron/runs",
+      "query": ["job","limit"],
+      "request": null,
+      "response": "CronRuns",
       "stream": null
     }
   ]

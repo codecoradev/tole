@@ -64,6 +64,7 @@ use tole_cli::session_host::{
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
+mod cron;
 mod discussions;
 pub mod missions;
 mod models;
@@ -1882,6 +1883,18 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         {
             discussions::show(state, &p["/discussions/".len()..])
         }
+        // Cron jobs (#1042): read, pause, and resume what the owner reviewed.
+        ("GET", "/cron/jobs") => cron::list(),
+        ("POST", p) if id_between(p, "/cron/jobs/", "/pause").is_some() => cron::set_paused(
+            state,
+            id_between(p, "/cron/jobs/", "/pause").unwrap_or_default(),
+            true,
+        ),
+        ("POST", p) if id_between(p, "/cron/jobs/", "/resume").is_some() => cron::set_paused(
+            state,
+            id_between(p, "/cron/jobs/", "/resume").unwrap_or_default(),
+            false,
+        ),
         // Cron run results (#579, design §9): the pull delivery target.
         ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {
             let query = |key: &str| {

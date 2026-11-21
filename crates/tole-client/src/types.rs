@@ -326,6 +326,68 @@ wire! {
         pub advice: Vec<String>,
     }
 
+    /// One job of `GET /cron/jobs`. `created_by` is `cli` (its owner) or
+    /// `agent`; `awaiting_review` is true for an agent's job the owner has not
+    /// enabled, which cannot be resumed over serve.
+    pub struct CronJob {
+        pub id: String,
+        pub name: String,
+        pub schedule: String,
+        pub timezone: String,
+        pub mode: String,
+        /// `active` or `paused`.
+        pub state: String,
+        /// Unix seconds of the next run, `null` while paused.
+        pub next_run: Option<i64>,
+        pub next: String,
+        /// The last run's status: `ok`, `error`, `cancelled`, `budget`,
+        /// `awaiting_approval` or `interrupted`.
+        pub last: Option<String>,
+        pub missed: u64,
+        pub blocked: u64,
+        pub created_by: String,
+        pub awaiting_review: bool,
+    }
+
+    /// Whether a ticker is alive to run the jobs, and where it runs.
+    pub struct CronScheduler {
+        pub alive: bool,
+        /// `serve` (`tole serve --cron`) or `tick` (`tole cron tick`).
+        pub host: Option<String>,
+        pub age_seconds: Option<i64>,
+    }
+
+    /// `GET /cron/jobs`.
+    pub struct CronJobs {
+        pub jobs: Vec<CronJob>,
+        pub scheduler: CronScheduler,
+    }
+
+    /// The answer to pausing or resuming a job.
+    pub struct CronJobState {
+        pub id: String,
+        pub state: String,
+    }
+
+    /// One run of `GET /cron/runs`; `output` is capped by the server.
+    pub struct CronRun {
+        pub fire_id: String,
+        pub job_id: String,
+        pub scheduled_for: i64,
+        /// `null` while the run is going.
+        pub status: Option<String>,
+        pub session_id: Option<String>,
+        pub usage: Option<Value>,
+        pub deliveries: Vec<Value>,
+        pub output: String,
+        pub output_truncated: bool,
+    }
+
+    /// `GET /cron/runs`.
+    pub struct CronRuns {
+        pub runs: Vec<CronRun>,
+    }
+
     /// The answer to `POST /discussions/{id}/resume`.
     pub struct DiscussionResumed {
         pub id: String,

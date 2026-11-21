@@ -28,6 +28,7 @@ pub use crate::ledger_file as store;
 pub mod tick;
 pub mod tool;
 pub mod trust;
+pub mod view;
 pub mod webhook;
 
 use std::path::{Path, PathBuf};
@@ -811,6 +812,11 @@ pub struct JobRow {
     pub last: Option<RunStatus>,
     pub missed: u64,
     pub blocked: usize,
+    /// Who saved the job: `cli` (its owner) or `agent` (the `cron_create` tool).
+    pub created_by: String,
+    /// The owner stands behind it ([`view::reviewed`]); false for an agent's
+    /// job nobody has enabled yet.
+    pub reviewed: bool,
 }
 
 pub fn list(dir: &Path) -> anyhow::Result<Vec<JobRow>> {
@@ -838,6 +844,8 @@ pub fn list(dir: &Path) -> anyhow::Result<Vec<JobRow>> {
                     .map(|m| m.count)
                     .sum(),
                 blocked: s.blocked().filter(|b| b.job_id == job.id).count(),
+                created_by: field(job, "created_by").unwrap_or("unknown").to_string(),
+                reviewed: view::reviewed(job),
             }
         })
         .collect())

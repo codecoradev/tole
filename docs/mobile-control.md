@@ -277,6 +277,22 @@ and read by the library exactly as `--file` is (a path outside it, a symlink, a 
 a duplicate are refused). The contract's own rules (question length, 1 to 12 criteria, a positive budget, at most 10
 rounds) are the CLI's, because the library applies them.
 
+## Cron jobs (#1042)
+
+`GET /cron/runs` (below, the pull delivery target) is joined by the job list and two controls. They read and write
+the same cron ledger `tole cron` does, through `tole_cli::cron::view`.
+
+| Action | Route | Answer |
+|---|---|---|
+| List jobs | `GET /cron/jobs` | `{"jobs": [{"id", "name", "schedule", "timezone", "mode", "state", "next_run", "next", "last", "missed", "blocked", "created_by", "awaiting_review"}], "scheduler": {"alive", "host", "age_seconds"}}`. `state` is `active` or `paused`; `next_run` is Unix seconds (`null` while paused); `last` is the last run's status; `created_by` is `cli` (saved by its owner) or `agent` (the `cron_create` tool); `awaiting_review` is true for an agent's job nobody has enabled. `scheduler` says whether a ticker has passed lately and where it runs (`serve` for `tole serve --cron`, `tick` for `tole cron tick`) |
+| Run history | `GET /cron/runs?job=<id>&limit=<n>` | unchanged (#579): newest first, at most 500, each with its redacted output capped at 16 KiB. `404` for an unknown `job` |
+| Pause | `POST /cron/jobs/{id}/pause` | `200 {"id", "state": "paused"}`. Any job, on any server: a paused job has less authority |
+| Resume | `POST /cron/jobs/{id}/resume` | `200 {"id", "state": "active"}` for a job its owner stands behind (saved with `tole cron create`, or an agent's job the owner already enabled). `403` for an agent's job nobody enabled: reviewing and enabling it is trust approval and stays `tole cron resume <id>` at a terminal. `409` on a `--plan-mode` server. The owner's review record (`enabled_by`) is never written over serve |
+
+A job is addressed by its `id` (the name does not resolve; a wrong id is `404`). There is no route to create, edit,
+remove or run a job: those stay local-only owner actions (a job carries a prompt, an allow list and, for a script, a
+command run with the owner's authority).
+
 ## Resume by id (#524)
 
 `POST /sessions {"resume": "<id>", "cwd"?: "..."}` makes an existing session live
