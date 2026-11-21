@@ -338,7 +338,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     `discuss`, `discuss_status` and `discuss_stop` under the rules of
     `delegate` (the owner chose both entry points, see `automation-design.md`
     "Entry point"); independent child participants for agents (#704) are in
-    as read-only reviewers that stay read-only; the owner's approval surface
+    as read-only reviewers that stay read-only (#1039 lets the owner give them named connected tools, one approval per tool per discussion, with `tole discuss start --tool`); the owner's approval surface
     for delegated children is #714, built in six parts behind
     `[delegation] approvals` (default `off`), see
     `delegation-approvals-design.md` and `approving-delegated-work.md`);

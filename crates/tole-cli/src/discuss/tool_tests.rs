@@ -377,6 +377,7 @@ fn a_session_manages_only_the_discussions_it_started() {
             budget_tokens: 50_000,
             max_rounds: Some(2),
             files: vec![],
+            tools: vec![],
         },
         &crate::discuss::Env {
             dir: &r.dir,
@@ -385,6 +386,7 @@ fn a_session_manages_only_the_discussions_it_started() {
             secrets: SecretSet::default(),
             make,
             workdir: &r.dir,
+            delegator: None,
         },
     )
     .unwrap();

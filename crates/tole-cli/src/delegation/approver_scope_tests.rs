@@ -241,3 +241,57 @@ fn a_deny_pattern_is_final_for_a_named_tool_even_once_the_owner_allowed_it() {
     let c = scoped_with(&f, SEARCH, SEARCH, p).unwrap();
     assert_eq!(c.decide(&mcp(SEARCH, &i)), Verdict::Allow);
 }
+
+/// What the discussion driver reads back from the queue (#1039): an allow
+/// (once consumed too), a denial and an unanswered request, for this helper's
+/// node only, and nothing while a request is still waiting.
+#[test]
+fn the_driver_reads_the_owners_answers_back_per_helper() {
+    use crate::discuss::helper_tools::{decisions, ToolDecision};
+    use tole_core::discussion::ToolVerdict;
+    const THIRD: &str = "mcp_nginjen_third";
+    let f = fx("scope-decisions", 3600);
+    let seen = |f: &Fx, now: i64| {
+        let mut d = decisions(&f.store(), &f.kid, now).unwrap();
+        d.sort_by(|a, b| a.tool.cmp(&b.tool));
+        d.into_iter()
+            .map(|x: ToolDecision| (x.tool, x.verdict))
+            .collect::<Vec<_>>()
+    };
+    f.on_nap({
+        let f2 = f.clone();
+        move |n, now| match n {
+            1 => answer(&f2, 0, Choice::Allow, now),
+            2 => answer(&f2, 1, Choice::Deny, now),
+            // The third request is waiting: it is not listed yet.
+            3 => assert_eq!(seen(&f2, now).len(), 2),
+            _ => {}
+        }
+    });
+    let a = scoped(&f, &format!("{SEARCH},{SCRAPE},{THIRD}"), "").unwrap();
+    let i = json!({"q": "x"});
+    assert_eq!(a.decide(&mcp(SEARCH, &i)), Verdict::Allow);
+    assert_eq!(a.decide(&mcp(SCRAPE, &i)), Verdict::Deny);
+    f.on_nap({
+        let f2 = f.clone();
+        move |n, now| {
+            if n == 1 {
+                assert_eq!(seen(&f2, now).len(), 2, "waiting is not listed");
+            }
+        }
+    });
+    assert_eq!(a.decide(&mcp(THIRD, &i)), Verdict::Deny);
+    let now = f.clock.load(SeqCst);
+    assert_eq!(
+        seen(&f, now),
+        [
+            (SCRAPE.to_string(), ToolVerdict::Deny),
+            (SEARCH.to_string(), ToolVerdict::Allow),
+            (THIRD.to_string(), ToolVerdict::Expired),
+        ]
+    );
+    // Another node's requests are not this helper's.
+    assert!(decisions(&f.store(), "somebody-else", now)
+        .unwrap()
+        .is_empty());
+}

@@ -252,7 +252,10 @@ restart or from a second device. `GET /sessions` stays the live list (`id`, `bus
 The owner's `tole discuss` over serve: read, dry run, start, resume and stop. They are the same library
 (`tole_cli::discuss`) the terminal uses; the routes only turn a request into its arguments and an error into a
 status. Starting is the owner's action under the server's auth, at depth 0 (inline, read-only voices with no tools),
-with the contract, participant, budget and file rules of `tole discuss start`. A discussion a model starts with the
+with the contract, participant, budget and file rules of `tole discuss start`. A discussion that a terminal started
+with `--tool` (helpers with the owner's named connected tools, #1039) can be listed, shown and stopped from here, but
+not resumed while it is open: `serve` has no host to start helper children, so that resume is refused and the
+terminal's `tole discuss resume` continues it (a stop and a finished discussion need no host). A discussion a model starts with the
 `discuss` tool is still only an approval and is not started from here.
 
 | Action | Route | Answer |
@@ -266,7 +269,7 @@ with the contract, participant, budget and file rules of `tole discuss start`. A
 
 Not here yet, and left to the owner (see the open questions of #1042): continuing a discussion with a note for the next
 round or reopening a closed one (the ledger has no owner-note event and a closed discussion is final), per-discussion
-tool allowance (#1039), and discussion events on the live stream (`GET /sessions/{id}/events` is per session; read
+tool allowance (#1039; it is the terminal's `--tool`, see `docs/faces.md`), and discussion events on the live stream (`GET /sessions/{id}/events` is per session; read
 `GET /discussions/{id}` while the `state` is `running`).
 
 The request body carries what the owner types for `tole discuss start`: `question`, `criteria`, `participants`,

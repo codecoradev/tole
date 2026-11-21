@@ -324,6 +324,13 @@ impl Delegator {
         ))
     }
 
+    /// The approvals store of this host's goal, for a reader that is not a
+    /// level of it: the discussion driver reading the owner's answers about a
+    /// helper's tool requests (#1039). Read-only use.
+    pub fn approvals_store(&self) -> crate::delegated_approver::Store {
+        crate::delegated_approver::Store::new(self.log.clone())
+    }
+
     /// The canonical workspace root every path of this host is keyed on.
     pub fn root(&self) -> &Path {
         &self.root

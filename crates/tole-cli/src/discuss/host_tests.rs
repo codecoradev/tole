@@ -1280,10 +1280,10 @@ fn sixteen_independent_participants_run_one_process_at_a_time_within_the_budget(
     assert_eq!(*runner.peak.lock().unwrap(), 1);
 }
 
-/// #1039: a contract that allows helper tools needs the independent helpers
-/// and approval wiring a later change adds; until then it is refused before
-/// anything is written or called, never run with inline helpers that would
-/// silently have no tools.
+/// #1039: a contract that allows helper tools needs its participants seated
+/// as independent helpers; a driver without them refuses it before anything is
+/// written or called, never runs inline helpers that would silently have no
+/// tools.
 #[test]
 fn a_contract_with_helper_tools_is_refused_not_run_without_them() {
     let (s, make) = script(&[]);
@@ -1303,3 +1303,6 @@ fn a_contract_with_helper_tools_is_refused_not_run_without_them() {
     assert!(d.run().unwrap_err().contains("allows helper tools"));
     assert!(kinds(&s).is_empty());
 }
+
+#[path = "host_tools_tests.rs"]
+mod tools;

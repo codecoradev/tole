@@ -6,12 +6,16 @@
 //! participants, token budget and `max_rounds` are command-line values, never
 //! model output. A discussion started here is at depth 0, its participants
 //! are read-only inline voices (no tools, no process), and its budget is the
-//! one the owner named. Nothing here starts a child, writes a file in the
-//! workspace or widens a secret, allow pattern or profile: the host library
+//! one the owner named. Only when the owner passes `--tool` (#1039) are the
+//! participants read-only independent children instead, holding exactly the
+//! connected tools the owner named, each asked once per discussion
+//! ([`helper_tools`]). Nothing here writes a file in the workspace or widens a
+//! secret, allow pattern or profile: the host library
 //! ([`crate::discussion_host`]) does the work and only the gate decides.
 
 pub mod audit;
 pub mod files;
+pub mod helper_tools;
 pub mod host;
 pub mod owner;
 pub mod tool;
@@ -40,6 +44,10 @@ pub struct StartArgs {
     /// Background files (#1038): paths as the owner typed them, inside the
     /// working folder ([`Env::workdir`]).
     pub files: Vec<String>,
+    /// The connected tools the owner allows the helpers (#1039), as registry
+    /// names (`mcp_<server>_<tool>`, from `--tool <server>.<tool>` by
+    /// [`helper_tools::resolve`]). Empty: inline voices with no tools, as ever.
+    pub tools: Vec<String>,
 }
 
 /// Where and with what a discussion runs.
@@ -53,6 +61,9 @@ pub struct Env<'a> {
     pub make: Factory,
     /// The working folder background files are named against and read from.
     pub workdir: &'a Path,
+    /// The host that starts helper children, for a discussion that allows
+    /// tools (#1039); `None` refuses such a discussion.
+    pub delegator: Option<Arc<crate::delegate::Delegator>>,
 }
 
 /// A fresh discussion id from the clock (`d-<unix seconds>`).
@@ -92,6 +103,7 @@ fn contract_and_background(
         args.max_rounds,
         secrets,
     )?;
+    let c = c.with_tools(&args.tools)?;
     if args.files.is_empty() {
         return Ok((c, Vec::new()));
     }
@@ -165,6 +177,18 @@ pub fn cost_plan_with(c: &Contract, background: &[Background]) -> String {
         ),
     };
     let q_chars = c.question.chars().count();
+    let tools = if c.tools.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Helper tools: {}. Every participant runs as an independent read-only child (at \
+             least {} tokens reserved per turn), and the first call of each tool is asked of you \
+             in the delegation approvals queue (`tole delegation approvals list|allow|deny`, from the same folder): allow covers that tool for this \
+             discussion only.\n",
+            c.tools.join(", "),
+            host::INDEPENDENT_MIN_TOKENS
+        )
+    };
     let files = if background.is_empty() {
         String::new()
     } else {
@@ -196,7 +220,7 @@ pub fn cost_plan_with(c: &Contract, background: &[Background]) -> String {
          (each round: one per participant, a scribe and a claim-checker).\n\
          Question: {q_chars} characters (about {} tokens), sent with every call and counted \
          in the estimate below.\n\
-         {files}\
+         {files}{tools}\
          Estimate: a round reserves at least {floor} tokens ({n} participant calls and a \
          claim-checker, plus a scribe for a large round); {fit}\n\
          Budget: {} tokens, a hard cap: a call that does not fit stops the discussion \
@@ -224,6 +248,19 @@ pub fn advice_with(c: &Contract, background: &[Background]) -> Vec<String> {
     let mut out: Vec<String> = discussion::participants_advice(c.participants.len())
         .into_iter()
         .collect();
+    // A helper child is reserved at least this many tokens a turn (#1039), a
+    // floor the inline estimate below does not see.
+    let helpers = c.participants.len() as u64 * host::INDEPENDENT_MIN_TOKENS;
+    if !c.tools.is_empty() && c.budget_tokens < helpers {
+        out.push(format!(
+            "helpers with tools are independent children, each reserved at least {} tokens a \
+             turn: the budget ({} tokens) does not fit one round of {} of them ({helpers} \
+             reserved), so the discussion will stop with a budget escalation in round 1",
+            host::INDEPENDENT_MIN_TOKENS,
+            c.budget_tokens,
+            c.participants.len()
+        ));
+    }
     let floor = host::round_floor_with(c, background);
     if c.budget_tokens < floor {
         out.push(format!(
@@ -256,6 +293,9 @@ pub fn plan(args: &StartArgs, env: &Env<'_>) -> Result<String, String> {
     let (c, bg) = prepared(args, env.workdir, now_secs(), &env.secrets)?;
     let log = DiscussionLog::at(env.dir, &c.id)?;
     check_participants(&c, env, log)?;
+    if !c.tools.is_empty() {
+        helper_tools::need_approvals(env.cfg)?;
+    }
     Ok(format!("{}\n", cost_plan_with(&c, &bg)))
 }
 
@@ -322,6 +362,7 @@ pub fn begin(args: &StartArgs, env: &Env<'_>) -> Result<Ready, String> {
     )?
     .with_workdir(env.workdir)
     .with_background(bg);
+    let driver = helper_tools::seat(driver, &c, env.cfg, env.delegator.as_ref())?;
     // Before anything is written: the files the contract was built from are
     // the ones the driver will show, so the ledger can always be resumed.
     driver.check_files(&c)?;
@@ -366,6 +407,13 @@ pub fn prepare_resume(id: &str, env: &Env<'_>) -> Result<Ready, String> {
         pot,
     )?
     .with_workdir(env.workdir);
+    // Helpers only when a step can still start one: a stopped or finished
+    // discussion is closed or shown without a delegation host (#1039).
+    let driver = if helper_tools::needs_helpers(&st.next()) {
+        helper_tools::seat(driver, &c, env.cfg, env.delegator.as_ref())?
+    } else {
+        driver
+    };
     // A file that is gone or changed is not a failure a resume can cure, so it
     // is reported as it is, without the "continue it with resume" advice.
     driver.check_files(&c)?;

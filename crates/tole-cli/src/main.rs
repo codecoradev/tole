@@ -843,6 +843,21 @@ enum DiscussAction {
         /// refuses a file that is gone or changed.
         #[arg(long = "file")]
         files: Vec<String>,
+        /// A connected (MCP) tool the participants may use, as
+        /// <server>.<tool> (e.g. nginjen.search); repeat for more (at most
+        /// 8). The server must be in the `mcp_server` list of your config (or
+        /// be the cora preset): the helpers are separate processes that do
+        /// not get a `--mcp-server` flag. The tool name must need no change
+        /// to be registered (letters, digits, `_`, `-`; the name `mcp_<server>_<tool>`
+        /// is printed). With any, every participant
+        /// runs as an independent read-only child (it cannot write or run
+        /// programs) and the FIRST call of each tool in this discussion is
+        /// asked of you in the delegation approvals queue (answer it with
+        /// `tole delegation approvals list|allow|deny` from the same folder): allow
+        /// covers that tool for this discussion only, never another one. It
+        /// needs `[delegation] approvals = "owner"` in your user config.
+        #[arg(long = "tool")]
+        tools: Vec<String>,
         /// Validate the contract and show what it may cost; call no model
         /// and write nothing.
         #[arg(long)]
@@ -2373,7 +2388,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        Command::Discuss { action } => discuss_command(action, cfg.as_ref()),
+        Command::Discuss { action } => {
+            // The servers a helper child can resolve (#1039): the child is a
+            // separate `tole mission` that reads the config and the cora
+            // preset, and gets no `--mcp-server` flag of this process.
+            #[cfg(feature = "mcp")]
+            let servers = helper_mcp_servers(cfg.as_ref(), auto_mcp_specs());
+            #[cfg(not(feature = "mcp"))]
+            let servers: Vec<String> = Vec::new();
+            discuss_command(action, cfg.as_ref(), &servers, &host.delegation)
+        }
         Command::Delegation { action } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
             delegation_command(action, &root)
@@ -2598,7 +2622,12 @@ fn delegation_command(action: DelegationAction, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>) -> Result<()> {
+fn discuss_command(
+    action: DiscussAction,
+    cfg: Option<&tole_cli::config::Config>,
+    servers: &[String],
+    delegation: &tole_cli::delegate::Setup,
+) -> Result<()> {
     use tole_cli::discuss;
     let dir = discuss::dir().map_err(anyhow::Error::msg)?;
     let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
@@ -2642,6 +2671,20 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                     tole_cli::config_apply::discussion_timeout(),
                 )
             };
+            // The host that starts helper children, for a discussion that
+            // allows tools (#1039): one root goal in this folder, no allow
+            // patterns of its own (a helper's authority is nothing but the
+            // owner's allowance).
+            let delegator = std::env::current_exe().ok().and_then(|bin| {
+                tole_cli::delegate::Delegator::for_session(
+                    bin,
+                    workdir.clone(),
+                    false,
+                    Vec::new(),
+                    delegation.clone(),
+                    &tole_cli::config_apply::real_env,
+                )
+            });
             let env = discuss::Env {
                 dir: &dir,
                 cfg,
@@ -2649,6 +2692,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                 secrets,
                 make,
                 workdir: &workdir,
+                delegator: delegator.map(std::sync::Arc::new),
             };
             match action {
                 DiscussAction::Start {
@@ -2659,6 +2703,7 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                     max_rounds,
                     id,
                     files,
+                    tools,
                     dry_run,
                 } => {
                     let args = discuss::StartArgs {
@@ -2669,6 +2714,15 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                         budget_tokens: budget,
                         max_rounds,
                         files,
+                        tools: {
+                            let names = discuss::helper_tools::resolve(&tools, servers)
+                                .map_err(anyhow::Error::msg)?;
+                            // The exact registry name each spelling allows.
+                            for (spec, name) in tools.iter().zip(&names) {
+                                eprintln!("tole: helper tool {spec} is allowed as {name}");
+                            }
+                            names
+                        },
                     };
                     for line in discuss::advice_for(&args, env.workdir, &env.secrets) {
                         eprintln!("tole: advice: {line}");
@@ -2756,6 +2810,22 @@ fn auto_mcp_specs() -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// The names of the connected servers a discussion's helper child starts with:
+/// the `mcp_server` list of the config and, unless `no_auto_mcp` is set, the
+/// auto presets (`auto` is injected like for [`merge_mcp_specs`]). A server
+/// given only with the `--mcp-server` flag of this process is not one of them:
+/// the helper is a separate `tole mission` that does not receive the flag.
+#[cfg(feature = "mcp")]
+fn helper_mcp_servers(cfg: Option<&tole_cli::config::Config>, auto: Vec<String>) -> Vec<String> {
+    let explicit = cfg.and_then(|c| c.mcp_server.clone()).unwrap_or_default();
+    let no_auto = cfg.and_then(|c| c.no_auto_mcp).unwrap_or(false);
+    merge_mcp_specs(&explicit, no_auto, auto)
+        .iter()
+        .filter_map(|s| s.split('=').next())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Merge explicit `--mcp-server` specs over the auto-detected presets.
@@ -4529,7 +4599,7 @@ mod session_id_rule_tests {
 
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_preset_tests {
-    use super::merge_mcp_specs;
+    use super::{helper_mcp_servers, merge_mcp_specs};
 
     #[test]
     fn auto_spec_appended_when_no_explicit() {
@@ -4568,6 +4638,19 @@ mod mcp_preset_tests {
             vec!["cora=cora mcp".into()],
         );
         assert_eq!(merged, vec!["fs=npx -y fs-server".to_string()]);
+    }
+
+    #[test]
+    fn helpers_get_the_config_servers_and_the_preset_never_the_flag() {
+        let cfg = |src: &str| tole_cli::config::parse(src, std::path::Path::new("u.toml")).unwrap();
+        let auto = || vec!["cora=cora mcp".to_string()];
+        // No config at all: only the preset (the `--mcp-server` flag of this
+        // process is not an input here).
+        assert_eq!(helper_mcp_servers(None, auto()), ["cora"]);
+        let c = cfg("mcp_server = [\"nginjen=nginjen-mcp --x\"]\n");
+        assert_eq!(helper_mcp_servers(Some(&c), auto()), ["nginjen", "cora"]);
+        let c = cfg("mcp_server = [\"nginjen=nginjen-mcp\"]\nno_auto_mcp = true\n");
+        assert_eq!(helper_mcp_servers(Some(&c), auto()), ["nginjen"]);
     }
 
     #[test]
