@@ -254,6 +254,190 @@ wire! {
         pub default: Option<String>,
     }
 
+    /// The body of `POST /sessions/{id}/interrupt`: steer the running turn
+    /// without cancelling it.
+    pub struct InterruptRequest {
+        /// What to tell the agent; a blank text is refused (`400`).
+        pub text: String,
+        /// Also wake a long wait of the turn; serve reads it as `false` when
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub urgent: Option<bool>,
+    }
+
+    /// The answer to `POST /sessions/{id}/interrupt` (`202`): queued, and
+    /// delivered at the turn's next safe point.
+    #[serde(rename_all = "camelCase")]
+    pub struct InterruptReply {
+        pub queued: bool,
+        pub urgent: bool,
+        pub session_id: String,
+    }
+
+    /// The answer to `POST /sessions/{id}/detach` (`202`): the running turn
+    /// stops being waited for and ends `detached`, resumable.
+    #[serde(rename_all = "camelCase")]
+    pub struct DetachReply {
+        pub detached: bool,
+        pub session_id: String,
+    }
+
+    /// The body of `POST /sessions/{id}/fork`.
+    #[derive(Default)]
+    pub struct ForkRequest {
+        /// The `seq` of a settled entry (as `entries` shows it) to cut at;
+        /// absent means the last settled entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub at: Option<u64>,
+    }
+
+    /// The answer to `POST /sessions/{id}/fork`: a NEW session file. It is not
+    /// live; open it with [`NewSession::resume`].
+    #[serde(rename_all = "camelCase")]
+    pub struct ForkReply {
+        /// The new session.
+        pub id: String,
+        pub forked_from: String,
+        /// The entry id the fork was cut at.
+        pub at: String,
+        /// That entry's `seq` in the source, `null` when it is not found there.
+        pub seq: Option<u64>,
+    }
+
+    /// One session of `GET /sessions/{id}/tree`.
+    pub struct TreeNode {
+        pub id: String,
+        /// The session this one was forked from.
+        pub parent: Option<String>,
+        /// The entry id it was cut at.
+        pub at: Option<String>,
+        /// The server's state code for the session (a string, so a code this
+        /// client does not know is kept).
+        pub state: String,
+        pub turns: u64,
+        /// 0 for the root of the family.
+        pub depth: u64,
+        /// True for the session the request named.
+        pub current: bool,
+    }
+
+    /// `GET /sessions/{id}/tree`: the session's parent chain up to the root and
+    /// every fork below it, depth-first.
+    pub struct SessionTree {
+        pub id: String,
+        pub tree: Vec<TreeNode>,
+    }
+
+    /// The answer to `POST /sessions/{id}/compact`: `compaction` is
+    /// `requested`; the session's NEXT prompt compacts first.
+    pub struct CompactReply {
+        pub id: String,
+        pub compaction: String,
+    }
+
+    /// The body of `POST /sessions/{id}/name`.
+    pub struct NameRequest {
+        /// At most 120 characters, no control characters.
+        pub name: String,
+    }
+
+    /// The answer to `POST /sessions/{id}/name`: the trimmed label.
+    pub struct NameReply {
+        pub id: String,
+        pub name: String,
+    }
+
+    /// The body of `POST /sessions/{id}/model`.
+    pub struct ModelRequest {
+        /// One of [`Models::models`].
+        pub model: String,
+    }
+
+    /// The answer to `POST /sessions/{id}/model`.
+    pub struct ModelReply {
+        pub id: String,
+        pub model: String,
+    }
+
+    /// The body of `POST /sessions/{id}/effort`. The key is always sent: a
+    /// missing one is a `400`, `null` clears the override.
+    pub struct EffortRequest {
+        /// `minimal`, `low`, `medium` or `high`; `None` clears it.
+        pub effort: Option<String>,
+    }
+
+    /// The answer to `POST /sessions/{id}/effort`: the canonical level, or
+    /// `null` once cleared.
+    pub struct EffortReply {
+        pub id: String,
+        pub effort: Option<String>,
+    }
+
+    /// The answer to `POST /sessions/{id}/images`: the reference to put in
+    /// [`PromptRequest::images`]. `id` is the content hash (`fnv1a64`).
+    pub struct ImageUploaded {
+        pub id: String,
+        /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`, sniffed by
+        /// the server from the bytes.
+        pub mime: String,
+        pub bytes: u64,
+        pub fnv1a64: String,
+    }
+
+    /// The body of `POST /missions`. Only these four keys are accepted: the
+    /// verify command, the workspace and the allow list are the server owner's
+    /// configuration, and a budget can only be lowered below the owner's
+    /// ceiling.
+    pub struct MissionRequest {
+        pub goal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_steps: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_minutes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_tokens: Option<u64>,
+    }
+
+    /// The answer to `POST /missions` (`202`): the mission is its own session
+    /// and runs on the server, one at a time.
+    pub struct MissionStarted {
+        pub id: String,
+        /// `running`.
+        pub status: String,
+    }
+
+    /// `GET /missions/{id}`. While it runs only `id`, `status` (`running`) and
+    /// `running` are set. Once it ended `status` is how (`complete`,
+    /// `exhausted_steps`, `exhausted_tokens`, `exhausted_time`,
+    /// `verify_failed`, `verify_refused`, `stopped`, or `error` with `error`
+    /// set); `summary` is the durable `fact/mission` register as the server
+    /// holds it. A figure the server sent as `null` reads as `None`.
+    #[serde(rename_all = "camelCase")]
+    pub struct Mission {
+        pub id: String,
+        pub status: String,
+        pub running: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub turns: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub steps: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wall_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub summary: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+
+    /// The answer to `POST /missions/{id}/cancel` (`202`): the mission ends at
+    /// its next checkpoint with a durable summary.
+    pub struct MissionCancelled {
+        pub id: String,
+        pub cancelled: bool,
+    }
+
     /// One row of `GET /discussions`. A ledger that cannot be read is a row
     /// with `status` `unreadable` and an `error` instead of the figures.
     pub struct DiscussionRow {
@@ -539,6 +723,16 @@ pub enum Decision {
     Deny,
 }
 
+/// The bytes of an uploaded image and the type the server recorded for it
+/// (`GET /sessions/{id}/images/{hash}` answers the image itself, not JSON, so
+/// this is not a wire type of the schema).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 impl DecisionRequest {
     /// The body for `approval_id`. Serve's own rows need only the verdict; a
     /// delegated child's (`dap-*`) allow also carries `confirm` set to the id,
@@ -559,6 +753,57 @@ impl NewSession {
         Self {
             resume: Some(id.into()),
             ..Self::default()
+        }
+    }
+}
+
+impl InterruptRequest {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            urgent: None,
+        }
+    }
+}
+
+impl ForkRequest {
+    /// Cut at the entry with this `seq`.
+    pub fn at(seq: u64) -> Self {
+        Self { at: Some(seq) }
+    }
+}
+
+impl NameRequest {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl ModelRequest {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+}
+
+impl EffortRequest {
+    /// Set a level, or clear the override with `None`.
+    pub fn new(effort: Option<&str>) -> Self {
+        Self {
+            effort: effort.map(str::to_string),
+        }
+    }
+}
+
+impl MissionRequest {
+    /// A goal with the owner's default budgets.
+    pub fn goal(goal: impl Into<String>) -> Self {
+        Self {
+            goal: goal.into(),
+            max_steps: None,
+            max_minutes: None,
+            max_tokens: None,
         }
     }
 }

@@ -20,6 +20,8 @@ const MAX_TRAILER_BYTES: usize = 64 * 1024;
 pub struct ResponseBody {
     inner: BufReader<Guard>,
     mode: Mode,
+    /// The `Content-Type` header of the response, as sent.
+    content_type: Option<String>,
     /// Once a read has failed the body is finished: the framing readers drop
     /// the bytes they had already consumed (half a chunk-size line, one byte
     /// of a CRLF), so a retry of the read would desynchronize. Every later
@@ -98,6 +100,8 @@ pub(crate) struct Request<'a> {
     pub path: &'a str,
     pub token: Option<&'a str>,
     pub body: Option<&'a [u8]>,
+    /// The `Content-Type` of `body`; sent only when there is one.
+    pub content_type: &'a str,
     pub accept: &'a str,
     /// Bound of one socket read.
     pub read_timeout: Option<Duration>,
@@ -131,7 +135,8 @@ pub(crate) fn send(mut conn: Box<dyn Connection>, req: &Request) -> Result<(u16,
     }
     if let Some(b) = req.body {
         head.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            "Content-Type: {}\r\nContent-Length: {}\r\n",
+            req.content_type,
             b.len()
         ));
     }
@@ -150,7 +155,7 @@ pub(crate) fn send(mut conn: Box<dyn Connection>, req: &Request) -> Result<(u16,
         deadline: None,
     });
     for _ in 0..MAX_INTERIM {
-        let (status, length, chunked) = read_head(&mut inner)?;
+        let (status, length, chunked, content_type) = read_head(&mut inner)?;
         // An interim response (100 Continue, 103 Early Hints) is followed by
         // the real one. 101 is final.
         if (100..200).contains(&status) && status != 101 {
@@ -176,6 +181,7 @@ pub(crate) fn send(mut conn: Box<dyn Connection>, req: &Request) -> Result<(u16,
             ResponseBody {
                 inner,
                 mode,
+                content_type,
                 failed: None,
             },
         ));
@@ -219,19 +225,20 @@ fn write_bounded(
 }
 
 /// The status line and headers of one response: the status, the
-/// `Content-Length` if any, and whether the body is chunked.
-fn read_head(inner: &mut impl BufRead) -> Result<(u16, Option<u64>, bool)> {
+/// `Content-Length` if any, whether the body is chunked, and the
+/// `Content-Type` if any.
+fn read_head(inner: &mut impl BufRead) -> Result<(u16, Option<u64>, bool, Option<String>)> {
     let status_line = read_line(inner)?;
     let status = status_line
         .strip_prefix("HTTP/1.")
         .and_then(|r| r.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
         .ok_or_else(|| Error::Protocol("bad status line".into()))?;
-    let (mut length, mut chunked) = (None, false);
+    let (mut length, mut chunked, mut content_type) = (None, false, None);
     for _ in 0..=MAX_HEADERS {
         let line = read_line(inner)?;
         if line.is_empty() {
-            return Ok((status, length, chunked));
+            return Ok((status, length, chunked, content_type));
         }
         if let Some((name, value)) = line.split_once(':') {
             let value = value.trim();
@@ -241,6 +248,8 @@ fn read_head(inner: &mut impl BufRead) -> Result<(u16, Option<u64>, bool)> {
                         .parse::<u64>()
                         .map_err(|_| Error::Protocol("bad content-length".into()))?,
                 );
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("transfer-encoding")
                 && value.to_ascii_lowercase().contains("chunked")
             {
@@ -282,6 +291,12 @@ fn window(buf_len: usize, left: u64) -> usize {
 }
 
 impl ResponseBody {
+    /// The `Content-Type` header the server sent, if any (the recorded type of
+    /// an image, for [`Client::image`](crate::Client::image)).
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
     /// Lift the response deadline: the body is a stream that may legitimately
     /// last (the event stream). Only the per-read bound applies from now on.
     pub(crate) fn unlimit(&mut self) {
@@ -453,6 +468,7 @@ mod tests {
             path: "/",
             token: None,
             body: None,
+            content_type: "application/json",
             accept: "*/*",
             read_timeout: None,
             deadline: None,
@@ -466,6 +482,7 @@ mod tests {
             path: "/",
             token: None,
             body: None,
+            content_type: "application/json",
             accept: "*/*",
             read_timeout: None,
             deadline: None,
@@ -512,6 +529,7 @@ mod tests {
             path: "/",
             token: None,
             body: None,
+            content_type: "application/json",
             accept: "*/*",
             read_timeout: None,
             deadline: None,

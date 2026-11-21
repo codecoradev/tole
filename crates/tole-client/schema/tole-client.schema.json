@@ -66,6 +66,15 @@
       "required": ["id"],
       "type": "object"
     },
+    "CompactReply": {
+      "description": "The answer to `POST /sessions/{id}/compact`: `compaction` is\n`requested`; the session's NEXT prompt compacts first.",
+      "properties": {
+        "compaction": {"type":"string"},
+        "id": {"type":"string"}
+      },
+      "required": ["id","compaction"],
+      "type": "object"
+    },
     "CronJob": {
       "description": "One job of `GET /cron/jobs`. `created_by` is `cli` (its owner) or\n`agent`; `awaiting_review` is true for an agent's job the owner has not\nenabled, which cannot be resumed over serve.",
       "properties": {
@@ -161,6 +170,15 @@
         "fingerprint": {"type":["string","null"]}
       },
       "required": ["decision"],
+      "type": "object"
+    },
+    "DetachReply": {
+      "description": "The answer to `POST /sessions/{id}/detach` (`202`): the running turn\nstops being waited for and ends `detached`, resumable.",
+      "properties": {
+        "detached": {"type":"boolean"},
+        "sessionId": {"type":"string"}
+      },
+      "required": ["detached","sessionId"],
       "type": "object"
     },
     "Discussion": {
@@ -289,6 +307,22 @@
       "required": ["id","outcome","state"],
       "type": "object"
     },
+    "EffortReply": {
+      "description": "The answer to `POST /sessions/{id}/effort`: the canonical level, or\n`null` once cleared.",
+      "properties": {
+        "effort": {"type":["string","null"]},
+        "id": {"type":"string"}
+      },
+      "required": ["id"],
+      "type": "object"
+    },
+    "EffortRequest": {
+      "description": "The body of `POST /sessions/{id}/effort`. The key is always sent: a\nmissing one is a `400`, `null` clears the override.",
+      "properties": {
+        "effort": {"description":"`minimal`, `low`, `medium` or `high`; `None` clears it.","type":["string","null"]}
+      },
+      "type": "object"
+    },
     "EntriesPage": {
       "description": "`GET /sessions/{id}/entries`. Page with `after = next_after` while\n`has_more`.",
       "properties": {
@@ -315,6 +349,24 @@
       "required": ["seq","id","type","timestamp","payload"],
       "type": "object"
     },
+    "ForkReply": {
+      "description": "The answer to `POST /sessions/{id}/fork`: a NEW session file. It is not\nlive; open it with [`NewSession::resume`].",
+      "properties": {
+        "at": {"description":"The entry id the fork was cut at.","type":"string"},
+        "forkedFrom": {"type":"string"},
+        "id": {"description":"The new session.","type":"string"},
+        "seq": {"description":"That entry's `seq` in the source, `null` when it is not found there.","format":"uint64","minimum":0,"type":["integer","null"]}
+      },
+      "required": ["id","forkedFrom","at"],
+      "type": "object"
+    },
+    "ForkRequest": {
+      "description": "The body of `POST /sessions/{id}/fork`.",
+      "properties": {
+        "at": {"description":"The `seq` of a settled entry (as `entries` shows it) to cut at;\nabsent means the last settled entry.","format":"uint64","minimum":0,"type":["integer","null"]}
+      },
+      "type": "object"
+    },
     "Health": {
       "description": "`GET /health`: `status`, and since serve reports its protocol and\nbinary version (#1043) also `protocol` and `version`. Both are\noptional so a server that predates them still decodes, and a decoded\nanswer serializes back to the JSON the server sent.",
       "properties": {
@@ -325,6 +377,98 @@
       "required": ["status"],
       "type": "object"
     },
+    "ImageUploaded": {
+      "description": "The answer to `POST /sessions/{id}/images`: the reference to put in\n[`PromptRequest::images`]. `id` is the content hash (`fnv1a64`).",
+      "properties": {
+        "bytes": {"format":"uint64","minimum":0,"type":"integer"},
+        "fnv1a64": {"type":"string"},
+        "id": {"type":"string"},
+        "mime": {"description":"`image/png`, `image/jpeg`, `image/gif` or `image/webp`, sniffed by\nthe server from the bytes.","type":"string"}
+      },
+      "required": ["id","mime","bytes","fnv1a64"],
+      "type": "object"
+    },
+    "InterruptReply": {
+      "description": "The answer to `POST /sessions/{id}/interrupt` (`202`): queued, and\ndelivered at the turn's next safe point.",
+      "properties": {
+        "queued": {"type":"boolean"},
+        "sessionId": {"type":"string"},
+        "urgent": {"type":"boolean"}
+      },
+      "required": ["queued","urgent","sessionId"],
+      "type": "object"
+    },
+    "InterruptRequest": {
+      "description": "The body of `POST /sessions/{id}/interrupt`: steer the running turn\nwithout cancelling it.",
+      "properties": {
+        "text": {"description":"What to tell the agent; a blank text is refused (`400`).","type":"string"},
+        "urgent": {"description":"Also wake a long wait of the turn; serve reads it as `false` when\nabsent.","type":["boolean","null"]}
+      },
+      "required": ["text"],
+      "type": "object"
+    },
+    "Mission": {
+      "description": "`GET /missions/{id}`. While it runs only `id`, `status` (`running`) and\n`running` are set. Once it ended `status` is how (`complete`,\n`exhausted_steps`, `exhausted_tokens`, `exhausted_time`,\n`verify_failed`, `verify_refused`, `stopped`, or `error` with `error`\nset); `summary` is the durable `fact/mission` register as the server\nholds it. A figure the server sent as `null` reads as `None`.",
+      "properties": {
+        "error": {"type":["string","null"]},
+        "id": {"type":"string"},
+        "running": {"type":"boolean"},
+        "status": {"type":"string"},
+        "steps": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "summary": true,
+        "tokens": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "turns": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "wallSeconds": {"format":"uint64","minimum":0,"type":["integer","null"]}
+      },
+      "required": ["id","status","running"],
+      "type": "object"
+    },
+    "MissionCancelled": {
+      "description": "The answer to `POST /missions/{id}/cancel` (`202`): the mission ends at\nits next checkpoint with a durable summary.",
+      "properties": {
+        "cancelled": {"type":"boolean"},
+        "id": {"type":"string"}
+      },
+      "required": ["id","cancelled"],
+      "type": "object"
+    },
+    "MissionRequest": {
+      "description": "The body of `POST /missions`. Only these four keys are accepted: the\nverify command, the workspace and the allow list are the server owner's\nconfiguration, and a budget can only be lowered below the owner's\nceiling.",
+      "properties": {
+        "goal": {"type":"string"},
+        "max_minutes": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "max_steps": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "max_tokens": {"format":"uint64","minimum":0,"type":["integer","null"]}
+      },
+      "required": ["goal"],
+      "type": "object"
+    },
+    "MissionStarted": {
+      "description": "The answer to `POST /missions` (`202`): the mission is its own session\nand runs on the server, one at a time.",
+      "properties": {
+        "id": {"type":"string"},
+        "status": {"description":"`running`.","type":"string"}
+      },
+      "required": ["id","status"],
+      "type": "object"
+    },
+    "ModelReply": {
+      "description": "The answer to `POST /sessions/{id}/model`.",
+      "properties": {
+        "id": {"type":"string"},
+        "model": {"type":"string"}
+      },
+      "required": ["id","model"],
+      "type": "object"
+    },
+    "ModelRequest": {
+      "description": "The body of `POST /sessions/{id}/model`.",
+      "properties": {
+        "model": {"description":"One of [`Models::models`].","type":"string"}
+      },
+      "required": ["model"],
+      "type": "object"
+    },
     "Models": {
       "description": "`GET /models`: what the owner lets a client pick.",
       "properties": {
@@ -332,6 +476,23 @@
         "models": {"items":{"type":"string"},"type":"array"}
       },
       "required": ["models"],
+      "type": "object"
+    },
+    "NameReply": {
+      "description": "The answer to `POST /sessions/{id}/name`: the trimmed label.",
+      "properties": {
+        "id": {"type":"string"},
+        "name": {"type":"string"}
+      },
+      "required": ["id","name"],
+      "type": "object"
+    },
+    "NameRequest": {
+      "description": "The body of `POST /sessions/{id}/name`.",
+      "properties": {
+        "name": {"description":"At most 120 characters, no control characters.","type":"string"}
+      },
+      "required": ["name"],
       "type": "object"
     },
     "NewSession": {
@@ -482,6 +643,15 @@
       "required": ["id","busy"],
       "type": "object"
     },
+    "SessionTree": {
+      "description": "`GET /sessions/{id}/tree`: the session's parent chain up to the root and\nevery fork below it, depth-first.",
+      "properties": {
+        "id": {"type":"string"},
+        "tree": {"items":{"$ref":"#/$defs/TreeNode"},"type":"array"}
+      },
+      "required": ["id","tree"],
+      "type": "object"
+    },
     "SkillDraft": {
       "description": "A skill the agent proposed, waiting for the owner's review.",
       "properties": {
@@ -578,10 +748,24 @@
       },
       "required": ["servers","notes","probed"],
       "type": "object"
+    },
+    "TreeNode": {
+      "description": "One session of `GET /sessions/{id}/tree`.",
+      "properties": {
+        "at": {"description":"The entry id it was cut at.","type":["string","null"]},
+        "current": {"description":"True for the session the request named.","type":"boolean"},
+        "depth": {"description":"0 for the root of the family.","format":"uint64","minimum":0,"type":"integer"},
+        "id": {"type":"string"},
+        "parent": {"description":"The session this one was forked from.","type":["string","null"]},
+        "state": {"description":"The server's state code for the session (a string, so a code this\nclient does not know is kept).","type":"string"},
+        "turns": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["id","state","turns","depth","current"],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what.",
+  "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
   "properties": {
     "events": {
       "properties": {
@@ -603,39 +787,57 @@
       "properties": {
         "DecisionRequest": {"$ref":"#/$defs/DecisionRequest"},
         "DiscussionRequest": {"$ref":"#/$defs/DiscussionRequest"},
+        "EffortRequest": {"$ref":"#/$defs/EffortRequest"},
+        "ForkRequest": {"$ref":"#/$defs/ForkRequest"},
+        "InterruptRequest": {"$ref":"#/$defs/InterruptRequest"},
+        "MissionRequest": {"$ref":"#/$defs/MissionRequest"},
+        "ModelRequest": {"$ref":"#/$defs/ModelRequest"},
+        "NameRequest": {"$ref":"#/$defs/NameRequest"},
         "NewSession": {"$ref":"#/$defs/NewSession"},
         "PromptRequest": {"$ref":"#/$defs/PromptRequest"}
       },
-      "required": ["DecisionRequest","DiscussionRequest","NewSession","PromptRequest"],
+      "required": ["DecisionRequest","DiscussionRequest","EffortRequest","ForkRequest","InterruptRequest","MissionRequest","ModelRequest","NameRequest","NewSession","PromptRequest"],
       "type": "object"
     },
     "responses": {
       "properties": {
         "ApprovalList": {"$ref":"#/$defs/ApprovalList"},
         "CancelReply": {"$ref":"#/$defs/CancelReply"},
+        "CompactReply": {"$ref":"#/$defs/CompactReply"},
         "CronJobState": {"$ref":"#/$defs/CronJobState"},
         "CronJobs": {"$ref":"#/$defs/CronJobs"},
         "CronRuns": {"$ref":"#/$defs/CronRuns"},
         "DecisionReply": {"$ref":"#/$defs/DecisionReply"},
+        "DetachReply": {"$ref":"#/$defs/DetachReply"},
         "Discussion": {"$ref":"#/$defs/Discussion"},
         "DiscussionEstimate": {"$ref":"#/$defs/DiscussionEstimate"},
         "DiscussionList": {"$ref":"#/$defs/DiscussionList"},
         "DiscussionResumed": {"$ref":"#/$defs/DiscussionResumed"},
         "DiscussionStarted": {"$ref":"#/$defs/DiscussionStarted"},
         "DiscussionStopped": {"$ref":"#/$defs/DiscussionStopped"},
+        "EffortReply": {"$ref":"#/$defs/EffortReply"},
         "EntriesPage": {"$ref":"#/$defs/EntriesPage"},
+        "ForkReply": {"$ref":"#/$defs/ForkReply"},
         "Health": {"$ref":"#/$defs/Health"},
+        "ImageUploaded": {"$ref":"#/$defs/ImageUploaded"},
+        "InterruptReply": {"$ref":"#/$defs/InterruptReply"},
+        "Mission": {"$ref":"#/$defs/Mission"},
+        "MissionCancelled": {"$ref":"#/$defs/MissionCancelled"},
+        "MissionStarted": {"$ref":"#/$defs/MissionStarted"},
+        "ModelReply": {"$ref":"#/$defs/ModelReply"},
         "Models": {"$ref":"#/$defs/Models"},
+        "NameReply": {"$ref":"#/$defs/NameReply"},
         "Profiles": {"$ref":"#/$defs/Profiles"},
         "PromptReply": {"$ref":"#/$defs/PromptReply"},
         "SessionIndex": {"$ref":"#/$defs/SessionIndex"},
         "SessionList": {"$ref":"#/$defs/SessionList"},
         "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
         "SessionStatus": {"$ref":"#/$defs/SessionStatus"},
+        "SessionTree": {"$ref":"#/$defs/SessionTree"},
         "SkillsState": {"$ref":"#/$defs/SkillsState"},
         "ToolsState": {"$ref":"#/$defs/ToolsState"}
       },
-      "required": ["ApprovalList","CancelReply","CronJobState","CronJobs","CronRuns","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","Profiles","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus","SkillsState","ToolsState"],
+      "required": ["ApprovalList","CancelReply","CompactReply","CronJobState","CronJobs","CronRuns","DecisionReply","DetachReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EffortReply","EntriesPage","ForkReply","Health","ImageUploaded","InterruptReply","Mission","MissionCancelled","MissionStarted","ModelReply","Models","NameReply","Profiles","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus","SessionTree","SkillsState","ToolsState"],
       "type": "object"
     }
   },
@@ -647,6 +849,7 @@
       "method": "GET",
       "path": "/health",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "Health",
       "stream": null
@@ -655,6 +858,7 @@
       "method": "GET",
       "path": "/sessions",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "SessionList",
       "stream": null
@@ -663,6 +867,7 @@
       "method": "GET",
       "path": "/sessions/index",
       "query": ["limit","cursor"],
+      "rawBody": null,
       "request": null,
       "response": "SessionIndex",
       "stream": null
@@ -671,6 +876,7 @@
       "method": "POST",
       "path": "/sessions",
       "query": [],
+      "rawBody": null,
       "request": "NewSession",
       "response": "SessionOpened",
       "stream": null
@@ -679,6 +885,7 @@
       "method": "POST",
       "path": "/sessions/{id}/prompt",
       "query": [],
+      "rawBody": null,
       "request": "PromptRequest",
       "response": "PromptReply",
       "stream": null
@@ -687,6 +894,7 @@
       "method": "POST",
       "path": "/sessions/{id}/cancel",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "CancelReply",
       "stream": null
@@ -695,6 +903,7 @@
       "method": "GET",
       "path": "/sessions/{id}/status",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "SessionStatus",
       "stream": null
@@ -703,6 +912,7 @@
       "method": "GET",
       "path": "/sessions/{id}/entries",
       "query": ["after","limit"],
+      "rawBody": null,
       "request": null,
       "response": "EntriesPage",
       "stream": null
@@ -711,6 +921,7 @@
       "method": "GET",
       "path": "/sessions/{id}/events",
       "query": ["after"],
+      "rawBody": null,
       "request": null,
       "response": null,
       "stream": "events"
@@ -719,6 +930,7 @@
       "method": "GET",
       "path": "/approvals",
       "query": ["session"],
+      "rawBody": null,
       "request": null,
       "response": "ApprovalList",
       "stream": null
@@ -727,6 +939,7 @@
       "method": "POST",
       "path": "/approvals/{id}/decision",
       "query": [],
+      "rawBody": null,
       "request": "DecisionRequest",
       "response": "DecisionReply",
       "stream": null
@@ -735,6 +948,7 @@
       "method": "GET",
       "path": "/models",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "Models",
       "stream": null
@@ -743,6 +957,7 @@
       "method": "GET",
       "path": "/discussions",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "DiscussionList",
       "stream": null
@@ -751,6 +966,7 @@
       "method": "GET",
       "path": "/discussions/{id}",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "Discussion",
       "stream": null
@@ -759,6 +975,7 @@
       "method": "POST",
       "path": "/discussions/estimate",
       "query": [],
+      "rawBody": null,
       "request": "DiscussionRequest",
       "response": "DiscussionEstimate",
       "stream": null
@@ -767,6 +984,7 @@
       "method": "POST",
       "path": "/discussions",
       "query": [],
+      "rawBody": null,
       "request": "DiscussionRequest",
       "response": "DiscussionStarted",
       "stream": null
@@ -775,6 +993,7 @@
       "method": "POST",
       "path": "/discussions/{id}/resume",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "DiscussionResumed",
       "stream": null
@@ -783,6 +1002,7 @@
       "method": "POST",
       "path": "/discussions/{id}/stop",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "DiscussionStopped",
       "stream": null
@@ -791,6 +1011,7 @@
       "method": "GET",
       "path": "/cron/jobs",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "CronJobs",
       "stream": null
@@ -799,6 +1020,7 @@
       "method": "POST",
       "path": "/cron/jobs/{id}/pause",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "CronJobState",
       "stream": null
@@ -807,6 +1029,7 @@
       "method": "POST",
       "path": "/cron/jobs/{id}/resume",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "CronJobState",
       "stream": null
@@ -815,6 +1038,7 @@
       "method": "GET",
       "path": "/cron/runs",
       "query": ["job","limit"],
+      "rawBody": null,
       "request": null,
       "response": "CronRuns",
       "stream": null
@@ -823,6 +1047,7 @@
       "method": "GET",
       "path": "/profiles",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "Profiles",
       "stream": null
@@ -831,6 +1056,7 @@
       "method": "GET",
       "path": "/skills",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "SkillsState",
       "stream": null
@@ -839,8 +1065,126 @@
       "method": "GET",
       "path": "/tools",
       "query": [],
+      "rawBody": null,
       "request": null,
       "response": "ToolsState",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/interrupt",
+      "query": [],
+      "rawBody": null,
+      "request": "InterruptRequest",
+      "response": "InterruptReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/detach",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "DetachReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/fork",
+      "query": [],
+      "rawBody": null,
+      "request": "ForkRequest",
+      "response": "ForkReply",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/{id}/tree",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "SessionTree",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/compact",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "CompactReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/name",
+      "query": [],
+      "rawBody": null,
+      "request": "NameRequest",
+      "response": "NameReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/model",
+      "query": [],
+      "rawBody": null,
+      "request": "ModelRequest",
+      "response": "ModelReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/effort",
+      "query": [],
+      "rawBody": null,
+      "request": "EffortRequest",
+      "response": "EffortReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/images",
+      "query": [],
+      "rawBody": "request",
+      "request": null,
+      "response": "ImageUploaded",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/{id}/images/{hash}",
+      "query": [],
+      "rawBody": "response",
+      "request": null,
+      "response": null,
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/missions",
+      "query": [],
+      "rawBody": null,
+      "request": "MissionRequest",
+      "response": "MissionStarted",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/missions/{id}",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "Mission",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/missions/{id}/cancel",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "MissionCancelled",
       "stream": null
     }
   ]
