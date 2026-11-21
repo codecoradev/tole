@@ -298,7 +298,38 @@ mod tests {
         assert!(try_lock(&held).unwrap());
         assert!(!serve_lock_is_free(&path).unwrap());
         drop(held);
-        assert!(serve_lock_is_free(&path).unwrap());
+        wait_until_free(&path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A lock is released when the LAST copy of its descriptor closes. Another
+    /// thread that spawns a process holds a copy between the fork and the exec
+    /// (the descriptor is close-on-exec), so right after a drop the lock can
+    /// still be held for a moment: a test waits for "free", never asserts it at
+    /// once.
+    fn wait_until_free(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !serve_lock_is_free(path).unwrap() {
+            assert!(Instant::now() < deadline, "the lock was never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_lock_is_free_only_when_the_last_copy_of_its_descriptor_is_closed() {
+        let root = scratch("copy");
+        let path = root.join("s.sock.lock");
+        let held = open_lock_file(&path, true).unwrap();
+        assert!(try_lock(&held).unwrap());
+        let copy = held.try_clone().unwrap(); // what a forked child holds
+        drop(held);
+        assert!(!serve_lock_is_free(&path).unwrap(), "a copy still holds it");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(copy);
+        });
+        wait_until_free(&path);
+        closer.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
