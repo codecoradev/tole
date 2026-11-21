@@ -33,16 +33,23 @@ DESKTOP = "tole-desktop"
 # A package whose name starts with one of these is the GUI toolkit (or part of
 # its supply chain, as zed-* forks are).
 TOOLKIT_PREFIXES = ("gpui", "zed")
-# The session host and agent logic. tole-client (#1040) is the one tole crate a
-# desktop may use once it exists: add "tole-client" to ALLOWED_FOR_DESKTOP then.
-# It is never allowed in the model crate.
+# The session host and agent logic: the desktop never lists any of these among
+# its own dependencies, in any kind or target.
 SESSION_HOST = {"tole-cli", "tole-core", "tole-tui"}
+# tole-client (#1040) is the one tole crate a desktop may depend on. It is never
+# allowed in the model crate.
 TOLE_CLIENT = "tole-client"
-ALLOWED_FOR_DESKTOP = set()  # OFF: nothing is allowed yet
+ALLOWED_FOR_DESKTOP = {TOLE_CLIENT}
+# The wire types of tole-client are tole-core's own, so tole-core is in the
+# desktop's closure, but ONLY through tole-client (#1029). The session host
+# (tole-cli) and the terminal UI (tole-tui) are refused everywhere.
+ALLOWED_VIA_CLIENT = {"tole-core"}
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 EXACT_REQ = re.compile(r"=\d+\.\d+\.\d+(-[0-9A-Za-z.\-]+)?")
 MAX_FILE_LINES = 500
-MAX_CRATE_LINES = 2000
+# Owner rule D1 (2026-11-20): a crate's ideal size is 1,500 to 2,500 lines, the
+# hard ceiling 4,000. The 500-line per-file cap is unchanged.
+MAX_CRATE_LINES = 4000
 
 findings = []  # (severity, text)
 
@@ -298,14 +305,37 @@ def check_deps(root):
             error(model_manifest, 1, f"{MODEL} depends (possibly through another crate) on {name}; "
                                      "the model has no GUI toolkit and no tole dependency")
 
-    # (b) the desktop never reaches the session host or agent logic, with its own
-    # features all on (and only its own: another member's feature is not counted).
-    banned_desktop = (SESSION_HOST | {TOLE_CLIENT}) - ALLOWED_FOR_DESKTOP
-    for name in tree_names(root, DESKTOP, ["--all-features"]):
-        if norm(name) in banned_desktop:
+    # (b) the desktop is a thin client: of the tole crates only tole-client may be
+    # a dependency, and the session host reaches it at most through tole-client.
+    # (b1) what the desktop itself declares, in every kind and target, by the real
+    # package name (a rename does not hide it).
+    for dep in desk["dependencies"]:
+        name = norm(dep["name"])
+        if name in SESSION_HOST or (name == TOLE_CLIENT and name not in ALLOWED_FOR_DESKTOP):
+            error(desk_manifest, 1, f"{DESKTOP} lists {dep['name']} among its own dependencies; the desktop is "
+                                    f"a thin client of the serve and may depend on {TOLE_CLIENT} only")
+    # (b2) tole-client must be the workspace crate, not a registry package of that name.
+    for pkg in desk_meta["packages"]:
+        if norm(pkg["name"]) == TOLE_CLIENT and pkg["source"] is not None:
+            error(desk_manifest, 1, f"{pkg['name']} {pkg['version']} resolves from {pkg['source']}; "
+                                    "it must be the workspace crate")
+    # (b3) the closure, with the desktop's own features all on (and only its own:
+    # another member's feature is not counted). tole-tui and tole-cli are refused
+    # everywhere, tole-client's own subtree included.
+    closure = tree_names(root, DESKTOP, ["--all-features"])
+    for name in closure:
+        if norm(name) in SESSION_HOST - ALLOWED_VIA_CLIENT:
             error(desk_manifest, 1, f"{DESKTOP} depends (possibly through another crate) on {name}; "
-                                    "the desktop is a thin client of the serve (use the typed client crate "
-                                    "once it is allowed)")
+                                    "the desktop never reaches the session host or the terminal UI")
+    # (b4) tole-core only through tole-client: prune that subtree and look again.
+    if any(norm(n) == TOLE_CLIENT for n in closure):
+        outside = tree_names(root, DESKTOP, ["--all-features", "--prune", TOLE_CLIENT])
+    else:
+        outside = closure
+    for name in outside:
+        if norm(name) in ALLOWED_VIA_CLIENT:
+            error(desk_manifest, 1, f"{DESKTOP} reaches {name} other than through {TOLE_CLIENT}; {name} is "
+                                    f"allowed in the closure only as a dependency of {TOLE_CLIENT}")
 
     # (c) every toolkit dependency of the desktop: optional, exact, crates.io, normal kind.
     for dep in desk["dependencies"]:
