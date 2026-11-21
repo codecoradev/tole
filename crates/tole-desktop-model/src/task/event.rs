@@ -26,8 +26,11 @@
 //!
 //! **The adapter passes text through raw.** The model makes every tool name,
 //! target, plan line, approval summary and synthetic note printable and cuts it
-//! (`MAX_*` below, an ellipsis marks a cut). The answer is Markdown and stays
-//! raw: the renderer must not run HTML or open links by itself.
+//! (`MAX_*` below, an ellipsis marks a cut). The answer, entry and streamed
+//! draft alike, loses control, bidi and zero-width characters, keeps its line
+//! breaks and tabs, and is cut at `MAX_ANSWER_CHARS` (`cut` on its row). What
+//! is left for the renderer is Markdown handling: no raw HTML, no links opened
+//! by themselves. The owner's own prompt and steer text stay as typed.
 //!
 //! **After an allow** (`approved` resolved) the resumed turn has no prompt
 //! call to wait for ("unobserved": `Run::unobserved`). The adapter must send
@@ -74,6 +77,9 @@ pub const MAX_PLAN_TEXT_CHARS: usize = 200;
 pub const MAX_PLAN_ITEMS: usize = 50;
 pub const MAX_SUMMARY_CHARS: usize = 300;
 pub const MAX_NOTE_CHARS: usize = 300;
+/// Longest answer (or streamed draft) kept, in characters; a cut one ends in an
+/// ellipsis and its row says `cut`.
+pub const MAX_ANSWER_CHARS: usize = 200_000;
 
 /// What a tool does, for the status row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

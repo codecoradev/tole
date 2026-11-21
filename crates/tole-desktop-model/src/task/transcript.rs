@@ -13,13 +13,16 @@
 //! - A Change step that failed, did not finish, or whose settlement was lost
 //!   makes "may have changed" (core calls those outcomes unknown), never
 //!   "nothing changed".
-//! - Text a model wrote is made printable and cut when it enters.
+//! - Text a model wrote is made printable and cut when it enters: names, targets
+//!   and notes by `printable`; the answer, entry and draft alike, by
+//!   `printable_text` (lines kept, capped at `MAX_ANSWER_CHARS`). The owner's
+//!   own prompt and steer text stay as typed.
 
 use super::event::{
-    tool_effect, PlanItem, TaskEvent, ToolEffect, UserKind, MAX_NOTE_CHARS, MAX_PLAN_ITEMS,
-    MAX_PLAN_TEXT_CHARS, MAX_TARGET_CHARS, MAX_TOOL_CHARS,
+    tool_effect, PlanItem, TaskEvent, ToolEffect, UserKind, MAX_ANSWER_CHARS, MAX_NOTE_CHARS,
+    MAX_PLAN_ITEMS, MAX_PLAN_TEXT_CHARS, MAX_TARGET_CHARS, MAX_TOOL_CHARS,
 };
-use crate::plain::printable;
+use crate::plain::{clean_text, printable, printable_text};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +70,12 @@ pub enum Item {
     },
     /// Tole's own note to the model (stop gate, denied call): not the owner's.
     Note(String),
-    /// Tole's words as Markdown; `streaming` while still being written.
+    /// Tole's words as Markdown, made printable; `streaming` while still being
+    /// written, `cut` when it hit `MAX_ANSWER_CHARS` and ends in an ellipsis.
     Answer {
         markdown: String,
         streaming: bool,
+        cut: bool,
     },
     Work(WorkGroup),
     Plan(Vec<PlanItem>),
@@ -95,6 +100,8 @@ pub struct Transcript {
     last_seq: Option<u64>,
     /// The row standing in for the current turn's answer until its entry comes.
     standin: Option<usize>,
+    /// Characters in the draft being written (it is capped).
+    draft_chars: usize,
     /// Intents of plan tools (not steps): their settlements are not unknowns.
     plan_ids: HashSet<String>,
 }
@@ -178,9 +185,11 @@ impl Transcript {
                 if !self.fresh(*seq) {
                     return false;
                 }
+                let (markdown, cut) = printable_text(text, MAX_ANSWER_CHARS);
                 let row = Item::Answer {
-                    markdown: text.clone(),
+                    markdown,
                     streaming: false,
+                    cut,
                 };
                 match self.standin.take().filter(|i| *i < self.items.len()) {
                     Some(i) => self.items[i] = row,
@@ -211,20 +220,7 @@ impl Transcript {
                 }
                 self.set_plan(items);
             }
-            TaskEvent::TextDelta { text } => match self.items.last_mut() {
-                Some(Item::Answer {
-                    markdown,
-                    streaming: true,
-                }) => markdown.push_str(text),
-                _ => {
-                    let (markdown, streaming) = (text.clone(), true);
-                    self.items.push(Item::Answer {
-                        markdown,
-                        streaming,
-                    });
-                    self.standin = Some(self.items.len() - 1);
-                }
-            },
+            TaskEvent::TextDelta { text } => self.append_draft(&clean_text(text)),
             TaskEvent::Reconnected | TaskEvent::Resync if self.drafting() => {
                 self.items.pop();
                 self.standin = None;
@@ -233,6 +229,39 @@ impl Transcript {
             _ => {}
         }
         true
+    }
+
+    /// Add already-clean text to the draft, which stops at the cap: the last
+    /// character is an ellipsis, `cut` is set, and later text is ignored.
+    fn append_draft(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.drafting() {
+            self.items.push(Item::Answer {
+                markdown: String::new(),
+                streaming: true,
+                cut: false,
+            });
+            self.standin = Some(self.items.len() - 1);
+            self.draft_chars = 0;
+        }
+        let Some(Item::Answer { markdown, cut, .. }) = self.items.last_mut() else {
+            return;
+        };
+        if *cut {
+            return;
+        }
+        let room = MAX_ANSWER_CHARS - self.draft_chars;
+        let mut chars = text.chars();
+        let head: String = chars.by_ref().take(room).collect();
+        self.draft_chars += head.chars().count();
+        markdown.push_str(&head);
+        if chars.next().is_some() {
+            markdown.pop(); // the last character makes room for the ellipsis
+            markdown.push('\u{2026}');
+            *cut = true;
+        }
     }
 
     fn fresh(&mut self, seq: u64) -> bool {

@@ -13,6 +13,8 @@ mod late_tests;
 mod review_tests;
 mod run;
 mod status;
+#[cfg(test)]
+mod text_tests;
 mod transcript;
 #[cfg(test)]
 mod transcript_tests;

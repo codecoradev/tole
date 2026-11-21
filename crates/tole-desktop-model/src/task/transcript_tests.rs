@@ -102,11 +102,11 @@ fn an_old_entry_is_ignored() {
 fn the_final_entry_replaces_the_draft_and_a_tool_call_keeps_it_as_a_note() {
     let t = run(vec![vec![delta("Hel"), delta("lo")]]);
     assert!(
-        matches!(&t.items[..], [Item::Answer { markdown, streaming: true }] if markdown == "Hello")
+        matches!(&t.items[..], [Item::Answer { markdown, streaming: true, .. }] if markdown == "Hello")
     );
     let done = run(vec![vec![delta("Hel"), answer(9, "Hello.")]]);
     assert!(
-        matches!(&done.items[..], [Item::Answer { markdown, streaming: false }] if markdown == "Hello.")
+        matches!(&done.items[..], [Item::Answer { markdown, streaming: false, .. }] if markdown == "Hello.")
     );
     assert_eq!(
         shape(&run(vec![

@@ -39,6 +39,7 @@ fn rows(t: &TaskState) -> Vec<String> {
         Item::Answer {
             markdown,
             streaming,
+            ..
         } => format!("{markdown}{}", if *streaming { "~" } else { "" }),
         other => format!("{other:?}").chars().take(4).collect(),
     };
