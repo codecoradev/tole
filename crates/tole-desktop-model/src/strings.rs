@@ -286,3 +286,5 @@ mod tests {
         assert_eq!(badge_label(Section::SkillsAndTools, 2), "2 new");
     }
 }
+
+pub mod automations;
