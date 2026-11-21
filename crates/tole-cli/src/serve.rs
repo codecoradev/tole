@@ -69,6 +69,7 @@ mod discussions;
 pub mod missions;
 mod models;
 pub mod past_sessions;
+mod state_views;
 
 pub struct ServeConfig {
     pub bind: String,
@@ -1883,6 +1884,10 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         {
             discussions::show(state, &p["/discussions/".len()..])
         }
+        // The owner's profiles, skills and connected tools (#1042): read-only.
+        ("GET", "/profiles") => state_views::profiles(state),
+        ("GET", "/skills") => state_views::skills(state),
+        ("GET", "/tools") => state_views::tools(state),
         // Cron jobs (#1042): read, pause, and resume what the owner reviewed.
         ("GET", "/cron/jobs") => cron::list(),
         ("POST", p) if id_between(p, "/cron/jobs/", "/pause").is_some() => cron::set_paused(

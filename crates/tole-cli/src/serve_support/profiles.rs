@@ -136,6 +136,59 @@ impl ProfileSource {
         }
     }
 
+    /// The profiles of the user config as display rows, read-only (#1042):
+    /// `name`, `persona` (the first line of the persona file, at most 200
+    /// characters, and `persona_chars` its length), `models` (the tiers the
+    /// profile sets and its `default` tier name), `memory_room`, `may_use`
+    /// (the profile's own allow patterns) and `session_allow` (what a session
+    /// opened with it gets here, [`ProfileSource::effective_allow`]). Secret
+    /// grants, skill paths and the persona text beyond its first line stay in
+    /// the owner's files. A profile that cannot be loaded is a row with an
+    /// `error` and no fields, never a failure of the list. No config is no rows.
+    pub fn list(
+        &self,
+        secrets: &tole_core::secrets::SecretSet,
+    ) -> Result<Vec<serde_json::Value>, ProfileError> {
+        let Some((cfg, path)) = self.load_config()? else {
+            return Ok(Vec::new());
+        };
+        let base = path.parent().map(Path::to_path_buf);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let names: Vec<&String> = cfg.profiles.iter().flatten().map(|(n, _)| n).collect();
+        let rows = names.into_iter().map(|name| {
+            match Profile::resolve(&cfg, name, base.as_deref(), home.as_deref()) {
+                Ok(p) => {
+                    let persona = p.system_prompt.as_deref().unwrap_or("");
+                    let first = persona.lines().map(str::trim).find(|l| !l.is_empty());
+                    let tiers = [
+                        ("light", &p.models.light),
+                        ("standard", &p.models.standard),
+                        ("heavy", &p.models.heavy),
+                        ("advisor", &p.models.advisor),
+                    ];
+                    let mut models = serde_json::Map::new();
+                    for (tier, m) in tiers {
+                        if let Some(m) = m.as_ref().filter(|m| !m.trim().is_empty()) {
+                            models.insert(tier.into(), m.clone().into());
+                        }
+                    }
+                    models.insert("default".into(), p.models.default_tier().into());
+                    serde_json::json!({
+                        "name": p.name,
+                        "persona": first.map(|l| l.chars().take(200).collect::<String>()),
+                        "persona_chars": persona.chars().count(),
+                        "models": models,
+                        "memory_room": p.memory_room,
+                        "may_use": p.allow,
+                        "session_allow": self.effective_allow(&p.allow),
+                    })
+                }
+                Err(e) => serde_json::json!({"name": name, "error": e}),
+            }
+        });
+        Ok(rows.map(|r| secrets.redact_value(&r)).collect())
+    }
+
     /// The allow precedence of the module doc.
     pub fn effective_allow(&self, profile_allow: &[String]) -> Vec<String> {
         let mut out = if self.allow_pinned || profile_allow.is_empty() {

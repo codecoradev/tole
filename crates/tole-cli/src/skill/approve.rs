@@ -382,20 +382,29 @@ fn audit_rows_at(ws: Option<&Path>, path: &Path) -> Result<Vec<serde_json::Value
     for name in tole_core::skills::skill_names(ws) {
         let pkg = read_package(ws, &name);
         let approved = approvals.skills.get(&name);
-        let status = match (&pkg, approved) {
-            (Err(e), _) => format!("unreadable: {e}"),
-            (Ok(_), Some(_)) if blocked.contains_key(&name) => {
-                format!("refused: approval ignored, {}", blocked[&name])
-            }
-            (Ok(p), Some(a)) if a.hash == p.hash && unrecorded.contains(&name) => {
-                "approved, unrecorded in the ledger (loads; approve again to record it)".to_string()
-            }
-            (Ok(p), Some(a)) if a.hash == p.hash => "approved".to_string(),
-            (Ok(_), Some(_)) => "changed since approval: refused until approved again".to_string(),
-            (Ok(_), None) => "not approved: refused".to_string(),
+        // `state` is the closed word a client switches on; `status` is the
+        // sentence the terminal prints.
+        let (state, status) = match (&pkg, approved) {
+            (Err(e), _) => ("unreadable", format!("unreadable: {e}")),
+            (Ok(_), Some(_)) if blocked.contains_key(&name) => (
+                "refused",
+                format!("refused: approval ignored, {}", blocked[&name]),
+            ),
+            (Ok(p), Some(a)) if a.hash == p.hash && unrecorded.contains(&name) => (
+                "approved",
+                "approved, unrecorded in the ledger (loads; approve again to record it)"
+                    .to_string(),
+            ),
+            (Ok(p), Some(a)) if a.hash == p.hash => ("approved", "approved".to_string()),
+            (Ok(_), Some(_)) => (
+                "changed",
+                "changed since approval: refused until approved again".to_string(),
+            ),
+            (Ok(_), None) => ("not_approved", "not approved: refused".to_string()),
         };
         rows.push(serde_json::json!({
             "name": name,
+            "state": state,
             "status": status,
             "hash": pkg.as_ref().ok().map(|p| p.hash.clone()),
             "approved_hash": approved.map(|a| a.hash.clone()),

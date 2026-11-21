@@ -38,6 +38,17 @@
       "required": ["approvals"],
       "type": "object"
     },
+    "ArchivedSkill": {
+      "description": "A skill the curator moved to the archive.",
+      "properties": {
+        "at": {"type":"string"},
+        "entry": {"format":"uint64","minimum":0,"type":"integer"},
+        "reason": {"type":"string"},
+        "skill": {"type":"string"}
+      },
+      "required": ["skill","entry","at","reason"],
+      "type": "object"
+    },
     "CancelReply": {
       "description": "`POST /sessions/{id}/cancel`.",
       "properties": {
@@ -349,6 +360,29 @@
       "required": ["id","folder","lastActivity","entries","turns","live","busy"],
       "type": "object"
     },
+    "Profile": {
+      "description": "One helper of `GET /profiles`. A profile that cannot be loaded is a row\nwith only `name` and `error`. `persona` is the first line of the persona\nfile (absent when it has none); `models` has the tiers the profile sets\nand its `default` tier name; `may_use` is the profile's own allow list\nand `session_allow` what a session opened with it gets on this server.",
+      "properties": {
+        "error": {"type":["string","null"]},
+        "may_use": {"items":{"type":"string"},"type":["array","null"]},
+        "memory_room": {"type":["string","null"]},
+        "models": {"additionalProperties":true,"type":["object","null"]},
+        "name": {"type":"string"},
+        "persona": {"type":["string","null"]},
+        "persona_chars": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "session_allow": {"items":{"type":"string"},"type":["array","null"]}
+      },
+      "required": ["name"],
+      "type": "object"
+    },
+    "Profiles": {
+      "description": "`GET /profiles`.",
+      "properties": {
+        "profiles": {"items":{"$ref":"#/$defs/Profile"},"type":"array"}
+      },
+      "required": ["profiles"],
+      "type": "object"
+    },
     "PromptReply": {
       "description": "The answer to a prompt, once the turn stopped. `stop_reason` is\n`approval_required` when a Write waits for a decision: `approval` is\nthen the queue row (absent when it was decided or expired meanwhile).",
       "properties": {
@@ -448,6 +482,48 @@
       "required": ["id","busy"],
       "type": "object"
     },
+    "SkillDraft": {
+      "description": "A skill the agent proposed, waiting for the owner's review.",
+      "properties": {
+        "created_at": {"type":"string"},
+        "description": {"type":"string"},
+        "hash": {"type":"string"},
+        "id": {"type":"string"},
+        "name": {"type":"string"},
+        "nearest": {"type":["string","null"]},
+        "tainted": {"description":"The session that proposed it read untrusted text.","type":"boolean"},
+        "warnings": {"items":{"type":"string"},"type":"array"}
+      },
+      "required": ["id","name","description","created_at","hash","tainted","warnings"],
+      "type": "object"
+    },
+    "SkillRow": {
+      "description": "One skill of `GET /skills`. `state` is `approved`, `changed` (the\ncontent differs from what was approved: it is not used), `not_approved`,\n`refused` (the approval ledger disagrees) or `unreadable`.",
+      "properties": {
+        "approved_at": {"type":["string","null"]},
+        "approved_hash": {"type":["string","null"]},
+        "hash": {"type":["string","null"]},
+        "history": {"items":true,"type":"array"},
+        "name": {"type":"string"},
+        "source": true,
+        "source_text": {"type":"string"},
+        "state": {"type":"string"},
+        "status": {"type":"string"}
+      },
+      "required": ["name","state","status","source_text","history"],
+      "type": "object"
+    },
+    "SkillsState": {
+      "description": "`GET /skills`.",
+      "properties": {
+        "archived": {"items":{"$ref":"#/$defs/ArchivedSkill"},"type":"array"},
+        "drafts": {"items":{"$ref":"#/$defs/SkillDraft"},"type":"array"},
+        "notes": {"items":{"type":"string"},"type":"array"},
+        "skills": {"items":{"$ref":"#/$defs/SkillRow"},"type":"array"}
+      },
+      "required": ["skills","drafts","archived","notes"],
+      "type": "object"
+    },
     "TextData": {
       "description": "`text_delta` and `reasoning`.",
       "properties": {
@@ -466,6 +542,24 @@
       "required": ["tool","ok","preview"],
       "type": "object"
     },
+    "ToolServer": {
+      "description": "One connected tool server of `GET /tools`. `trust` is `trusted`,\n`changed`, `not_trusted` or `removed` (revoked, or approved but no\nlonger configured); `state` is the sentence `tole plugin list` prints.",
+      "properties": {
+        "approved_at": {"type":["string","null"]},
+        "lock": {"type":"string"},
+        "manifest_hash": {"type":["string","null"]},
+        "name": {"type":"string"},
+        "sandbox": {"type":"string"},
+        "secrets": {"items":{"type":"string"},"type":"array"},
+        "source": {"type":["string","null"]},
+        "state": {"type":"string"},
+        "tier": {"type":"string"},
+        "trust": {"type":"string"},
+        "version": {"type":["string","null"]}
+      },
+      "required": ["trust","name","state","tier","secrets","sandbox","lock"],
+      "type": "object"
+    },
     "ToolStartedData": {
       "description": "`tool_started`.",
       "properties": {
@@ -473,6 +567,16 @@
         "tool": {"type":"string"}
       },
       "required": ["tool","input"],
+      "type": "object"
+    },
+    "ToolsState": {
+      "description": "`GET /tools`. `probed` is always false: the live manifest check starts\nthe server and is done at a terminal with `tole plugin list`.",
+      "properties": {
+        "notes": {"items":{"type":"string"},"type":"array"},
+        "probed": {"type":"boolean"},
+        "servers": {"items":{"$ref":"#/$defs/ToolServer"},"type":"array"}
+      },
+      "required": ["servers","notes","probed"],
       "type": "object"
     }
   },
@@ -522,13 +626,16 @@
         "EntriesPage": {"$ref":"#/$defs/EntriesPage"},
         "Health": {"$ref":"#/$defs/Health"},
         "Models": {"$ref":"#/$defs/Models"},
+        "Profiles": {"$ref":"#/$defs/Profiles"},
         "PromptReply": {"$ref":"#/$defs/PromptReply"},
         "SessionIndex": {"$ref":"#/$defs/SessionIndex"},
         "SessionList": {"$ref":"#/$defs/SessionList"},
         "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
-        "SessionStatus": {"$ref":"#/$defs/SessionStatus"}
+        "SessionStatus": {"$ref":"#/$defs/SessionStatus"},
+        "SkillsState": {"$ref":"#/$defs/SkillsState"},
+        "ToolsState": {"$ref":"#/$defs/ToolsState"}
       },
-      "required": ["ApprovalList","CancelReply","CronJobState","CronJobs","CronRuns","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
+      "required": ["ApprovalList","CancelReply","CronJobState","CronJobs","CronRuns","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","Profiles","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus","SkillsState","ToolsState"],
       "type": "object"
     }
   },
@@ -710,6 +817,30 @@
       "query": ["job","limit"],
       "request": null,
       "response": "CronRuns",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/profiles",
+      "query": [],
+      "request": null,
+      "response": "Profiles",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/skills",
+      "query": [],
+      "request": null,
+      "response": "SkillsState",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/tools",
+      "query": [],
+      "request": null,
+      "response": "ToolsState",
       "stream": null
     }
   ]
