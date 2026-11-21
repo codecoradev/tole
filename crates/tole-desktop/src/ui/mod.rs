@@ -4,6 +4,10 @@
 //! The GPUI window is behind the `gpui` cargo feature (off by default, so a
 //! plain `cargo test --workspace` does not build a GUI toolkit). Without it
 //! [`run`] reports that the build has no window.
+//!
+//! The offscreen render harness (`harness`, feature `render-harness`) is not
+//! part of any committed build: it needs a local patch that
+//! `scripts/desktop-render.sh` applies to a temporary copy.
 
 use std::fmt;
 
@@ -11,6 +15,8 @@ use tole_desktop_model::{strings, ShellState};
 
 #[cfg(feature = "gpui")]
 mod adapter;
+#[cfg(feature = "render-harness")]
+pub mod harness;
 #[cfg(feature = "gpui")]
 mod shell;
 
