@@ -58,6 +58,32 @@ pub struct Palette {
     pub danger: Rgb,
 }
 
+/// What a status colour says, so a state names the meaning and the palette
+/// picks the colour (a light theme then changes one place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Nothing is claimed: a preview, an idle or paused state.
+    Neutral,
+    /// Done, connected.
+    Good,
+    /// Waiting: something is starting, or the owner is asked.
+    Attention,
+    /// A failure or a refusal.
+    Bad,
+}
+
+impl Palette {
+    /// The colour of a [`Tone`].
+    pub const fn tone(&self, tone: Tone) -> Rgb {
+        match tone {
+            Tone::Neutral => self.text_faint,
+            Tone::Good => self.ok,
+            Tone::Attention => self.amber,
+            Tone::Bad => self.danger,
+        }
+    }
+}
+
 /// The dark palette (the only theme for now).
 pub const DARK: Palette = Palette {
     background: Rgb(0x0F1113),
@@ -94,6 +120,14 @@ pub mod size {
     pub const RADIUS: f32 = 6.0;
     /// Status dot diameter.
     pub const DOT: f32 = 8.0;
+    /// Icon drawn from plain boxes (the sidebar toggle).
+    pub const ICON: f32 = 16.0;
+    /// Height of the connection footer of the sidebar: two lines.
+    pub const FOOTER_HEIGHT: f32 = 44.0;
+    /// Widest the connection label of the header grows before it is cut.
+    pub const HEADER_LABEL_MAX_WIDTH: f32 = 220.0;
+    /// Widest a folder name grows in a chip before it is cut.
+    pub const CHIP_MAX_WIDTH: f32 = 180.0;
     /// First window size.
     pub const WINDOW_WIDTH: f32 = 1200.0;
     pub const WINDOW_HEIGHT: f32 = 780.0;
@@ -130,6 +164,17 @@ mod tests {
         assert_eq!(DARK.line.hex(), 0x262B30);
         assert_eq!(DARK.accent.hex(), 0x5CC8B0);
         assert_eq!(DARK.danger.hex(), 0xF2A39B);
+    }
+
+    #[test]
+    fn every_tone_has_its_own_colour_and_neutral_is_visible_on_the_panel() {
+        let tones = [Tone::Neutral, Tone::Good, Tone::Attention, Tone::Bad];
+        for (i, a) in tones.iter().enumerate() {
+            assert!(tones[i + 1..]
+                .iter()
+                .all(|b| DARK.tone(*a) != DARK.tone(*b)));
+            assert_ne!(DARK.tone(*a), DARK.panel);
+        }
     }
 
     #[test]
