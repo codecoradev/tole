@@ -820,6 +820,54 @@ working folder (the folder `tole discuss` is run in) instead.
   context, which is a different trust decision than a path the owner typed;
   it is left for an owner decision.
 
+### Helper tools, by the owner's allowance (#1039)
+
+A discussion's helpers cannot look anything up today: inline voices hold no
+tools and an independent reviewer runs in plan mode. This section is the
+design of a per-discussion tool allowance; the ledger side below exists, the
+rest is listed as not yet built.
+
+**Owner decision (2026-11-20): one approval per tool per discussion.** The
+allowance is set only by the owner when the discussion starts, never by model
+output. Naming a connected tool allows nothing by itself: the first call of
+each one in a discussion goes to the owner's approval surface, and "Allow for
+this discussion" is a rule bound to that discussion and that tool. It ends
+when the discussion closes or is stopped, is never allow-always, is never
+`Destructive`, and is never carried to another discussion or session.
+
+Built so far (ledger and display only):
+
+- **The allowance is in the contract.** `Contract.tools` holds up to 8 registry
+  names of connected (MCP) tools (`mcp_<server>_<tool>`, at most 64 characters),
+  checked by `tool_name_ok`: a built-in is never named here, and MCP tools stay
+  `Risk::Write` whatever a server says. The field is `serde(default)` and
+  skipped when empty: a contract without tools is written exactly as before and
+  a ledger from before the field replays unchanged (a test replays an
+  old-format ledger). A binary from before it ignores the field.
+- **Each decision is a ledger record.** `Event::ToolApproval { req, tool,
+  verdict }` (`allow`, `deny`, `expired`) records the owner's answer to one
+  approvals-queue request, once per request: recording the same request again
+  writes nothing. It is append-only; a grant is taken back by a later record,
+  never by editing one. A binary from before the record refuses a log that holds
+  one (an unknown event is corruption to it), so a discussion that has one is
+  finished with the version that wrote it. The records are a few hundred bytes;
+  a test writes the largest contract (the longest question in 4-byte
+  characters, 8 tools of 64 characters) and an approval and checks them against
+  `MAX_RECORD_BYTES`.
+- **The grant is derived, never stored.** `State::tool_grants` is the set of
+  allowed tools whose latest decision is `allow`, and it is empty once the
+  discussion is stopped, finishing or closed, so the grant lives and dies with
+  this discussion's state. Another discussion, a closed one and a tool the
+  contract does not allow all get nothing.
+- **Shown.** `tole discuss show` and `tole audit --discussion` print the
+  allowance and each decision (text and JSON).
+- **Refused until the host exists.** A host that does not yet run helpers with
+  tools refuses a contract that allows some (`Driver::start` and `Driver::run`),
+  loudly, instead of running its helpers inline with no tools.
+
+Not built yet: the helper child that can call the named tools, the owner's
+prompt and the grant check around a call, and the `--tool` flag.
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"

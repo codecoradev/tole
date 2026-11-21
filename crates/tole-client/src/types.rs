@@ -483,6 +483,14 @@ wire! {
         pub text: String,
     }
 
+    /// The owner's decision about a helper's first call of an allowed tool
+    /// (#1039): `verdict` is `allow`, `deny` or `expired`.
+    pub struct DiscussionToolApproval {
+        pub request: String,
+        pub tool: String,
+        pub verdict: String,
+    }
+
     /// `GET /discussions/{id}`.
     pub struct Discussion {
         pub id: String,
@@ -492,6 +500,14 @@ wire! {
         pub participants: Vec<String>,
         pub budget: u64,
         pub max_rounds: u32,
+        /// The connected tools the owner allowed the helpers (#1039); left
+        /// out when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tools: Vec<String>,
+        /// The owner's decisions about those tools, in ledger order; left out
+        /// when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tool_approvals: Vec<DiscussionToolApproval>,
         pub tokens_used: u64,
         pub open_calls: u64,
         pub rounds: Vec<DiscussionRound>,
