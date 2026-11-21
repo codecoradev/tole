@@ -19,6 +19,7 @@
 
 mod card;
 mod kind;
+mod queue;
 mod request;
 mod summary;
 mod wait;
@@ -27,6 +28,9 @@ pub mod strings;
 
 pub use card::{ApprovalCard, Button, CardState, DetailRow, BUTTONS};
 pub use kind::{effect_care, risk_care, Care, Wording};
+pub use queue::{
+    AnswerError, ApprovalsAction, ApprovalsState, ComposerState, Row, Scope, Tab, MAX_DECIDED,
+};
 pub use request::{ApprovalRequest, Decision, DecisionIntent, Outcome};
 pub use summary::{ActionSummary, LineKind, Preview, PreviewLine, Shape};
 pub use wait::{Wait, EXPIRY_SECS};
@@ -35,3 +39,5 @@ pub use wait::{Wait, EXPIRY_SECS};
 mod card_tests;
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod queue_tests;
