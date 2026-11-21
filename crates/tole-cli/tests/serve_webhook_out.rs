@@ -520,7 +520,14 @@ fn a_closed_port_is_retried_and_does_not_stop_the_server() {
         rows(&base).is_empty(),
         "not terminal after one refused connection"
     );
-    let outbox = std::fs::read_to_string(base.join("cron/outbox.jsonl")).unwrap();
+    // The tick records the run as done under the lock and queues the event
+    // afterwards, outside it, so the outbox may not exist yet when the run is
+    // seen as done: wait for the queued line instead of reading it at once.
+    let outbox = common::wait_for(Duration::from_secs(30), "the event to be queued", || {
+        std::fs::read_to_string(base.join("cron/outbox.jsonl"))
+            .ok()
+            .filter(|o| o.contains("\"k\":\"enqueue\""))
+    });
     assert!(outbox.contains("\"k\":\"enqueue\""), "{outbox}");
     assert_no_leak("stderr", &s.stderr());
 }
