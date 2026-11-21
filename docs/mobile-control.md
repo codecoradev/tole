@@ -212,7 +212,9 @@ session's log, so a client that connects late or reconnects can render history:
 - It reads the session **file** (replayed read-only, a torn tail is skipped, never
   truncated), not the live storage handle, so it works while a turn is in flight and
   shows entries as soon as they are durable. Cost is a replay of the file per call.
-- `400` for a bad `after`/`limit`, `404` for an unknown (not live) session, `401`
+- `400` for a bad `after`/`limit`, `404` for an unknown (not live) session, `404`
+  (`session transcript not found`) when a live session's file or its directory has
+  been removed from outside (#915; never a `500` with a raw OS error), `401`
   without the token. A session that is not live (after a serve restart) is not readable
   until it is resumed (see below).
 - Entries carry tool inputs and outputs. The token already grants approval authority
