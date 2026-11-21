@@ -15,6 +15,7 @@
 //!
 //! - [`supervisor`] (macOS and Linux): attaches to or starts the local serve.
 
+pub mod adapter;
 #[cfg(unix)]
 pub mod supervisor;
 pub mod ui;
