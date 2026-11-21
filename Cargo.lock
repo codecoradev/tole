@@ -7313,6 +7313,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "libc",
+ "serde_json",
  "tole-client",
  "tole-desktop-model",
 ]
