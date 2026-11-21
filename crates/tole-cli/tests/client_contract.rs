@@ -349,10 +349,18 @@ fn an_approval_is_listed_decided_and_resumed_through_the_client(t: &Target) {
         (row.tool.as_str(), row.status.as_str()),
         ("write_file", "pending")
     );
+    // The summary is typed, and the same on the stop body and in the list.
+    let summary = row.summary.as_ref().expect("the summary of the request");
+    assert_eq!(
+        (summary.kind.as_str(), summary.effect.as_str()),
+        ("create_file", "adds")
+    );
+    assert!(summary.inside_workspace, "{summary:?}");
 
     let list = c.approvals(Some(&id)).unwrap();
     assert_eq!(list.approvals.len(), 1);
     assert_eq!(list.approvals[0].id, row.id);
+    assert_eq!(list.approvals[0].summary, row.summary);
     lossless(
         "approvals",
         &list,

@@ -1,5 +1,19 @@
 {
   "$defs": {
+    "ActionSummary": {
+      "description": "The structured summary of an approval request (#1041). `kind` and\n`effect` are the server's codes (`create_file`, `adds`, ...) and stay\nstrings: a client translates by code, and a code it does not know is\nkept, not rejected. Nothing in a summary is model text, and it never\nchanges the risk tier.",
+      "properties": {
+        "effect": {"type":"string"},
+        "insideWorkspace": {"default":false,"description":"True only when the server confirmed the target is inside the\nworking folder.","type":"boolean"},
+        "kind": {"type":"string"},
+        "preview": {"default":[],"description":"Bounded raw detail: diff lines (`+` and `-`), the command, or the\ninput.","items":{"type":"string"},"type":"array"},
+        "previewTruncated": {"default":false,"description":"True when `preview` is not the whole of it.","type":"boolean"},
+        "target": {"description":"A path relative to the working folder, a command line, or a tool\nname.","type":"string"},
+        "targetTruncated": {"default":false,"description":"True when `target` was cut.","type":"boolean"}
+      },
+      "required": ["kind","target","effect"],
+      "type": "object"
+    },
     "Approval": {
       "additionalProperties": true,
       "description": "One row of the approval queue (`GET /approvals`, the\n`approval_requested` / `approval_resolved` event frames, and a prompt\nthat stopped for approval). Rows of a delegated child have a different\nfield set: what the client does not model is kept in `extra`.",
@@ -10,6 +24,7 @@
         "id": {"type":"string"},
         "sessionId": {"type":["string","null"]},
         "status": {"description":"`pending`, `approved`, `denied` or `expired`.","type":"string"},
+        "summary": {"anyOf":[{"$ref":"#/$defs/ActionSummary"},{"type":"null"}],"description":"What the request will do, derived by code next to the gate (#1041).\nAbsent on a row from a server without it. Boxed so that the event\ntype that carries an approval stays small."},
         "tool": {"type":"string"}
       },
       "required": ["id","tool","status"],
