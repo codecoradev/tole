@@ -12,11 +12,11 @@ fn requested(q: &mut ApprovalsState, r: ApprovalRequest, now: u64) -> bool {
 }
 
 fn started(q: &mut ApprovalsState, scope: Scope) {
-    q.apply(ApprovalsAction::FetchStarted(scope));
+    q.apply(ApprovalsAction::FetchStarted(scope, FetchId(1)));
 }
 
 fn snapshot(q: &mut ApprovalsState, rows: Vec<ApprovalRequest>, scope: Scope, now: u64) {
-    q.apply(ApprovalsAction::Snapshot(rows, scope, now));
+    q.apply(ApprovalsAction::Snapshot(rows, scope, FetchId(1), now));
 }
 
 fn known() -> ApprovalsState {
@@ -58,7 +58,7 @@ fn a_burst_over_the_cap_does_not_leave_the_list_unknown_for_good() {
 fn a_late_reply_after_a_loss_does_not_make_the_list_known() {
     for loss in [
         ApprovalsAction::ConnectionLost,
-        ApprovalsAction::FetchFailed(Scope::All),
+        ApprovalsAction::FetchFailed(Scope::All, FetchId(1)),
     ] {
         let mut q = known();
         started(&mut q, Scope::All);
@@ -165,8 +165,13 @@ fn a_request_the_list_reports_decided_never_stays_answerable_past_the_cap() {
     assert_eq!(q.composer("s"), ComposerState::Open);
     assert_eq!(
         q.answer("w", Decision::AllowOnce, T0 + 1_001),
-        Err(AnswerError::Unknown)
+        Err(AnswerError::NotWaiting)
     );
+    // And it is not forgotten with the old history: it shows its outcome.
+    let rows = q.rows(Tab::Decided, T0 + 1_001);
+    assert!(rows
+        .iter()
+        .any(|r| r.id == "w" && r.outcome == Some(Outcome::Allowed)));
 }
 
 #[test]

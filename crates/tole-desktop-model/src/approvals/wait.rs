@@ -11,7 +11,7 @@
 pub const EXPIRY_SECS: u64 = 900;
 /// How far the two clocks may disagree before the server's timestamp is not
 /// believed.
-const SKEW_MS: u64 = 60_000;
+pub(crate) const SKEW_MS: u64 = 60_000;
 
 /// The moment a request stops waiting, on the clock of the adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,15 @@ impl Wait {
         let deadline = created_at_ms.filter(agrees).map(|c| c.saturating_add(len));
         Wait {
             deadline_ms: deadline.map_or(from_now, |d| d.min(from_now)),
+        }
+    }
+
+    /// The same wait, but not over before `deadline_ms`: the server said the
+    /// request is still pending, so a local clock that ran ahead (by up to the
+    /// skew) is not believed.
+    pub fn at_least(self, deadline_ms: u64) -> Wait {
+        Wait {
+            deadline_ms: self.deadline_ms.max(deadline_ms),
         }
     }
 

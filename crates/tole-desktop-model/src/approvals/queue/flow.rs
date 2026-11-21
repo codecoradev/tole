@@ -1,19 +1,17 @@
 //! How a request enters the queue and how its outcome is settled: frames,
 //! snapshots, the knowledge of the list, the bounds and the tombstones.
 
-use std::collections::HashSet;
-
 use super::super::request::{ApprovalRequest, Outcome};
-use super::super::wait::Wait;
+use super::super::wait::{Wait, SKEW_MS};
 use super::ingest::{admit, valid_key, MAX_SESSION_ID_LEN};
 use super::{
-    waiting, ApprovalsState, Entry, Overflow, Phase, Refusal, Scope, Tombstones, MAX_DECIDED,
-    MAX_KNOWN_SESSIONS, MAX_OVERFLOW, MAX_REFUSALS, MAX_TOMBSTONES, MAX_WAITING,
+    waiting, ApprovalsState, Entry, Overflow, Phase, Rank, Refusal, Tombstones, MAX_DECIDED,
+    MAX_OVERFLOW, MAX_REFUSALS, MAX_TOMBSTONES, MAX_WAITING,
 };
 
 impl Tombstones {
-    fn add(&mut self, id: String) {
-        if self.ids.insert(id.clone()) {
+    fn add(&mut self, id: String, guess: bool) {
+        if self.ids.insert(id.clone(), guess).is_none() {
             self.order.push_back(id);
             if self.order.len() > MAX_TOMBSTONES {
                 if let Some(old) = self.order.pop_front() {
@@ -24,14 +22,25 @@ impl Tombstones {
     }
 
     fn has(&self, id: &str) -> bool {
-        self.ids.contains(id)
+        self.ids.contains_key(id)
+    }
+
+    /// The id was trimmed while it was only a guess (not the server's word).
+    fn was_guess(&self, id: &str) -> bool {
+        self.ids.get(id).copied().unwrap_or(false)
+    }
+
+    fn remove(&mut self, id: &str) {
+        if self.ids.remove(id).is_some() {
+            self.order.retain(|x| x != id);
+        }
     }
 }
 
 impl ApprovalsState {
     /// A row that passed [`admit`], or a count of the refusal (only a row that
     /// may be pending matters: it could be a request nobody can answer).
-    fn admitted(&mut self, request: ApprovalRequest) -> Option<ApprovalRequest> {
+    pub(super) fn admitted(&mut self, request: ApprovalRequest) -> Option<ApprovalRequest> {
         let pending_like = Outcome::of_status(&request.status).is_none()
             || !Outcome::status_is_known(&request.status);
         let session = request.session_id.clone();
@@ -92,9 +101,9 @@ impl ApprovalsState {
             return true; // counted
         };
         match Outcome::of_status(&request.status) {
-            Some(outcome) => self.decide(request, outcome, now, false, now), // a decision
+            Some(outcome) => self.decide_here(request, outcome, now), // a decision
             None => {
-                let appeared = self.pending(request, now);
+                let appeared = self.pending(request, now, false);
                 if appeared {
                     self.auto_select();
                 }
@@ -109,7 +118,7 @@ impl ApprovalsState {
         };
         // A frame that says "pending" is not a decision.
         match Outcome::of_status(&request.status) {
-            Some(outcome) => self.decide(request, outcome, now, false, now),
+            Some(outcome) => self.decide_here(request, outcome, now),
             None => false,
         }
     }
@@ -120,11 +129,20 @@ impl ApprovalsState {
 
     /// A request the server says is pending. A repeat changes nothing; a
     /// decision that was only a guess and is still inside its wait is revived;
-    /// a trimmed id never comes back.
-    fn pending(&mut self, request: ApprovalRequest, now: u64) -> bool {
+    /// a trimmed id never comes back. `server_word`: the row is in the reply of
+    /// the current fetch, the server's word after the fetch started: it also
+    /// revives a guess whose wait is over (the local clock may run ahead) and
+    /// an id trimmed as a guess, with the skew as grace.
+    pub(super) fn pending(
+        &mut self,
+        request: ApprovalRequest,
+        now: u64,
+        server_word: bool,
+    ) -> bool {
         let seq = self.seq + 1; // taken only if the request is kept
         let full = self.waiting_listed() >= MAX_WAITING;
-        let known = (self.entries.get(&request.id)).map(|e| {
+        let id = request.id.clone();
+        let known = (self.entries.get(&id)).map(|e| {
             let guess = matches!(
                 e.phase,
                 Phase::Decided {
@@ -134,25 +152,44 @@ impl ApprovalsState {
             );
             (guess, e.wait)
         });
-        let wait = match known {
-            Some((guess, wait)) if guess && !wait.expired(now) => wait,
-            Some(_) => return false, // a repeat after a reconnect: the first row stays
-            None if self.tombstones.has(&request.id) => return false,
-            None => Wait::new(request.created_at_ms, request.expires_in_secs, now),
+        let mut contradicted = false;
+        let wait =
+            match known {
+                Some((true, wait)) if server_word || !wait.expired(now) => {
+                    contradicted = wait.expired(now);
+                    wait
+                }
+                Some(_) => return false, // a repeat after a reconnect: the first row stays
+                None if self.tombstones.has(&id) => {
+                    if !(server_word && self.tombstones.was_guess(&id)) {
+                        return false;
+                    }
+                    contradicted = true;
+                    Wait::new(request.created_at_ms, request.expires_in_secs, now)
+                }
+                None => (self.overflow.get(&id).map(|o| o.wait)) // promoted: its own wait
+                    .unwrap_or_else(|| {
+                        Wait::new(request.created_at_ms, request.expires_in_secs, now)
+                    }),
+            };
+        let wait = match contradicted {
+            true => wait.at_least(now.saturating_add(SKEW_MS)),
+            false => wait,
         };
         if full {
             return self.overflowed(&request, wait, seq);
         }
         self.seq = seq;
         let phase = Phase::Waiting { answering: None };
-        let id = request.id.clone();
         match self.entries.get_mut(&id) {
             Some(e) => {
                 e.request = request; // revived: the server's pending row
+                e.wait = wait;
                 e.phase = phase;
                 e.seq = seq;
             }
             None => {
+                self.tombstones.remove(&id);
                 self.entries.insert(
                     id.clone(),
                     Entry {
@@ -184,22 +221,38 @@ impl ApprovalsState {
         true
     }
 
+    pub(super) fn local_rank(&mut self) -> Rank {
+        self.decided_seq += 1;
+        (true, self.decided_seq)
+    }
+
+    /// Settles a request the server decided now, as far as this queue knows.
+    pub(super) fn decide_here(
+        &mut self,
+        request: ApprovalRequest,
+        outcome: Outcome,
+        now: u64,
+    ) -> bool {
+        let rank = self.local_rank();
+        self.decide(request, outcome, rank, false, now)
+    }
+
     /// Settles a request. The server's decision replaces a guess; any other
     /// decided request keeps its first answer, and a guess (also a status this
-    /// version does not know) never replaces another decision. `at_ms` is when
-    /// it was decided, `now` the adapter's clock.
+    /// version does not know) never replaces another decision. `rank` orders
+    /// it in the history, `now` is the adapter's clock.
     pub(super) fn decide(
         &mut self,
         request: ApprovalRequest,
         outcome: Outcome,
-        at_ms: u64,
+        rank: Rank,
         guess: bool,
         now: u64,
     ) -> bool {
         let provisional = guess || !Outcome::status_is_known(&request.status);
         let phase = Phase::Decided {
             outcome,
-            at_ms,
+            rank,
             provisional,
             answer_lost: false,
         };
@@ -241,12 +294,14 @@ impl ApprovalsState {
         changed
     }
 
-    /// Drops the oldest decided requests over [`MAX_DECIDED`] and remembers
-    /// their ids.
+    /// Drops the oldest decided requests over [`MAX_DECIDED`] (by [`Rank`], not
+    /// by the clock) and remembers their ids. A dropped request whose status
+    /// this version did not know may have been pending: the list is not
+    /// trusted until the next full snapshot.
     pub(super) fn trim_decided(&mut self) {
-        let mut decided: Vec<(u64, u64, &String)> = (self.entries.iter())
+        let mut decided: Vec<(Rank, u64, &String)> = (self.entries.iter())
             .filter_map(|(id, e)| match e.phase {
-                Phase::Decided { at_ms, .. } => Some((at_ms, e.seq, id)),
+                Phase::Decided { rank, .. } => Some((rank, e.seq, id)),
                 Phase::Waiting { .. } => None,
             })
             .collect();
@@ -260,156 +315,23 @@ impl ApprovalsState {
             .map(|(_, _, id)| id.clone())
             .collect();
         for id in gone {
-            self.entries.remove(&id);
-            self.tombstones.add(id);
-        }
-    }
-
-    pub(super) fn fetch_started(&mut self, scope: Scope) -> bool {
-        if matches!(&scope, Scope::Session(_))
-            && !self.marks.contains_key(&scope)
-            && self.marks.len() >= MAX_KNOWN_SESSIONS
-        {
-            return false; // no room to tell: its snapshot will close nothing
-        }
-        let seq = self.seq;
-        self.marks.insert(scope, seq) != Some(seq)
-    }
-
-    pub(super) fn fetch_failed(&mut self, scope: &Scope) -> bool {
-        self.marks.remove(scope);
-        match scope {
-            Scope::All => std::mem::replace(&mut self.known_all, false),
-            Scope::Session(id) => self.known_sessions.remove(id),
-        }
-    }
-
-    pub(super) fn connection_lost(&mut self) -> bool {
-        self.marks.clear();
-        let had = self.known_all || !self.known_sessions.is_empty();
-        self.known_all = false;
-        self.known_sessions.clear();
-        had
-    }
-
-    /// A whole list from the server. Pending rows are taken first (a request
-    /// that needs an answer must not lose its place to history), then decided
-    /// ones: those of requests that wait here always, the others newest first
-    /// and at most [`MAX_DECIDED`], stamped with the time the request was made
-    /// (the list does not say when it was decided): they never push out an
-    /// answer given here. A snapshot that answers a `FetchStarted` (a marked
-    /// one) also closes what the list omits and the queue saw before the
-    /// fetch started, discounts the refusals and the overflow of that time,
-    /// and makes the list known. An unmarked one only merges its rows.
-    pub(super) fn snapshot(&mut self, rows: Vec<ApprovalRequest>, scope: Scope, now: u64) -> bool {
-        let mark = self.marks.remove(&scope);
-        let seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
-        let mut changed = false;
-        if let Some(mark) = mark {
-            changed |= self.account_for(&scope, mark);
-            // First, so the room it frees is there for the rows of the list.
-            changed |= self.close_omitted(&scope, &seen, mark, now);
-        }
-        let (pending, decided): (Vec<_>, Vec<_>) = rows
-            .into_iter()
-            .partition(|r| Outcome::of_status(&r.status).is_none());
-        let (mine, mut rest): (Vec<_>, Vec<_>) = decided.into_iter().partition(|r| {
-            (self.entries.get(&r.id)).is_some_and(waiting) || self.overflow.contains_key(&r.id)
-        });
-        for row in pending {
-            match self.admitted(row) {
-                Some(row) => {
-                    let appeared = self.pending(row, now);
-                    changed |= appeared;
-                    if appeared {
-                        self.auto_select();
-                    }
-                }
-                None => changed = true,
-            }
-        }
-        rest.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
-        rest.truncate(MAX_DECIDED);
-        for row in mine.into_iter().chain(rest) {
-            let Some(row) = self.admitted(row) else {
+            let Some(e) = self.entries.remove(&id) else {
                 continue;
             };
-            let outcome = Outcome::of_status(&row.status).unwrap_or(Outcome::Closed);
-            let at = row.created_at_ms.unwrap_or(0).min(now);
-            changed |= self.decide(row, outcome, at, false, now);
-        }
-        if mark.is_some() {
-            match &scope {
-                Scope::All => changed |= !std::mem::replace(&mut self.known_all, true),
-                Scope::Session(id) if self.known_sessions.len() < MAX_KNOWN_SESSIONS => {
-                    changed |= self.known_sessions.insert(id.clone());
-                }
-                Scope::Session(_) => {}
-            }
-            changed |= std::mem::replace(&mut self.stale, false);
-        }
-        changed |= self.refresh_if_room();
-        changed
-    }
-
-    /// What a fetch that started at `mark` accounts for: the requests over the
-    /// cap, the refused rows and the loss of count that it could have listed
-    /// (a full list is rebuilt from the reply; what came later stays).
-    fn account_for(&mut self, scope: &Scope, mark: u64) -> bool {
-        let (over, refused) = (self.overflow.len(), self.refusals.len());
-        match scope {
-            Scope::All => {
-                self.overflow.retain(|_, o| o.seq > mark);
-                self.refusals.retain(|r| r.seq > mark);
-            }
-            Scope::Session(id) => {
-                let ours = |s: Option<&str>| s == Some(id.as_str());
-                self.overflow
-                    .retain(|_, o| o.seq > mark || !ours(o.session.as_deref()));
-                self.refusals
-                    .retain(|r| r.seq > mark || !ours(r.session.as_deref()));
-            }
-        }
-        let lost = *scope == Scope::All && self.saturated.is_some_and(|s| s <= mark);
-        if lost {
-            self.saturated = None;
-        }
-        lost || over != self.overflow.len() || refused != self.refusals.len()
-    }
-
-    /// Waiting requests of `scope` the list omits and the queue saw before the
-    /// fetch started: no longer waiting, outcome unknown (a guess).
-    fn close_omitted(
-        &mut self,
-        scope: &Scope,
-        seen: &HashSet<String>,
-        mark: u64,
-        now: u64,
-    ) -> bool {
-        let in_scope = |session: Option<&str>| match scope {
-            Scope::All => true,
-            Scope::Session(id) => session == Some(id.as_str()),
-        };
-        let before = self.overflow.len();
-        self.overflow
-            .retain(|id, o| seen.contains(id) || o.seq > mark || !in_scope(o.session.as_deref()));
-        let mut changed = self.overflow.len() != before;
-        for (id, e) in &mut self.entries {
-            if waiting(e)
-                && e.seq <= mark
-                && !seen.contains(id)
-                && in_scope(e.request.session_id.as_deref())
-            {
-                e.phase = Phase::Decided {
-                    outcome: Outcome::Closed,
-                    at_ms: now,
+            let guess = matches!(
+                e.phase,
+                Phase::Decided {
                     provisional: true,
-                    answer_lost: false,
-                };
-                changed = true;
+                    ..
+                }
+            );
+            if guess && !Outcome::status_is_known(&e.request.status) {
+                self.refuse(None);
+                if let Some(r) = self.refusals.last_mut() {
+                    r.any_session = true;
+                }
             }
+            self.tombstones.add(id, guess);
         }
-        self.trim_decided();
-        changed
     }
 }

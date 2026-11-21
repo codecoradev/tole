@@ -1,6 +1,7 @@
 //! What the views read: the badge, the composer, the lists and the cards.
 
 use super::super::card::{headline, ApprovalCard, CardState};
+use super::super::request::Outcome;
 use super::super::strings;
 use super::super::summary::{bound, ActionSummary, MAX_DISPLAY_CHARS};
 use super::{waiting, ApprovalsState, ComposerState, Entry, Phase, Row, Tab};
@@ -27,7 +28,8 @@ impl ApprovalsState {
         let complete = self.known_all
             && self.overflow.is_empty()
             && self.saturated.is_none()
-            && self.refusals.is_empty();
+            && self.refusals.is_empty()
+            && !self.entries.values().any(unreadable);
         if complete {
             Badge::Count(self.waiting_count())
         } else {
@@ -52,7 +54,9 @@ impl ApprovalsState {
         }
         let known = self.known_all || self.known_sessions.contains(session_id);
         let refused = (self.refusals.iter()).any(|r| r.any_session || mine(r.session.as_deref()));
-        if known && self.saturated.is_none() && !refused {
+        let unreadable =
+            (self.entries.values()).any(|e| unreadable(e) && mine(e.request.session_id.as_deref()));
+        if known && self.saturated.is_none() && !refused && !unreadable {
             ComposerState::Open
         } else {
             ComposerState::Checking
@@ -64,9 +68,11 @@ impl ApprovalsState {
         let mut list: Vec<&Entry> = (self.entries.values())
             .filter(|e| waiting(e) == (tab == Tab::Waiting))
             .collect();
-        list.sort_by_key(|e| match e.phase {
-            Phase::Decided { at_ms, .. } => (-i128::from(at_ms), e.seq),
-            Phase::Waiting { .. } => (i128::from(e.wait.deadline_ms()), e.seq),
+        list.sort_by(|a, b| match (&a.phase, &b.phase) {
+            (Phase::Decided { rank: ra, .. }, Phase::Decided { rank: rb, .. }) => {
+                rb.cmp(ra).then(a.seq.cmp(&b.seq)) // newest first
+            }
+            _ => (a.wait.deadline_ms().cmp(&b.wait.deadline_ms())).then(a.seq.cmp(&b.seq)),
         });
         list.into_iter().map(|e| self.row(e, now)).collect()
     }
@@ -172,13 +178,25 @@ impl ApprovalsState {
             tab.min_by_key(|(_, e)| (e.wait.deadline_ms(), e.seq))
         } else {
             tab.max_by_key(|(_, e)| match e.phase {
-                Phase::Decided { at_ms, .. } => (at_ms, e.seq),
-                Phase::Waiting { .. } => (0, e.seq),
+                Phase::Decided { rank, .. } => (rank, e.seq),
+                Phase::Waiting { .. } => ((false, 0), e.seq),
             })
         };
         self.selected = next.map(|(id, _)| id.clone());
         self.selected.is_some()
     }
+}
+
+/// Decided only by a guess about a status this version cannot read: it may
+/// be pending, so it is never counted as "nothing waits".
+fn unreadable(e: &Entry) -> bool {
+    matches!(
+        e.phase,
+        Phase::Decided {
+            provisional: true,
+            ..
+        }
+    ) && !Outcome::status_is_known(&e.request.status)
 }
 
 fn card_state(e: &Entry) -> CardState {

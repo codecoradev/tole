@@ -43,19 +43,31 @@ impl ApprovalsState {
     /// reply never came, and the server has expired it by now.
     pub(super) fn expire(&mut self, now: u64) -> bool {
         let mut changed = false;
+        let mut n = self.decided_seq;
         for e in self.entries.values_mut() {
-            if let Phase::Waiting { answering } = e.phase {
-                if e.wait.expired(now) {
+            match e.phase {
+                Phase::Waiting { answering } if e.wait.expired(now) => {
+                    n += 1;
                     e.phase = Phase::Decided {
                         outcome: Outcome::Expired,
-                        at_ms: now,
+                        rank: (true, n),
                         provisional: true,
                         answer_lost: answering.is_some(),
                     };
                     changed = true;
                 }
+                // Its time is over at the server too: it is no longer pending,
+                // whatever status this version could not read.
+                Phase::Decided {
+                    provisional: true, ..
+                } if e.wait.expired(now) && !Outcome::status_is_known(&e.request.status) => {
+                    e.request.status = "closed".to_owned();
+                    changed = true;
+                }
+                _ => {}
             }
         }
+        self.decided_seq = n;
         let before = self.overflow.len();
         self.overflow.retain(|_, o| !o.wait.expired(now));
         changed |= self.overflow.len() != before;
@@ -71,6 +83,8 @@ impl ApprovalsState {
     /// word or the next snapshot says otherwise; and makes the list stale.
     pub(super) fn answer_failed(&mut self, id: &str, conflict: bool, now: u64) -> bool {
         let mut changed = false;
+        let mut ranked = false;
+        let rank = (true, self.decided_seq + 1);
         if let Some(e) = self.entries.get_mut(id) {
             if matches!(e.phase, Phase::Waiting { answering: Some(_) }) {
                 let outcome = match (conflict, e.wait.expired(now)) {
@@ -81,14 +95,18 @@ impl ApprovalsState {
                 e.phase = match outcome {
                     Some(outcome) => Phase::Decided {
                         outcome,
-                        at_ms: now,
+                        rank,
                         provisional: true,
                         answer_lost: false,
                     },
                     None => Phase::Waiting { answering: None },
                 };
                 changed = true;
+                ranked = matches!(e.phase, Phase::Decided { .. });
             }
+        }
+        if ranked {
+            self.decided_seq += 1;
         }
         if changed {
             self.trim_decided();

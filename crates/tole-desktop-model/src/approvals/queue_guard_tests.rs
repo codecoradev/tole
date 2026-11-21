@@ -15,14 +15,18 @@ fn resolved(q: &mut ApprovalsState, id: &str, status: &str, now: u64) -> bool {
     q.apply(ApprovalsAction::Resolved(r, now))
 }
 
+fn started(q: &mut ApprovalsState, scope: Scope, id: u64) {
+    q.apply(ApprovalsAction::FetchStarted(scope, FetchId(id)));
+}
+
 fn snapshot(q: &mut ApprovalsState, rows: Vec<ApprovalRequest>, scope: Scope, now: u64) {
-    q.apply(ApprovalsAction::Snapshot(rows, scope, now));
+    q.apply(ApprovalsAction::Snapshot(rows, scope, FetchId(1), now));
 }
 
 /// A state that has loaded the whole list once.
 fn known() -> ApprovalsState {
     let mut q = ApprovalsState::new();
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![], Scope::All, T0 - 1);
     q
 }
@@ -50,7 +54,7 @@ fn an_unloaded_list_is_unknown_not_zero_and_the_box_does_not_claim_nothing_waits
         (Badge::Unknown, 1)
     );
     // A successful fetch does.
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![pending("a", "s2")], Scope::All, T0 + 1);
     assert_eq!(q.waiting_badge(), Badge::Count(1));
     assert_eq!(q.composer("s1"), ComposerState::Open);
@@ -64,14 +68,19 @@ fn an_unloaded_list_is_unknown_not_zero_and_the_box_does_not_claim_nothing_waits
 fn a_lost_connection_or_a_failed_fetch_makes_the_list_unknown_until_a_fetch_succeeds() {
     for lost in [
         ApprovalsAction::ConnectionLost,
-        ApprovalsAction::FetchFailed(Scope::All),
+        ApprovalsAction::FetchFailed(Scope::All, FetchId(1)),
     ] {
         let mut q = known();
         assert_eq!(q.waiting_badge(), Badge::Count(0));
+        started(&mut q, Scope::All, 7);
+        let lost = match lost {
+            ApprovalsAction::FetchFailed(s, _) => ApprovalsAction::FetchFailed(s, FetchId(7)),
+            other => other,
+        };
         assert!(q.apply(lost));
         assert_eq!(q.waiting_badge(), Badge::Unknown);
         assert_eq!(q.composer("s1"), ComposerState::Checking);
-        q.apply(ApprovalsAction::FetchStarted(Scope::All));
+        q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
         snapshot(&mut q, vec![], Scope::All, T0);
         assert_eq!(q.waiting_badge(), Badge::Count(0));
         assert_eq!(q.composer("s1"), ComposerState::Open, "it recovers");
@@ -81,12 +90,22 @@ fn a_lost_connection_or_a_failed_fetch_makes_the_list_unknown_until_a_fetch_succ
 #[test]
 fn the_list_of_one_task_opens_only_that_tasks_box() {
     let mut q = ApprovalsState::new();
-    q.apply(ApprovalsAction::FetchStarted(Scope::Session("s1".into())));
+    q.apply(ApprovalsAction::FetchStarted(
+        Scope::Session("s1".into()),
+        FetchId(1),
+    ));
     snapshot(&mut q, vec![], Scope::Session("s1".into()), T0);
     assert_eq!(q.composer("s1"), ComposerState::Open);
     assert_eq!(q.composer("s2"), ComposerState::Checking);
     assert_eq!(q.waiting_badge(), Badge::Unknown);
-    assert!(q.apply(ApprovalsAction::FetchFailed(Scope::Session("s1".into()))));
+    q.apply(ApprovalsAction::FetchStarted(
+        Scope::Session("s1".into()),
+        FetchId(2),
+    ));
+    assert!(q.apply(ApprovalsAction::FetchFailed(
+        Scope::Session("s1".into()),
+        FetchId(2)
+    )));
     assert_eq!(q.composer("s1"), ComposerState::Checking);
 }
 
@@ -94,7 +113,7 @@ fn the_list_of_one_task_opens_only_that_tasks_box() {
 fn a_snapshot_does_not_close_what_the_stream_announced_after_its_fetch_started() {
     let mut q = known();
     requested(&mut q, pending("old", "s"), T0);
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     requested(&mut q, pending("fresh", "s"), T0 + 1);
     snapshot(&mut q, vec![], Scope::All, T0 + 2);
     assert_eq!(outcome(&q, "old", T0 + 3), Some(Outcome::Closed));
@@ -108,14 +127,14 @@ fn a_snapshot_does_not_close_what_the_stream_announced_after_its_fetch_started()
 fn a_request_closed_by_omission_comes_back_when_the_server_says_pending() {
     let mut q = known();
     requested(&mut q, pending("a", "s"), T0);
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![], Scope::All, T0 + 1);
     assert_eq!(q.waiting_count(), 0);
     // The repeat frame after a reconnect.
     assert!(requested(&mut q, pending("a", "s"), T0 + 2));
     assert_eq!((q.waiting_count(), q.selected()), (1, Some("a")));
     // A later snapshot that lists it pending, too.
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![], Scope::All, T0 + 3);
     snapshot(&mut q, vec![pending("a", "s")], Scope::All, T0 + 4);
     assert_eq!(q.waiting_count(), 1);
@@ -242,7 +261,7 @@ fn waiting_requests_are_capped_and_the_rest_is_counted_never_hidden() {
     resolved(&mut q, &last, "approved", T0 + 1);
     assert_eq!(q.waiting_at_least(), MAX_WAITING + 49);
     // Room again after a full list: the count is exact.
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![pending("only", "s0")], Scope::All, T0 + 2);
     assert_eq!(q.waiting_badge(), Badge::Count(1));
     // Overflowing requests expire with their time.
@@ -288,7 +307,7 @@ fn a_row_with_a_bad_id_is_refused_and_the_badge_says_so() {
     resolved(&mut q, "a b", "approved", T0);
     assert_eq!(q.refused(), bad.len() + 1);
     // A full list that was asked for after them is the truth again.
-    q.apply(ApprovalsAction::FetchStarted(Scope::All));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![pending("ok", "s")], Scope::All, T0 + 1);
     assert_eq!((q.refused(), q.waiting_badge()), (0, Badge::Count(1)));
     let row = &q.rows(Tab::Waiting, T0 + 1)[0];
