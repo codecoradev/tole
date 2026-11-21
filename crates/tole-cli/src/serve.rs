@@ -1701,6 +1701,16 @@ fn hook_action(
     }
 }
 
+/// The id of a route shaped `{prefix}{id}{suffix}`, or `None` when the path is
+/// not of that shape. The id may be empty (`/discussions//resume`) and the
+/// caller refuses it. A path that is only the suffix after the collection
+/// (`/discussions/resume`) starts with the prefix and ends with the suffix at
+/// once, and slicing it by the two lengths made a reversed range and a panic,
+/// so the prefix is stripped first and the suffix from what is left.
+fn id_between<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)?.strip_suffix(suffix)
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (
@@ -1851,20 +1861,22 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("GET", p) if p.starts_with("/missions/") && !p["/missions/".len()..].contains('/') => {
             missions::status(state, &p["/missions/".len()..])
         }
-        ("POST", p) if p.starts_with("/missions/") && p.ends_with("/cancel") => {
-            let id = &p["/missions/".len()..p.len() - "/cancel".len()];
-            missions::cancel(state, id)
-        }
+        ("POST", p) if id_between(p, "/missions/", "/cancel").is_some() => missions::cancel(
+            state,
+            id_between(p, "/missions/", "/cancel").unwrap_or_default(),
+        ),
         // Discussions (#1042): the owner's `tole discuss`, read and dry run.
         ("GET", "/discussions") => discussions::list(state),
         ("POST", "/discussions/estimate") => discussions::estimate(state, body),
         ("POST", "/discussions") => discussions::start(state, body),
-        ("POST", p) if p.starts_with("/discussions/") && p.ends_with("/resume") => {
-            discussions::resume(state, &p["/discussions/".len()..p.len() - "/resume".len()])
-        }
-        ("POST", p) if p.starts_with("/discussions/") && p.ends_with("/stop") => {
-            discussions::stop(state, &p["/discussions/".len()..p.len() - "/stop".len()])
-        }
+        ("POST", p) if id_between(p, "/discussions/", "/resume").is_some() => discussions::resume(
+            state,
+            id_between(p, "/discussions/", "/resume").unwrap_or_default(),
+        ),
+        ("POST", p) if id_between(p, "/discussions/", "/stop").is_some() => discussions::stop(
+            state,
+            id_between(p, "/discussions/", "/stop").unwrap_or_default(),
+        ),
         ("GET", p)
             if p.starts_with("/discussions/") && !p["/discussions/".len()..].contains('/') =>
         {

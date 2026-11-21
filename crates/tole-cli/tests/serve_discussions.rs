@@ -456,3 +456,30 @@ fn an_id_that_is_not_an_id_is_refused_the_same_on_every_route() {
     let escaped = serve.dir.join("x.jsonl");
     assert!(!escaped.exists(), "{}", escaped.display());
 }
+
+/// A path that is only a route's suffix after the collection (`/discussions/resume`,
+/// `/discussions/stop`, `/missions/cancel`) starts with the route's prefix and
+/// ends with its suffix at the same time, with no room for an id between them.
+/// Slicing it as `{prefix}{id}{suffix}` made a reversed range and panicked the
+/// connection's thread, so the client got no answer at all. It is an unknown
+/// route, and the server keeps answering.
+#[test]
+fn a_path_that_is_only_a_route_suffix_is_not_found_and_does_not_panic() {
+    let serve = serve();
+    for path in [
+        "/discussions/resume",
+        "/discussions/stop",
+        "/missions/cancel",
+    ] {
+        let (code, body) = serve.http("POST", path, None);
+        assert_eq!(code, 404, "POST {path}: {body}");
+    }
+    // An empty id between the two is a bad id, not a missing route.
+    for path in ["/discussions//resume", "/discussions//stop"] {
+        let (code, body) = serve.http("POST", path, None);
+        assert_eq!(code, 400, "POST {path}: {body}");
+    }
+    // The server is still up after all of them.
+    let (code, _) = serve.http("GET", "/health", None);
+    assert_eq!(code, 200);
+}
