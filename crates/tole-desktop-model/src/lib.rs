@@ -36,6 +36,8 @@ mod serve_state;
 mod shell;
 mod skills;
 pub mod strings;
+pub mod task;
+pub mod task_strings;
 pub mod tokens;
 
 pub use approvals::{ApprovalCard, ApprovalRequest};
@@ -63,3 +65,4 @@ pub use skills::{
     RawSkill, RawTool, ReviewItem, ReviewReason, SkillsPageState, SkillsView, Tab, ToolChange,
     ToolRow, ToolTrust,
 };
+pub use task::{status_row, Composer, Item, SendMode, StatusRow, TaskEvent, TaskState, Transcript};
