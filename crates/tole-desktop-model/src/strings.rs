@@ -212,6 +212,8 @@ pub fn connections_error_text(error: &ConnectionsError) -> String {
     }
 }
 
+pub use crate::task_strings as task;
+
 #[cfg(test)]
 mod tests {
     use super::*;
