@@ -183,7 +183,7 @@ pub fn cost_plan_with(c: &Contract, background: &[Background]) -> String {
         format!(
             "Helper tools: {}. Every participant runs as an independent read-only child (at \
              least {} tokens reserved per turn), and the first call of each tool is asked of you \
-             in the approvals queue (`tole approvals`): allow covers that tool for this \
+             in the delegation approvals queue (`tole delegation approvals list|allow|deny`, from the same folder): allow covers that tool for this \
              discussion only.\n",
             c.tools.join(", "),
             host::INDEPENDENT_MIN_TOKENS

@@ -95,3 +95,17 @@ fn a_spelling_that_registration_would_change_is_refused_with_its_registry_name()
     // A non-ASCII tool name is replaced character by character: refused too.
     assert!(resolve(&s(&["nginjen.rech\u{e9}rche"]), &servers).is_err());
 }
+
+#[test]
+fn a_name_another_configured_server_could_also_produce_is_refused() {
+    // Cannot happen with names `McpServerConfig::parse` accepts; the check is
+    // a backstop if a configured name ever holds an underscore.
+    let servers = s(&["a", "a_b"]);
+    let e = resolve(&s(&["a.b_c"]), &servers).unwrap_err();
+    assert!(e.contains("mcp_a_b_c") && e.contains("`a_b`"), "{e}");
+    assert_eq!(
+        resolve(&s(&["a.c"]), &servers).unwrap(),
+        s(&["mcp_a_c"]),
+        "an unambiguous tool still resolves"
+    );
+}

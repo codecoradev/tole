@@ -83,6 +83,16 @@ pub fn resolve(specs: &[String], servers: &[String]) -> Result<Vec<String>, Stri
                      needs no change"
                 ));
             }
+            // Server names cannot hold `_` (`McpServerConfig::parse`), so two servers cannot
+            // share a registry name today; refuse it anyway if a configured name ever could.
+            if let Some(other) = servers
+                .iter()
+                .find(|s| *s != server && registry.starts_with(&format!("mcp_{s}_")))
+            {
+                return Err(format!(
+                    "--tool {spec:?}: `{registry}` could also be a tool of the server `{other}`"
+                ));
+            }
             Ok(registry)
         })
         .collect()

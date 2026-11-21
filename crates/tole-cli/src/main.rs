@@ -852,7 +852,8 @@ enum DiscussAction {
         /// is printed). With any, every participant
         /// runs as an independent read-only child (it cannot write or run
         /// programs) and the FIRST call of each tool in this discussion is
-        /// asked of you in the approvals queue (`tole approvals`): allow
+        /// asked of you in the delegation approvals queue (answer it with
+        /// `tole delegation approvals list|allow|deny` from the same folder): allow
         /// covers that tool for this discussion only, never another one. It
         /// needs `[delegation] approvals = "owner"` in your user config.
         #[arg(long = "tool")]
