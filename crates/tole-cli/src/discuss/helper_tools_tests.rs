@@ -11,11 +11,10 @@ fn a_tool_is_named_as_server_dot_tool_and_the_server_must_be_configured() {
         resolve(&s(&["nginjen.search", "uteke.recall"]), &servers).unwrap(),
         s(&["mcp_nginjen_search", "mcp_uteke_recall"])
     );
-    // A tool name with characters a provider rejects gets the registration's
-    // own spelling, so what is allowed is what the helper's registry holds.
+    // A tool name that needs no change to be registered resolves as it is.
     assert_eq!(
-        resolve(&s(&["nginjen.web.search"]), &servers).unwrap(),
-        s(&["mcp_nginjen_web_search"])
+        resolve(&s(&["nginjen.web-search_2"]), &servers).unwrap(),
+        s(&["mcp_nginjen_web-search_2"])
     );
     for bad in ["search", ".search", "nginjen.", "", "nginjen"] {
         let e = resolve(&s(&[bad]), &servers).unwrap_err();
@@ -62,4 +61,37 @@ fn the_approvals_queue_must_be_on_for_tools() {
         let e = need_approvals(&cfg(off)).unwrap_err();
         assert!(e.contains("approvals = \"owner\""), "{off:?}: {e}");
     }
+}
+
+/// The registry name is not one-to-one (characters are replaced, the name is
+/// cut), so a spelling that registration would change is refused: the allowance
+/// must name the tool the owner typed, never a neighbour with the same
+/// registry name.
+#[test]
+fn a_spelling_that_registration_would_change_is_refused_with_its_registry_name() {
+    let servers = s(&["nginjen"]);
+    for (spec, registry) in [
+        ("nginjen.web.search", "mcp_nginjen_web_search"),
+        ("nginjen.web search", "mcp_nginjen_web_search"),
+        ("nginjen.search!", "mcp_nginjen_search_"),
+    ] {
+        let e = resolve(&s(&[spec]), &servers).unwrap_err();
+        assert!(
+            e.contains(spec) && e.contains(registry) && e.contains("replaced"),
+            "{spec}: {e}"
+        );
+    }
+    // Too long: cut at 64 bytes, so it would name whichever tool registers
+    // first under the prefix.
+    let long = format!("nginjen.{}", "x".repeat(100));
+    let e = resolve(&s(&[&long]), &servers).unwrap_err();
+    let cut = discussion::mcp_registry_name("nginjen", &"x".repeat(100));
+    assert!(e.contains("cut") && e.contains(&cut), "{e}");
+    // The longest tool that still fits is accepted whole.
+    let max = "x".repeat(64 - "mcp_nginjen_".len());
+    let ok = resolve(&s(&[&format!("nginjen.{max}")]), &servers).unwrap();
+    assert_eq!(ok, s(&[&format!("mcp_nginjen_{max}")]));
+    assert_eq!(ok[0].len(), 64);
+    // A non-ASCII tool name is replaced character by character: refused too.
+    assert!(resolve(&s(&["nginjen.rech\u{e9}rche"]), &servers).is_err());
 }

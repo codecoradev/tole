@@ -71,13 +71,15 @@ fn a_start_that_cannot_ask_the_owner_or_start_a_helper_writes_nothing() {
         ..args(1_000_000)
     };
     let (_, make) = factory(10, agreeable());
-    assert!(start(&many, &env(&dir, &on, make)).is_err());
+    let e = start(&many, &env(&dir, &on, make)).unwrap_err();
+    assert!(e.contains("at most 8"), "{e}");
     let bad = StartArgs {
         tools: vec!["write_file".into()],
         ..args(1_000_000)
     };
     let (_, make) = factory(10, agreeable());
-    assert!(start(&bad, &env(&dir, &on, make)).is_err());
+    let e = start(&bad, &env(&dir, &on, make)).unwrap_err();
+    assert!(e.contains("not a connected tool name"), "{e}");
     assert!(!dir.join("pick-db.jsonl").exists());
 }
 
@@ -103,4 +105,68 @@ fn a_budget_that_cannot_fit_the_helper_children_is_flagged() {
             .any(|l| l.contains("independent children") && l.contains("40000")),
         "{a:?}"
     );
+}
+
+/// A ledger of a discussion started with tools, as `tole discuss start` left
+/// it: open, nothing said yet.
+fn open_tools_ledger(dir: &Path) -> DiscussionLog {
+    let c = Contract::new(
+        "pick-db",
+        "Which database?",
+        &["a choice is named".to_string()],
+        &["coder".to_string(), "ops".to_string()],
+        1_000_000,
+        Some(3),
+        &SecretSet::default(),
+    )
+    .unwrap()
+    .with_tools(&[SEARCH.to_string()])
+    .unwrap();
+    let log = DiscussionLog::at(dir, "pick-db").unwrap();
+    log.start(c, 100).unwrap();
+    log
+}
+
+/// A helper is seated only when the next step can start one: a stop, a close
+/// or a look at a finished discussion needs no delegation host, so it works
+/// from `tole serve` (no host) and after `[delegation] approvals` was turned
+/// off.
+#[test]
+fn a_stopped_or_finished_tools_discussion_closes_and_shows_without_a_delegation_host() {
+    let dir = tmp("dtools-stopped");
+    let log = open_tools_ledger(&dir);
+    // Still open and about to need a helper: refused, as before.
+    let on = cfg_with("owner");
+    let (_, make) = factory(10, agreeable());
+    let e = resume("pick-db", &env(&dir, &on, make)).err().unwrap();
+    assert!(e.contains("no delegation host"), "{e}");
+    // The owner stops it from a host without delegation (serve's Env has no
+    // delegator, and approvals may be off): the ledger closes.
+    let off = cfg_with("");
+    let (calls, make) = factory(10, agreeable());
+    let out = owner::Owner::default()
+        .stop("pick-db", &env(&dir, &off, make))
+        .unwrap();
+    assert_eq!(out["state"], "closed", "{out}");
+    assert!(out.get("note").is_none(), "{out}");
+    assert!(log.state().unwrap().closed.is_some());
+    // A finished discussion prints its outcome again, whatever the config.
+    let (_, make) = factory(10, agreeable());
+    let text = resume("pick-db", &env(&dir, &off, make)).unwrap();
+    assert!(text.contains("Outcome: "), "{text}");
+    assert_eq!(calls.lock().unwrap().len(), 0, "no model was called");
+}
+
+/// The same for a stop recorded in a ledger nobody closed yet.
+#[test]
+fn a_recorded_stop_is_closed_by_resume_without_a_helper() {
+    let dir = tmp("dtools-stop-recorded");
+    let log = open_tools_ledger(&dir);
+    log.stop(200).unwrap();
+    assert!(log.state().unwrap().closed.is_none());
+    let off = cfg_with("");
+    let (_, make) = factory(10, agreeable());
+    let text = resume("pick-db", &env(&dir, &off, make)).unwrap();
+    assert!(text.contains("Outcome: "), "{text}");
+    assert!(log.state().unwrap().closed.is_some());
 }

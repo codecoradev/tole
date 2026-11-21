@@ -407,7 +407,13 @@ pub fn prepare_resume(id: &str, env: &Env<'_>) -> Result<Ready, String> {
         pot,
     )?
     .with_workdir(env.workdir);
-    let driver = helper_tools::seat(driver, &c, env.cfg, env.delegator.as_ref())?;
+    // Helpers only when a step can still start one: a stopped or finished
+    // discussion is closed or shown without a delegation host (#1039).
+    let driver = if helper_tools::needs_helpers(&st.next()) {
+        helper_tools::seat(driver, &c, env.cfg, env.delegator.as_ref())?
+    } else {
+        driver
+    };
     // A file that is gone or changed is not a failure a resume can cure, so it
     // is reported as it is, without the "continue it with resume" advice.
     driver.check_files(&c)?;

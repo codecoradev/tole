@@ -610,9 +610,14 @@ impl Driver {
     pub fn run(&self) -> Result<Outcome, String> {
         // Before any step: the background files are the contract's, or nothing
         // runs (a no-op without files, cached after the first check).
-        if let Some(c) = self.log.state()?.contract {
-            self.check_tools(&c)?;
-            self.check_files(&c)?;
+        let st = self.log.state()?;
+        if let Some(c) = &st.contract {
+            // Helpers are needed only while a step can still start one: the
+            // stop, the close and a finished discussion's outcome run without.
+            if helper_tools::needs_helpers(&st.next()) {
+                self.check_tools(c)?;
+            }
+            self.check_files(c)?;
         }
         loop {
             let st = self.log.state()?;
@@ -745,7 +750,27 @@ impl Driver {
         loop {
             let ended = runner.poll(&handle)?;
             if scope.is_some() {
-                self.record_decisions(runner, &handle);
+                let mut recorded = self.record_decisions(runner, &handle);
+                if ended.is_some() && recorded.is_err() {
+                    // The last poll is the last time the answers can be read,
+                    // so it is tried once more.
+                    recorded = self.record_decisions(runner, &handle);
+                }
+                if let Err(e) = recorded {
+                    let text = discussion::sanitize(&e, &self.secrets, 300).text;
+                    if ended.is_some() {
+                        // Settling now would lose an approved use for good:
+                        // the helper stays bound and unsettled, so a resume
+                        // polls it again and records what is still there.
+                        return Err(format!(
+                            "{who}'s tool approvals in round {round} were not recorded in the \
+                             ledger: {text}"
+                        ));
+                    }
+                    // Still running: the answers are read again on the next
+                    // poll. One note, however long it lasts.
+                    self.note_once(text);
+                }
             }
             if let Some((text, spent)) = ended {
                 self.log.settle(&call, spent, (self.now)())?;
@@ -757,22 +782,25 @@ impl Driver {
     }
 
     /// Copies the owner's answers about helper `handle`'s tool requests into
-    /// the ledger, once per request (#1039). A failure is a note, never a
-    /// silent drop and never a change of gate: the answer is still in the
-    /// approvals queue and is seen again on the next poll.
-    fn record_decisions(&self, runner: &dyn Independent, handle: &str) {
-        let found = match runner.decisions(handle) {
-            Ok(d) => d,
-            Err(e) => return self.note(format!("tool approvals could not be read: {e}")),
-        };
+    /// the ledger, once per request (#1039). Every answer is tried; the first
+    /// failure is returned. The caller decides what it means: while the helper
+    /// runs the answers are read again on the next poll, and on its last poll
+    /// the discussion stops there (resumable) rather than settle the helper
+    /// without them.
+    fn record_decisions(&self, runner: &dyn Independent, handle: &str) -> Result<(), String> {
+        let found = runner
+            .decisions(handle)
+            .map_err(|e| format!("tool approvals could not be read: {e}"))?;
+        let mut first = None;
         for d in found {
             if let Err(e) = self
                 .log
                 .tool_approval(&d.req, &d.tool, d.verdict, (self.now)())
             {
-                self.note(format!("tool approval {} was not recorded: {e}", d.req));
+                first.get_or_insert(format!("tool approval {} was not recorded: {e}", d.req));
             }
         }
+        first.map_or(Ok(()), Err)
     }
 
     /// A contract that allows helper tools needs every participant seated as
@@ -1116,6 +1144,15 @@ impl Driver {
     fn note(&self, n: String) {
         if let Ok(mut v) = self.notes.lock() {
             v.push(n);
+        }
+    }
+
+    /// [`note`](Driver::note), unless the same note is already there.
+    fn note_once(&self, n: String) {
+        if let Ok(mut v) = self.notes.lock() {
+            if !v.contains(&n) {
+                v.push(n);
+            }
         }
     }
 

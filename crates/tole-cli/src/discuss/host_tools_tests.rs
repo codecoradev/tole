@@ -15,6 +15,10 @@ struct Helpers {
     starts: Mutex<Vec<(String, String, DiscussionScope)>>,
     plain: Mutex<u32>,
     answers: Mutex<Vec<(String, Vec<ToolDecision>)>>,
+    /// The next this many reads of the queue fail (with a secret in the text).
+    read_fails: Mutex<u32>,
+    /// The next this many polls find the helper still running.
+    running: Mutex<u32>,
 }
 
 impl Helpers {
@@ -45,9 +49,19 @@ impl Independent for Helpers {
         Ok(None)
     }
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
+        let mut running = self.running.lock().unwrap();
+        if *running > 0 {
+            *running -= 1;
+            return Ok(None);
+        }
         Ok(Some((format!("{handle} looked it up"), 500)))
     }
     fn decisions(&self, handle: &str) -> Result<Vec<ToolDecision>, String> {
+        let mut fails = self.read_fails.lock().unwrap();
+        if *fails > 0 {
+            *fails -= 1;
+            return Err(format!("approvals log unreadable {SECRET}\u{7}"));
+        }
         Ok(self
             .answers
             .lock()
@@ -204,4 +218,86 @@ fn inline_voices_and_a_runner_without_tools_are_refused_not_run_without_them() {
         .start(bad)
         .unwrap_err()
         .contains("not a connected tool name"));
+}
+
+/// The helper's last poll is the last time its answers can be read: a failure
+/// to read or record them there is an error that leaves the ledger resumable
+/// (the helper stays bound and unsettled), never a note and a settled call
+/// that lost an approved use. The resume reads them again.
+#[test]
+fn a_failure_to_record_on_the_final_poll_leaves_the_ledger_resumable() {
+    let h = Arc::new(Helpers::default());
+    h.answers(1, vec![answer("dap-1", ToolVerdict::Allow)]);
+    // The read fails on the final poll and on its one retry.
+    *h.read_fails.lock().unwrap() = 2;
+    let (l, _dir) = log("tools-final-poll");
+    let d = seated(l.clone(), &h);
+    d.start(with_tools(1_000_000)).unwrap();
+    let e = d.run().unwrap_err();
+    assert!(
+        e.contains("tool approvals") && e.contains("not recorded") && !e.contains(SECRET),
+        "{e}"
+    );
+    let st = l.state().unwrap();
+    assert!(st.tool_approvals.is_empty());
+    let (call, handle) = st.open_call(1, "participant-coder").unwrap();
+    assert_eq!(
+        handle.as_deref(),
+        Some("node-1"),
+        "bound, so a resume polls it: {call}"
+    );
+    assert!(st.contributions.is_empty(), "the helper was not settled");
+    // The resume polls the same helper again, records the approval and goes on.
+    let h2 = Arc::new(Helpers::default());
+    h2.answers(1, vec![answer("dap-1", ToolVerdict::Allow)]);
+    let d2 = seated(l.clone(), &h2);
+    d2.run().unwrap();
+    let starts = h2.starts.lock().unwrap().clone();
+    assert_eq!(
+        starts.len(),
+        1,
+        "the first helper was polled, not started again"
+    );
+    let st = l.state().unwrap();
+    assert_eq!(st.tool_approvals.len(), 1);
+    assert_eq!(st.tool_approvals[0].verdict, ToolVerdict::Allow);
+}
+
+/// One failed read on the final poll is retried once.
+#[test]
+fn one_failed_read_on_the_final_poll_is_retried() {
+    let h = Arc::new(Helpers::default());
+    h.answers(1, vec![answer("dap-1", ToolVerdict::Allow)]);
+    *h.read_fails.lock().unwrap() = 1;
+    let (l, _dir) = log("tools-final-retry");
+    let d = seated(l.clone(), &h);
+    d.start(with_tools(1_000_000)).unwrap();
+    d.run().unwrap();
+    assert_eq!(l.state().unwrap().tool_approvals.len(), 1);
+}
+
+/// While a helper runs, a failure to read is one redacted, capped note however
+/// many polls it lasts, and the answer is still recorded once the queue reads.
+#[test]
+fn a_failure_while_the_helper_runs_is_one_sanitized_note() {
+    let h = Arc::new(Helpers::default());
+    h.answers(1, vec![answer("dap-1", ToolVerdict::Allow)]);
+    *h.running.lock().unwrap() = 3;
+    *h.read_fails.lock().unwrap() = 3;
+    let (l, _dir) = log("tools-inflight");
+    let d = seated(l.clone(), &h);
+    d.start(with_tools(1_000_000)).unwrap();
+    let out = d.run().unwrap();
+    let unread: Vec<_> = out
+        .notes
+        .iter()
+        .filter(|n| n.contains("could not be read"))
+        .collect();
+    assert_eq!(unread.len(), 1, "{:?}", out.notes);
+    assert!(
+        !unread[0].contains(SECRET) && !unread[0].contains('\u{7}'),
+        "{}",
+        unread[0]
+    );
+    assert_eq!(l.state().unwrap().tool_approvals.len(), 1);
 }

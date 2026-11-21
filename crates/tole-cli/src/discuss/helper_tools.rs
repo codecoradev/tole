@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tole_core::child_env::DiscussionScope;
 use tole_core::delegation_approvals::{Choice, ExpireReason, Status};
 use tole_core::discussion::{self, Contract, ToolVerdict};
-use tole_core::discussion_log::State;
+use tole_core::discussion_log::{Next, State};
 
 use crate::config::Config;
 use crate::delegated_approver::Store;
@@ -33,9 +33,17 @@ pub struct ToolDecision {
 }
 
 /// The registry names for the owner's `--tool <server>.<tool>` values.
-/// `servers` are the connected servers this host knows (`name` of each
-/// `--mcp-server name=...` or config entry): naming a tool of a server that is
-/// not configured is refused, because the helper would silently lack it.
+/// `servers` are the connected servers a helper child can resolve (the
+/// `mcp_server` list of the config and the cora preset: a helper is a separate
+/// `tole mission` process that does not get the `--mcp-server` flag): naming a
+/// tool of any other server is refused, because the helper would silently lack
+/// it.
+///
+/// A spelling that registration would change is refused too. The registry name
+/// is not one-to-one (a character a provider rejects becomes `_`, and the
+/// whole is cut at 64 bytes), so allowing it could cover a different tool of
+/// the same server than the one the owner typed. What is accepted is exactly
+/// `mcp_<server>_<tool>`, and that is the name the caller shows.
 pub fn resolve(specs: &[String], servers: &[String]) -> Result<Vec<String>, String> {
     specs
         .iter()
@@ -48,8 +56,9 @@ pub fn resolve(specs: &[String], servers: &[String]) -> Result<Vec<String>, Stri
                 })?;
             if !servers.iter().any(|s| s == server) {
                 return Err(format!(
-                    "--tool {spec:?}: no connected server `{server}` is configured here \
-                     (configured: {})",
+                    "--tool {spec:?}: no connected server `{server}` is configured for helpers \
+                     (they read `mcp_server` from your config and the cora preset; a \
+                     --mcp-server flag does not reach them; configured: {})",
                     if servers.is_empty() {
                         "none".to_string()
                     } else {
@@ -57,7 +66,24 @@ pub fn resolve(specs: &[String], servers: &[String]) -> Result<Vec<String>, Stri
                     }
                 ));
             }
-            Ok(discussion::mcp_registry_name(server, tool))
+            let registry = discussion::mcp_registry_name(server, tool);
+            if registry != format!("mcp_{server}_{tool}") {
+                let why = if tool
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    "a registered name is cut at 64 bytes"
+                } else {
+                    "a character a provider rejects in a function name (anything but letters, \
+                     digits, `_` and `-`) is replaced by `_` when a tool is registered"
+                };
+                return Err(format!(
+                    "--tool {spec:?}: {why}, so this would name `{registry}`, which could be \
+                     another tool of `{server}` than the one you typed; name a tool whose name \
+                     needs no change"
+                ));
+            }
+            Ok(registry)
         })
         .collect()
 }
@@ -132,6 +158,15 @@ pub fn decisions(store: &Store, node: &str, now: i64) -> Result<Vec<ToolDecision
             })
             .collect()
     })
+}
+
+/// Whether a step of the ledger at `next` can still start a helper. A stop
+/// (the ledger's escalation), a close and a finished discussion never do, so
+/// they need no delegation host and no approvals queue: they work from a host
+/// that has none (`tole serve`) and after `[delegation] approvals` was turned
+/// off. Every other step is a round in progress, and a later one starts helpers.
+pub fn needs_helpers(next: &Next) -> bool {
+    !matches!(next, Next::Done | Next::Finish { .. })
 }
 
 /// Seats every participant of `c` as an independent helper when it allows

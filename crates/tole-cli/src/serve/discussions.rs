@@ -114,8 +114,9 @@ pub(super) fn parse(body: &str) -> Result<StartArgs, (u16, Value)> {
         budget_tokens,
         max_rounds,
         files: strings(&req, "files").map_err(bad)?,
-        // Helper tools are the owner's `--tool` on the command line (#1039):
-        // a request over serve names none, whatever it carries.
+        // Helper tools are the owner's `--tool` on the command line (#1039).
+        // A `tools` field is refused as unknown by the KEYS check above; this
+        // stays empty.
         tools: Vec::new(),
     })
 }

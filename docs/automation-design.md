@@ -862,8 +862,14 @@ How it works:
   allowance and each decision (text and JSON).
 - **Refused where it cannot run.** A driver whose participants are not all
   seated as independent helpers refuses a contract that allows tools
-  (`Driver::start` and `Driver::run`), loudly, instead of running inline voices
-  that would have no tools.
+  (`Driver::start`, and `Driver::run` while a step can still start a helper),
+  loudly, instead of running inline voices that would have no tools. A stop, a
+  close and the outcome of a finished discussion start no helper, so they need
+  no delegation host and no approvals queue (`helper_tools::needs_helpers`):
+  `tole serve` can stop and show a discussion the terminal started with
+  `--tool`, and `tole discuss resume` of a finished one works after
+  `[delegation] approvals` was turned off. Resuming one that is still open
+  needs the host and the queue, so it is refused over `serve`.
 - **The helper child keeps the named tools, and only those.** An independent
   helper (a `consult` child, #704) runs in plan mode, which removes every
   `Write` tool. When the host launches it with a scope
@@ -913,9 +919,17 @@ How it works:
 
 - **The owner starts it with `--tool`.** `tole discuss start --tool
   <server>.<tool>` (repeat, at most 8) names connected tools; the server must be
-  configured (`--mcp-server` or the config), the name is turned into the
-  registry name by the one function MCP registration uses
-  (`discussion::mcp_registry_name`), and `[delegation] approvals` must be
+  one a helper can resolve: the `mcp_server` list of the config or the cora
+  preset. A helper is a separate `tole mission` process that does not receive
+  the `--mcp-server` flag of the command, so a server given only by that flag
+  is refused (it would be accepted and silently missing in the helper). The
+  name is turned into the registry name by the one function MCP registration
+  uses (`discussion::mcp_registry_name`), and the command prints the name each
+  spelling allows. That function is not one-to-one (a character a provider
+  rejects becomes `_`, the whole is cut at 64 bytes), so a spelling it would
+  change is refused rather than allowed under a name that could also be another
+  tool of the server: a tool name must be letters, digits, `_` and `-`, and fit.
+  `[delegation] approvals` must be
   `owner` or `chain`: with it off every call would be denied, so the start is
   refused before anything is written (the dry run says the same). The
   model-facing `discuss` tool takes no `tools` field (it is refused like any
@@ -935,7 +949,11 @@ How it works:
   (`State::tool_grants`), so a later helper, a later round and a resumed
   discussion do not ask again for an approved tool, and a denied or expired one
   is asked again. A stop or a close ends the grants because nothing is started
-  after it.
+  after it. On a helper's last poll a failure to read or record its answers is
+  retried once and then stops the discussion with an error before the helper is
+  settled: the ledger stays resumable and the bound helper is polled again, so
+  an approved use is never missing from the ledger. While it runs, a failure is
+  one redacted note.
 
 Residual, stated so nobody assumes more: a helper already running when the
 owner stops the discussion keeps the grants it started with until it ends (its

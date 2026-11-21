@@ -3,11 +3,15 @@
 //!
 //! Nothing here decides what a discussion may do. A start validates and
 //! records through [`discuss::begin`] and a continue through
-//! [`discuss::prepare_resume`], the same functions `tole discuss start` and
+//! [`super::prepare_resume`], the same functions `tole discuss start` and
 //! `resume` run, so the contract rules, the participant rules (profiles of the
 //! owner's config, never a built-in role), the hard token budget, the depth
-//! (an owner-started discussion is depth 0 with inline, read-only voices and
-//! no tools) and the background-file checks are the CLI's. This module adds
+//! (a discussion started here is depth 0 with inline, read-only voices and no
+//! tools; one the terminal started with `--tool` has no host here to start its
+//! helper children, so over serve it can be listed, shown and stopped, and a
+//! resume of it while open is refused: [`discuss::prepare_resume`] seats
+//! helpers only when a step can still start one) and the background-file
+//! checks are the CLI's. This module adds
 //! only a thread per running discussion. There is no limit on how many run at
 //! once (owner decision of 2026-11-20): each discussion's own budget is its
 //! bound, and the one thing refused is the same discussion running twice.

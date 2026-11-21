@@ -197,10 +197,10 @@ fn list_and_show_need_no_config_and_no_provider() {
     assert!(!o.status.success());
 }
 
-/// #1039: `--tool <server>.<tool>` names a connected tool of a configured
-/// server; the first call of it is asked of the owner in the approvals queue,
+/// #1039: `--tool <server>.<tool>` names a connected tool of a server in the
+/// config (not one given by the `--mcp-server` flag, which a helper never gets); the first call of it is asked of the owner in the approvals queue,
 /// so the queue must be on. Everything is checked before anything is written.
-#[cfg(feature = "mcp")] // `--mcp-server` exists only with the feature
+#[cfg(feature = "mcp")] // the `mcp_server` config key exists only with the feature
 #[test]
 fn the_tool_flag_names_a_configured_server_and_needs_the_approvals_queue() {
     let home = home_with_profiles("tool-flag");
@@ -221,22 +221,41 @@ fn the_tool_flag_names_a_configured_server_and_needs_the_approvals_queue() {
         "{}",
         out(&o)
     );
-    // Configured, but the approvals queue is off: every call would be denied.
+    // A server given only by the `--mcp-server` flag is not one a helper can
+    // use: the helper is a separate process that never gets the flag.
     let o = dry(&["--mcp-server", "nginjen=true", "--tool", "nginjen.search"]);
+    assert!(!o.status.success());
+    assert!(
+        out(&o).contains("no connected server `nginjen`") && out(&o).contains("--mcp-server"),
+        "{}",
+        out(&o)
+    );
+    // The server is the config's.
+    let config = |approvals: &str| {
+        format!("mcp_server = [\"nginjen=true\"]\n[profiles.coder]\n[profiles.ops]\n{approvals}")
+    };
+    std::fs::write(home.join("tole/config.toml"), config("")).unwrap();
+    // A spelling that registration would change is refused, with its name.
+    let o = dry(&["--tool", "nginjen.web.search"]);
+    assert!(!o.status.success());
+    assert!(out(&o).contains("mcp_nginjen_web_search"), "{}", out(&o));
+    // Configured, but the approvals queue is off: every call would be denied.
+    let o = dry(&["--tool", "nginjen.search"]);
     assert!(!o.status.success());
     assert!(out(&o).contains("approvals = \"owner\""), "{}", out(&o));
     // With the queue on, the plan shows the allowance and writes nothing.
     std::fs::write(
         home.join("tole/config.toml"),
-        "[profiles.coder]\n[profiles.ops]\n[delegation]\napprovals = \"owner\"\n",
+        config("[delegation]\napprovals = \"owner\"\n"),
     )
     .unwrap();
-    let o = dry(&["--mcp-server", "nginjen=true", "--tool", "nginjen.search"]);
+    let o = dry(&["--tool", "nginjen.search"]);
     let text = out(&o);
     assert!(o.status.success(), "{text}");
     assert!(
         text.contains("Helper tools: mcp_nginjen_search")
-            && text.contains("independent read-only child"),
+            && text.contains("independent read-only child")
+            && text.contains("helper tool nginjen.search is allowed as mcp_nginjen_search"),
         "{text}"
     );
     assert!(!home.join("tole/discussions").exists());
@@ -247,19 +266,20 @@ fn the_tool_flag_names_a_configured_server_and_needs_the_approvals_queue() {
 /// the contract records the allowance, and `discuss show` prints it. The mock
 /// provider answers the children with plain text, so each one hands in no
 /// report; the discussion still runs to its end.
-#[cfg(feature = "mcp")] // `--mcp-server` exists only with the feature
+#[cfg(feature = "mcp")] // the `mcp_server` config key exists only with the feature
 #[test]
 fn a_discussion_with_tools_runs_its_helpers_as_children_and_shows_the_allowance() {
     let home = tmp("tool-run");
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(
         home.join("tole/config.toml"),
-        "[profiles.coder]\n[profiles.ops]\n[delegation]\napprovals = \"owner\"\n",
+        "mcp_server = [\"nginjen=true\"]\n[profiles.coder]\n[profiles.ops]\n\
+         [delegation]\napprovals = \"owner\"\n",
     )
     .unwrap();
     let base = spawn_mock();
     let mut args = START.to_vec();
-    args.extend(["--max-rounds", "1", "--mcp-server", "nginjen=true"]);
+    args.extend(["--max-rounds", "1"]);
     args.extend(["--tool", "nginjen.search"]);
     let o = run(&home, Some(&base), &args);
     let text = out(&o);
