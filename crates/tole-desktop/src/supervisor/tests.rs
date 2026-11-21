@@ -11,6 +11,7 @@ use tole_desktop_model::{ServeFailure, ServeState};
 
 use super::fake::{FakeServe, TestDir};
 use super::probe::EXPECTED_PROTOCOL;
+use super::sys::LaunchLock;
 use super::token::{self, Token};
 use super::{Backoff, Config, StopError, Supervisor};
 
@@ -322,6 +323,7 @@ fn a_serve_that_comes_back_on_its_own_is_attached_to_without_starting_another() 
     let mut serve = FakeServe::start(&cfg.runtime_dir, TOKEN, Some(EXPECTED_PROTOCOL), "1.0.0");
     save_token(&cfg.runtime_dir, TOKEN);
     let runtime = cfg.runtime_dir.clone();
+    let launch_lock = cfg.launch_lock();
     let sup = Supervisor::launch(cfg);
 
     serve.stop();
@@ -330,8 +332,16 @@ fn a_serve_that_comes_back_on_its_own_is_attached_to_without_starting_another() 
         matches!(s, ServeState::Restarting { .. })
     });
     // Another desktop (or the owner) starts one before the wait is over.
-    let _again = FakeServe::start_over(&runtime, "second-launch-token-bbbbbbbbbb", "2.0.0");
-    save_token(&runtime, "second-launch-token-bbbbbbbbbb");
+    // A real second desktop holds the launch lock while it starts a serve and
+    // saves its credential, and `ensure` takes that lock before it probes: so
+    // the supervisor never sees the new serve without its credential. The test
+    // does the same, instead of racing the supervisor's next probe.
+    let _again = {
+        let _launch = LaunchLock::acquire(&launch_lock, Duration::from_secs(5)).unwrap();
+        let again = FakeServe::start_over(&runtime, "second-launch-token-bbbbbbbbbb", "2.0.0");
+        save_token(&runtime, "second-launch-token-bbbbbbbbbb");
+        again
+    };
     wait_for("the new serve", &sup, |s| {
         matches!(s, ServeState::Attached { .. })
     });
