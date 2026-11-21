@@ -426,3 +426,33 @@ fn a_plan_mode_server_starts_and_resumes_nothing() {
     let r = c.resume_discussion("open-one");
     assert!(matches!(r, Err(Error::Status { status: 409, .. })), "{r:?}");
 }
+
+/// The id of a route is checked the same way on every route (`id_ok`), before
+/// the ledger is looked at: an id that could name another path, or that is not
+/// a discussion id at all, is a 400 on show, resume and stop alike.
+#[test]
+fn an_id_that_is_not_an_id_is_refused_the_same_on_every_route() {
+    let serve = serve();
+    let long = "a".repeat(49);
+    let bad = ["../x", "a/b", "A", "-x", "x.y", long.as_str()];
+    for id in bad {
+        // The router takes show's id as the rest of the path when it has no
+        // slash, so a slash-bearing id only reaches resume and stop.
+        let routes: Vec<(&str, String, bool)> = vec![
+            ("GET", format!("/discussions/{id}"), !id.contains('/')),
+            ("POST", format!("/discussions/{id}/resume"), true),
+            ("POST", format!("/discussions/{id}/stop"), true),
+        ];
+        for (method, path, reaches_the_route) in routes {
+            if !reaches_the_route {
+                continue;
+            }
+            let (code, body) = serve.http(method, &path, None);
+            assert_eq!(code, 400, "{method} {path}: {body}");
+            assert_eq!(body["error"], "invalid discussion id", "{method} {path}");
+        }
+    }
+    // Nothing was written outside the discussions directory by any of them.
+    let escaped = serve.dir.join("x.jsonl");
+    assert!(!escaped.exists(), "{}", escaped.display());
+}

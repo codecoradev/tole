@@ -238,6 +238,9 @@ pub(super) fn start(state: &State, body: &str) -> (u16, Value) {
 /// interrupted (a crash, a failed call). `202`; `409` when it is closed or
 /// already running. Takes no body: there is nothing to change.
 pub(super) fn resume(state: &State, id: &str) -> (u16, Value) {
+    if !tole_core::discussion::id_ok(id) {
+        return (400, json!({"error": "invalid discussion id"}));
+    }
     if let Err(e) = writable(state) {
         return e;
     }
@@ -250,6 +253,9 @@ pub(super) fn resume(state: &State, id: &str) -> (u16, Value) {
 /// `POST /discussions/{id}/stop`: the ledger's own escalation; the
 /// discussion closes with the usual report. Repeating it is harmless.
 pub(super) fn stop(state: &State, id: &str) -> (u16, Value) {
+    if !tole_core::discussion::id_ok(id) {
+        return (400, json!({"error": "invalid discussion id"}));
+    }
     // A stop only ends spending, so it is allowed on every server.
     match with_env(state, true, |env| state.discussions.stop(id, env)) {
         Ok(v) => (200, v),
