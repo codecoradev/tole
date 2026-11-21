@@ -16,7 +16,7 @@ pub struct ApprovalRequest {
     pub session_id: Option<String>,
     pub tool: String,
     pub description: Option<String>,
-    /// `pending`, `approved`, `denied` or `expired`.
+    /// `pending`, `approved`, `denied`, `expired` or `closed`.
     pub status: String,
     pub created_at_ms: Option<u64>,
     /// The whole wait of a serve row (900) or the time left of a child's row.
@@ -87,6 +87,15 @@ impl Outcome {
             _ => Some(Outcome::Closed),
         }
     }
+
+    /// Whether this version knows `status`. An unknown one reads as
+    /// [`Outcome::Closed`] but is only a guess: a later known status corrects it.
+    pub fn status_is_known(status: &str) -> bool {
+        matches!(
+            status,
+            "pending" | "approved" | "denied" | "expired" | "closed"
+        )
+    }
 }
 
 /// The answer to one request. There is no third value: an answer is one time
@@ -119,7 +128,9 @@ mod tests {
         assert_eq!(Outcome::of_status("expired"), Some(Outcome::Expired));
         for code in ["", "Approved", "allowed", "approved "] {
             assert_eq!(Outcome::of_status(code), Some(Outcome::Closed));
+            assert!(!Outcome::status_is_known(code));
         }
+        assert!(Outcome::status_is_known("closed") && Outcome::status_is_known("pending"));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 use super::kind::{effect_care, risk_care, Care, Wording};
 use super::request::{ApprovalRequest, Decision, Outcome};
 use super::strings as s;
-use super::summary::{bound, safe_line, Preview, MAX_DETAIL_CHARS, MAX_DISPLAY_CHARS};
+use super::summary::{
+    bound, safe_line, ActionSummary, Preview, MAX_DETAIL_CHARS, MAX_DISPLAY_CHARS,
+};
 use super::wait::Wait;
 
 /// The two buttons of a card, in the order they are drawn. There is no
@@ -82,6 +84,32 @@ pub struct ApprovalCard {
     pub state_note: Option<&'static str>,
 }
 
+/// What a row of a list needs of a request, worked out the way the card does
+/// it: no preview and no details are built.
+pub(super) struct Headline {
+    pub wording: Wording,
+    pub care: Care,
+    pub outside_folder: bool,
+    pub consistent: bool,
+}
+
+pub(super) fn headline(request: &ApprovalRequest, summary: &ActionSummary) -> Headline {
+    let wording = summary.wording();
+    let outside_folder = summary.outside_folder();
+    let consistent = summary.consistent();
+    let mut care = wording.care().max(effect_care(&summary.effect));
+    care = care.max(request.risk.as_deref().map_or(Care::Notice, risk_care));
+    if outside_folder || !consistent {
+        care = Care::Danger;
+    }
+    Headline {
+        wording,
+        care,
+        outside_folder,
+        consistent,
+    }
+}
+
 impl ApprovalCard {
     /// Builds the card of `request` in `state`; `wait` and `now_ms` give the
     /// time left. A card is answerable only for a request that is still
@@ -90,14 +118,12 @@ impl ApprovalCard {
     /// local guess such as an expiry).
     pub fn build(request: &ApprovalRequest, state: CardState, wait: Wait, now_ms: u64) -> Self {
         let summary = request.summary_or_unknown();
-        let wording = summary.wording();
-        let outside = summary.outside_folder();
-        let consistent = summary.consistent();
-        let mut care = wording.care().max(effect_care(&summary.effect));
-        care = care.max(request.risk.as_deref().map_or(Care::Notice, risk_care));
-        if outside || !consistent {
-            care = Care::Danger;
-        }
+        let Headline {
+            wording,
+            care,
+            outside_folder: outside,
+            consistent,
+        } = headline(request, &summary);
         let state = match Outcome::of_status(&request.status) {
             Some(o) => CardState::Decided(o),
             None => state,
