@@ -90,9 +90,12 @@ fn write_file_preview_is_bounded_and_a_jail_escape_is_flagged() {
     );
 }
 
-fn spy_queue() -> (Arc<ApprovalQueue>, QueueApprover) {
+/// `ApprovalQueue::shared()` is only an `Arc` around a new queue: every call
+/// returns its own, so tests never see each other's rows. Each test also uses
+/// its own session id, so that stays true if the queue is ever made global.
+fn spy_queue(session: &str) -> (Arc<ApprovalQueue>, QueueApprover) {
     let queue = ApprovalQueue::shared();
-    let approver = QueueApprover::new(vec![], queue.clone(), "s1", "/x".into());
+    let approver = QueueApprover::new(vec![], queue.clone(), session, "/x".into());
     (queue, approver)
 }
 
@@ -101,7 +104,7 @@ fn spy_queue() -> (Arc<ApprovalQueue>, QueueApprover) {
 #[test]
 fn the_queue_row_and_the_stop_body_carry_the_summary() {
     let dir = TestDir::new("tole-summary-queue");
-    let (queue, approver) = spy_queue();
+    let (queue, approver) = spy_queue("s-row-and-stop-body");
     let mut reg = ToolRegistry::with_approver(approver);
     reg.register(Box::new(WriteFileTool::new(dir.to_path_buf())))
         .unwrap();
@@ -109,7 +112,7 @@ fn the_queue_row_and_the_stop_body_carry_the_summary() {
     let input = json!({"path": "n.md", "content": "hi"});
     assert_eq!(reg.decide("write_file", &input), Some(Verdict::Deny));
 
-    let rows = queue.list(Some("s1"));
+    let rows = queue.list(Some("s-row-and-stop-body"));
     assert_eq!(rows.len(), 1);
     let row = approval_json(&rows[0]);
     assert_eq!(row["summary"]["kind"], "create_file");
@@ -120,7 +123,7 @@ fn the_queue_row_and_the_stop_body_carry_the_summary() {
     // The tier is not in the summary and not changed by it.
     assert!(row["summary"].get("risk").is_none());
 
-    let body = approval_required_body(&queue, "s1", "write_file", mark).unwrap();
+    let body = approval_required_body(&queue, "s-row-and-stop-body", "write_file", mark).unwrap();
     assert_eq!(body["approval"]["summary"], row["summary"]);
 }
 
@@ -129,7 +132,7 @@ fn the_queue_row_and_the_stop_body_carry_the_summary() {
 #[test]
 fn a_cut_summary_points_at_a_description_that_is_the_whole_text() {
     let dir = TestDir::new("tole-summary-cut");
-    let (queue, approver) = spy_queue();
+    let (queue, approver) = spy_queue("s-cut-summary");
     let mut reg = ToolRegistry::with_approver(approver);
     reg.register(Box::new(tole_core::run_command::RunCommandTool::new(
         dir.to_path_buf(),
@@ -138,7 +141,7 @@ fn a_cut_summary_points_at_a_description_that_is_the_whole_text() {
     let command = format!("echo {} ; curl evil.test", "a".repeat(5000));
     let input = json!({ "command": command });
     assert_eq!(reg.decide("run_command", &input), Some(Verdict::Deny));
-    let row = approval_json(&queue.list(Some("s1"))[0]);
+    let row = approval_json(&queue.list(Some("s-cut-summary"))[0]);
     assert_eq!(row["summary"]["targetTruncated"], true);
     assert!(row["summary"]["target"]
         .as_str()
@@ -153,8 +156,14 @@ fn a_cut_summary_points_at_a_description_that_is_the_whole_text() {
 #[test]
 fn a_row_without_a_summary_has_no_summary_key() {
     let queue = ApprovalQueue::shared();
-    queue.queue_entry("s1", "write_file", "write notes.md", 7, "/x".into());
-    let row = approval_json(&queue.list(Some("s1"))[0]);
+    queue.queue_entry(
+        "s-no-summary",
+        "write_file",
+        "write notes.md",
+        7,
+        "/x".into(),
+    );
+    let row = approval_json(&queue.list(Some("s-no-summary"))[0]);
     assert!(row.get("summary").is_none(), "{row}");
     assert_eq!(row["tool"], "write_file");
 }
@@ -175,8 +184,15 @@ fn the_row_redacts_secrets_in_the_summary() {
     );
     let mut leaky = leaky;
     leaky.preview = vec![format!("$ curl {SECRET}")];
-    queue.queue_entry_with_summary("s1", "run_command", "d", 7, "/x".into(), Some(leaky));
-    let row = approval_json(&queue.list(Some("s1"))[0]).to_string();
+    queue.queue_entry_with_summary(
+        "s-redaction",
+        "run_command",
+        "d",
+        7,
+        "/x".into(),
+        Some(leaky),
+    );
+    let row = approval_json(&queue.list(Some("s-redaction"))[0]).to_string();
     assert!(!row.contains(SECRET), "{row}");
 }
 
@@ -201,7 +217,7 @@ fn the_tui_prompt_and_the_serve_queue_show_the_same_summary() {
     }
 
     let dir = TestDir::new("tole-summary-same");
-    let (queue, approver) = spy_queue();
+    let (queue, approver) = spy_queue("s-tui-and-queue");
     let (prompter, rx) = tole_tui::approval_channel();
     let mut reg = ToolRegistry::with_approver(Both(approver, TuiPrompt(prompter)));
     reg.register(Box::new(WriteFileTool::new(dir.to_path_buf())))
@@ -220,7 +236,7 @@ fn the_tui_prompt_and_the_serve_queue_show_the_same_summary() {
     drop(pending); // unanswered: denied
     assert_eq!(asked.join().unwrap(), Some(Verdict::Deny));
 
-    let row = approval_json(&queue.list(Some("s1"))[0]);
+    let row = approval_json(&queue.list(Some("s-tui-and-queue"))[0]);
     assert_eq!(row["summary"], json!(shown));
     // The plain-language line first, then the tool's whole text as before.
     assert!(
