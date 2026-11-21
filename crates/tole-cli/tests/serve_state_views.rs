@@ -81,13 +81,24 @@ fn serve() -> (Serve, std::path::PathBuf) {
     .unwrap();
 
     let marker = dir.join("server-started");
-    let script = home_of(&dir).join("fake-server.sh");
-    common::write_executable(
-        &script,
-        format!("#!/bin/sh\ntouch {}\nsleep 5\n", marker.display()),
-    );
-    let spec = format!("nginjen={}", script.display());
-    let serve = Serve::spawn_in_env_args(&spawn_mock(0), dir, true, &[], &["--mcp-server", &spec]);
+    // `--mcp-server` exists only in a build with the `mcp` feature; without it
+    // there is no connected server to configure and nothing that could start.
+    #[cfg(feature = "mcp")]
+    let args = {
+        let script = home_of(&dir).join("fake-server.sh");
+        common::write_executable(
+            &script,
+            format!("#!/bin/sh\ntouch {}\nsleep 5\n", marker.display()),
+        );
+        vec![
+            "--mcp-server".to_string(),
+            format!("nginjen={}", script.display()),
+        ]
+    };
+    #[cfg(not(feature = "mcp"))]
+    let args: Vec<String> = Vec::new();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let serve = Serve::spawn_in_env_args(&spawn_mock(0), dir, true, &[], &args);
     (serve, marker)
 }
 
@@ -194,6 +205,7 @@ fn the_skills_are_listed_by_state_and_never_trusted_by_reading() {
     );
 }
 
+#[cfg(feature = "mcp")]
 #[test]
 fn the_tools_state_comes_from_the_lock_and_starts_no_server() {
     let (serve, marker) = serve();
