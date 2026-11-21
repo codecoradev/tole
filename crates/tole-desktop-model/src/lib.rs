@@ -21,6 +21,7 @@
 //! - [`tokens`]: colours, sizes and fonts (one semantic module).
 //! - [`strings`]: every word the window shows.
 
+pub mod approvals;
 mod automations;
 mod captures;
 mod connections;
@@ -36,6 +37,7 @@ mod shell;
 pub mod strings;
 pub mod tokens;
 
+pub use approvals::{ApprovalCard, ApprovalRequest};
 pub use automations::{
     AutomationId, AutomationRow, AutomationsState, NextRun, Notice, Origin, RawJob, RawRun,
     RowNote, RunEntry, RunOutcome, Schedule, Scheduler, SchedulerHost, Switch, ToggleIntent,
