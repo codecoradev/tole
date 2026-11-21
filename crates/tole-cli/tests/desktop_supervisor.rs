@@ -199,9 +199,18 @@ fn launch_starts_a_serve_with_a_private_credential_and_quit_completely_stops_it(
         // The credential is in neither the arguments nor the environment.
         let secret = w.token();
         let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
-        let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
         let has = |hay: &[u8]| hay.windows(secret.len()).any(|w| w == secret.as_bytes());
-        assert!(!has(&args) && !has(&env), "the credential leaked");
+        assert!(!has(&args), "the credential leaked into the arguments");
+        // `tole` marks itself non-dumpable (process_guard), so another user,
+        // or this user without privilege, cannot read its environment at all:
+        // that refusal is the protection, and CI runs unprivileged. Where the
+        // read is allowed (a privileged test run) the credential must not be
+        // in it. The unit test of `Serve::spawn` checks the environment of
+        // the child with a stand-in binary that is dumpable.
+        match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(env) => assert!(!has(&env), "the credential leaked into the environment"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        }
         assert!(String::from_utf8_lossy(&args).contains("--token-fd"));
         assert!(is_running(pid));
     }
