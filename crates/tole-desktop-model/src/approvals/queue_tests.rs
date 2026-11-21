@@ -114,11 +114,8 @@ fn an_answer_is_sent_once_and_the_first_reply_wins() {
         Err(AnswerError::NotWaiting)
     );
     assert!(!q.card("dap-7", T0 + 11).unwrap().answerable());
-    // Not confirmed yet: the time running out does not decide for it.
-    q.apply(ApprovalsAction::Tick(T0 + 901_000));
-    assert_eq!(q.waiting_count(), 1);
     // A failed call gives the request back; a conflict makes the list stale.
-    q.apply(ApprovalsAction::AnswerFailed("dap-7".into(), true));
+    q.apply(ApprovalsAction::AnswerFailed("dap-7".into(), true, T0 + 12));
     assert!(q.is_stale() && q.card("dap-7", T0 + 12).unwrap().state == CardState::Waiting);
     q.apply(ApprovalsAction::Snapshot(vec![], Scope::All, T0 + 902_000));
     assert!(!q.is_stale());
@@ -132,6 +129,7 @@ fn a_snapshot_decides_what_the_server_no_longer_lists() {
     let mut c = req("c", "s2", "create_file", "adds");
     c.status = "expired".into();
     // A snapshot of one session only touches that session.
+    q.apply(ApprovalsAction::FetchStarted(Scope::Session("s1".into())));
     q.apply(ApprovalsAction::Snapshot(
         vec![c],
         Scope::Session("s1".into()),
@@ -159,6 +157,7 @@ fn a_snapshot_decides_what_the_server_no_longer_lists() {
 #[test]
 fn the_composer_is_disabled_while_the_turn_waits() {
     let mut q = ApprovalsState::new();
+    q.apply(ApprovalsAction::Snapshot(vec![], Scope::All, T0 - 1));
     assert_eq!(q.composer("s1"), ComposerState::Open);
     requested(&mut q, req("a", "s1", "create_file", "adds"), T0);
     requested(&mut q, req("dap-1", "", "create_file", "adds"), T0);

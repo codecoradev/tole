@@ -28,7 +28,9 @@ impl Wait {
     pub fn new(created_at_ms: Option<u64>, expires_in_secs: Option<u64>, now_ms: u64) -> Wait {
         let len = expires_in_secs.unwrap_or(EXPIRY_SECS).min(EXPIRY_SECS) * 1000;
         let from_now = now_ms.saturating_add(len);
-        let agrees = |c: &u64| *c <= now_ms + SKEW_MS && c.saturating_add(len + SKEW_MS) >= now_ms;
+        let agrees = |c: &u64| {
+            *c <= now_ms.saturating_add(SKEW_MS) && c.saturating_add(len + SKEW_MS) >= now_ms
+        };
         let deadline = created_at_ms.filter(agrees).map(|c| c.saturating_add(len));
         Wait {
             deadline_ms: deadline.map_or(from_now, |d| d.min(from_now)),
@@ -62,6 +64,14 @@ mod tests {
         assert_eq!(w.remaining_secs(NOW + 839_001), 1);
         assert!(!w.expired(NOW + 839_999) && w.expired(NOW + 840_000));
         assert_eq!(w.remaining_secs(NOW + 900_000), 0);
+    }
+
+    #[test]
+    fn a_clock_near_the_end_of_time_does_not_overflow() {
+        let now = u64::MAX - 10;
+        let w = Wait::new(Some(now - 1), Some(900), now);
+        assert_eq!(w.deadline_ms(), u64::MAX);
+        assert!(!w.expired(now));
     }
 
     #[test]
