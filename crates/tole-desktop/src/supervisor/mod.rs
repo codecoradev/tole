@@ -61,11 +61,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tole_client::Client;
-use tole_desktop_model::{ServeFailure, ServeState};
 
 pub use config::{default_runtime_dir, Backoff, CloseBehavior, Config};
 pub use hub::Observer;
 pub use stop::StopError;
+pub use tole_desktop_model::{ServeFailure, ServeState};
 
 use engine::{Engine, Outcome};
 use hub::Hub;
