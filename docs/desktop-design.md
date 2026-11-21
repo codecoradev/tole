@@ -169,7 +169,7 @@ S14 to S16), which need these further routes, tracked in #1042:
 | Stop | `POST /cancel` | exists |
 | Approval card | `approval_required` row, `GET /approvals`, `POST /decision` | exists |
 | Footer (status, usage) | stream frames, `GET /status` | exists; during a turn `usage_report` is `null`, the model, effort and window are a `stale` snapshot (#573) |
-| `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree) |
+| `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree); a panel that reads the folder directly on the same machine, display only, is the row in [faces.md](faces.md) if the owner wants one |
 | Image attach and view | `POST /images`, `GET /images/{hash}` | exists |
 | Model picker, thinking level | `GET /models`, `POST /model`, `POST /effort` | exists (#574) |
 | Fork, tree, compact, rename | `/fork`, `/tree`, `/compact`, `/name` | exists |
