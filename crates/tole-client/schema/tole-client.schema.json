@@ -80,6 +80,100 @@
       "required": ["decision"],
       "type": "object"
     },
+    "Discussion": {
+      "description": "`GET /discussions/{id}`.",
+      "properties": {
+        "budget": {"format":"uint64","minimum":0,"type":"integer"},
+        "criteria": {"items":{"type":"string"},"type":"array"},
+        "id": {"type":"string"},
+        "max_rounds": {"format":"uint32","minimum":0,"type":"integer"},
+        "open_calls": {"format":"uint64","minimum":0,"type":"integer"},
+        "outcome": {"anyOf":[{"$ref":"#/$defs/DiscussionOutcome"},{"type":"null"}]},
+        "participants": {"items":{"type":"string"},"type":"array"},
+        "question": {"type":"string"},
+        "rounds": {"items":{"$ref":"#/$defs/DiscussionRound"},"type":"array"},
+        "status": {"type":"string"},
+        "tokens_used": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["id","status","question","criteria","participants","budget","max_rounds","tokens_used","open_calls","rounds"],
+      "type": "object"
+    },
+    "DiscussionEstimate": {
+      "description": "The answer to the estimate: the cost plan as text and as numbers.",
+      "properties": {
+        "advice": {"items":{"type":"string"},"type":"array"},
+        "budget_tokens": {"format":"uint64","minimum":0,"type":"integer"},
+        "files": {"items":{"type":"string"},"type":"array"},
+        "max_calls": {"format":"uint64","minimum":0,"type":"integer"},
+        "max_rounds": {"format":"uint32","minimum":0,"type":"integer"},
+        "participants": {"items":{"type":"string"},"type":"array"},
+        "plan": {"type":"string"},
+        "round_floor_tokens": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["plan","advice","participants","max_rounds","max_calls","budget_tokens","round_floor_tokens","files"],
+      "type": "object"
+    },
+    "DiscussionList": {
+      "description": "`GET /discussions`.",
+      "properties": {
+        "discussions": {"items":{"$ref":"#/$defs/DiscussionRow"},"type":"array"}
+      },
+      "required": ["discussions"],
+      "type": "object"
+    },
+    "DiscussionOutcome": {
+      "description": "How a closed discussion ended: the gate's decision and the report text.",
+      "properties": {
+        "gate": {"type":"string"},
+        "text": {"type":"string"},
+        "why": {"type":"string"}
+      },
+      "required": ["gate","why","text"],
+      "type": "object"
+    },
+    "DiscussionRequest": {
+      "description": "The body of `POST /discussions/estimate`: what the owner types for\n`tole discuss start`. Participants are profile names of the server\nowner's user config; `files` are paths inside the server's workspace.",
+      "properties": {
+        "budget_tokens": {"format":"uint64","minimum":0,"type":"integer"},
+        "criteria": {"items":{"type":"string"},"type":"array"},
+        "files": {"items":{"type":"string"},"type":"array"},
+        "id": {"type":["string","null"]},
+        "max_rounds": {"format":"uint32","minimum":0,"type":["integer","null"]},
+        "participants": {"items":{"type":"string"},"type":"array"},
+        "question": {"type":"string"}
+      },
+      "required": ["question","criteria","participants","budget_tokens"],
+      "type": "object"
+    },
+    "DiscussionRound": {
+      "description": "One round of a discussion. `summary` is the scribe's digest (decisions,\nclaims, `disagreements`, open questions, actions) or the list of\nspeakers when it was passed on as written; `checklist` is the\nclaim-checker's verdict per criterion. Both stay as the server's JSON.",
+      "properties": {
+        "charged": {"items":true,"type":"array"},
+        "checklist": {"items":true,"type":["array","null"]},
+        "gate": {"type":["string","null"]},
+        "retries": {"format":"uint64","minimum":0,"type":"integer"},
+        "round": {"format":"uint32","minimum":0,"type":"integer"},
+        "speakers": {"items":{"type":"string"},"type":"array"},
+        "summary": true,
+        "tokens": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["round","speakers","tokens","retries","charged"],
+      "type": "object"
+    },
+    "DiscussionRow": {
+      "description": "One row of `GET /discussions`. A ledger that cannot be read is a row\nwith `status` `unreadable` and an `error` instead of the figures.",
+      "properties": {
+        "budget": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "error": {"type":["string","null"]},
+        "id": {"type":"string"},
+        "question": {"type":["string","null"]},
+        "rounds": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "status": {"description":"`open`, `closed (<gate>)` or `unreadable`.","type":"string"},
+        "tokens_used": {"format":"uint64","minimum":0,"type":["integer","null"]}
+      },
+      "required": ["id","status"],
+      "type": "object"
+    },
     "EntriesPage": {
       "description": "`GET /sessions/{id}/entries`. Page with `after = next_after` while\n`has_more`.",
       "properties": {
@@ -300,10 +394,11 @@
     "requests": {
       "properties": {
         "DecisionRequest": {"$ref":"#/$defs/DecisionRequest"},
+        "DiscussionRequest": {"$ref":"#/$defs/DiscussionRequest"},
         "NewSession": {"$ref":"#/$defs/NewSession"},
         "PromptRequest": {"$ref":"#/$defs/PromptRequest"}
       },
-      "required": ["DecisionRequest","NewSession","PromptRequest"],
+      "required": ["DecisionRequest","DiscussionRequest","NewSession","PromptRequest"],
       "type": "object"
     },
     "responses": {
@@ -311,6 +406,9 @@
         "ApprovalList": {"$ref":"#/$defs/ApprovalList"},
         "CancelReply": {"$ref":"#/$defs/CancelReply"},
         "DecisionReply": {"$ref":"#/$defs/DecisionReply"},
+        "Discussion": {"$ref":"#/$defs/Discussion"},
+        "DiscussionEstimate": {"$ref":"#/$defs/DiscussionEstimate"},
+        "DiscussionList": {"$ref":"#/$defs/DiscussionList"},
         "EntriesPage": {"$ref":"#/$defs/EntriesPage"},
         "Health": {"$ref":"#/$defs/Health"},
         "Models": {"$ref":"#/$defs/Models"},
@@ -320,7 +418,7 @@
         "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
         "SessionStatus": {"$ref":"#/$defs/SessionStatus"}
       },
-      "required": ["ApprovalList","CancelReply","DecisionReply","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
+      "required": ["ApprovalList","CancelReply","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
       "type": "object"
     }
   },
@@ -422,6 +520,30 @@
       "query": [],
       "request": null,
       "response": "Models",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/discussions",
+      "query": [],
+      "request": null,
+      "response": "DiscussionList",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/discussions/{id}",
+      "query": [],
+      "request": null,
+      "response": "Discussion",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/discussions/estimate",
+      "query": [],
+      "request": "DiscussionRequest",
+      "response": "DiscussionEstimate",
       "stream": null
     }
   ]

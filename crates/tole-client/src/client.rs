@@ -37,10 +37,13 @@ pub enum Route {
     Approvals,
     Decide,
     Models,
+    Discussions,
+    Discussion,
+    DiscussionEstimate,
 }
 
 impl Route {
-    pub const ALL: [Route; 12] = [
+    pub const ALL: [Route; 15] = [
         Route::Health,
         Route::Sessions,
         Route::SessionIndex,
@@ -53,11 +56,18 @@ impl Route {
         Route::Approvals,
         Route::Decide,
         Route::Models,
+        Route::Discussions,
+        Route::Discussion,
+        Route::DiscussionEstimate,
     ];
 
     pub fn method(self) -> &'static str {
         match self {
-            Route::CreateSession | Route::Prompt | Route::Cancel | Route::Decide => "POST",
+            Route::CreateSession
+            | Route::Prompt
+            | Route::Cancel
+            | Route::Decide
+            | Route::DiscussionEstimate => "POST",
             _ => "GET",
         }
     }
@@ -77,6 +87,9 @@ impl Route {
             Route::Approvals => "/approvals",
             Route::Decide => "/approvals/{id}/decision",
             Route::Models => "/models",
+            Route::Discussions => "/discussions",
+            Route::Discussion => "/discussions/{id}",
+            Route::DiscussionEstimate => "/discussions/estimate",
         }
     }
 }
@@ -408,6 +421,23 @@ impl Client {
     /// frames are best effort: see [`StreamItem::Reconnected`](crate::StreamItem::Reconnected).
     pub fn follow_events(&self, id: &str, after: u64, policy: ReconnectPolicy) -> ResumingStream {
         ResumingStream::new(self.clone(), id.to_string(), after, policy)
+    }
+
+    /// The owner's discussions, as `tole discuss list --json` shows them.
+    pub fn discussions(&self) -> Result<DiscussionList> {
+        self.call(Route::Discussions, None, "", None)
+    }
+
+    /// One discussion: rounds, the gate's report, disagreements, the claim
+    /// checks and the tokens used (never a raw contribution).
+    pub fn discussion(&self, id: &str) -> Result<Discussion> {
+        self.call(Route::Discussion, Some(id), "", None)
+    }
+
+    /// The dry run of `tole discuss start`: validates the request and says
+    /// what it may cost. Writes nothing and calls no model.
+    pub fn estimate_discussion(&self, req: &DiscussionRequest) -> Result<DiscussionEstimate> {
+        self.call(Route::DiscussionEstimate, None, "", Some(req))
     }
 }
 

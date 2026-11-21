@@ -56,6 +56,7 @@ use tole_cli::session_host::{
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
+mod discussions;
 pub mod missions;
 mod models;
 pub mod past_sessions;
@@ -1751,6 +1752,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("POST", p) if p.starts_with("/missions/") && p.ends_with("/cancel") => {
             let id = &p["/missions/".len()..p.len() - "/cancel".len()];
             missions::cancel(state, id)
+        }
+        // Discussions (#1042): the owner's `tole discuss`, read and dry run.
+        ("GET", "/discussions") => discussions::list(state),
+        ("POST", "/discussions/estimate") => discussions::estimate(state, body),
+        ("GET", p)
+            if p.starts_with("/discussions/") && !p["/discussions/".len()..].contains('/') =>
+        {
+            discussions::show(state, &p["/discussions/".len()..])
         }
         // Cron run results (#579, design §9): the pull delivery target.
         ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {

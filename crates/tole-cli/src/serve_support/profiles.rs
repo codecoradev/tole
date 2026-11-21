@@ -83,6 +83,22 @@ impl ProfileError {
 }
 
 impl ProfileSource {
+    /// The user config and its path, read now (never cached, so an edit
+    /// applies to the next request): `Ok(None)` when there is none, or under
+    /// `--no-config`.
+    pub fn load_config(&self) -> Result<Option<(config::Config, &Path)>, ProfileError> {
+        let Some(path) = self.config.as_deref() else {
+            return Ok(None);
+        };
+        match config::user_config_present(path) {
+            Ok(true) => config::load(path)
+                .map(|cfg| Some((cfg, path)))
+                .map_err(|e| ProfileError::Unusable(format!("the user config is invalid: {e}"))),
+            Ok(false) => Ok(None),
+            Err(e) => Err(ProfileError::Unusable(e)),
+        }
+    }
+
     /// Select profile `name`. The name is checked for shape BEFORE it is
     /// looked up or echoed, so a hostile value never reaches a message, a
     /// path or a log line.
@@ -93,14 +109,8 @@ impl ProfileSource {
                     .into(),
             ));
         }
-        let Some(path) = self.config.as_deref() else {
+        let Some((cfg, path)) = self.load_config()? else {
             return Err(unknown_none(name));
-        };
-        let cfg = match config::user_config_present(path) {
-            Ok(true) => config::load(path)
-                .map_err(|e| ProfileError::Unusable(format!("the user config is invalid: {e}")))?,
-            Ok(false) => return Err(unknown_none(name)),
-            Err(e) => return Err(ProfileError::Unusable(e)),
         };
         let base = path.parent().map(Path::to_path_buf);
         let home = std::env::var_os("HOME").map(PathBuf::from);

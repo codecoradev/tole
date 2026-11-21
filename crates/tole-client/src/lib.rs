@@ -73,8 +73,9 @@
 //! # Not yet
 //!
 //! Routes beyond the first desktop set (interrupt, detach, fork, tree,
-//! compact, name, model, effort, images, missions, and the discussion, cron
-//! and profile routes of #1042).
+//! compact, name, model, effort, images, missions, and the rest of the
+//! discussion, cron and profile routes of #1042; the discussion list, show
+//! and estimate are in).
 
 mod client;
 mod error;
