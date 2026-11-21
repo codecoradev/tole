@@ -621,6 +621,7 @@ mod tests {
             status,
             storage_path: PathBuf::new(),
             seq: 0,
+            summary: None,
         }
     }
 

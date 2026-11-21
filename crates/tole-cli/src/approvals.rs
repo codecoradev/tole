@@ -19,6 +19,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tole_core::action_summary::ActionSummary;
 use tole_core::approval::{AllowlistApprover, Approver, ToolRequest, Verdict};
 use tole_core::tool::Risk;
 use tole_core::turn::call_fingerprint;
@@ -47,6 +48,9 @@ pub struct PendingApproval {
     /// Position in the queue's monotonic sequence (#571): lets a caller
     /// tell an entry queued during its own turn from an older one.
     pub seq: u64,
+    /// The code-derived summary of the call (#1041), already redacted and
+    /// bounded. `None` for an entry queued without one.
+    pub summary: Option<ActionSummary>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +264,26 @@ impl ApprovalQueue {
         fingerprint: u64,
         storage_path: std::path::PathBuf,
     ) -> String {
+        self.queue_entry_with_summary(
+            session_id,
+            tool,
+            description,
+            fingerprint,
+            storage_path,
+            None,
+        )
+    }
+
+    /// [`Self::queue_entry`] with the call's summary (#1041).
+    pub fn queue_entry_with_summary(
+        &self,
+        session_id: &str,
+        tool: &str,
+        description: &str,
+        fingerprint: u64,
+        storage_path: std::path::PathBuf,
+        summary: Option<ActionSummary>,
+    ) -> String {
         self.prune_expired();
         // Issue #255 (rescan #36): the id previously used only
         // (millisecond timestamp, low-32 fingerprint) — two entries
@@ -305,6 +329,7 @@ impl ApprovalQueue {
             status: ApprovalStatus::Pending,
             storage_path,
             seq: entry_seq,
+            summary,
         };
         entries.push(entry.clone());
         drop(entries);
@@ -516,12 +541,13 @@ impl Approver for QueueApprover {
         if self.queue.take_one_shot(&self.session_id, fp) {
             return Verdict::Allow;
         }
-        self.queue.queue_entry(
+        self.queue.queue_entry_with_summary(
             &self.session_id,
             req.tool,
             &req.description,
             fp,
             self.storage_path.clone(),
+            Some(req.action_summary()),
         );
         // Fail closed (#84): the turn settles ApprovalRequired — the
         // remote decision resumes it.
@@ -539,11 +565,15 @@ impl Approver for QueueApprover {
 /// serve token) plus the `${NAME}` secrets of `web_fetch` headers, which are
 /// only in the set once a session was built.
 pub fn redact_description(description: &str) -> String {
+    egress_secrets().redact(description).into_owned()
+}
+
+fn egress_secrets() -> tole_core::secrets::SecretSet {
     let mut set = tole_core::secrets::process_secrets();
     for (name, value) in tole_core::web::header_secrets(&|k| std::env::var(k).ok()) {
         set = set.with(&name, &value);
     }
-    set.redact(description).into_owned()
+    set
 }
 
 pub fn approval_json(e: &PendingApproval) -> Value {
@@ -551,8 +581,9 @@ pub fn approval_json(e: &PendingApproval) -> Value {
     // it can carry a secret the model read. `GET /approvals` and the event
     // stream are the one place it left the process unredacted (#911, design
     // section 6, question 11): redact it with the process's secret set.
-    let description = redact_description(&e.description);
-    json!({
+    let set = egress_secrets();
+    let description = set.redact(&e.description).into_owned();
+    let mut row = json!({
         "id": e.id,
         "sessionId": e.session_id,
         "tool": e.tool,
@@ -560,7 +591,14 @@ pub fn approval_json(e: &PendingApproval) -> Value {
         "status": e.status.as_str(),
         "createdAtMs": e.created_at_ms,
         "expiresInSeconds": EXPIRY_SECS,
-    })
+    });
+    // #1041: the shared, code-derived summary, redacted once more with the
+    // egress set (header secrets are only known here). Absent for an entry
+    // queued without one, so an old consumer's row is unchanged.
+    if let Some(s) = &e.summary {
+        row["summary"] = json!(s.finalized(&set));
+    }
+    row
 }
 
 /// The `POST /sessions/{id}/prompt` body for a turn that stopped on an

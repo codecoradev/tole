@@ -71,6 +71,7 @@ true; the status column says where the work is.
 | Every turn through `turn_runner` | yes (#944) | yes | n/a | yes | one path |
 | Tool roster built by `roster_for` and a `FacePolicy` (#943) | yes | yes | yes | yes | one path |
 | The approval gate (`gate::authorize`) | yes | yes | yes | yes | one path |
+| The action summary of an approval (#1041; built by `ToolRegistry::decide`, so every face's request carries it) | TUI prompt shows it; the stdio prompt (the plain-terminal CLI paths) still prints the tool's `describe` text | `serve` shows it (`GET /approvals`, the `approval_required` stop, the approval events); the ACP permission `title` still uses `describe`; a delegated child's `dap-` approval and the webhook events carry none | n/a (pre-authorized allowlist, no prompt) | n/a (a parked run is answered through the `serve` queue) | drift #1041 follow-up: each of these is a prompt or row that does not render the summary yet, because it is a different presentation (a one-line ACP title, the delegation queue's own row, a fixed webhook payload). The summary is already on the request, so closing it is a rendering change, not new derivation |
 | Sandbox profile for process tools | yes | yes | yes | yes | one path |
 
 ## Adding or changing a face capability
