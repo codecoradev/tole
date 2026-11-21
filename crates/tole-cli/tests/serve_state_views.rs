@@ -98,8 +98,43 @@ fn serve() -> (Serve, std::path::PathBuf) {
     #[cfg(not(feature = "mcp"))]
     let args: Vec<String> = Vec::new();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let serve = Serve::spawn_in_env_args(&spawn_mock(0), dir, true, &[], &args);
+    // The version check of serve is a background job that writes
+    // `update-cache.json` into the data directory when it gets an answer: on a
+    // machine with a network it lands in the middle of a test and shows up as a
+    // change the requests did not make. This test owns the directory, so the
+    // check is off (the switch other serve tests use).
+    let serve = Serve::spawn_in_env_args(
+        &spawn_mock(0),
+        dir,
+        true,
+        &[("TOLE_NO_UPDATE_CHECK", "1")],
+        &args,
+    );
     (serve, marker)
+}
+
+/// Which files differ between two snapshots, by name and size, so a failure
+/// says what changed instead of printing every byte of every file.
+fn describe_change(
+    before: &BTreeMap<String, Vec<u8>>,
+    after: &BTreeMap<String, Vec<u8>>,
+) -> String {
+    let mut out = Vec::new();
+    for name in before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        match (before.get(name), after.get(name)) {
+            (Some(a), Some(b)) if a != b => {
+                out.push(format!("{name} changed ({} to {} bytes)", a.len(), b.len()))
+            }
+            (Some(_), None) => out.push(format!("{name} removed")),
+            (None, Some(b)) => out.push(format!("{name} added ({} bytes)", b.len())),
+            _ => {}
+        }
+    }
+    out.join(", ")
 }
 
 fn client(serve: &Serve) -> Client {
@@ -257,10 +292,11 @@ fn no_route_trusts_a_skill_or_tool_changes_the_allow_list_or_edits_a_profile() {
         // The read routes also take no query that changes anything.
         serve.http("GET", &format!("{path}?approve=1&trust=1"), None);
     }
-    assert_eq!(
-        snapshot(&serve),
-        before,
-        "a request changed the owner's files"
+    let after = snapshot(&serve);
+    assert!(
+        after == before,
+        "a request changed the owner's files: {}",
+        describe_change(&before, &after)
     );
     assert!(!marker.exists());
 }
