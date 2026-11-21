@@ -12,6 +12,7 @@
 //! - [`Connections`], [`Endpoint`]: the servers the desktop can talk to and the
 //!   rule for plain `http://` (owner decision D6); a remote entry holds a
 //!   reference to its credential, never the text.
+//! - [`ServeState`]: what the supervisor of the local serve reports.
 //! - [`tokens`]: colours, sizes and fonts (one semantic module).
 //! - [`strings`]: every word the window shows.
 
@@ -19,6 +20,7 @@ mod connections;
 mod credential;
 mod endpoint;
 mod section;
+mod serve_state;
 mod shell;
 pub mod strings;
 pub mod tokens;
@@ -30,4 +32,5 @@ pub use connections::{
 pub use credential::{CredentialRef, CredentialStore, Secret, StoreError};
 pub use endpoint::{Endpoint, EndpointError, PlainHttp, Scheme};
 pub use section::Section;
+pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};

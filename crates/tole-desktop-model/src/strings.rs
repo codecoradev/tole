@@ -5,7 +5,10 @@
 //! own. Wording follows the design draft (plain words for people who are not
 //! technical) and is still a draft.
 
-use crate::{ConnectionStatus, ConnectionsError, EndpointError, PlainHttp, Section, Target};
+use crate::{
+    ConnectionStatus, ConnectionsError, EndpointError, OwnerAction, PlainHttp, Section,
+    ServeFailure, ServeState, Target,
+};
 
 pub const APP_NAME: &str = "Tole";
 pub const WINDOW_TITLE: &str = "Tole";
@@ -55,6 +58,74 @@ pub fn status_label(status: ConnectionStatus) -> &'static str {
         ConnectionStatus::Connecting => "connecting",
         ConnectionStatus::Connected => "connected",
         ConnectionStatus::Unreachable => "not reachable",
+    }
+}
+
+/// What the local serve is doing, for the connection line and the state page.
+pub fn serve_state_label(state: &ServeState) -> String {
+    match state {
+        ServeState::Starting => "Starting Tole in the background".to_owned(),
+        ServeState::Attached { version } => format!("Connected to Tole {version} on this computer"),
+        ServeState::Running { version } => format!("Tole {version} is running on this computer"),
+        ServeState::Restarting { attempt, retry_in } => format!(
+            "Tole stopped. Starting it again in {} s (try {attempt})",
+            retry_in.as_secs().max(1)
+        ),
+        ServeState::Stopping => "Stopping Tole".to_owned(),
+        ServeState::Stopped => "Tole is stopped".to_owned(),
+        ServeState::Failed(failure) => serve_failure_text(failure),
+    }
+}
+
+/// Why the local serve cannot be used, in words for the owner.
+pub fn serve_failure_text(failure: &ServeFailure) -> String {
+    match failure {
+        ServeFailure::Unsupported => {
+            "This computer cannot run Tole in the background from the desktop yet.".to_owned()
+        }
+        ServeFailure::BinaryNotFound => {
+            "The desktop cannot find the tole program. Install it, or set its location in Settings."
+                .to_owned()
+        }
+        ServeFailure::DirectoryNotPrivate { path, reason } => format!(
+            "The folder {path} is not private to you ({reason}), so the desktop will not use it. \
+             Make it yours alone and try again."
+        ),
+        ServeFailure::VersionMismatch { found, expected } => {
+            let seen = match found {
+                Some(found) => format!("speaks version {found}"),
+                None => "is too old to say which version it speaks".to_owned(),
+            };
+            format!(
+                "The Tole running here {seen}; this desktop needs version {expected}. \
+                 Restart it with the one that came with the desktop."
+            )
+        }
+        ServeFailure::CredentialUnavailable => {
+            "Tole is running here, but it was started by something else and the desktop cannot \
+             sign in to it. Restart it from the desktop."
+                .to_owned()
+        }
+        ServeFailure::NotTole => {
+            "Something that is not Tole answers where the desktop expects it. Restart it from \
+             the desktop."
+                .to_owned()
+        }
+        ServeFailure::StartFailed { detail } => format!("Tole did not start: {detail}"),
+        ServeFailure::GaveUp { attempts, detail } => {
+            format!("Tole stopped {attempts} times in a row and the desktop gave up: {detail}")
+        }
+        ServeFailure::CouldNotStop => {
+            "Tole did not stop when asked. It may still be running.".to_owned()
+        }
+    }
+}
+
+/// The button label a failure calls for.
+pub fn owner_action_label(action: OwnerAction) -> &'static str {
+    match action {
+        OwnerAction::RestartServe => "Restart Tole",
+        OwnerAction::Retry => "Try again",
     }
 }
 
@@ -129,6 +200,24 @@ mod tests {
             why: PlainHttp::PublicAddress,
         });
         assert!(public.contains("public") && !public.contains("mark it"));
+    }
+
+    #[test]
+    fn every_serve_state_has_a_label_and_a_failure_names_its_cause() {
+        let attached = serve_state_label(&ServeState::Attached {
+            version: "0.12.0".into(),
+        });
+        assert!(attached.contains("0.12.0"));
+        let mismatch = serve_failure_text(&ServeFailure::VersionMismatch {
+            found: Some(2),
+            expected: 1,
+        });
+        assert!(mismatch.contains('2') && mismatch.contains('1') && mismatch.contains("Restart"));
+        assert!(!serve_state_label(&ServeState::Stopped).is_empty());
+        assert_ne!(
+            owner_action_label(OwnerAction::Retry),
+            owner_action_label(OwnerAction::RestartServe)
+        );
     }
 
     #[test]
