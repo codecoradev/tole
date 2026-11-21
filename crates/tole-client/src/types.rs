@@ -185,8 +185,41 @@ wire! {
         pub created_at_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires_in_seconds: Option<u64>,
+        /// What the request will do, derived by code next to the gate (#1041).
+        /// Absent on a row from a server without it. Boxed so that the event
+        /// type that carries an approval stays small.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub summary: Option<Box<ActionSummary>>,
         #[serde(flatten)]
         pub extra: Map<String, Value>,
+    }
+
+    /// The structured summary of an approval request (#1041). `kind` and
+    /// `effect` are the server's codes (`create_file`, `adds`, ...) and stay
+    /// strings: a client translates by code, and a code it does not know is
+    /// kept, not rejected. Nothing in a summary is model text, and it never
+    /// changes the risk tier.
+    #[serde(rename_all = "camelCase")]
+    pub struct ActionSummary {
+        pub kind: String,
+        /// A path relative to the working folder, a command line, or a tool
+        /// name.
+        pub target: String,
+        pub effect: String,
+        /// True only when the server confirmed the target is inside the
+        /// working folder.
+        #[serde(default)]
+        pub inside_workspace: bool,
+        /// True when `target` was cut.
+        #[serde(default)]
+        pub target_truncated: bool,
+        /// Bounded raw detail: diff lines (`+` and `-`), the command, or the
+        /// input.
+        #[serde(default)]
+        pub preview: Vec<String>,
+        /// True when `preview` is not the whole of it.
+        #[serde(default)]
+        pub preview_truncated: bool,
     }
 
     /// `GET /approvals`.
@@ -268,6 +301,38 @@ impl PromptRequest {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_approval_row_decodes_its_summary_and_keeps_an_unknown_code() {
+        let row = json!({
+            "id": "apr-1", "tool": "write_file", "status": "pending",
+            "summary": {
+                "kind": "from_a_newer_server", "target": "n.md", "effect": "adds",
+                "insideWorkspace": true, "targetTruncated": false,
+                "preview": ["+ hi"], "previewTruncated": false
+            }
+        });
+        let a: Approval = serde_json::from_value(row.clone()).unwrap();
+        let s = a.summary.as_ref().expect("a summary");
+        assert_eq!(
+            (s.kind.as_str(), s.target.as_str()),
+            ("from_a_newer_server", "n.md")
+        );
+        assert!(s.inside_workspace && !s.target_truncated && !s.preview_truncated);
+        assert_eq!(s.preview, vec!["+ hi".to_string()]);
+        // The summary is a typed field now, not part of `extra`, and the row
+        // serializes back to the JSON the server sent.
+        assert!(a.extra.is_empty(), "{:?}", a.extra);
+        assert_eq!(serde_json::to_value(&a).unwrap(), row);
+    }
+
+    #[test]
+    fn an_approval_row_without_a_summary_has_none_and_no_key() {
+        let row = json!({"id": "apr-1", "tool": "write_file", "status": "pending"});
+        let a: Approval = serde_json::from_value(row.clone()).unwrap();
+        assert!(a.summary.is_none());
+        assert_eq!(serde_json::to_value(&a).unwrap(), row);
+    }
 
     #[test]
     fn a_decision_body_carries_confirm_and_fingerprint_only_for_delegated_rows() {
