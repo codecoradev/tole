@@ -212,8 +212,12 @@ pub struct DelegateIndependent(pub Arc<crate::delegate::Delegator>);
 
 impl Independent for DelegateIndependent {
     fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String> {
-        self.0
-            .consult_participant(who, &format!("{}\n\n{task}", call_marker(key)), tokens)
+        self.0.consult_participant(
+            who,
+            &format!("{}\n\n{task}", call_marker(key)),
+            tokens,
+            None,
+        )
     }
     fn find(&self, key: &str) -> Result<Option<String>, String> {
         self.0.find_child(&call_marker(key))

@@ -47,6 +47,29 @@ pub const DELEGATION_REPORT: &str = "TOLE_DELEGATION_REPORT";
 /// host registers neither tool where it is set.
 pub const DISCUSSION_PARTICIPANT: &str = "TOLE_DISCUSSION_PARTICIPANT";
 
+/// The discussion a participant belongs to, and the connected tools its
+/// owner allowed it (#1039), as the host builds them (never a model).
+pub const DISCUSSION_ID: &str = "TOLE_DISCUSSION_ID";
+pub const DISCUSSION_TOOLS: &str = "TOLE_DISCUSSION_TOOLS";
+/// The subset of those tools the owner already approved for this discussion:
+/// the participant does not ask again for them.
+pub const DISCUSSION_GRANTED: &str = "TOLE_DISCUSSION_GRANTED";
+/// The variables that carry a participant's scope. A launcher removes them
+/// from the child's environment before it sets the launch's own, so a value
+/// inherited from the host's environment never reaches a helper.
+pub const SCOPE_VARS: [&str; 3] = [DISCUSSION_ID, DISCUSSION_TOOLS, DISCUSSION_GRANTED];
+
+/// What an independent participant may ask for in one discussion (#1039):
+/// the discussion's id, the connected tools the owner named, and those of
+/// them already approved for this discussion. Built by the discussion host
+/// from the ledger; a child only reads it back ([`discussion_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscussionScope {
+    pub id: String,
+    pub tools: Vec<String>,
+    pub granted: Vec<String>,
+}
+
 /// The secret variables a child agent keeps (#595): the provider keys its
 /// own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209 reserve) and the
 /// provider base URLs, which the scrub removes when they carry a password
@@ -82,6 +105,8 @@ pub struct ChildLaunch {
     pub report: Option<PathBuf>,
     /// The child is an independent discussion participant (#704).
     pub participant: bool,
+    /// The tools its owner allowed it, for a participant (#1039).
+    pub discussion: Option<DiscussionScope>,
 }
 
 impl ChildLaunch {
@@ -107,6 +132,13 @@ impl ChildLaunch {
         }
         if self.participant {
             vars.push((DISCUSSION_PARTICIPANT, OsString::from("1")));
+            // Only a participant carries a scope: the marker is what makes
+            // the child read-only, and the scope only narrows what it asks.
+            if let Some(s) = &self.discussion {
+                vars.push((DISCUSSION_ID, OsString::from(&s.id)));
+                vars.push((DISCUSSION_TOOLS, OsString::from(s.tools.join(","))));
+                vars.push((DISCUSSION_GRANTED, OsString::from(s.granted.join(","))));
+            }
         }
         vars
     }
@@ -115,6 +147,36 @@ impl ChildLaunch {
 /// True in a child that is an independent discussion participant (#704).
 pub fn discussion_participant(env: &dyn Fn(&str) -> Option<String>) -> bool {
     env(DISCUSSION_PARTICIPANT).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The tools a discussion's owner allowed this participant (#1039), or `None`
+/// for anything that is not a participant with a well-formed scope: the
+/// participant marker, a valid discussion id and at least one connected tool
+/// name. A name that is not a connected tool's, or a granted tool that is not
+/// among the allowed ones, is dropped, so a malformed variable can only
+/// narrow what the child may ask for.
+pub fn discussion_scope(env: &dyn Fn(&str) -> Option<String>) -> Option<DiscussionScope> {
+    if !discussion_participant(env) {
+        return None;
+    }
+    let id = env(DISCUSSION_ID).filter(|i| crate::discussion::id_ok(i))?;
+    let list = |key: &str| -> Vec<String> {
+        env(key)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|t| crate::discussion::tool_name_ok(t))
+            .map(str::to_string)
+            .collect()
+    };
+    let tools = list(DISCUSSION_TOOLS);
+    if tools.is_empty() {
+        return None;
+    }
+    let granted = list(DISCUSSION_GRANTED)
+        .into_iter()
+        .filter(|t| tools.contains(t))
+        .collect();
+    Some(DiscussionScope { id, tools, granted })
 }
 
 /// This process's child depth: `0` when not a child (or unparseable).
@@ -203,7 +265,85 @@ mod tests {
             delegation: None,
             report: None,
             participant: false,
+            discussion: None,
         }
+    }
+
+    /// #1039: every variable a scoped launch sets is on the list a launcher
+    /// clears first, so an inherited value can never survive into a helper.
+    #[test]
+    fn the_scope_variables_a_launch_sets_are_all_cleared_by_the_launcher() {
+        let mut part = launch(None);
+        part.participant = true;
+        part.discussion = Some(DiscussionScope {
+            id: "d-1".into(),
+            tools: vec!["mcp_a_search".into()],
+            granted: vec!["mcp_a_search".into()],
+        });
+        let set: Vec<&str> = part
+            .vars()
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("TOLE_DISCUSSION_") && *k != DISCUSSION_PARTICIPANT)
+            .collect();
+        assert_eq!(set.len(), SCOPE_VARS.len());
+        for k in set {
+            assert!(
+                SCOPE_VARS.contains(&k),
+                "{k} is set by a launch but never cleared"
+            );
+        }
+    }
+
+    /// #1039: a participant reads back the tools its owner allowed it, only
+    /// as a participant, and a malformed value can only narrow it.
+    #[test]
+    fn a_participant_reads_back_its_allowance_and_nothing_wider() {
+        let scope = DiscussionScope {
+            id: "d-1".into(),
+            tools: vec!["mcp_a_search".into(), "mcp_a_scrape".into()],
+            granted: vec!["mcp_a_search".into()],
+        };
+        let mut part = launch(None);
+        part.participant = true;
+        part.discussion = Some(scope.clone());
+        assert_eq!(discussion_scope(&env_of(part.vars())), Some(scope.clone()));
+        // Without the marker the scope is not read, so a stray variable on
+        // an ordinary child changes nothing; the launch does not write it.
+        let mut plain = launch(None);
+        plain.discussion = Some(scope);
+        let env = env_of(plain.vars());
+        assert_eq!(env(DISCUSSION_TOOLS), None);
+        assert_eq!(discussion_scope(&env), None);
+        let stray = |k: &str| match k {
+            DISCUSSION_ID => Some("d-1".to_string()),
+            DISCUSSION_TOOLS => Some("mcp_a_search".to_string()),
+            _ => None,
+        };
+        assert_eq!(discussion_scope(&stray), None);
+        // A participant with bad values: no id, no valid tool, a granted
+        // tool outside the allowed ones, a built-in name.
+        let with = |id: &str, tools: &str, granted: &str| {
+            let (id, tools, granted) = (id.to_string(), tools.to_string(), granted.to_string());
+            move |k: &str| match k {
+                DISCUSSION_PARTICIPANT => Some("1".to_string()),
+                DISCUSSION_ID => Some(id.clone()),
+                DISCUSSION_TOOLS => Some(tools.clone()),
+                DISCUSSION_GRANTED => Some(granted.clone()),
+                _ => None,
+            }
+        };
+        assert_eq!(discussion_scope(&with("Bad Id", "mcp_a_b", "")), None);
+        assert_eq!(discussion_scope(&with("d-1", "", "")), None);
+        assert_eq!(
+            discussion_scope(&with("d-1", "write_file,run_command", "")),
+            None
+        );
+        let s = discussion_scope(&with("d-1", "write_file,mcp_a_b", "mcp_c_d,mcp_a_b")).unwrap();
+        assert_eq!(
+            (s.tools, s.granted),
+            (vec!["mcp_a_b".into()], vec!["mcp_a_b".into()])
+        );
     }
 
     /// The contract round trip: what the parent writes is exactly what the

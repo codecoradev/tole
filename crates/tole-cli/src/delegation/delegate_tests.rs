@@ -1418,7 +1418,9 @@ const PART_TASK: &str = "[tole discussion call d-1-c1]\n\nreview the plan";
 fn a_participant_child_launches_read_only_with_no_profile_allow_and_the_marker() {
     let root = tmp("participant");
     let h = host(&root, 0, &["write_*"], PROFILE);
-    let node = h.consult_participant("coder", PART_TASK, 400).unwrap();
+    let node = h
+        .consult_participant("coder", PART_TASK, 400, None)
+        .unwrap();
     let (argv, env, n) = recorded(&root, &node);
     assert!(argv.iter().any(|a| a == "--plan-mode"), "{argv:?}");
     assert!(
@@ -1462,11 +1464,17 @@ fn an_ordinary_child_is_not_a_participant() {
 fn a_participant_needs_its_call_marker_and_a_profile_and_is_carved_never_added() {
     let root = tmp("participant-refused");
     let h = host(&root, 0, &["write_*"], PROFILE);
-    let err = h.consult_participant("coder", "review", 100).unwrap_err();
+    let err = h
+        .consult_participant("coder", "review", 100, None)
+        .unwrap_err();
     assert!(err.contains("call marker"), "{err}");
-    assert!(h.consult_participant("stranger", PART_TASK, 100).is_err());
+    assert!(h
+        .consult_participant("stranger", PART_TASK, 100, None)
+        .is_err());
     // Never more than is left (the goal has 1000): the carve is capped.
-    let node = h.consult_participant("coder", PART_TASK, 5_000).unwrap();
+    let node = h
+        .consult_participant("coder", PART_TASK, 5_000, None)
+        .unwrap();
     let carved = log_of(&root).poll(&node).unwrap().budget.tokens;
     assert!(carved <= 1_000, "carved {carved} of a 1000 goal");
     let _ = std::fs::remove_dir_all(&root);
@@ -1478,7 +1486,9 @@ fn a_participant_needs_its_call_marker_and_a_profile_and_is_carved_never_added()
 fn a_discussion_participant_gets_no_delegation_host() {
     let root = tmp("participant-nohost");
     let h = host(&root, 0, &["write_*"], PROFILE);
-    let node = h.consult_participant("coder", PART_TASK, 400).unwrap();
+    let node = h
+        .consult_participant("coder", PART_TASK, 400, None)
+        .unwrap();
     let n = log_of(&root).poll(&node).cloned().unwrap();
     let log = log_file(&root).to_string_lossy().to_string();
     let child_env = |marked: bool| {
@@ -1688,4 +1698,48 @@ fn describe_follows_the_parsers_execute_uses_and_never_cuts_the_task() {
     let long = format!("{} TAIL_MARK", "word ".repeat(1000));
     let d = start.describe(&json!({"task": long}));
     assert!(d.contains("TAIL_MARK") && d.len() > 5000, "{}", d.len());
+}
+
+/// #1039: a participant started with a scope is told the discussion, the
+/// connected tools its owner allowed and those already approved, in its
+/// environment; it is still plan mode with an empty allow list. The scope
+/// reaches no ordinary child and none that is not a participant.
+#[test]
+fn a_participant_child_gets_its_allowance_in_its_environment_and_no_other_does() {
+    let root = tmp("participant-scope");
+    let h = host(&root, 0, &["write_*"], PROFILE);
+    let scope = tole_core::child_env::DiscussionScope {
+        id: "d-1".into(),
+        tools: vec!["mcp_a_search".into(), "mcp_a_scrape".into()],
+        granted: vec!["mcp_a_search".into()],
+    };
+    let node = h
+        .consult_participant("coder", PART_TASK, 400, Some(&scope))
+        .unwrap();
+    let (argv, env, n) = recorded(&root, &node);
+    assert!(argv.iter().any(|a| a == "--plan-mode"), "{argv:?}");
+    assert!(n.allow.is_empty(), "{:?}", n.allow);
+    for want in [
+        "TOLE_DISCUSSION_PARTICIPANT=1\n",
+        "TOLE_DISCUSSION_ID=d-1\n",
+        "TOLE_DISCUSSION_TOOLS=mcp_a_search,mcp_a_scrape\n",
+        "TOLE_DISCUSSION_GRANTED=mcp_a_search\n",
+    ] {
+        assert!(env.contains(want), "{want}: {env}");
+    }
+    // No scope: the participant of before, with none of those variables.
+    let plain = h
+        .consult_participant("coder", PART_TASK, 400, None)
+        .unwrap();
+    let (_, env, _) = recorded(&root, &plain);
+    assert!(!env.contains("TOLE_DISCUSSION_TOOLS"), "{env}");
+    // An ordinary child, whatever a model puts in its input, gets none.
+    let (start, _) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "x", "profile": "coder", "mode": "consult",
+                        "budget": {"tokens": 400}, "discussion": {"tools": ["mcp_a_b"]}}))
+        .unwrap();
+    let (_, env, _) = recorded(&root, out["node"].as_str().unwrap());
+    assert!(!env.contains("TOLE_DISCUSSION_TOOLS"), "{env}");
+    let _ = std::fs::remove_dir_all(&root);
 }

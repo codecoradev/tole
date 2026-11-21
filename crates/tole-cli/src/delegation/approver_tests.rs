@@ -565,3 +565,6 @@ fn a_consume_needs_the_childs_own_fingerprint_and_works_once() {
     assert!(f.entries()[0].consumed_at.is_some());
     assert_eq!(a.consume(&id, &fp, now), Verdict::Deny, "once");
 }
+
+#[path = "approver_scope_tests.rs"]
+mod scope;

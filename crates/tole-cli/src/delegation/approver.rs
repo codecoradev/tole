@@ -21,12 +21,14 @@
 //! - serve and cron keep their own deny-then-resume path; `resume_turn` is
 //!   untouched.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tole_core::approval::{pattern_verdict, Approver, PatternVerdict, ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
+use tole_core::child_env::DiscussionScope;
 use tole_core::delegation::Delegation;
 use tole_core::delegation_approvals::{
     fingerprint, ApprovalError, Approvals, ExpireReason, NewRequest, Origin, Record, Status,
@@ -203,19 +205,34 @@ pub struct DelegatedApprover {
     workspace: String,
     approval_secs: i64,
     level_secs: i64,
+    /// An independent discussion participant whose owner allowed it some
+    /// connected tools (#1039): the tools, and the ones already approved.
+    scope: Option<Scoped>,
+}
+
+/// A participant's allowance and what the owner has approved so far.
+struct Scoped {
+    s: DiscussionScope,
+    /// Tools approved for this discussion: those the host found granted in
+    /// the ledger when it started this child, and each one the owner allows
+    /// while it runs. In memory only: it dies with this process.
+    granted: Mutex<BTreeSet<String>>,
 }
 
 /// The approver for this process, or `None` (today's stdio approver) when
 /// `[delegation] approvals` is `off`, this is not a delegated child, or it is
-/// a discussion participant (read-only for good: it never asks for a Write).
+/// a discussion participant that was given no tools (read-only for good: it
+/// never asks for a Write). A participant the owner allowed some connected
+/// tools (#1039) gets this approver too, but it may ask only for those.
 pub fn for_child(
     env: &dyn Fn(&str) -> Option<String>,
     cfg: Option<&DelegationConfig>,
     p: Params,
 ) -> Option<DelegatedApprover> {
     let mode = cfg.and_then(|c| c.approvals).unwrap_or_default();
+    let scope = tole_core::child_env::discussion_scope(env);
     if mode == tole_core::delegation_approvals::ApprovalsMode::Off
-        || tole_core::child_env::discussion_participant(env)
+        || (tole_core::child_env::discussion_participant(env) && scope.is_none())
         || tole_core::child_env::depth(env) < 1
     {
         return None;
@@ -229,6 +246,10 @@ pub fn for_child(
         workspace,
         approval_secs: secs(cfg.and_then(|c| c.approval_secs), DEFAULT_APPROVAL_SECS),
         level_secs: secs(cfg.and_then(|c| c.approval_level_secs), DEFAULT_LEVEL_SECS),
+        scope: scope.map(|s| Scoped {
+            granted: Mutex::new(s.granted.iter().cloned().collect()),
+            s,
+        }),
         p,
     })
 }
@@ -240,12 +261,29 @@ impl DelegatedApprover {
 
     /// Asks, parks, and returns the verdict.
     fn park(&self, req: &ToolRequest<'_>) -> Result<Verdict, String> {
+        self.park_as(req, None)
+    }
+
+    /// [`Self::park`], with `scope` the discussion the request is for: the
+    /// owner's prompt says so and what "allow" covers.
+    fn park_as(
+        &self,
+        req: &ToolRequest<'_>,
+        for_discussion: Option<&str>,
+    ) -> Result<Verdict, String> {
         let session = self
             .store
             .read(|d, _| d.poll(&self.node).and_then(|n| n.session.clone()))?
             .ok_or("approvals: the node has no session in the delegation log")?;
         let shown = self.p.secrets.redact_value(req.input);
-        let line = format!("{}: {}", req.tool, req.description);
+        let line = match for_discussion {
+            Some(id) => format!(
+                "discussion `{id}` helper asks to use {}: {} (allow covers every call of this \
+                 tool in this discussion, until it ends)",
+                req.tool, req.description
+            ),
+            None => format!("{}: {}", req.tool, req.description),
+        };
         let display = self.p.secrets.redact(&line).into_owned();
         let root = self.p.root.as_path();
         let nonce = nonce();
@@ -319,8 +357,68 @@ impl DelegatedApprover {
     }
 }
 
+impl DelegatedApprover {
+    /// A participant with an allowance (#1039). Authority is the owner's
+    /// list and nothing else: no pattern, no `--yes`. Only a tool the owner
+    /// named may be asked about; the first call of it goes to the owner's
+    /// approval surface (the durable queue, owner-only for an MCP tool) and
+    /// "allow" is for this discussion, so later calls of the same tool in
+    /// it run without asking. Denial, expiry and a failed request deny.
+    fn decide_scoped(&self, sc: &Scoped, req: &ToolRequest<'_>) -> Verdict {
+        if req.risk == Risk::Destructive {
+            return Verdict::Deny;
+        }
+        if req.risk == Risk::ReadOnly {
+            return Verdict::Allow;
+        }
+        // The one Write tool every participant has: its report, allowed by
+        // the single pattern its host launched it with. No other pattern is
+        // read here, so none can allow anything else.
+        if req.tool == tole_core::delegation_report::REPORT_TOOL {
+            return match pattern_verdict(&self.p.patterns, req) {
+                PatternVerdict::Allow => Verdict::Allow,
+                _ => Verdict::Deny,
+            };
+        }
+        if !sc.s.tools.iter().any(|t| t == req.tool) {
+            return Verdict::Deny;
+        }
+        // A deny pattern of the allow list is final here as in the unscoped
+        // path: the owner's `!pattern` is not undone by naming the tool and
+        // allowing it once. (An allow pattern never grants one: only the
+        // owner's answer to the request does.)
+        if matches!(
+            pattern_verdict(&self.p.patterns, req),
+            PatternVerdict::Deny | PatternVerdict::Ask
+        ) {
+            return Verdict::Deny;
+        }
+        let granted = |g: &Mutex<BTreeSet<String>>| g.lock().is_ok_and(|g| g.contains(req.tool));
+        if granted(&sc.granted) {
+            return Verdict::Allow;
+        }
+        match self.park_as(req, Some(&sc.s.id)) {
+            Ok(Verdict::Allow) => {
+                if let Ok(mut g) = sc.granted.lock() {
+                    g.insert(req.tool.to_string());
+                }
+                Verdict::Allow
+            }
+            Ok(Verdict::Deny) => Verdict::Deny,
+            Err(e) => {
+                // Fail closed: a refused or failed request is a denial.
+                eprintln!("{e}");
+                Verdict::Deny
+            }
+        }
+    }
+}
+
 impl Approver for DelegatedApprover {
     fn decide(&self, req: &ToolRequest<'_>) -> Verdict {
+        if let Some(sc) = &self.scope {
+            return self.decide_scoped(sc, req);
+        }
         if req.risk == Risk::Destructive {
             return Verdict::Deny;
         }
