@@ -167,6 +167,16 @@ impl Owner {
     }
 }
 
+/// Runs `work` and marks the discussion as no longer driven when it ends, by
+/// returning or by panicking. Without the guard a panic in the driver would
+/// leave the discussion reported as running until the process restarts: a
+/// resume would answer 409, its state would be wrong and a stop could not
+/// claim it.
+fn run_to_end(done: Arc<AtomicBool>, work: impl FnOnce()) {
+    let _ended = Claim(done);
+    work();
+}
+
 /// Runs `driver` to its end on a thread and records it as live.
 fn spawn(
     live: &mut BTreeMap<String, Live>,
@@ -180,20 +190,22 @@ fn spawn(
     std::thread::Builder::new()
         .name(format!("discussion-{id}"))
         .spawn(move || {
-            let mut out = driver.run();
-            // A stop recorded while a call was in flight makes that step
-            // fail; the ledger then only needs closing.
-            for _ in 0..3 {
-                let finishing = matches!(log.state().map(|s| s.next()), Ok(Next::Finish { .. }));
-                if out.is_err() && finishing {
-                    out = driver.run();
-                } else {
-                    break;
+            run_to_end(flag, || {
+                let mut out = driver.run();
+                // A stop recorded while a call was in flight makes that step
+                // fail; the ledger then only needs closing.
+                for _ in 0..3 {
+                    let finishing =
+                        matches!(log.state().map(|s| s.next()), Ok(Next::Finish { .. }));
+                    if out.is_err() && finishing {
+                        out = driver.run();
+                    } else {
+                        break;
+                    }
                 }
-            }
-            // An error leaves the ledger resumable; the owner reads it as
-            // `interrupted` and continues it.
-            flag.store(true, Ordering::SeqCst);
+                // An error leaves the ledger resumable; the owner reads it as
+                // `interrupted` and continues it.
+            });
         })
         .map_err(|e| format!("cannot start the discussion's thread: {e}"))?;
     live.insert(id, Live { done });
@@ -221,6 +233,26 @@ mod tests {
         assert!(!owner.running("d-1"));
         assert_eq!(owner.state("d-1", false), "interrupted");
         assert!(owner.claim("d-1").is_some(), "free again once it ended");
+    }
+
+    /// The thread of a running discussion marks it as ended when its work
+    /// returns and when it panics, so the owner never reads a dead thread as a
+    /// running discussion.
+    #[test]
+    fn a_discussion_thread_that_panics_is_not_left_running() {
+        for panics in [false, true] {
+            let done = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&done);
+            let handle = std::thread::spawn(move || {
+                run_to_end(flag, || {
+                    if panics {
+                        panic!("the driver failed");
+                    }
+                });
+            });
+            assert_eq!(handle.join().is_err(), panics);
+            assert!(done.load(Ordering::SeqCst), "panics={panics}");
+        }
     }
 
     /// A panic while closing must not leave the discussion running forever.
