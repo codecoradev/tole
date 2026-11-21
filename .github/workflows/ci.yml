@@ -94,28 +94,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Shard #1101: the workspace suite took 8m40s in one job (21 Nov run
+  # #44879360049). Each member group runs in parallel from the same
+  # rust-cache; the wall time is now the slowest shard, not the sum.
+  # Coverage is unchanged: every workspace member's tests run exactly
+  # once — Check/Clippy still compile all members (--workspace,
+  # --all-targets), so an untested member fails the build gates.
   test:
-    name: Test
+    name: Test (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - core
+          - cli
+          - small
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # #781: the suites must not leave directories behind. The tests run
-      # with a fresh, private TMPDIR (the cargo step only), and the job fails
-      # when a `tole-*` or `cora-*` entry is still there afterwards, in it or
-      # in cargo's target/tmp (where the integration tests keep theirs).
-      # Process-wide fixtures use fixed `shared-*` names and are not counted.
-      # The directory is under /tmp, not RUNNER_TEMP: that one sits inside
+      # #781: the suites must not leave directories behind. Each shard
+      # runs with a fresh, private TMPDIR, and the shard fails when a
+      # `tole-*` or `cora-*` entry is still there afterwards. Process-wide
+      # fixtures use fixed `shared-*` names and are not counted. The
+      # directory is under /tmp, not RUNNER_TEMP: that one sits inside
       # $HOME, and the sandbox tests rightly refuse a workspace under it.
       - name: Prepare a private TMPDIR
         run: |
           rm -rf target/tmp
           echo "TOLE_TEST_TMP=$(mktemp -d /tmp/tole-test-tmp.XXXXXX)" >> "$GITHUB_ENV"
-      - run: cargo test --workspace
+      - name: Tests (core)
+        if: matrix.group == 'core'
+        run: cargo test -p tole-core
+        env:
+          TMPDIR: ${{ env.TOLE_TEST_TMP }}
+      - name: Tests (cli)
+        if: matrix.group == 'cli'
+        run: cargo test -p tole-cli
+        env:
+          TMPDIR: ${{ env.TOLE_TEST_TMP }}
+      - name: Tests (small crates)
+        if: matrix.group == 'small'
+        run: cargo test -p tole-tui -p tole-client -p tole-desktop -p tole-desktop-model
         env:
           TMPDIR: ${{ env.TOLE_TEST_TMP }}
       - name: No test directory left behind
+        if: always()
         run: |
           left=$(find "$TOLE_TEST_TMP" target/tmp -mindepth 1 -maxdepth 1 \( -name 'tole-*' -o -name 'cora-*' \) 2>/dev/null | sort)
           if [ -n "$left" ]; then
@@ -123,6 +148,25 @@ jobs:
             echo "$left" | head -50
             exit 1
           fi
+
+  # Aggregates the test matrix above and carries the branch-protection
+  # check name "Test" (GitHub reports a matrix job by its display name,
+  # so the shards show as "Test (core)" etc. and would never satisfy a
+  # required "Test" check). Skipped shards cannot pass the gate: the
+  # summary fails unless all three shards reported success.
+  test-summary:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Verify all shards succeeded
+        run: |
+          result="${{ needs.test.result }}"
+          case "$result" in
+            success) echo "all test shards green" ;;
+            *) echo "::error::test matrix finished with: $result"; exit 1 ;;
+          esac
 
   # Compile the release profile — catches optimizer-only errors that the
   # dev-profile Check job misses (uteke parity; required check on main).
