@@ -235,3 +235,58 @@ fn nothing_was_changed_is_only_said_for_a_complete_history() {
     t.history_complete = true;
     assert_eq!(status_text(&t.status()), "Done. Nothing was changed.");
 }
+
+// Round 4.
+#[test]
+fn a_not_busy_snapshot_right_after_an_allow_neither_ends_nor_silences_the_resumed_turn() {
+    let allowed = || {
+        vec![
+            prompt(1),
+            intent(2, "write_file"),
+            ask("a1"),
+            resolved("a1", true),
+        ]
+    };
+    let mut t = task(allowed());
+    t.apply(TaskEvent::Ready { busy: false });
+    assert_eq!(
+        (t.status().phase, t.status().can_stop),
+        (Phase::Resuming, true)
+    );
+    t.apply(delta("Hi"));
+    assert_eq!(rows(&t).last().unwrap(), "Hi~", "the text is kept");
+    t.apply(answer(4, "Hi."));
+    assert_eq!(rows(&t).iter().filter(|r| r.starts_with("Hi")).count(), 1);
+    assert_eq!(t.status().phase, Phase::Idle);
+    let mut quiet = task(allowed());
+    quiet.apply(TaskEvent::Ready { busy: false });
+    quiet.apply(TaskEvent::ResumeTimedOut);
+    assert_eq!(quiet.status().phase, Phase::Idle);
+    let mut stopped = task(allowed());
+    assert!(stopped.press_stop());
+    stopped.apply(TaskEvent::Ready { busy: false });
+    assert_eq!(stopped.status().phase, Phase::Idle);
+}
+
+#[test]
+fn an_approval_announced_after_it_was_decided_is_not_a_new_card() {
+    for approved in [true, false] {
+        let t = task(vec![
+            prompt(1),
+            ask("a1"),
+            resolved("a1", approved),
+            ask("a1"),
+        ]);
+        assert!(t.run.approvals.is_empty(), "approved: {approved}");
+        assert_ne!(t.status().phase, Phase::WaitingApproval);
+    }
+}
+
+#[test]
+fn stop_while_the_prompt_goes_out_ends_with_the_not_busy_answer_to_cancel() {
+    let mut t = TaskState::new(false);
+    sent(&mut t);
+    assert!(t.press_stop());
+    t.apply(TaskEvent::Ready { busy: false });
+    assert_eq!(t.status().phase, Phase::Idle);
+}

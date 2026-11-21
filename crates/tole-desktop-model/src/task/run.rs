@@ -14,12 +14,14 @@
 //! - A turn that asks for an OK is parked, not running: a request clears busy
 //!   and stop. A denial leaves the turn parked, so it is idle. An allow resumes
 //!   it with no one watching (`unobserved`): the phase is `Resuming` until a
-//!   snapshot, text, a tool entry or an answer confirms it. Stop works while
-//!   resuming, steering does not. `ResumeTimedOut` ends an unobserved turn
-//!   whenever it is still running, since nothing else would.
+//!   snapshot, text, a tool entry or an answer confirms it. A not-busy snapshot
+//!   does not (serve starts the turn after its 202), unless Stop was pressed.
+//!   Stop works while resuming, steering does not. `ResumeTimedOut` ends an
+//!   unobserved turn whenever it is still running, since nothing else would.
 //! - An approval is kept once per id. The refresh of the queue adds what the
 //!   server lists, keeps what the stream announced since the stream (re)opened,
-//!   and does not bring back what the stream resolved meanwhile.
+//!   and does not bring back what the stream resolved meanwhile. A request for
+//!   an id already resolved is a late announcement and is ignored.
 //! - `stopping` ends with the turn, a not-busy snapshot, a closed session, a
 //!   failed prompt or a failed Stop.
 
@@ -149,12 +151,18 @@ impl Run {
             }
             TaskEvent::Ready { busy: false } => {
                 self.link = Link::Live;
-                if !self.sending {
+                // Not yet running is not over: the prompt is still going out, or an
+                // allowed turn is being started (serve answers 202 first). Only a
+                // Stop makes the owner's "nothing runs" final.
+                if self.stopping || !(self.sending || self.resuming) {
                     self.end_turn();
                 }
             }
             TaskEvent::ApprovalRequested(info) => {
                 self.link = Link::Live;
+                if self.gone.contains(&info.cleaned().id) {
+                    return; // already decided: a late announcement, not a new card
+                }
                 self.busy = false;
                 self.resuming = false;
                 self.unobserved = false;

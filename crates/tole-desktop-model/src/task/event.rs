@@ -31,13 +31,28 @@
 //!
 //! **After an allow** (`approved` resolved) the resumed turn has no prompt
 //! call to wait for ("unobserved": `Run::unobserved`). The adapter must send
-//! [`TaskEvent::Ready`] from `GET /status` and keep polling it until it says
-//! not busy, and [`TaskEvent::ResumeTimedOut`] if nothing confirmed the turn
-//! after a few seconds or the polling is lost. The model does not rely on it:
-//! until something confirms, the phase is `Resuming` (Stop works, steering does
-//! not), and `ResumeTimedOut` ends an unobserved turn at any time until it ends.
+//! [`TaskEvent::Ready`] from `GET /status` and keep polling it, and send
+//! [`TaskEvent::ResumeTimedOut`] when a few seconds pass with no activity seen
+//! or the polling is lost. A `busy:false` snapshot right after an allow is
+//! normal (serve answers 202 before it starts the turn), so the model ignores
+//! it while `Resuming`; poll until a not-busy snapshot arrives after activity
+//! was seen, or until the timeout ends it. Until something confirms, the phase
+//! is `Resuming` (Stop works, steering does not), and `ResumeTimedOut` ends an
+//! unobserved turn at any time until it ends.
 //! For a Stop the adapter sends `Ready{busy:false}` when cancel answers
-//! `cancelled: false`, and calls `TaskState::stop_failed` when the call fails.
+//! `cancelled: false` (honoured even while a prompt goes out or a turn
+//! resumes), and calls `TaskState::stop_failed` when the call fails. A Stop
+//! while the prompt is still going out must abort the send and call
+//! `TaskState::send_failed(sent, false)`; the model cannot cancel a call it
+//! has not made.
+//!
+//! **Known limits** the adapter should work around, not the model:
+//! `AnswerEntry` and `TurnEnded` carry no turn identity, so a late one of turn 1
+//! can end turn 2 if the owner sends within the gap (a few ms to 150 ms);
+//! a busy that comes from a snapshot, a 409 or another face's turn ends only
+//! with an answer, `Ready{busy:false}` or `Closed`, so poll status for it too;
+//! a draft the stop gate blocked stays as a note until reload, since core
+//! commits no entry for it.
 //!
 //! **Late and old frames.** Text and reasoning frames after the turn ended, or
 //! after its answer, are ignored until the next prompt, a `Ready{busy:true}` or
