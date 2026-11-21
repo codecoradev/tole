@@ -63,18 +63,25 @@
 //! The bearer token is sent in the `Authorization` header only. It is not in
 //! `Debug` output, errors or any log (this crate does not log).
 //!
+//! # JSON Schema
+//!
+//! `schema/tole-client.schema.json` is generated from these types (a test, no
+//! dependency of the crate) and a check fails when it is out of date; see
+//! `scripts/client-schema.sh`. Mobile and web clients build their models from
+//! it.
+//!
 //! # Not yet
 //!
 //! Routes beyond the first desktop set (interrupt, detach, fork, tree,
 //! compact, name, model, effort, images, missions, and the discussion, cron
-//! and profile routes of #1042) and the generated JSON Schema. The types
-//! derive `Serialize` and `Deserialize`, so a schema can be added without
-//! reshaping them.
+//! and profile routes of #1042).
 
 mod client;
 mod error;
 mod http;
 mod resume;
+#[cfg(test)]
+mod schema;
 mod sse;
 pub mod transport;
 mod types;

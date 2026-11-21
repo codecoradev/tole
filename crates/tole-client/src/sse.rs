@@ -182,12 +182,55 @@ impl<R: Read> FrameReader<R> {
 
 /// `ready`: the replay is complete.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Ready {
     pub id: String,
     pub after: u64,
     pub last_seq: u64,
     pub busy: bool,
+}
+
+/// The `data:` payloads of the ephemeral frames that carry more than a
+/// shared type. Private to the decoder; the committed JSON Schema describes
+/// them (#1068), which is why they are named types and not local structs.
+pub(crate) mod payload {
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    /// `text_delta` and `reasoning`.
+    #[derive(Deserialize)]
+    #[cfg_attr(test, derive(schemars::JsonSchema))]
+    pub(crate) struct TextData {
+        pub(crate) text: String,
+    }
+    /// `tool_started`.
+    #[derive(Deserialize)]
+    #[cfg_attr(test, derive(schemars::JsonSchema))]
+    pub(crate) struct ToolStartedData {
+        pub(crate) tool: String,
+        pub(crate) input: Value,
+    }
+    /// `tool_finished`.
+    #[derive(Deserialize)]
+    #[cfg_attr(test, derive(schemars::JsonSchema))]
+    pub(crate) struct ToolFinishedData {
+        pub(crate) tool: String,
+        pub(crate) ok: bool,
+        pub(crate) preview: String,
+    }
+    /// `resync`: ephemeral frames this slow stream lost.
+    #[derive(Deserialize)]
+    #[cfg_attr(test, derive(schemars::JsonSchema))]
+    pub(crate) struct ResyncData {
+        pub(crate) dropped: u64,
+    }
+    /// `closed`: the session left the server.
+    #[derive(Deserialize)]
+    #[cfg_attr(test, derive(schemars::JsonSchema))]
+    pub(crate) struct ClosedData {
+        pub(crate) id: String,
+    }
 }
 
 /// A typed frame. Unknown event names are kept as [`Event::Other`], so a newer
@@ -246,50 +289,28 @@ impl Event {
     }
 
     fn typed(f: &Frame) -> Result<Event> {
+        use payload::{ClosedData, ResyncData, TextData, ToolFinishedData, ToolStartedData};
         fn data<T: serde::de::DeserializeOwned>(f: &Frame) -> Result<T> {
             Ok(serde_json::from_str(&f.data)?)
-        }
-        #[derive(Deserialize)]
-        struct Text {
-            text: String,
-        }
-        #[derive(Deserialize)]
-        struct Started {
-            tool: String,
-            input: Value,
-        }
-        #[derive(Deserialize)]
-        struct Finished {
-            tool: String,
-            ok: bool,
-            preview: String,
-        }
-        #[derive(Deserialize)]
-        struct Dropped {
-            dropped: u64,
-        }
-        #[derive(Deserialize)]
-        struct Closed {
-            id: String,
         }
         Ok(match f.event.as_str() {
             "entry" => Event::Entry(data(f)?),
             "ready" => Event::Ready(data(f)?),
             "text_delta" => Event::TextDelta {
-                text: data::<Text>(f)?.text,
+                text: data::<TextData>(f)?.text,
             },
             "reasoning" => Event::Reasoning {
-                text: data::<Text>(f)?.text,
+                text: data::<TextData>(f)?.text,
             },
             "tool_started" => {
-                let s: Started = data(f)?;
+                let s: ToolStartedData = data(f)?;
                 Event::ToolStarted {
                     tool: s.tool,
                     input: s.input,
                 }
             }
             "tool_finished" => {
-                let s: Finished = data(f)?;
+                let s: ToolFinishedData = data(f)?;
                 Event::ToolFinished {
                     tool: s.tool,
                     ok: s.ok,
@@ -299,10 +320,10 @@ impl Event {
             "approval_requested" => Event::ApprovalRequested(data(f)?),
             "approval_resolved" => Event::ApprovalResolved(data(f)?),
             "resync" => Event::Resync {
-                dropped: data::<Dropped>(f)?.dropped,
+                dropped: data::<ResyncData>(f)?.dropped,
             },
             "closed" => Event::Closed {
-                id: data::<Closed>(f)?.id,
+                id: data::<ClosedData>(f)?.id,
             },
             other => Event::Other {
                 event: other.to_string(),

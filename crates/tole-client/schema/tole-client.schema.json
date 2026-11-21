@@ -1,0 +1,413 @@
+{
+  "$defs": {
+    "Approval": {
+      "additionalProperties": true,
+      "description": "One row of the approval queue (`GET /approvals`, the\n`approval_requested` / `approval_resolved` event frames, and a prompt\nthat stopped for approval). Rows of a delegated child have a different\nfield set: what the client does not model is kept in `extra`.",
+      "properties": {
+        "createdAtMs": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "description": {"type":["string","null"]},
+        "expiresInSeconds": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "id": {"type":"string"},
+        "sessionId": {"type":["string","null"]},
+        "status": {"description":"`pending`, `approved`, `denied` or `expired`.","type":"string"},
+        "tool": {"type":"string"}
+      },
+      "required": ["id","tool","status"],
+      "type": "object"
+    },
+    "ApprovalList": {
+      "description": "`GET /approvals`.",
+      "properties": {
+        "approvals": {"items":{"$ref":"#/$defs/Approval"},"type":"array"}
+      },
+      "required": ["approvals"],
+      "type": "object"
+    },
+    "CancelReply": {
+      "description": "`POST /sessions/{id}/cancel`.",
+      "properties": {
+        "cancelled": {"type":"boolean"},
+        "sessionId": {"type":"string"}
+      },
+      "required": ["cancelled","sessionId"],
+      "type": "object"
+    },
+    "ClosedData": {
+      "description": "`closed`: the session left the server.",
+      "properties": {
+        "id": {"type":"string"}
+      },
+      "required": ["id"],
+      "type": "object"
+    },
+    "Decision": {
+      "description": "The verdict of `POST /approvals/{id}/decision`.",
+      "enum": ["allow","deny"],
+      "type": "string"
+    },
+    "DecisionReply": {
+      "description": "`POST /approvals/{id}/decision`. A repeat of the same verdict is\nidempotent; the opposite verdict is a 409 ([`crate::Error::Status`]).",
+      "properties": {
+        "id": {"type":"string"},
+        "resuming": {"description":"`true` when the allowed call is being replayed in the background.","type":["boolean","null"]},
+        "status": {"type":"string"}
+      },
+      "required": ["id","status"],
+      "type": "object"
+    },
+    "DecisionRequest": {
+      "description": "The body of `POST /approvals/{id}/decision`. Build it with\n[`DecisionRequest::new`]: a delegated child's row (`dap-*` id) needs\n`confirm` (the id) for an allow, and its `fingerprint`.",
+      "properties": {
+        "confirm": {"type":["string","null"]},
+        "decision": {"$ref":"#/$defs/Decision"},
+        "fingerprint": {"type":["string","null"]}
+      },
+      "required": ["decision"],
+      "type": "object"
+    },
+    "EntriesPage": {
+      "description": "`GET /sessions/{id}/entries`. Page with `after = next_after` while\n`has_more`.",
+      "properties": {
+        "entries": {"items":{"$ref":"#/$defs/Entry"},"type":"array"},
+        "hasMore": {"type":"boolean"},
+        "id": {"type":"string"},
+        "lastSeq": {"format":"uint64","minimum":0,"type":"integer"},
+        "nextAfter": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["id","entries","nextAfter","hasMore","lastSeq"],
+      "type": "object"
+    },
+    "Entry": {
+      "additionalProperties": false,
+      "description": "`tole_core::entry::Entry`, mirrored because tole-core must not depend on\n`schemars`. `the_entry_mirror_matches_tole_core` keeps the two in step: the\nmirror refuses unknown keys, and both must carry the same key set.",
+      "properties": {
+        "id": {"description":"Unique entry id (`e_<seq>` when auto-assigned).","type":"string"},
+        "parentId": {"default":null,"description":"Parent entry id; null only for the session root entry.","type":["string","null"]},
+        "payload": {"description":"Type-specific payload, owned by the entry kind."},
+        "seq": {"description":"Global monotonic sequence number assigned at commit time.","format":"uint64","minimum":0,"type":"integer"},
+        "timestamp": {"description":"Creation time, milliseconds since the Unix epoch.","format":"uint64","minimum":0,"type":"integer"},
+        "type": {"description":"What kind of entry this is. A string, not a closed set: a newer server\nmay write kinds this client does not know (`message`, `intent`,\n`tool_result` and `error` today).","type":"string"}
+      },
+      "required": ["seq","id","type","timestamp","payload"],
+      "type": "object"
+    },
+    "Health": {
+      "description": "`GET /health`: `status`, and since serve reports its protocol and\nbinary version (#1043) also `protocol` and `version`. Both are\noptional so a server that predates them still decodes, and a decoded\nanswer serializes back to the JSON the server sent.",
+      "properties": {
+        "protocol": {"format":"uint32","minimum":0,"type":["integer","null"]},
+        "status": {"type":"string"},
+        "version": {"type":["string","null"]}
+      },
+      "required": ["status"],
+      "type": "object"
+    },
+    "Models": {
+      "description": "`GET /models`: what the owner lets a client pick.",
+      "properties": {
+        "default": {"type":["string","null"]},
+        "models": {"items":{"type":"string"},"type":"array"}
+      },
+      "required": ["models"],
+      "type": "object"
+    },
+    "NewSession": {
+      "description": "`POST /sessions`: create a session, or reopen one with `resume`.",
+      "properties": {
+        "cwd": {"description":"Working folder (must lie inside the server's workspace).","type":["string","null"]},
+        "plan_mode": {"description":"Only when creating: the registry without mutation tools.","type":["boolean","null"]},
+        "profile": {"type":["string","null"]},
+        "resume": {"description":"Reopen this session id instead of creating one.","type":["string","null"]}
+      },
+      "type": "object"
+    },
+    "PastSession": {
+      "description": "One row of `GET /sessions/index`: a past or live session of the workspace.",
+      "properties": {
+        "busy": {"type":"boolean"},
+        "entries": {"format":"uint64","minimum":0,"type":"integer"},
+        "folder": {"type":"string"},
+        "id": {"type":"string"},
+        "lastActivity": {"description":"Milliseconds since the Unix epoch.","format":"uint64","minimum":0,"type":"integer"},
+        "live": {"type":"boolean"},
+        "name": {"type":["string","null"]},
+        "parent": {"description":"The session this one was forked from.","type":["string","null"]},
+        "turns": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["id","folder","lastActivity","entries","turns","live","busy"],
+      "type": "object"
+    },
+    "PromptReply": {
+      "description": "The answer to a prompt, once the turn stopped. `stop_reason` is\n`approval_required` when a Write waits for a decision: `approval` is\nthen the queue row (absent when it was decided or expired meanwhile).",
+      "properties": {
+        "approval": {"anyOf":[{"$ref":"#/$defs/Approval"},{"type":"null"}]},
+        "stopReason": {"type":"string"},
+        "text": {"type":["string","null"]}
+      },
+      "required": ["stopReason"],
+      "type": "object"
+    },
+    "PromptRequest": {
+      "description": "`POST /sessions/{id}/prompt`.",
+      "properties": {
+        "images": {"description":"Ids of images uploaded to this session.","items":{"type":"string"},"type":"array"},
+        "text": {"type":"string"}
+      },
+      "required": ["text"],
+      "type": "object"
+    },
+    "Ready": {
+      "description": "`ready`: the replay is complete.",
+      "properties": {
+        "after": {"format":"uint64","minimum":0,"type":"integer"},
+        "busy": {"type":"boolean"},
+        "id": {"type":"string"},
+        "lastSeq": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["id","after","lastSeq","busy"],
+      "type": "object"
+    },
+    "ResyncData": {
+      "description": "`resync`: ephemeral frames this slow stream lost.",
+      "properties": {
+        "dropped": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["dropped"],
+      "type": "object"
+    },
+    "SessionIndex": {
+      "description": "`GET /sessions/index`. Page with `cursor = next_cursor`.",
+      "properties": {
+        "nextCursor": {"type":["string","null"]},
+        "scanTruncated": {"type":"boolean"},
+        "sessions": {"items":{"$ref":"#/$defs/PastSession"},"type":"array"},
+        "skipped": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["sessions","skipped","scanTruncated"],
+      "type": "object"
+    },
+    "SessionList": {
+      "description": "`GET /sessions`: the sessions live in this serve.",
+      "properties": {
+        "sessions": {"items":{"$ref":"#/$defs/SessionSummary"},"type":"array"}
+      },
+      "required": ["sessions"],
+      "type": "object"
+    },
+    "SessionOpened": {
+      "description": "The answer to `POST /sessions`. A create sets `workspace`; a resume\nsets `resumed` and `already_live` (and `busy` for a session that was\nalready live).",
+      "properties": {
+        "alreadyLive": {"type":["boolean","null"]},
+        "busy": {"type":["boolean","null"]},
+        "planMode": {"type":["boolean","null"]},
+        "profile": {"type":["string","null"]},
+        "resumed": {"type":["boolean","null"]},
+        "sessionId": {"type":"string"},
+        "workspace": {"type":["string","null"]}
+      },
+      "required": ["sessionId"],
+      "type": "object"
+    },
+    "SessionStatus": {
+      "description": "`GET /sessions/{id}/status`. Model, effort and context figures are\n`null` until known; `stale` says they come from the last snapshot\nbecause a turn is running.",
+      "properties": {
+        "busy": {"type":"boolean"},
+        "contextUsed": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "contextWindow": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "effort": {"type":["string","null"]},
+        "entries": {"description":"`null` while a turn holds the session.","format":"uint64","minimum":0,"type":["integer","null"]},
+        "id": {"type":"string"},
+        "model": {"type":["string","null"]},
+        "name": {"type":["string","null"]},
+        "snapshotAt": {"format":"uint64","minimum":0,"type":["integer","null"]},
+        "stale": {"type":"boolean"},
+        "usage_report": {"description":"The usage report as the server builds it (opaque to the client)."}
+      },
+      "required": ["id","busy","usage_report","stale"],
+      "type": "object"
+    },
+    "SessionSummary": {
+      "description": "One live session in `GET /sessions`.",
+      "properties": {
+        "busy": {"type":"boolean"},
+        "id": {"type":"string"},
+        "profile": {"type":["string","null"]}
+      },
+      "required": ["id","busy"],
+      "type": "object"
+    },
+    "TextData": {
+      "description": "`text_delta` and `reasoning`.",
+      "properties": {
+        "text": {"type":"string"}
+      },
+      "required": ["text"],
+      "type": "object"
+    },
+    "ToolFinishedData": {
+      "description": "`tool_finished`.",
+      "properties": {
+        "ok": {"type":"boolean"},
+        "preview": {"type":"string"},
+        "tool": {"type":"string"}
+      },
+      "required": ["tool","ok","preview"],
+      "type": "object"
+    },
+    "ToolStartedData": {
+      "description": "`tool_started`.",
+      "properties": {
+        "input": true,
+        "tool": {"type":"string"}
+      },
+      "required": ["tool","input"],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what.",
+  "properties": {
+    "events": {
+      "properties": {
+        "approval_requested": {"$ref":"#/$defs/Approval"},
+        "approval_resolved": {"$ref":"#/$defs/Approval"},
+        "closed": {"$ref":"#/$defs/ClosedData"},
+        "entry": {"$ref":"#/$defs/Entry"},
+        "ready": {"$ref":"#/$defs/Ready"},
+        "reasoning": {"$ref":"#/$defs/TextData"},
+        "resync": {"$ref":"#/$defs/ResyncData"},
+        "text_delta": {"$ref":"#/$defs/TextData"},
+        "tool_finished": {"$ref":"#/$defs/ToolFinishedData"},
+        "tool_started": {"$ref":"#/$defs/ToolStartedData"}
+      },
+      "required": ["approval_requested","approval_resolved","closed","entry","ready","reasoning","resync","text_delta","tool_finished","tool_started"],
+      "type": "object"
+    },
+    "requests": {
+      "properties": {
+        "DecisionRequest": {"$ref":"#/$defs/DecisionRequest"},
+        "NewSession": {"$ref":"#/$defs/NewSession"},
+        "PromptRequest": {"$ref":"#/$defs/PromptRequest"}
+      },
+      "required": ["DecisionRequest","NewSession","PromptRequest"],
+      "type": "object"
+    },
+    "responses": {
+      "properties": {
+        "ApprovalList": {"$ref":"#/$defs/ApprovalList"},
+        "CancelReply": {"$ref":"#/$defs/CancelReply"},
+        "DecisionReply": {"$ref":"#/$defs/DecisionReply"},
+        "EntriesPage": {"$ref":"#/$defs/EntriesPage"},
+        "Health": {"$ref":"#/$defs/Health"},
+        "Models": {"$ref":"#/$defs/Models"},
+        "PromptReply": {"$ref":"#/$defs/PromptReply"},
+        "SessionIndex": {"$ref":"#/$defs/SessionIndex"},
+        "SessionList": {"$ref":"#/$defs/SessionList"},
+        "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
+        "SessionStatus": {"$ref":"#/$defs/SessionStatus"}
+      },
+      "required": ["ApprovalList","CancelReply","DecisionReply","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
+      "type": "object"
+    }
+  },
+  "required": ["requests","responses","events"],
+  "title": "tole serve client protocol",
+  "type": "object",
+  "x-tole-routes": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "query": [],
+      "request": null,
+      "response": "Health",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions",
+      "query": [],
+      "request": null,
+      "response": "SessionList",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/index",
+      "query": ["limit","cursor"],
+      "request": null,
+      "response": "SessionIndex",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions",
+      "query": [],
+      "request": "NewSession",
+      "response": "SessionOpened",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/prompt",
+      "query": [],
+      "request": "PromptRequest",
+      "response": "PromptReply",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/sessions/{id}/cancel",
+      "query": [],
+      "request": null,
+      "response": "CancelReply",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/{id}/status",
+      "query": [],
+      "request": null,
+      "response": "SessionStatus",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/{id}/entries",
+      "query": ["after","limit"],
+      "request": null,
+      "response": "EntriesPage",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/sessions/{id}/events",
+      "query": ["after"],
+      "request": null,
+      "response": null,
+      "stream": "events"
+    },
+    {
+      "method": "GET",
+      "path": "/approvals",
+      "query": ["session"],
+      "request": null,
+      "response": "ApprovalList",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/approvals/{id}/decision",
+      "query": [],
+      "request": "DecisionRequest",
+      "response": "DecisionReply",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/models",
+      "query": [],
+      "request": null,
+      "response": "Models",
+      "stream": null
+    }
+  ]
+}
