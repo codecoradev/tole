@@ -180,6 +180,36 @@ fn resume_brings_a_session_back_after_a_restart() {
     assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
 }
 
+/// #915: the entries route reads the session FILE. When that file (or the
+/// directory it lives in) is gone while the session is still registered, the
+/// answer is a defined `404`, never a `500` carrying a raw OS error. The race
+/// is injected by removing the file from the test, not by timing.
+#[test]
+fn a_session_file_that_is_gone_answers_404_not_a_raw_os_error() {
+    let serve = Serve::spawn(&spawn_mock(0));
+    let id = new_session(&serve);
+    prompt(&serve, &id, "then it vanishes");
+    let route = format!("/sessions/{id}/entries");
+    assert_eq!(serve.http("GET", &route, None).0, 200);
+
+    // The file is gone, its directory is still there.
+    std::fs::remove_file(serve.session_file(&id)).unwrap();
+    let (code, body) = serve.http("GET", &route, None);
+    assert_eq!(code, 404, "{body}");
+    assert_eq!(body["error"], "session transcript not found");
+
+    // The whole sessions directory is gone (a sibling test removing the
+    // workspace is how CI saw this).
+    std::fs::remove_dir_all(serve.dir.join(".tole/sessions")).unwrap();
+    let (code, body) = serve.http("GET", &route, None);
+    assert_eq!(code, 404, "{body}");
+    assert_eq!(body["error"], "session transcript not found");
+
+    // The session is still registered: an unknown id keeps its own 404.
+    let (code, body) = serve.http("GET", "/sessions/srv-nope/entries", None);
+    assert_eq!((code, &body["error"]), (404, &json!("unknown session")));
+}
+
 /// Resuming a live session changes nothing: it is not reopened (the lock
 /// is held by this very process) and a running turn is not disturbed.
 #[test]

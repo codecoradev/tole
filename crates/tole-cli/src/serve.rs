@@ -2074,6 +2074,11 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         Err(tole_cli::protocol::EntriesError::BadQuery(m)) => {
                             return (400, json!({"error": m}))
                         }
+                        // Not reachable (the query parser reads no file),
+                        // answered like the page read below.
+                        Err(tole_cli::protocol::EntriesError::Missing) => {
+                            return (404, json!({"error": "session transcript not found"}))
+                        }
                         Err(tole_cli::protocol::EntriesError::Read(m)) => {
                             return (500, json!({"error": m}))
                         }
@@ -2087,6 +2092,12 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     };
                     match tole_cli::protocol::entries_page(&path, id, after, limit) {
                         Ok(page) => (200, serde_json::to_value(&page).unwrap_or(json!(null))),
+                        // The file is gone while the session is still registered
+                        // (removed from outside, #915): a defined 404, not a raw
+                        // OS error as a 500.
+                        Err(tole_cli::protocol::EntriesError::Missing) => {
+                            (404, json!({"error": "session transcript not found"}))
+                        }
                         Err(tole_cli::protocol::EntriesError::Read(m)) => {
                             (500, json!({"error": m}))
                         }

@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 use tole_core::entry::Entry;
-use tole_core::storage::{JsonlStorage, Storage};
+use tole_core::storage::{JsonlStorage, Storage, StorageError};
 
 /// The version of the serve wire contract (#1043), reported by `GET /health`
 /// next to the binary version so a client can refuse a serve it does not fit.
@@ -52,7 +52,11 @@ pub struct EntriesPage {
 pub enum EntriesError {
     /// `after` / `limit` is not a non-negative integer, or `limit` is 0.
     BadQuery(String),
-    /// The session file could not be read.
+    /// The session file (or its directory) no longer exists, for example
+    /// because it was removed while the session was live (#915). A defined
+    /// answer (`404`), not the raw OS error of a failed read.
+    Missing,
+    /// The session file could not be read for another reason.
     Read(String),
 }
 
@@ -94,8 +98,10 @@ pub fn entries_page(
     after: u64,
     limit: usize,
 ) -> Result<EntriesPage, EntriesError> {
-    let storage =
-        JsonlStorage::open_read_only(path).map_err(|e| EntriesError::Read(e.to_string()))?;
+    let storage = JsonlStorage::open_read_only(path).map_err(|e| match e {
+        StorageError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => EntriesError::Missing,
+        e => EntriesError::Read(e.to_string()),
+    })?;
     Ok(page_of(id, storage.entries(), after, limit))
 }
 
@@ -269,10 +275,15 @@ mod tests {
         assert!(!page.has_more);
         let tail = entries_page(&path, "p1", replayed[1].seq, 50).unwrap();
         assert_eq!(tail.entries, replayed[2..].to_vec());
-        assert!(matches!(
-            entries_page(&dir.join("nope.jsonl"), "n", 0, 1),
-            Err(EntriesError::Read(_))
-        ));
+        // A file that is gone (#915) is a defined `Missing`, not a raw read error.
+        assert_eq!(
+            entries_page(&dir.join("nope.jsonl"), "n", 0, 1).unwrap_err(),
+            EntriesError::Missing
+        );
+        assert_eq!(
+            entries_page(&dir.join("no-dir").join("n.jsonl"), "n", 0, 1).unwrap_err(),
+            EntriesError::Missing
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
