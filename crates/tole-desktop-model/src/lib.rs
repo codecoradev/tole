@@ -19,17 +19,24 @@
 //! - [`tokens`]: colours, sizes and fonts (one semantic module).
 //! - [`strings`]: every word the window shows.
 
+mod automations;
 mod captures;
 mod connections;
 mod credential;
 mod endpoint;
 mod focus;
+mod plain;
 mod section;
 mod serve_state;
 mod shell;
 pub mod strings;
 pub mod tokens;
 
+pub use automations::{
+    AutomationId, AutomationRow, AutomationsState, NextRun, Notice, Origin, RawJob, RawRun,
+    RowNote, RunEntry, RunOutcome, Schedule, Scheduler, SchedulerHost, Switch, ToggleIntent,
+    ToggleRequest, ToggleResult, OWNER_RESUME_COMMAND,
+};
 pub use captures::{shell_captures, Capture};
 pub use connections::{
     ConnectionId, Connections, ConnectionsError, RemoteDraft, RemoteEntry, RemoteId, SavedRemote,
@@ -38,6 +45,7 @@ pub use connections::{
 pub use credential::{CredentialRef, CredentialStore, Secret, StoreError};
 pub use endpoint::{Endpoint, EndpointError, PlainHttp, Scheme};
 pub use focus::FocusTarget;
+pub use plain::Load;
 pub use section::Section;
 pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};

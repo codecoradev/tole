@@ -241,3 +241,5 @@ mod tests {
         assert_eq!(target_label(&Target::ThisComputer), "This computer");
     }
 }
+
+pub mod automations;
