@@ -23,8 +23,10 @@ continuity, infra facts.
 - `crates/tole-desktop` — the native desktop client (`tole-desktop` binary):
   the `ui` module renders the model; the GPUI toolkit is behind the
   off-by-default `gpui` feature, so `cargo test --workspace` does not build it.
-  Not published. A thin client of `tole serve`: it never depends on the
-  session host (`tole-cli`), `tole-core` or `tole-tui`.
+  Not published. A thin client of `tole serve`: its one tole dependency is the
+  typed client `tole-client`. It never lists `tole-core`, `tole-tui` or
+  `tole-cli` (the session host) among its own dependencies; `tole-core` is in
+  its closure only through `tole-client`, `tole-tui` and `tole-cli` nowhere.
 - `docs/` — architecture, PRD, epics (roadmap + tracking issues), threat
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
@@ -99,7 +101,7 @@ cargo test --workspace
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
 # only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
 scripts/test-desktop-check.sh # self-test of the guardrail script
-scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps. ADVISORY (warns only): literals in the ui layer
+scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 4,000 per crate). ADVISORY (warns only): literals in the ui layer
 ```
 
 CI enforces the first three. The desktop script runs in a separate `Desktop`

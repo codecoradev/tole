@@ -19,10 +19,13 @@
 #               named gpui* or zed*, and none of tole-cli, tole-core, tole-tui,
 #               tole-client, anywhere in its dependency closure. As it is a
 #               separate crate, the compiler also refuses a toolkit name there.
-#             - tole-desktop has none of tole-cli (the session host), tole-core
-#               or tole-tui in its closure, in any kind or target. tole-client
-#               (#1040) is the one tole crate it may use, through an allowlist
-#               in desktop-lint.py that is OFF.
+#             - tole-desktop lists none of tole-cli (the session host), tole-core
+#               or tole-tui among its own dependencies, in any kind or target.
+#               tole-client (#1040) is the one tole crate it may depend on
+#               (ALLOWED_FOR_DESKTOP in desktop-lint.py; it must be the
+#               workspace crate). tole-core is in its closure only through
+#               tole-client (the closure minus tole-client's subtree has none),
+#               and tole-cli and tole-tui are in it nowhere.
 #             - every toolkit dependency of tole-desktop is optional, exact
 #               (`=X.Y.Z`), from crates.io and a normal dependency, and a
 #               toolkit package resolved from anywhere else (a [patch], a path)
@@ -31,7 +34,8 @@
 #             - secondary, by text: in the tole-desktop crate (every .rs file,
 #               tests and build scripts included) only src/ui/adapter.rs names
 #               gpui*, and `#[path]` and `include!` are not used.
-# size      At most 500 lines per .rs file and 2,000 per crate in each desktop
+# size      At most 500 lines per .rs file and 4,000 per crate (owner rule D1,
+#           2026-11-20: ideal 1,500 to 2,500, hard ceiling 4,000) in each desktop
 #           crate. Other crates are only reported, as warnings: the cap is for
 #           the desktop alone. Every check walks a crate the same way: paths
 #           relative to the crate, pruning only the crate's own top-level

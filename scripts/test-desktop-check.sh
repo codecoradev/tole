@@ -137,11 +137,95 @@ helper = { path = "../helper" }
 TOML
 expect "tole-core through another crate" deps 1 "tole-core"
 
-new_ws; fake tole-client tole-client; desktop <<'TOML'
+# ---- deps: tole-client is the desktop's one tole dependency (#1029) ------------
+# client_ws: tole-client depends on tole-core, as the real one does.
+client_ws() {
+  new_ws; fake tole-core tole-core
+  manifest tole-client tole-client <<'TOML'
+[dependencies]
+tole-core = { path = "../tole-core" }
+TOML
+}
+desktop_with() { # desktop_with <extra dependency line...>: the model plus the lines on stdin
+  { printf '[dependencies]\ntole-desktop-model = { path = "../tole-desktop-model" }\n'; cat; } | desktop
+}
+
+client_ws; desktop_with <<'TOML'
+tole-client = { path = "../tole-client" }
+TOML
+expect_clean "tole-client, with tole-core only through it, is allowed" deps
+
+client_ws; desktop_with <<'TOML'
+tole-client = { path = "../tole-client" }
+tole-core = { path = "../tole-core" }
+TOML
+expect "a direct tole-core next to tole-client is refused" deps 1 "lists tole-core among its own dependencies"
+
+client_ws; desktop <<'TOML'
+[dependencies]
+tole-client = { path = "../tole-client" }
+
+[dev-dependencies]
+core = { package = "tole-core", path = "../tole-core" }
+TOML
+expect "a renamed dev-dependency on tole-core is refused" deps 1 "lists tole-core among its own dependencies"
+
+client_ws; desktop <<'TOML'
+[dependencies]
+tole-client = { path = "../tole-client" }
+
+[target.'cfg(unix)'.build-dependencies]
+core = { package = "tole-core", path = "../tole-core" }
+TOML
+expect "a target-specific build-dependency on tole-core is refused" deps 1 "lists tole-core among its own dependencies"
+
+# tole-core reached through another crate, with tole-client present: only the
+# subtree of tole-client is allowed to hold it.
+client_ws; manifest helper helper <<'TOML'
+[dependencies]
+tole-core = { path = "../tole-core" }
+TOML
+desktop_with <<'TOML'
+tole-client = { path = "../tole-client" }
+helper = { path = "../helper" }
+TOML
+expect "tole-core through another crate, next to tole-client, is refused" deps 1 "other than through tole-client"
+
+client_ws; fake tole-cli tole-cli
+manifest tole-client tole-client <<'TOML'
+[dependencies]
+tole-core = { path = "../tole-core" }
+tole-cli = { path = "../tole-cli" }
+TOML
+desktop_with <<'TOML'
+tole-client = { path = "../tole-client" }
+TOML
+expect "tole-cli through tole-client is refused" deps 1 "on tole-cli"
+
+client_ws; fake tole-tui tole-tui
+manifest tole-client tole-client <<'TOML'
+[dependencies]
+tole-core = { path = "../tole-core" }
+
+[target.'cfg(windows)'.dependencies]
+tole-tui = { path = "../tole-tui" }
+TOML
+desktop_with <<'TOML'
+tole-client = { path = "../tole-client" }
+TOML
+expect "tole-tui through tole-client (target-specific) is refused" deps 1 "on tole-tui"
+
+client_ws; desktop <<'TOML'
+[dependencies]
+client = { package = "tole-client", path = "../tole-client" }
+TOML
+expect_clean "tole-client under another name is the same allowed crate" deps
+
+client_ws; model <<'TOML'
 [dependencies]
 tole-client = { path = "../tole-client" }
 TOML
-expect "tole-client (allowlist is off)" deps 1 "tole-client"
+expect "tole-client in the model is refused" deps 1 "tole-desktop-model depends"
 
 # ---- deps: the model crate ---------------------------------------------------
 new_ws; fake tole-core tole-core; model <<'TOML'
@@ -460,8 +544,12 @@ if [ "$got" = 2 ] && grep -q "python3 is needed" <<< "$out"; then echo "ok   pyt
 new_ws; seq 1 501 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop-model/src/big.rs"
 expect "model file over 500 lines" size 1 "cap 500 per file"
 
-new_ws; for i in 1 2 3 4 5; do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
-expect "desktop crate over 2000 lines" size 1 "cap 2000 per crate"
+new_ws; for i in 1 2 3 4 5 6 7 8 9; do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
+expect "desktop crate over 4000 lines" size 1 "cap 4000 per crate"
+
+# Between the old cap (2000) and the new one (4000, owner rule D1): allowed.
+new_ws; for i in 1 2 3 4 5 6; do seq 1 450 | sed 's/.*/\/\/ line/' > "$ws/crates/tole-desktop/src/f$i.rs"; done
+expect "desktop crate of 2700 lines is under the cap" size 0 "ok \(enforced rules\)"
 
 new_ws; fake other other; seq 1 600 | sed 's/.*/\/\/ line/' > "$ws/crates/other/src/lib.rs"
 expect "other crates only warn" size 0 "warning: .*other"
