@@ -31,6 +31,11 @@ on:
     branches: [main, develop]
   merge_group:
   workflow_dispatch:
+    inputs:
+      render:
+        description: Also render the window offscreen and attach the images (scripts/desktop-render.sh)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -151,3 +156,36 @@ jobs:
       - run: cargo clippy -p tole-desktop --features gpui --all-targets -- -D warnings
       - run: cargo build -p tole-desktop --features gpui
       - run: cargo test -p tole-desktop --features gpui
+
+  # Optional and manual: renders the real window offscreen (no display; the
+  # frame is drawn by a software Vulkan rasteriser) and attaches the images to
+  # the run. Never part of a PR or push run, and not a required check. The
+  # script builds in a temporary copy, so the committed manifest and lockfile
+  # stay as they are.
+  render:
+    name: Desktop offscreen render (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-render
+          workspaces: target/desktop-render
+      - name: Install Linux build packages and a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libvulkan-dev \
+            libdrm-dev libgbm-dev libasound2-dev libssl-dev libfreetype-dev \
+            mesa-vulkan-drivers fonts-inter fonts-jetbrains-mono
+      - name: Harness checks (PNG written, size, tokens on screen, Tab order)
+        run: bash scripts/desktop-render.sh --test
+      - name: Render every screen and state
+        run: bash scripts/desktop-render.sh "$RUNNER_TEMP/desktop-render"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-render
+          path: ${{ runner.temp }}/desktop-render
+          if-no-files-found: error
