@@ -3,6 +3,9 @@
 //! the window are not built, [`Visible::before`] and [`Visible::after`] pad
 //! the list. Pure numbers in logical pixels.
 
+/// Tallest row kept (logical pixels); a longer one is cut to this.
+pub const MAX_ROW_HEIGHT: f32 = 1_000_000.0;
+
 /// Heights of every row, with running offsets.
 #[derive(Debug, Clone)]
 pub struct ListLayout {
@@ -16,7 +19,7 @@ impl ListLayout {
     /// No rows; `estimate` is the height of an unmeasured row.
     pub fn new(estimate: f32) -> Self {
         let estimate = if estimate.is_finite() && estimate > 0.0 {
-            estimate
+            estimate.min(MAX_ROW_HEIGHT)
         } else {
             1.0
         };
@@ -52,11 +55,12 @@ impl ListLayout {
         self.rebuild(from);
     }
 
-    /// Record the measured height of row `i`. A row out of range, or a height
-    /// that is not a finite number of at least zero, changes nothing.
+    /// Record the measured height of row `i`, at most [`MAX_ROW_HEIGHT`] so a
+    /// sum of rows cannot overflow. A row out of range, or a height that is
+    /// not a finite number of at least zero, changes nothing.
     pub fn set_height(&mut self, i: usize, height: f32) {
         if i < self.heights.len() && height.is_finite() && height >= 0.0 {
-            self.heights[i] = height;
+            self.heights[i] = height.min(MAX_ROW_HEIGHT);
             self.rebuild(i);
         }
     }
@@ -158,5 +162,20 @@ mod tests {
             .for_each(|(i, h)| l.set_height(*i, *h));
         assert_eq!(l.total(), 115.0);
         assert_eq!(visible(&ListLayout::new(40.0), 0.0, 800.0, 100.0).end, 0);
+    }
+
+    #[test]
+    fn zero_height_rows_a_zero_viewport_and_huge_heights_stay_sane() {
+        let mut l = layout(5, 10.0);
+        [1, 2, 3].iter().for_each(|i| l.set_height(*i, 0.0));
+        let v = visible(&l, 10.0, 0.0, 0.0);
+        let built = l.top(v.end) - l.top(v.start);
+        assert!(v.start < v.end && v.before + built + v.after == l.total());
+        let flat = layout(4, 0.0001);
+        (0..4).for_each(|i| assert!(flat.index_at(flat.top(i)) < 4));
+        let mut big = layout(3, 10.0);
+        (0..3).for_each(|i| big.set_height(i, f32::MAX));
+        let v = visible(&big, 5.0, 100.0, 0.0);
+        assert!(big.total().is_finite() && v.after.is_finite() && v.start == 0);
     }
 }

@@ -4,7 +4,7 @@
 //! a sentence live in `crate::task`; these functions turn a state into words.
 
 use crate::task::{
-    AttachError, Counts, Phase, SendMode, StatusRow, Step, ToolEffect, MAX_IMAGE_BYTES,
+    AttachError, Counts, Phase, SendMode, StatusRow, Step, ToolEffect, MAX_IMAGES, MAX_IMAGE_BYTES,
 };
 
 fn plural(n: u32, one: &str, many: &str) -> String {
@@ -18,6 +18,7 @@ pub fn status_text(row: &StatusRow) -> String {
         Phase::Idle if !row.started => return "Ready.".to_string(),
         Phase::Idle => "Done.",
         Phase::Working => "Working.",
+        Phase::Resuming => "Continuing after your OK.",
         Phase::WaitingApproval => "Waiting for your OK.",
         Phase::Stopping => "Stopping.",
         Phase::Offline => {
@@ -25,13 +26,17 @@ pub fn status_text(row: &StatusRow) -> String {
         }
         Phase::Closed => return "This task has ended.".to_string(),
     };
-    let n = row.counts.changed;
-    let changes = match (n, done) {
-        (0, false) => "Nothing has been changed yet.".to_string(),
-        (0, true) => "Nothing was changed.".to_string(),
-        (_, false) => format!("{} made so far.", plural(n, "change", "changes")),
-        (1, true) => "1 change was made.".to_string(),
-        (_, true) => format!("{n} changes were made."),
+    let (n, unsure) = (row.counts.changed, row.counts.unsure);
+    let made = plural(n, "change", "changes");
+    let changes = match (n, unsure, done) {
+        (0, 0, false) => "Nothing has been changed yet.".to_string(),
+        (0, 0, true) => "Nothing was changed.".to_string(),
+        (0, _, _) => "Something may have been changed.".to_string(),
+        (1, 0, true) => "1 change was made.".to_string(),
+        (_, 0, true) => format!("{n} changes were made."),
+        (_, 0, false) => format!("{made} made so far."),
+        (_, _, true) => format!("{made} made. Something else may have been changed."),
+        (_, _, false) => format!("{made} made so far. Something else may have been changed."),
     };
     format!("{head} {changes}")
 }
@@ -78,6 +83,7 @@ pub fn composer_placeholder(mode: SendMode) -> &'static str {
             "Tole is waiting for your OK before it goes on."
         }
         SendMode::Disabled(Phase::Stopping) => "Stopping. You can write again in a moment.",
+        SendMode::Disabled(Phase::Resuming) => "Tole is picking up where it left off.",
         SendMode::Disabled(Phase::Closed) => "This task has ended.",
         SendMode::Disabled(_) => "Not connected.",
     }
@@ -91,6 +97,7 @@ pub fn attach_error_text(error: AttachError) -> String {
             let mb = MAX_IMAGE_BYTES / (1024 * 1024);
             format!("That image is larger than {mb} MB.")
         }
+        AttachError::TooMany => format!("You can add up to {MAX_IMAGES} images to one message."),
         AttachError::NotAnImage => "Tole can read PNG, JPEG, GIF and WebP images.".to_string(),
     }
 }
@@ -101,8 +108,14 @@ mod tests {
     use crate::task::{tool_effect, StepState};
 
     #[rustfmt::skip]
+    fn row_for(phase: Phase) -> StatusRow {
+        let counts = Counts { read: 0, changed: 0, unsure: 0 };
+        StatusRow { phase, counts, steps: 0, look_only: false, started: true, can_stop: false, send: SendMode::Send }
+    }
+
+    #[rustfmt::skip]
     fn said(phase: Phase, changed: u32, started: bool) -> String {
-        let counts = Counts { read: 0, changed };
+        let counts = Counts { read: 0, changed, unsure: 0 };
         let send = SendMode::Send;
         status_text(&StatusRow { phase, counts, steps: 0, look_only: false, started, can_stop: false, send })
     }
@@ -126,13 +139,46 @@ mod tests {
     }
 
     #[test]
+    fn a_change_that_may_have_happened_is_never_hidden() {
+        let counts = Counts {
+            read: 0,
+            changed: 0,
+            unsure: 1,
+        };
+        let base = row_for(Phase::Idle);
+        let say = |changed, phase| {
+            status_text(&StatusRow {
+                counts: Counts { changed, ..counts },
+                phase,
+                ..base
+            })
+        };
+        assert_eq!(
+            say(0, Phase::Idle),
+            "Done. Something may have been changed."
+        );
+        assert_eq!(
+            say(2, Phase::Idle),
+            "Done. 2 changes made. Something else may have been changed."
+        );
+        assert!(
+            say(2, Phase::Working).starts_with("Working. 2 changes made so far. Something else")
+        );
+        assert_eq!(
+            say(0, Phase::Resuming),
+            "Continuing after your OK. Something may have been changed."
+        );
+    }
+
+    #[test]
     fn headers_counts_and_chips_use_the_board_wording() {
         assert_eq!(group_header(3, true), "Working · 3 steps");
         assert_eq!(group_header(1, false), "Worked · 1 step");
         assert_eq!(
             counts_label(Counts {
                 read: 38,
-                changed: 0
+                changed: 0,
+                unsure: 0
             }),
             "38 read · 0 changed"
         );

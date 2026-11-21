@@ -12,6 +12,10 @@ use super::status::SendMode;
 /// 10 MiB, `tole_core::image::MAX_IMAGE_BYTES`, which this crate cannot name.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// At most this many images go with one prompt: the desktop's own limit, since
+/// neither the client nor serve has one, and every image is re-sent each step.
+pub const MAX_IMAGES: usize = 8;
+
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /// The working folder, shown as a chip above the text.
@@ -36,6 +40,7 @@ pub struct Attachment {
 pub enum AttachError {
     Empty,
     TooLarge { bytes: u64 },
+    TooMany,
     NotAnImage,
 }
 
@@ -84,6 +89,9 @@ impl Composer {
         let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
         if !ext.is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str())) {
             return Err(AttachError::NotAnImage);
+        }
+        if self.attachments.len() >= MAX_IMAGES {
+            return Err(AttachError::TooMany);
         }
         match bytes {
             0 => return Err(AttachError::Empty),
@@ -212,6 +220,11 @@ mod tests {
         assert_eq!(c.attach("empty.png", 0), Err(AttachError::Empty));
         assert_eq!(c.attach("notes.txt", 5), Err(AttachError::NotAnImage));
         assert_eq!(c.attachments.len(), 1);
+        (1..MAX_IMAGES).for_each(|_| {
+            c.attach("a.png", 5).unwrap();
+        });
+        assert_eq!(c.attach("a.png", 5), Err(AttachError::TooMany));
+        assert_eq!(c.attachments.len(), MAX_IMAGES);
     }
 
     #[test]

@@ -6,13 +6,15 @@
 //!
 //! | Client value | Model event |
 //! |---|---|
-//! | entry `message`, role `user` | [`TaskEvent::UserMessage`] (`images` = `payload.images.len()`) |
+//! | entry `message`, role `user`, payload flag `stop_gate_feedback` or `denial_note` | [`TaskEvent::UserMessage`], kind `Synthetic` |
+//! | the same with payload flag `interrupt` (a steer note) | kind `Steer` |
+//! | the same without those flags (`tole_core::turn::transcript::opens_turn`) | kind `Prompt` (`images` = `payload.images.len()`) |
 //! | entry `message`, role `assistant` | [`TaskEvent::AnswerEntry`] |
 //! | entry `intent` | [`TaskEvent::ToolIntent`] (`id` = entry id, `target` = path or command of `payload.input`) |
 //! | entry `tool_result` or `error` | [`TaskEvent::ToolSettled`] (`intent_id` = `parent_id`, `ok` = it is a `tool_result`) |
 //! | `update_plan` intent (input `entries`), `todo_write` result (output list) | also [`TaskEvent::PlanUpdated`], the full list |
 //! | `text_delta`, `reasoning` | [`TaskEvent::TextDelta`], [`TaskEvent::Reasoning`] (text not kept) |
-//! | `ready`, or `busy` of `GET /status` (after an allow: its resumed turn has no observer) | [`TaskEvent::Ready`] |
+//! | `ready`, or `busy` of `GET /status` | [`TaskEvent::Ready`] |
 //! | `approval_requested`, `approval_resolved` | [`TaskEvent::ApprovalRequested`], [`TaskEvent::ApprovalResolved`] (`approved` = status `approved`) |
 //! | `resync`, `closed` | [`TaskEvent::Resync`], [`TaskEvent::Closed`] |
 //! | `StreamItem::Reconnected` | [`TaskEvent::Reconnected`], then [`TaskEvent::ApprovalsRefreshed`] from `Client::approvals` |
@@ -21,6 +23,30 @@
 //!
 //! Not mapped: `tool_started`, `tool_finished` (the durable entries say the
 //! same), heartbeats, unknown frames. History and live use the same events.
+//!
+//! **The adapter passes text through raw.** The model makes every tool name,
+//! target, plan line, approval summary and synthetic note printable and cuts it
+//! (`MAX_*` below, an ellipsis marks a cut). The answer is Markdown and stays
+//! raw: the renderer must not run HTML or open links by itself.
+//!
+//! **After an allow** (`approved` resolved) the resumed turn has no prompt
+//! call to wait for, so the adapter must send [`TaskEvent::Ready`] from
+//! `GET /status` (and again when it changes), and [`TaskEvent::ResumeTimedOut`]
+//! if nothing confirmed the turn after a few seconds. The model does not rely
+//! on it: until something confirms, the phase is `Resuming` (Stop works, steering
+//! does not), and an answer, a tool entry or text confirms or ends it. For a Stop
+//! the adapter sends `Ready{busy:false}` when cancel answers `cancelled: false`,
+//! and calls `TaskState::stop_failed` when the call fails.
+
+use crate::plain::printable;
+
+/// Longest tool name, target, plan line, approval summary or note kept.
+pub const MAX_TOOL_CHARS: usize = 64;
+pub const MAX_TARGET_CHARS: usize = 200;
+pub const MAX_PLAN_TEXT_CHARS: usize = 200;
+pub const MAX_PLAN_ITEMS: usize = 50;
+pub const MAX_SUMMARY_CHARS: usize = 300;
+pub const MAX_NOTE_CHARS: usize = 300;
 
 /// What a tool does, for the status row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,12 +105,36 @@ pub struct ApprovalInfo {
     pub summary: Option<String>,
 }
 
+impl ApprovalInfo {
+    /// The same approval with every text made printable and cut.
+    pub(crate) fn cleaned(&self) -> ApprovalInfo {
+        let summary = self.summary.as_deref();
+        ApprovalInfo {
+            id: printable(&self.id, MAX_TOOL_CHARS),
+            tool: printable(&self.tool, MAX_TOOL_CHARS),
+            summary: summary.map(|s| printable(s, MAX_SUMMARY_CHARS)),
+        }
+    }
+}
+
+/// Who wrote a user-role message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserKind {
+    /// The owner's prompt: opens a turn.
+    Prompt,
+    /// The owner's steer note to a running turn: shown, but opens no turn.
+    Steer,
+    /// Tole's own note to the model (stop gate, denied call): not the owner's
+    /// words, shown as a note, opens no turn.
+    Synthetic,
+}
+
 /// One thing that happened in a task.
 #[rustfmt::skip] // one variant per line: it is a table of the wire frames
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskEvent {
     /// Entries are durable and ordered: one whose `seq` is not above the last seen is ignored.
-    UserMessage { seq: u64, text: String, images: u32 },
+    UserMessage { seq: u64, text: String, images: u32, kind: UserKind },
     /// The final answer of a turn, Markdown. It replaces any streamed text.
     AnswerEntry { seq: u64, text: String },
     /// A tool call was recorded; `id` is the intent entry id.
@@ -103,6 +153,8 @@ pub enum TaskEvent {
     ApprovalResolved { id: String, approved: bool },
     /// The queue as the server holds it now.
     ApprovalsRefreshed { pending: Vec<ApprovalInfo> },
+    /// An allowed turn was not confirmed running in time (see the module docs).
+    ResumeTimedOut,
     /// The stream dropped ephemeral frames.
     Resync,
     Reconnected,

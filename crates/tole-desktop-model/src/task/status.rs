@@ -6,6 +6,7 @@
 //! | Closed, Offline | no | disabled |
 //! | Waiting for an OK | no (the card answers it) | disabled |
 //! | Stopping | no (already asked) | disabled |
+//! | Resuming (allowed, not confirmed) | yes | disabled |
 //! | Working | yes | steers |
 //! | Idle | no | sends a prompt |
 
@@ -19,6 +20,8 @@ pub enum Phase {
     Working,
     WaitingApproval,
     Stopping,
+    /// An allowed turn is not confirmed running yet.
+    Resuming,
     /// The event stream is lost.
     Offline,
     /// The session left the server.
@@ -59,6 +62,8 @@ pub fn status_row(transcript: &Transcript, run: &Run, look_only: bool) -> Status
         Phase::WaitingApproval
     } else if run.stopping {
         Phase::Stopping
+    } else if run.resuming {
+        Phase::Resuming
     } else if run.busy {
         Phase::Working
     } else {
@@ -75,7 +80,7 @@ pub fn status_row(transcript: &Transcript, run: &Run, look_only: bool) -> Status
         steps: transcript.step_count(),
         look_only,
         started: !transcript.items.is_empty(),
-        can_stop: phase == Phase::Working,
+        can_stop: matches!(phase, Phase::Working | Phase::Resuming),
         send,
     }
 }
@@ -123,5 +128,28 @@ mod tests {
         assert_eq!((lost.phase, lost.can_stop), (Phase::Offline, false));
         let closed = row(&[TaskEvent::Closed], true);
         assert_eq!(closed.send, SendMode::Disabled(Phase::Closed));
+    }
+
+    #[test]
+    fn an_allowed_turn_can_be_stopped_but_not_steered_until_it_is_confirmed() {
+        let resumed = [
+            ask(),
+            TaskEvent::ApprovalResolved {
+                id: "a1".into(),
+                approved: true,
+            },
+        ];
+        let r = row(&resumed, false);
+        assert_eq!((r.phase, r.can_stop), (Phase::Resuming, true));
+        assert_eq!(r.send, SendMode::Disabled(Phase::Resuming));
+        let confirmed = row(
+            &[
+                resumed[0].clone(),
+                resumed[1].clone(),
+                TaskEvent::Ready { busy: true },
+            ],
+            false,
+        );
+        assert_eq!(confirmed.send, SendMode::Steer);
     }
 }

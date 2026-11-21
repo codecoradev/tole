@@ -7,6 +7,8 @@
 
 mod composer;
 mod event;
+#[cfg(test)]
+mod review_tests;
 mod run;
 mod status;
 mod transcript;
@@ -16,13 +18,13 @@ mod viewport;
 
 pub use composer::{
     AttachError, Attachment, AttachmentId, Composer, Enter, EnterOutcome, FolderChip, Submission,
-    MAX_IMAGE_BYTES,
+    MAX_IMAGES, MAX_IMAGE_BYTES,
 };
-pub use event::{tool_effect, ApprovalInfo, PlanItem, PlanStatus, TaskEvent, ToolEffect};
+pub use event::{tool_effect, ApprovalInfo, PlanItem, PlanStatus, TaskEvent, ToolEffect, UserKind};
 pub use run::{Link, Run};
 pub use status::{status_row, Phase, SendMode, StatusRow};
 pub use transcript::{Counts, Item, Step, StepState, Transcript, WorkGroup};
-pub use viewport::{visible, ListLayout, Visible};
+pub use viewport::{visible, ListLayout, Visible, MAX_ROW_HEIGHT};
 
 /// One open task.
 #[derive(Debug, Clone)]
@@ -51,11 +53,22 @@ impl TaskState {
 
     /// Fold in one event, from a history page or the live stream.
     pub fn apply(&mut self, event: TaskEvent) {
-        let stale = matches!(event, TaskEvent::TextDelta { .. }) && self.run.discard_text;
-        if !stale {
-            self.run.apply(&event);
-            self.transcript.apply(&event);
-            self.layout.set_len(self.transcript.items.len());
+        if matches!(event, TaskEvent::TextDelta { .. }) && self.run.discard_text {
+            return;
+        }
+        if !self.transcript.apply(&event) {
+            return; // an old entry: it must not move the run state either
+        }
+        self.run.apply(&event);
+        self.layout.set_len(self.transcript.items.len());
+        let ends = match event {
+            TaskEvent::Ready { busy } => !busy,
+            TaskEvent::AnswerEntry { .. } | TaskEvent::TurnEnded | TaskEvent::Closed => true,
+            TaskEvent::ResumeTimedOut => true,
+            _ => false,
+        };
+        if ends && !self.run.busy {
+            self.transcript.abandon_running();
         }
     }
 
@@ -90,12 +103,17 @@ impl TaskState {
     }
 
     /// The prompt or steer call failed: the draft comes back, and a prompt no
-    /// longer counts as running.
-    pub fn send_failed(&mut self, sent: Submission) {
+    /// longer counts as running unless serve said busy (409).
+    pub fn send_failed(&mut self, sent: Submission, server_busy: bool) {
         if sent.mode == SendMode::Send {
-            self.run.prompt_failed();
+            self.run.prompt_failed(server_busy);
         }
         self.composer.restore(sent);
+    }
+
+    /// The Stop call failed: the turn runs on.
+    pub fn stop_failed(&mut self) {
+        self.run.stop_failed();
     }
 
     /// Stop was pressed. True when the adapter should call the cancel route:
@@ -132,7 +150,7 @@ mod tests {
         assert!(t.press_stop() && !t.press_stop());
         assert_eq!(t.status().phase, Phase::Stopping);
         t.apply(TaskEvent::TurnEnded);
-        t.send_failed(s);
+        t.send_failed(s, false);
         assert_eq!(
             (t.composer.text.as_str(), t.status().phase),
             ("tidy", Phase::Idle)
