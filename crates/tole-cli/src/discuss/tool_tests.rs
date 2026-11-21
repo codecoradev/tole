@@ -817,3 +817,80 @@ fn above_the_ceiling_the_tool_refuses_before_carving_and_names_it() {
         "{spec}"
     );
 }
+
+/// #1041: the approval summary of `discuss` is code-derived: a fixed kind and
+/// effect, the participants as the target, the question as raw preview.
+#[test]
+fn the_approval_summary_of_discuss_is_derived_by_code() {
+    use tole_core::action_summary::{ActionEffect, ActionKind};
+    let r = rig("summary", &[], 100, agreeable());
+    let s = DiscussTool(r.host.clone())
+        .action_summary(&json!({
+            "question": "Ship it?\nOr wait?", "participants": ["coder", "ops"],
+        }))
+        .unwrap();
+    assert_eq!(s.kind, ActionKind::StartDiscussion);
+    // The participants are names the model sent: said so, not validated.
+    assert_eq!(s.target, "2 participants (requested by the model)");
+    assert_eq!(s.effect, ActionEffect::StartsDiscussion);
+    assert!(!s.inside_workspace);
+    // One line per participant, then the budget and rounds `describe`
+    // showed, then the question.
+    assert_eq!(
+        s.preview.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "participant (requested by the model): coder",
+            "participant (requested by the model): ops",
+            "budget (requested by the model): half of your remaining tokens",
+            &format!(
+                "rounds (requested by the model): up to {}",
+                discussion::DEFAULT_MAX_ROUNDS
+            ),
+            "question (from the model): Ship it?",
+            "question (from the model): Or wait?",
+        ]
+    );
+    let none = DiscussTool(r.host.clone())
+        .action_summary(&json!({}))
+        .unwrap();
+    assert_eq!(none.target, "no named participants");
+}
+
+/// A secret of 49+ characters in a model-sent participant name is redacted
+/// whole before the name is cut, so no head or tail of it reaches the summary.
+#[test]
+fn a_secret_in_a_participant_name_leaves_no_fragment() {
+    const SECRET: &str = "tole1041-participant-secret-0123456789-abcdefghijklmnopqrstuvwxyz";
+    tole_core::secrets::set_process_secrets(
+        tole_core::secrets::process_secrets().with("TOLE_TEST_1041_PART", SECRET),
+    );
+    let r = rig("summary-secret", &[], 100, agreeable());
+    let many: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
+    let s = DiscussTool(r.host.clone())
+        .action_summary(&json!({"question": "q", "participants": [SECRET, many]}))
+        .unwrap();
+    let all = format!("{} {:?}", s.target, s.preview);
+    assert!(!all.contains("tole1041-participant"), "{all}");
+    assert!(!all.contains("abcdefghij"), "{all}");
+    assert!(all.contains("«TOLE_TEST_1041_PART»"), "{all}");
+    // More participants than lines: counted, flagged.
+    let s = DiscussTool(r.host.clone())
+        .action_summary(&json!({"question": "q", "participants": many}))
+        .unwrap();
+    assert!(s.preview_truncated);
+    assert!(s
+        .preview
+        .iter()
+        .any(|l| l.contains("+3 more entries, see the full description")));
+}
+
+/// `describe` holds the whole question: the summary's cut markers point at it.
+#[test]
+fn describe_holds_the_whole_question() {
+    let r = rig("describe-long", &[], 100, agreeable());
+    let long = format!("{} TAIL_MARK", "word ".repeat(1000));
+    let d = DiscussTool(r.host.clone()).describe(&json!({
+        "question": long, "participants": ["coder"],
+    }));
+    assert!(d.contains("TAIL_MARK") && d.len() > 5000, "{}", d.len());
+}

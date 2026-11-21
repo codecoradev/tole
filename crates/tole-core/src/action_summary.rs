@@ -41,8 +41,13 @@ pub const MAX_LINE_CHARS: usize = 400;
 /// and names the omitted count (`… (N more characters) …`), and sets
 /// `targetTruncated`.
 pub const MAX_TARGET_CHARS: usize = 1000;
+/// At most this many entries of a list (an allowlist, the participants) get a
+/// line each; the rest are counted in a `+N more entries` line.
+pub const MAX_LIST_ENTRIES: usize = 6;
 /// A cut around a marker keeps at least this many characters on each side.
 const MIN_EDGE: usize = 8;
+/// A model-sent name is cut to this many characters (a cut keeps head and tail).
+pub const MAX_NAME_CHARS: usize = 96;
 /// Every cut says this, so a client and a person know where the whole text is:
 /// the approval row's `description` (and the TUI prompt) carry the tool's own
 /// text uncut.
@@ -410,6 +415,120 @@ pub fn redacted_text(text: &str) -> String {
     process_secrets().redact(text).into_owned()
 }
 
+/// The summary of a call that starts a child session. `policy` lines say what
+/// the human grants (allowlist, mode, budget, ...) and come FIRST, then the
+/// task text. The profile is a string the model sent: it is shown as
+/// "requested by the model", not as a validated profile.
+pub fn delegate_summary(profile: Option<&str>, task: &str, policy: &[String]) -> ActionSummary {
+    let target = match profile {
+        Some(p) => format!("profile {} (requested by the model)", short_name(p)),
+        None => "a new child session".to_string(),
+    };
+    let task = redacted_text(task);
+    let lines: Vec<String> = policy
+        .iter()
+        .cloned()
+        .chain(task.lines().map(|l| format!("task (from the model): {l}")))
+        .collect();
+    ActionSummary::new(
+        ActionKind::Delegate,
+        target,
+        ActionEffect::StartsChild,
+        false,
+    )
+    .with_preview(lines)
+}
+
+/// A model-sent name bounded to [`MAX_NAME_CHARS`] for a target or policy
+/// line: redacted as a whole FIRST, then neutralized, then cut (a cut carries
+/// the marker, which also sets the summary's truncation flag).
+pub fn short_name(s: &str) -> String {
+    cut(&sanitize_one_line(&redacted_text(s)), MAX_NAME_CHARS).0
+}
+
+/// The allow patterns a call asks for, parsed EXACTLY as `agent_start` and
+/// `delegate` execute do: a JSON array's string entries; anything else (a lone
+/// string, non-string entries) is not a request, and an empty result means the
+/// child inherits. Execute and the summary both call this, so the summary
+/// cannot show a list the call will not use.
+pub fn requested_allow(input: &Value) -> Vec<String> {
+    input
+        .get("allow")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The task text a call will run: the first of `keys` whose value is a string
+/// (so a non-string `task` falls through to `prompt`), and only when it is not
+/// blank. Shared by `agent_start` (`["prompt"]`), `delegate` (`["task",
+/// "prompt"]`) and their summaries.
+pub fn task_text(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// The budget numbers a `delegate` call carves: `tokens`, `steps`, `minutes`
+/// of its `budget` object, each only when it is an unsigned integer. Shared by
+/// `delegate` and its summary.
+pub fn budget_numbers(input: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let b = input.get("budget");
+    let num = |k: &str| b.and_then(|b| b.get(k)).and_then(Value::as_u64);
+    (num("tokens"), num("steps"), num("minutes"))
+}
+
+/// One preview line per entry (at most [`MAX_LIST_ENTRIES`]), then a
+/// `+N more entries` line, so a list the human is granting is never one long
+/// line cut in the middle. An empty list says `none`.
+pub fn list_lines(label: &str, items: &[String]) -> Vec<String> {
+    if items.is_empty() {
+        return vec![format!("{label}: none")];
+    }
+    let mut out: Vec<String> = items
+        .iter()
+        .take(MAX_LIST_ENTRIES)
+        .map(|i| format!("{label}: {i}"))
+        .collect();
+    if items.len() > MAX_LIST_ENTRIES {
+        out.push(format!(
+            "{label}: +{} more entries, {SEE_FULL}",
+            items.len() - MAX_LIST_ENTRIES
+        ));
+    }
+    out
+}
+
+/// The budget line of a `delegate` call: the values the call will really use
+/// ([`budget_numbers`]) and a note when the budget holds anything else, which
+/// the call ignores. `None` when no budget was sent.
+pub fn budget_line(label: &str, input: &Value) -> Option<String> {
+    let b = input.get("budget")?;
+    let (tokens, steps, minutes) = budget_numbers(input);
+    let mut parts: Vec<String> = [("tokens", tokens), ("steps", steps), ("minutes", minutes)]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
+        .collect();
+    if parts.is_empty() {
+        parts.push("nothing usable (omitted parts take half of what is left)".into());
+    }
+    let known = ["tokens", "steps", "minutes"];
+    let clean = b.as_object().is_some_and(|o| {
+        o.iter()
+            .all(|(k, v)| known.contains(&k.as_str()) && v.as_u64().is_some())
+    });
+    if !clean {
+        parts.push("(anything else in the budget is ignored)".into());
+    }
+    Some(format!("{label}: {}", parts.join(" ")))
+}
+
 /// `target` relative to `root`, `/`-separated, for display only: a component
 /// that is not valid UTF-8 is shown lossy and the text says so (the path is
 /// still the real one, never a reason to call the call refused). `.` for the
@@ -732,6 +851,97 @@ mod tests {
         let many: Vec<String> = (0..40).map(|i| format!("l{i}")).collect();
         let m = s.clone().with_preview(&many);
         assert!(m.preview.last().unwrap().contains(SEE_FULL) && m.preview_truncated);
+    }
+
+    /// A model-sent name is redacted as a whole BEFORE it is cut to 48
+    /// characters, and a cut name sets the flags.
+    #[test]
+    fn short_name_redacts_before_it_cuts_and_flags_a_cut() {
+        let set = SecretSet::default().with("TOK", SECRET);
+        crate::secrets::set_process_secrets(crate::secrets::process_secrets().with("TOK", SECRET));
+        let name = short_name(&format!("{SECRET}-tail"));
+        assert!(!name.contains("s3cr3t"), "{name}");
+        assert!(name.contains("«TOK»"), "{name}");
+        let padded = short_name(&format!("{} {SECRET}", "p".repeat(30)));
+        assert!(
+            !padded.contains("s3cr3t") && !padded.contains("ABCDEFGHIJKL"),
+            "{padded}"
+        );
+        // A plain long name is cut, marked, and the summary says so.
+        let long = short_name(&"n".repeat(200));
+        assert!(long.contains(SEE_FULL));
+        let s = ActionSummary::new(
+            ActionKind::Delegate,
+            format!("profile {long}"),
+            ActionEffect::StartsChild,
+            false,
+        )
+        .with_preview([format!("mode: {long}")]);
+        assert!(s.target_truncated && s.preview_truncated);
+        let _ = set;
+    }
+
+    #[test]
+    fn lists_get_one_line_per_entry_and_a_more_entries_line() {
+        let few = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(list_lines("allow", &few), ["allow: a", "allow: b"]);
+        assert_eq!(list_lines("allow", &[]), ["allow: none"]);
+        let many: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+        let lines = list_lines("allow", &many);
+        assert_eq!(lines.len(), MAX_LIST_ENTRIES + 1);
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("allow: +{} more entries, {SEE_FULL}", 20 - MAX_LIST_ENTRIES)
+        );
+        let s = ActionSummary::new(ActionKind::Delegate, "x", ActionEffect::StartsChild, false)
+            .with_preview(&lines);
+        assert!(s.preview_truncated);
+        // The shared parsers are the ones execute uses.
+        assert_eq!(
+            requested_allow(&json!({"allow": ["a", 1, "b"]})),
+            ["a", "b"]
+        );
+        assert!(requested_allow(&json!({"allow": "solo"})).is_empty());
+        assert!(requested_allow(&json!({})).is_empty());
+        assert_eq!(
+            task_text(&json!({"task": 5, "prompt": "run me"}), &["task", "prompt"]).as_deref(),
+            Some("run me")
+        );
+        assert_eq!(task_text(&json!({"task": "  "}), &["task", "prompt"]), None);
+        assert_eq!(task_text(&json!({"task": "t"}), &["prompt"]), None);
+        assert_eq!(
+            budget_numbers(&json!({"budget": {"tokens": 5, "steps": "x", "minutes": 2}})),
+            (Some(5), None, Some(2))
+        );
+        let bl = budget_line("budget", &json!({"budget": {"tokens": 5, "x": 1}})).unwrap();
+        assert_eq!(
+            bl,
+            "budget: tokens=5 (anything else in the budget is ignored)"
+        );
+        assert!(budget_line("budget", &json!({})).is_none());
+    }
+
+    /// A model-sent name is cut to a readable head and tail, never longer than
+    /// the cap and never only a marker.
+    #[test]
+    fn a_cut_name_keeps_a_readable_head_and_is_never_longer_than_the_cap() {
+        for n in [49usize, 60, 96, 97, 200, 5000] {
+            let name: String = "abcdefghij".chars().cycle().take(n).collect();
+            let out = short_name(&name);
+            assert!(out.chars().count() <= MAX_NAME_CHARS, "{n}: {out}");
+            assert!(out.starts_with("abcdefgh"), "{n}: {out}");
+            if n > MAX_NAME_CHARS {
+                assert!(out.contains(SEE_FULL), "{n}: {out}");
+            } else {
+                assert_eq!(out, name, "a name within the cap is not cut");
+            }
+        }
+        // A cap smaller than the marker: head and a bare ellipsis, within the cap.
+        let (out, cut_it) = cut(&"q".repeat(49), 48);
+        assert!(
+            cut_it && out.chars().count() <= 48 && out.starts_with("qqqqqqqq"),
+            "{out}"
+        );
     }
 
     /// A summary-less tool keeps its own description as the first preview line.

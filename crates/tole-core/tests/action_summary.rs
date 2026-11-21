@@ -186,6 +186,68 @@ fn run_command_and_job_start_run_a_program_outside_the_jail() {
     );
 }
 
+#[cfg(feature = "shell-tools")]
+#[test]
+fn agent_start_delegates_to_a_child_session() {
+    let (risk, s) = summary_of(
+        Box::new(tole_core::agents::AgentStartTool::new(
+            "tole",
+            std::env::temp_dir(),
+        )),
+        json!({"prompt": "fix the build\nthen run the tests"}),
+    );
+    assert_eq!(risk, Risk::Write);
+    assert_eq!(s.kind, ActionKind::Delegate);
+    assert_eq!(s.target, "a new child session");
+    assert_eq!(s.effect, ActionEffect::StartsChild);
+    // What `describe` showed (the child allowlist, the worktree flag) stays
+    // visible, first, ahead of the task text.
+    assert_eq!(
+        s.preview,
+        [
+            "child allowlist (inherited from you): none",
+            "worktree: false",
+            "task (from the model): fix the build",
+            "task (from the model): then run the tests",
+        ]
+    );
+    let granted = summary_of(
+        Box::new(
+            tole_core::agents::AgentStartTool::new("tole", std::env::temp_dir())
+                .with_parent_allows(vec!["read_*".into()])
+                .with_worktrees(true),
+        ),
+        json!({"prompt": "x", "allow": ["write_*", "run_command"]}),
+    )
+    .1;
+    // One line per allowlist entry, so padding cannot hide one.
+    assert_eq!(
+        granted.preview[..3],
+        [
+            "child allowlist (requested by the model): write_*",
+            "child allowlist (requested by the model): run_command",
+            "worktree: true",
+        ]
+    );
+    let padded: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+    let many = summary_of(
+        Box::new(tole_core::agents::AgentStartTool::new(
+            "tole",
+            std::env::temp_dir(),
+        )),
+        json!({"prompt": "x", "allow": padded}),
+    )
+    .1;
+    assert!(many.preview_truncated);
+    assert!(
+        many.preview
+            .iter()
+            .any(|l| l.contains("+34 more entries, see the full description")),
+        "{:?}",
+        many.preview
+    );
+}
+
 /// A server's own description and name never reach the wording, and the
 /// tier is `Write` however reassuring the server sounds.
 #[cfg(feature = "mcp")]
@@ -473,6 +535,53 @@ fn a_tool_without_a_summary_keeps_its_describe_text() {
     );
 }
 
+/// The summary parses `allow` and `prompt` with the code `execute` runs: a
+/// lone string or non-string entries are not a request (the child inherits the
+/// parent's list), and the task is the string `execute` would use.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn agent_start_summary_shows_the_allowlist_execute_will_use() {
+    let start = || {
+        Box::new(
+            tole_core::agents::AgentStartTool::new("tole", std::env::temp_dir())
+                .with_parent_allows(vec!["read_*".into(), "run_command:git status *".into()]),
+        )
+    };
+    let inherited = [
+        "child allowlist (inherited from you): read_*",
+        "child allowlist (inherited from you): run_command:git status *",
+    ];
+    // No allow, a lone string, a non-array, and an array of non-strings: inherited.
+    for allow in [
+        json!(null),
+        json!("git status"),
+        json!({"a": 1}),
+        json!([1, null]),
+    ] {
+        let (_, s) = summary_of(start(), json!({"prompt": "x", "allow": allow}));
+        assert_eq!(s.preview[..2], inherited, "{allow}: {:?}", s.preview);
+    }
+    // A mixed array: only the string entries, as execute filters.
+    let (_, s) = summary_of(
+        start(),
+        json!({"prompt": "x", "allow": ["read_*", 5, "write_*"]}),
+    );
+    assert_eq!(
+        s.preview[..2],
+        [
+            "child allowlist (requested by the model): read_*",
+            "child allowlist (requested by the model): write_*",
+        ]
+    );
+    // A non-string prompt is no task: no task line (execute refuses it).
+    let (_, s) = summary_of(start(), json!({"prompt": 5}));
+    assert!(
+        s.preview.iter().all(|l| !l.starts_with("task")),
+        "{:?}",
+        s.preview
+    );
+}
+
 /// A symlink to a file whose real name is not valid UTF-8 resolves inside the
 /// jail and `execute` accepts it: the summary keeps its kind and effect and
 /// shows the resolved name lossy, never "refused".
@@ -517,6 +626,51 @@ fn a_resolved_path_with_a_non_utf8_name_is_shown_lossy_not_refused() {
         json!({"path": std::str::from_utf8(b"src/lib.rs").unwrap()}),
     );
     assert_eq!(d.kind, ActionKind::DeleteFile);
+}
+
+/// The text the summary's cut markers point at is complete: `describe` does
+/// not cut the task or the arguments of a call.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn describe_holds_the_whole_task_and_mcp_arguments() {
+    let long = format!("{} TAIL_MARK", "word ".repeat(1000));
+    let start = tole_core::agents::AgentStartTool::new("tole", std::env::temp_dir());
+    let d = start.describe(&json!({"prompt": long}));
+    assert!(d.contains("TAIL_MARK") && d.len() > 5000, "{}", d.len());
+    // The registry's `description` is that whole text (sanitized, not cut).
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut reg = ToolRegistry::with_approver(DescriptionSpy(seen.clone()));
+    reg.register(Box::new(start)).unwrap();
+    reg.decide("agent_start", &json!({"prompt": long})).unwrap();
+    let described = seen.lock().unwrap().remove(0);
+    assert!(described.contains("TAIL_MARK") && described.len() > 5000);
+    // And the summary's own cut says where the rest is, truthfully.
+    let (_, s) = summary_of(
+        Box::new(tole_core::agents::AgentStartTool::new(
+            "tole",
+            std::env::temp_dir(),
+        )),
+        json!({"prompt": long}),
+    );
+    assert!(
+        s.preview_truncated
+            || s.preview
+                .iter()
+                .any(|l| l.contains("see the full description"))
+    );
+}
+
+#[cfg(feature = "shell-tools")]
+struct DescriptionSpy(Arc<Mutex<Vec<String>>>);
+#[cfg(feature = "shell-tools")]
+impl Approver for DescriptionSpy {
+    fn decide(&self, req: &ToolRequest<'_>) -> Verdict {
+        self.0.lock().unwrap().push(req.description.clone());
+        Verdict::Deny
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "mcp")]

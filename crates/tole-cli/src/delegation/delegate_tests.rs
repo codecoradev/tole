@@ -1508,3 +1508,184 @@ fn a_discussion_participant_gets_no_delegation_host() {
     assert!(open(true).is_none(), "a participant gets no host");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// #1041: `delegate` (and its alias `agent_start`) summarise as a delegation:
+/// the profile is the target when named, the task is raw preview.
+#[test]
+fn the_approval_summary_of_delegate_is_derived_by_code() {
+    use tole_core::action_summary::{ActionEffect, ActionKind};
+    let root = tmp("summary");
+    let h = host(&root, 0, &[], "");
+    let (start, _) = tools(&h, &root);
+    let s = start
+        .action_summary(&json!({"task": "add the parser\nand tests", "profile": "coder"}))
+        .unwrap();
+    assert_eq!(s.kind, ActionKind::Delegate);
+    assert_eq!(s.target, "profile coder (requested by the model)");
+    assert_eq!(s.effect, ActionEffect::StartsChild);
+    assert!(!s.inside_workspace);
+    // The policy `describe` showed (mode, allow) comes first, then the task.
+    assert_eq!(
+        s.preview,
+        [
+            "mode (requested by the model): execute",
+            "child allowlist: the profile's own list (read from the profile when the child starts, not shown here)",
+            "task (from the model): add the parser",
+            "task (from the model): and tests",
+        ]
+    );
+    let granted = start
+        .action_summary(&json!({
+            "task": "x", "mode": "consult", "allow": ["write_*", "run_command"],
+            "budget": {"tokens": 400, "huge": "padding"},
+        }))
+        .unwrap();
+    assert_eq!(granted.target, "a new child session");
+    assert_eq!(
+        granted.preview[..5],
+        [
+            "mode (requested by the model): consult",
+            "child allowlist (requested by the model): write_*",
+            "child allowlist (requested by the model): run_command",
+            "budget (requested by the model): tokens=400 (anything else in the budget is ignored)",
+            "task (from the model): x",
+        ]
+    );
+}
+
+/// The allowlist the summary shows is the one `delegate_as` gives the child:
+/// no allow and no profile inherits the parent's own list, a profile brings
+/// its own (and refuses an `allow`), a usable array is the request, and a
+/// lone string or non-string entries are no request.
+#[test]
+fn the_summary_shows_the_allowlist_delegate_will_really_use() {
+    let root = tmp("summary-allow");
+    let h = host(&root, 0, &["read_*", "write_*"], "");
+    let (start, _) = tools(&h, &root);
+    let allow_lines = |input: Value| -> Vec<String> {
+        start
+            .action_summary(&input)
+            .unwrap()
+            .preview
+            .into_iter()
+            .filter(|l| l.starts_with("child allowlist"))
+            .collect()
+    };
+    let inherited = [
+        "child allowlist (inherited from you): read_*",
+        "child allowlist (inherited from you): write_*",
+    ];
+    // No allow, no profile: the parent's own list.
+    assert_eq!(allow_lines(json!({"task": "x"})), inherited);
+    // A lone string and non-string entries are not a request: inherited too.
+    assert_eq!(
+        allow_lines(json!({"task": "x", "allow": "git status"})),
+        inherited
+    );
+    assert_eq!(
+        allow_lines(json!({"task": "x", "allow": [1, null]})),
+        inherited
+    );
+    // A mixed array: the string entries only, as `delegate_as` filters.
+    assert_eq!(
+        allow_lines(json!({"task": "x", "allow": ["read_*", 7, "write_*"]})),
+        [
+            "child allowlist (requested by the model): read_*",
+            "child allowlist (requested by the model): write_*",
+        ]
+    );
+    // A profile: its own list, which this summary cannot read; with an
+    // `allow` as well, the call is refused.
+    assert_eq!(
+        allow_lines(json!({"task": "x", "profile": "coder"})),
+        ["child allowlist: the profile's own list (read from the profile when the child starts, not shown here)"]
+    );
+    assert_eq!(
+        allow_lines(json!({"task": "x", "profile": "coder", "allow": ["read_*"]})),
+        ["child allowlist: REFUSED, a profile brings its own allow list; drop 'allow'"]
+    );
+}
+
+/// The task line is the string `delegate_as` runs: `prompt` when `task` is
+/// not a string; nothing when neither is a usable string.
+#[test]
+fn the_summary_shows_the_task_delegate_will_really_run() {
+    let root = tmp("summary-task");
+    let h = host(&root, 0, &[], "");
+    let (start, _) = tools(&h, &root);
+    let task_lines = |input: Value| -> Vec<String> {
+        start
+            .action_summary(&input)
+            .unwrap()
+            .preview
+            .into_iter()
+            .filter(|l| l.starts_with("task"))
+            .collect()
+    };
+    assert_eq!(
+        task_lines(json!({"task": 5, "prompt": "run the prompt"})),
+        ["task (from the model): run the prompt"]
+    );
+    assert_eq!(
+        task_lines(json!({"task": "the task", "prompt": "ignored"})),
+        ["task (from the model): the task"]
+    );
+    assert!(task_lines(json!({"task": 5, "prompt": 6})).is_empty());
+    assert!(start.execute(json!({"task": 5, "prompt": 6})).is_err());
+}
+
+/// A secret of 49+ characters in a model-sent `mode`, `role` or `profile`
+/// is redacted whole before the string is cut, so no fragment of it survives.
+#[test]
+fn a_secret_in_a_model_sent_name_leaves_no_fragment() {
+    const SECRET: &str = "tole1041-delegate-secret-0123456789-abcdefghijklmnopqrstuvwxyz";
+    tole_core::secrets::set_process_secrets(
+        tole_core::secrets::process_secrets().with("TOLE_TEST_1041_DLG", SECRET),
+    );
+    let root = tmp("summary-secret");
+    let h = host(&root, 0, &[], "");
+    let (start, _) = tools(&h, &root);
+    let s = start
+        .action_summary(&json!({
+            "task": "x", "profile": SECRET, "mode": format!("{SECRET}-m"), "role": SECRET,
+        }))
+        .unwrap();
+    let all = format!("{} {:?}", s.target, s.preview);
+    assert!(!all.contains("tole1041-delegate"), "{all}");
+    assert!(!all.contains("abcdefghij"), "{all}");
+    assert!(all.contains("«TOLE_TEST_1041_DLG»"), "{all}");
+    // A long allowlist is one line per entry and says how many are not shown.
+    let padded: Vec<String> = (0..30).map(|i| format!("p{i}")).collect();
+    let s = start
+        .action_summary(&json!({"task": "x", "allow": padded}))
+        .unwrap();
+    assert!(s.preview_truncated);
+    assert!(s
+        .preview
+        .iter()
+        .any(|l| l.contains("+24 more entries, see the full description")));
+}
+
+/// `describe` reads the task and the allowlist as `delegate_as` does, and does
+/// not cut the task: with `task: 5` the prompt is what runs and what is shown.
+#[test]
+fn describe_follows_the_parsers_execute_uses_and_never_cuts_the_task() {
+    let root = tmp("describe");
+    let h = host(&root, 0, &["read_*"], "");
+    let (start, _) = tools(&h, &root);
+    let d = start.describe(&json!({"task": 5, "prompt": "the real mission"}));
+    assert!(
+        d.contains("the real mission") && !d.contains("<missing task>"),
+        "{d}"
+    );
+    // A lone-string `allow` is no request: the parent's list is inherited.
+    let d = start.describe(&json!({"task": "t", "allow": "*"}));
+    assert!(d.ends_with(r#"allow inherited ["read_*"]"#), "{d}");
+    let d = start.describe(&json!({"task": "t", "allow": ["write_*", 3]}));
+    assert!(d.ends_with(r#"allow ["write_*"]"#), "{d}");
+    let d = start.describe(&json!({"task": "t", "profile": "coder"}));
+    assert!(d.ends_with("allow the profile's own list"), "{d}");
+    let long = format!("{} TAIL_MARK", "word ".repeat(1000));
+    let d = start.describe(&json!({"task": long}));
+    assert!(d.contains("TAIL_MARK") && d.len() > 5000, "{}", d.len());
+}
