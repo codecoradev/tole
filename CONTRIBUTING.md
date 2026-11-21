@@ -24,6 +24,9 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `Desktop` workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, not
   a required check unless the owner adds it to the branch protection) runs them
   and the window build.
+  A desktop UI change is also reviewed on the rendered window:
+  `scripts/desktop-render.sh <dir>` (offscreen, one PNG per screen and state;
+  not a gate, see the same README).
 - **Test directories** (#781): a test that needs a scratch directory uses
   `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
   and the `crate::test_dir` module in unit tests), never a hand-built
