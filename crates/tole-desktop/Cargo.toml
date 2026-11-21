@@ -25,6 +25,13 @@ publish = false
 [features]
 default = []
 gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
+# The offscreen render harness (`src/ui/harness.rs`, `examples/render.rs`,
+# `tests/render.rs`). It needs the `test-support` feature of `gpui` and
+# `gpui_platform`, which this manifest never enables, so it does not build from
+# here: `scripts/desktop-render.sh` enables it in a temporary copy of this
+# manifest and runs it there. Nothing in the committed dependency graph or in
+# `Cargo.lock` changes, and no CI job turns this feature on.
+render-harness = ["gpui"]
 
 [dependencies]
 tole-desktop-model = { version = "0.12.0", path = "../tole-desktop-model" }
@@ -46,3 +53,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "tole-desktop"
 path = "src/main.rs"
+
+# Both need `render-harness` (see above), so a plain `cargo test` or
+# `cargo clippy --all-targets` skips them.
+[[example]]
+name = "render"
+path = "examples/render.rs"
+required-features = ["render-harness"]
+
+[[test]]
+name = "render"
+path = "tests/render.rs"
+required-features = ["render-harness"]

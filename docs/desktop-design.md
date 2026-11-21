@@ -49,8 +49,9 @@ run it, or "automations keep running" does not hold.
 
 What stays in the desktop process and never becomes a serve route: writing
 config and profiles, trust approval of skills and connected tools (owner
-decision pending, #1034), the operating system's folder dialog. Each is to
-become a row of [faces.md](faces.md); #1029 and #1040 carry that work.
+decision pending, #1034), the operating system's folder dialog. Each is a row
+of [faces.md](faces.md) (#1070), which also records the desktop and mobile
+faces and a file panel that reads the folder directly.
 
 ## 1. One API, two transports
 
@@ -168,7 +169,7 @@ S14 to S16), which need these further routes, tracked in #1042:
 | Stop | `POST /cancel` | exists |
 | Approval card | `approval_required` row, `GET /approvals`, `POST /decision` | exists |
 | Footer (status, usage) | stream frames, `GET /status` | exists; during a turn `usage_report` is `null`, the model, effort and window are a `stale` snapshot (#573) |
-| `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree) |
+| `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree); a panel that reads the folder directly on the same machine, display only, is the row in [faces.md](faces.md) if the owner wants one |
 | Image attach and view | `POST /images`, `GET /images/{hash}` | exists |
 | Model picker, thinking level | `GET /models`, `POST /model`, `POST /effort` | exists (#574) |
 | Fork, tree, compact, rename | `/fork`, `/tree`, `/compact`, `/name` | exists |

@@ -70,11 +70,15 @@
 //! `scripts/client-schema.sh`. Mobile and web clients build their models from
 //! it.
 //!
-//! # Not yet
+//! # Routes
 //!
-//! Routes beyond the first desktop set (interrupt, detach, fork, tree,
-//! compact, name, model, effort, images, missions). The discussion, cron,
-//! profile, skill and tool routes of #1042 are in.
+//! One method per route of the desktop's set: sessions (create, resume, prompt,
+//! cancel, interrupt, detach, status, entries, events, fork, tree, compact,
+//! name, model, effort, images), approvals, models, missions, and the
+//! discussion, cron, profile, skill and tool routes of #1042. [`Route::ALL`]
+//! lists them. `crates/tole-cli/tests/client_routes.rs` compares that list with
+//! the routes `tole serve` registers and fails on a route on one side only,
+//! except for the few the client leaves out on purpose.
 
 mod client;
 mod error;

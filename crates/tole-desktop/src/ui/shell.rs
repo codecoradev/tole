@@ -1,18 +1,46 @@
 //! The app shell: top bar, sidebar and a placeholder main area (board S2).
 //! A pure function of [`ShellState`]; clicks become [`Action`]s.
 
+use std::collections::HashMap;
+
 use super::adapter::*;
 use tole_desktop_model::strings;
 use tole_desktop_model::tokens::{font, size, DARK};
-use tole_desktop_model::{Action, ConnectionStatus, Section, ShellState};
+use tole_desktop_model::{Action, ConnectionStatus, FocusTarget, Section, ShellState};
 
 pub struct ShellView {
     state: ShellState,
+    /// One focus handle per row that Tab visits (`ShellState::tab_order`).
+    focus: HashMap<FocusTarget, FocusHandle>,
 }
 
 impl ShellView {
     pub fn new(state: ShellState) -> Self {
-        ShellView { state }
+        ShellView {
+            state,
+            focus: HashMap::new(),
+        }
+    }
+
+    /// The row that has keyboard focus in `window`, if any (for the render harness).
+    #[cfg(feature = "render-harness")]
+    pub fn focused(&self, window: &Window) -> Option<FocusTarget> {
+        self.state
+            .tab_order()
+            .into_iter()
+            .find(|t| self.focus.get(t).is_some_and(|h| is_focused(h, window)))
+    }
+
+    /// Gives every row in the tab order a handle, and drops those of rows that
+    /// are gone.
+    fn sync_focus(&mut self, cx: &mut Context<Self>) {
+        let order = self.state.tab_order();
+        self.focus.retain(|t, _| order.contains(t));
+        for target in order {
+            self.focus
+                .entry(target)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
     }
 
     fn dispatch(&mut self, action: Action, cx: &mut Context<Self>) {
@@ -50,12 +78,16 @@ impl ShellView {
         let selected = self.state.section == section;
         let row = div()
             .id(section.index())
+            .track_focus(&self.focus[&FocusTarget::Section(section)])
             .h(len(size::ROW_HEIGHT))
             .flex()
             .items_center()
             .justify_between()
             .px(len(size::GUTTER))
             .rounded(len(size::RADIUS))
+            .border_1()
+            .border_color(transparent())
+            .focus_visible(|style| style.border_color(color(p.accent)))
             .cursor_pointer()
             .hover(|style| style.bg(color(p.raised)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -81,11 +113,15 @@ impl ShellView {
         let selected = self.state.selected_folder == Some(id);
         let row = div()
             .id(("folder", id.0 as usize))
+            .track_focus(&self.focus[&FocusTarget::Folder(id)])
             .h(len(size::ROW_HEIGHT))
             .flex()
             .items_center()
             .px(len(size::GUTTER))
             .rounded(len(size::RADIUS))
+            .border_1()
+            .border_color(transparent())
+            .focus_visible(|style| style.border_color(color(p.accent)))
             .cursor_pointer()
             .hover(|style| style.bg(color(p.raised)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -210,6 +246,7 @@ impl ShellView {
 impl Render for ShellView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = DARK;
+        self.sync_focus(cx);
         div()
             .size_full()
             .flex()
