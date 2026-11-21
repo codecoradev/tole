@@ -40,6 +40,21 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 /// Longest whole-request time a destination may set.
 pub const MAX_TIMEOUT_SECS: u64 = 30;
 
+/// Sleep for `total`, in slices of 50 ms, and stop early when `stop` is set: how
+/// the sender and ticker threads of `tole serve` notice a shutdown (#1014)
+/// without sleeping out a poll interval of seconds.
+pub fn sleep_unless(stop: &std::sync::atomic::AtomicBool, total: Duration) {
+    use std::sync::atomic::Ordering;
+    let end = std::time::Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
 /// `[a-z0-9_-]`, 1 to 32.
 pub fn valid_name(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len())

@@ -485,10 +485,12 @@ fn spawn_leaves_the_approval_queue_alone_unless_a_destination_lists_an_approval_
     })));
     // No destination lists an approval event: this must not replace the
     // notifier, start a thread or change anything.
-    spawn(
+    let spawned = spawn(
         dests(&[("cron", &[Event::CronRunFinished])]),
         Arc::clone(&approvals),
+        Arc::default(),
     );
+    assert!(spawned.threads.is_empty(), "no thread to wait for");
     approvals.queue_entry("s1", "write_file", "d", 7, "/x".into());
     assert_eq!(
         told.load(Ordering::SeqCst),
@@ -640,7 +642,7 @@ fn the_sender_starts_for_a_turn_event_alone() {
     assert!(one.any_lists(&[Event::TurnFinished]));
     let none = dests(&[("g", &[Event::CronRunFinished])]);
     assert!(!none.any_lists(&[Event::TurnFinished]));
-    let spawned = spawn(none, Arc::new(ApprovalQueue::default()));
+    let spawned = spawn(none, Arc::new(ApprovalQueue::default()), Arc::default());
     assert!(
         spawned.turns.is_none(),
         "no destination, no notifier, no thread"
@@ -798,7 +800,7 @@ fn a_hung_destination_delays_neither_another_destination_nor_the_expiry_timer() 
             Ok(self.0.clone())
         }
     }
-    let workers = start(
+    let (workers, _threads) = start(
         Arc::clone(&d),
         sender,
         Wiring {

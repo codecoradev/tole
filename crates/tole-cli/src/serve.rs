@@ -27,6 +27,13 @@
 //! code path (see `tole_cli::serve_support::transport`). `GET /health` also
 //! returns the protocol and binary version.
 //!
+//! SIGTERM and SIGINT start a graceful shutdown (#1014; see
+//! `tole_cli::serve_support::shutdown`): new requests get 503, running turns are
+//! detached through the session host's detach path, the cron ticker and the
+//! webhook senders stop, and the process exits 0 once nothing is left, or
+//! non-zero when `--shutdown-grace` (default 20 s) runs out or a second signal
+//! arrives.
+//!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`,
 //! `--token-file` or `--token`) or, with `--auth basic`, HTTP Basic against a
@@ -48,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
+use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::{self, Conn, Listener};
 use tole_cli::session_host::{
     lock_sessions, open_session_with, run_session_turn_with_end, SessionOverrides, Sessions,
@@ -85,6 +93,9 @@ pub struct ServeConfig {
     /// What the owner configured for `POST /missions` (#947): the verify
     /// command, its timeout and the budget ceilings. Never a request field.
     pub mission: missions::MissionSettings,
+    /// How long a SIGTERM/SIGINT drain waits for running turns before it exits
+    /// anyway (#1014).
+    pub shutdown_grace: Duration,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -186,6 +197,9 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // No human answers a serve session's start-up: an `optional` sandbox
     // counts as `required` here (#601).
     tole_core::sandbox::mark_unattended();
+    // Before the listener is reported ready: a SIGTERM that arrives right after
+    // the "listening" line must already be counted (#1014).
+    shutdown::install().context("installing the SIGTERM and SIGINT handlers")?;
     let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
         .context("resolving --workspace for the session jail root")?;
     // Webhook routes (#582), user config only: a route that cannot load
@@ -264,37 +278,85 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     );
     // The webhook sender (#911) runs whether or not `--cron` is given: a
     // webhook route can run a job without the ticker.
+    // Every helper thread (sender, ticker, event workers) ends when `stop` is
+    // set at shutdown, and is waited for within the grace period (#1014).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut helpers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     if !webhook_out.is_empty() {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!(
             "tole serve: webhook sender for {} destination(s)",
             webhook_out.len()
         );
-        tole_cli::cron::webhook::spawn_sender(dir, Arc::clone(&webhook_out));
+        helpers.push(tole_cli::cron::webhook::spawn_sender(
+            dir,
+            Arc::clone(&webhook_out),
+            Arc::clone(&stop),
+        ));
     }
     // Approval events (#911): when a destination lists them, the approval queue
     // tells a sender thread about each request and each resolution, and a timer
     // expires what nobody answers. Absent, the approval paths are unchanged.
     // The same sender also carries `turn_finished` (#962); its notifier is kept
     // for the turn routes.
-    if let Some(turns) = tole_cli::webhook_out::approval_sender::spawn(
+    let spawned = tole_cli::webhook_out::approval_sender::spawn(
         Arc::clone(&webhook_out),
         Arc::clone(&state.approvals),
-    )
-    .turns
-    {
+        Arc::clone(&stop),
+    );
+    helpers.extend(spawned.threads);
+    if let Some(turns) = spawned.turns {
         let _ = state.turn_events.set(turns);
     }
     if cfg.cron {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!("tole serve: cron ticker on {}", dir.display());
         let queue = Arc::clone(&state.approvals);
-        std::thread::spawn(move || tole_cli::cron::serve_ticker(&dir, queue));
+        let stop = Arc::clone(&stop);
+        helpers.push(std::thread::spawn(move || {
+            tole_cli::cron::serve_ticker(&dir, queue, &stop)
+        }));
     }
     use std::sync::atomic::Ordering;
-    loop {
-        let Ok(stream) = listener.accept() else {
-            continue;
+    let mut draining: Option<shutdown::Countdown> = None;
+    let ending = loop {
+        if draining.is_none() && shutdown::requested() {
+            // Stop everything that could start new work; the loop below keeps
+            // accepting only to answer 503 (see `handle_conn`), so a client is
+            // never left waiting on a queue nobody serves, and the socket and its
+            // lock stay held until the very end.
+            stop.store(true, Ordering::Relaxed);
+            let running = tole_cli::session_host::detach_running_turns(&state.sessions)
+                + state.missions.cancel_running();
+            eprintln!(
+                "tole serve: shutting down (grace {}s): {running} running turn(s) asked to detach",
+                cfg.shutdown_grace.as_secs()
+            );
+            draining = Some(shutdown::Countdown::start(cfg.shutdown_grace));
+        }
+        if let Some(countdown) = &draining {
+            // Again each pass: a request read just before the flag may claim its
+            // session after the first sweep.
+            let turns = tole_cli::session_host::detach_running_turns(&state.sessions);
+            let missions = state.missions.cancel_running();
+            let drained = turns + missions == 0
+                && helpers.iter().all(|h| h.is_finished())
+                && state.live_connections.load(Ordering::Relaxed) == 0;
+            if let Some(ending) = countdown.check(drained) {
+                break ending;
+            }
+        }
+        let stream = match listener.accept_within(shutdown::POLL) {
+            Ok(Some(stream)) => stream,
+            Ok(None) => continue,
+            Err(e) => {
+                // A transient accept error (EMFILE, ECONNABORTED, ...) must not
+                // end the server; the pause keeps resource exhaustion from
+                // spinning.
+                eprintln!("tole serve: accept failed (continuing): {e}");
+                std::thread::sleep(shutdown::POLL);
+                continue;
+            }
         };
         // Connection cap: refuse when at capacity (thread exhaustion DoS).
         if state.live_connections.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
@@ -311,7 +373,22 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         std::thread::spawn(move || {
             handle_conn(stream, Arc::clone(&state));
         });
+    };
+    // Leaving the function drops the listener: a local socket's file is removed
+    // and its `<socket>.lock` is released, the supervisor's proof that this
+    // serve is gone. Session writer locks go with the process.
+    let left = || {
+        let turns = lock_sessions(&state.sessions)
+            .iter()
+            .filter(|(_, st)| *st.busy.lock().expect("busy lock"))
+            .count();
+        let alive = helpers.iter().filter(|h| !h.is_finished()).count();
+        format!("{turns} running turn(s) and {alive} helper thread(s)")
+    };
+    if ending == shutdown::Ending::Clean {
+        eprintln!("tole serve: drained, exiting");
     }
+    ending.into_result("tole serve", cfg.shutdown_grace, left)
 }
 
 /// Largest `--token-file`.
@@ -794,6 +871,19 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
         }
     };
 
+    // Shutting down (#1014): nothing new starts, and a client is told so instead
+    // of being left to a timeout. Not behind auth: it says nothing a refused
+    // connection would not.
+    if shutdown::requested() {
+        respond_with(
+            &mut stream,
+            503,
+            &json!({"error": "tole serve is shutting down"}),
+            "Retry-After: 1\r\n",
+        );
+        return;
+    }
+
     // Auth: bearer token on everything except /health (a liveness probe that
     // reports only the protocol and binary version, see the threat model).
     // Failed auths are rate-limited
@@ -1129,6 +1219,15 @@ fn serve_events(
                 .poll()
                 .map(|rest| rest.iter().all(|e| write_all(&mut stream, &entry_frame(e))));
             let _ = write_all(&mut stream, &frame("closed", None, &json!({"id": id})));
+            return;
+        }
+        // Shutting down (#1014): end the stream once the session's turn has
+        // settled, entries included, so the drain never waits on an idle viewer.
+        // The client reconnects with `after` (to the next serve).
+        if shutdown::requested() && live_busy(state) != Some(true) {
+            let _ = tail
+                .poll()
+                .map(|rest| rest.iter().all(|e| write_all(&mut stream, &entry_frame(e))));
             return;
         }
         // Silence for HEARTBEAT_SECS: write a comment. This is also how a

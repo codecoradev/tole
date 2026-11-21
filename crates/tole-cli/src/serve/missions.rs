@@ -67,6 +67,19 @@ impl Missions {
             .insert(id.to_string(), Entry { cancel, done: None });
     }
 
+    /// Shutdown (#1014): ask every running mission to stop, through the same
+    /// cooperative cancel as `POST /missions/{id}/cancel`, and return how many are
+    /// still running. A mission is its own session and has no detach path of its
+    /// own; it ends at its next checkpoint with a durable summary.
+    pub fn cancel_running(&self) -> usize {
+        let table = self.lock();
+        table
+            .values()
+            .filter(|e| e.done.is_none())
+            .inspect(|e| e.cancel.cancel())
+            .count()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -329,5 +342,29 @@ pub(super) fn cancel(state: &State, id: &str) -> (u16, Value) {
             eprintln!("tole serve: mission {id} cancel requested");
             (202, json!({"id": id, "cancelled": true}))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tole_core::cancel::CancelToken;
+
+    #[test]
+    fn shutdown_cancels_a_running_mission_and_leaves_a_finished_one_alone() {
+        let m = Missions::default();
+        assert_eq!(m.cancel_running(), 0, "nothing runs");
+        let (running, finished) = (CancelToken::new(), CancelToken::new());
+        m.plant_running("mission-a", running.clone());
+        m.lock().insert(
+            "mission-b".to_string(),
+            Entry {
+                cancel: finished.clone(),
+                done: Some(Err("stopped".into())),
+            },
+        );
+        assert_eq!(m.cancel_running(), 1);
+        assert!(running.is_cancelled());
+        assert!(!finished.is_cancelled());
     }
 }

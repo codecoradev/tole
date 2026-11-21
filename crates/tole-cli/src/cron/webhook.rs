@@ -240,17 +240,25 @@ const MAX_PASSES_PER_LOOK: usize = 200;
 /// outbox. It notices new lines by the file's length (a `stat` every 5 s), runs
 /// passes when the file grew or a retry is due, writes the ledger rows of what
 /// it settles, and logs one stderr line per failed delivery with the
-/// destination NAME and a closed code only. It never joins on exit: pending
-/// events are on disk and an attempt in flight is abandoned (the receiver may
-/// have seen it, so it is sent again next start).
+/// destination NAME and a closed code only. Pending events are on disk; an
+/// attempt abandoned at a forced exit (the receiver may have seen it) is sent
+/// again next start.
+///
+/// Shutdown (#1014): the thread ends once `stop` is set, after the look it is in
+/// (an attempt in flight finishes, bounded by the destination's timeout); the
+/// caller waits for the returned handle within its grace period.
 ///
 /// Started whether or not `--cron` is given: a webhook route can run a job
 /// without the ticker, and the approval events (a later part) need it too.
-pub fn spawn_sender(dir: std::path::PathBuf, dests: std::sync::Arc<Destinations>) {
+pub fn spawn_sender(
+    dir: std::path::PathBuf,
+    dests: std::sync::Arc<Destinations>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut sender = Sender::new(&dir);
         let mut next_reconcile = 0;
-        loop {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             // At start (a crash recovery) and every 5 minutes: close the gaps
             // a crash leaves between the ledger and the outbox.
             if super::now() >= next_reconcile {
@@ -280,9 +288,9 @@ pub fn spawn_sender(dir: std::path::PathBuf, dests: std::sync::Arc<Destinations>
             if look.is_err() {
                 eprintln!("tole serve: the webhook sender hit an internal error; continuing");
             }
-            std::thread::sleep(SENDER_POLL);
+            crate::serve_support::shutdown::sleep_unless(&stop, SENDER_POLL);
         }
-    });
+    })
 }
 
 /// The state of the sender loop, so a step is a plain function of its inputs.

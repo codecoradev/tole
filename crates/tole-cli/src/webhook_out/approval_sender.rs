@@ -243,19 +243,30 @@ fn send_one(
 pub struct Spawned {
     /// For the serve turn path, when a destination lists `turn_finished`.
     pub turns: Option<TurnNotifier>,
+    /// The timer and worker threads. They end once the `stop` flag given to
+    /// [`spawn`] is set; serve waits for them at shutdown (#1014).
+    pub threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Installs the notifiers and starts the sender threads (#911, #962, #980):
 /// the timer and one worker per destination that lists an approval or turn
 /// event. Does nothing when no destination lists one, so a serve without one
 /// is exactly as before. The approval notifier and the expiry call are only
-/// installed when an approval event is listed. The threads are never joined:
-/// pending events are volatile and die with the process.
-pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) -> Spawned {
+/// installed when an approval event is listed. Pending events are volatile and
+/// die with the process. Setting `stop` (shutdown, #1014) ends the threads after
+/// their current pass; serve joins the handles within its grace period.
+pub fn spawn(
+    dests: Arc<Destinations>,
+    approvals: Arc<ApprovalQueue>,
+    stop: Arc<AtomicBool>,
+) -> Spawned {
     let approval_events = dests.any_lists(&[Event::ApprovalRequested, Event::ApprovalResolved]);
     let turn_events = dests.any_lists(&[Event::TurnFinished]);
     if !approval_events && !turn_events {
-        return Spawned { turns: None };
+        return Spawned {
+            turns: None,
+            threads: Vec::new(),
+        };
     }
     let queue = VolatileQueue::new();
     if approval_events {
@@ -285,7 +296,7 @@ pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) -> Spawned
             }
         }),
     );
-    start(
+    let (_, threads) = start(
         dests,
         sender,
         Wiring {
@@ -297,18 +308,18 @@ pub fn spawn(dests: Arc<Destinations>, approvals: Arc<ApprovalQueue>) -> Spawned
                 // receiver sent.
                 eprintln!("tole serve: webhook event to `{dest}` failed: {code}");
             }),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
         },
     );
-    Spawned { turns }
+    Spawned { turns, threads }
 }
 
 /// Reports an event given up on: the destination NAME and a closed code.
 pub(crate) type Failed = dyn Fn(&str, &str) + Send + Sync;
 
 /// What the sender threads use: the real network, keys and clock in [`spawn`],
-/// fakes in tests. `stop` ends the threads after their current pass (serve
-/// never sets it; pending events are volatile and die with the process).
+/// fakes in tests. `stop` ends the threads after their current pass (serve sets
+/// it at shutdown, #1014; events still queued then are volatile and are lost).
 pub(crate) struct Wiring {
     pub poster: Arc<dyn Poster + Send + Sync>,
     pub keys: Arc<dyn Keys + Send + Sync>,
@@ -318,9 +329,15 @@ pub(crate) struct Wiring {
 }
 
 /// Starts the timer thread, then one worker per destination that lists a
-/// volatile event, and returns how many workers started. The threads are never
-/// joined.
-pub(crate) fn start(dests: Arc<Destinations>, mut sender: ApprovalSender, w: Wiring) -> usize {
+/// volatile event. Returns how many workers started and the handles of every
+/// thread started (the timer included), for a caller that waits for them after
+/// setting `stop`.
+pub(crate) fn start(
+    dests: Arc<Destinations>,
+    mut sender: ApprovalSender,
+    w: Wiring,
+) -> (usize, Vec<std::thread::JoinHandle<()>>) {
+    let mut threads = Vec::new();
     let queue = Arc::clone(&sender.queue);
     // The timer first, so its first tick never waits behind the workers.
     let (timer_queue, clock, stop) = (
@@ -346,11 +363,12 @@ pub(crate) fn start(dests: Arc<Destinations>, mut sender: ApprovalSender, w: Wir
                     );
                     dropped_seen = dropped;
                 }
-                std::thread::sleep(POLL);
+                super::sleep_unless(&stop, POLL);
             }
         });
-    if timer.is_err() {
-        eprintln!("tole serve: could not start the webhook approval timer");
+    match timer {
+        Ok(h) => threads.push(h),
+        Err(_) => eprintln!("tole serve: could not start the webhook approval timer"),
     }
     let mut workers = 0;
     for name in dests.names() {
@@ -385,17 +403,20 @@ pub(crate) fn start(dests: Arc<Destinations>, mut sender: ApprovalSender, w: Wir
                     if pass.is_err() {
                         eprintln!("tole serve: the webhook event sender for `{name}` hit an internal error");
                     }
-                    std::thread::sleep(POLL);
+                    super::sleep_unless(&stop, POLL);
                 }
             });
         match worker {
-            Ok(_) => workers += 1,
+            Ok(h) => {
+                workers += 1;
+                threads.push(h);
+            }
             Err(_) => {
                 eprintln!("tole serve: could not start the webhook event sender for a destination")
             }
         }
     }
-    workers
+    (workers, threads)
 }
 
 fn unix_now() -> i64 {

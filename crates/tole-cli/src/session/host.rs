@@ -180,6 +180,16 @@ pub fn detach_session(st: &SessionState) -> bool {
     true
 }
 
+/// Shutdown (#1014): detach the in-flight turn of every live session through
+/// [`detach_session`], the one detach path, and return how many turns are still
+/// running. Safe to call again and again: a turn that claimed its session after
+/// the last call is caught by the next one, and a settled turn is not counted.
+/// Shared by the REST and MCP faces.
+pub fn detach_running_turns(sessions: &SharedSessions) -> usize {
+    let sessions = lock_sessions(sessions);
+    sessions.iter().filter(|(_, st)| detach_session(st)).count()
+}
+
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
 /// panic, so one failed turn cannot brick the session.
 pub struct BusyGuard(StdArc<Mutex<bool>>);
@@ -1232,6 +1242,36 @@ mod eviction_tests {
         assert_eq!(s.resolve_id(Some("x")), Ok("x".to_string()));
         s.admit("b".into(), state(dir.path(), "b", false)).unwrap();
         assert_eq!(s.resolve_id(None), Err(AMBIGUOUS_SESSION.to_string()));
+    }
+
+    #[test]
+    fn shutdown_detaches_every_running_turn_and_only_those() {
+        let dir = TmpDir::new("shutdown");
+        let shared: SharedSessions = StdArc::default();
+        assert_eq!(detach_running_turns(&shared), 0, "no sessions");
+        {
+            let mut s = lock_sessions(&shared);
+            s.admit("idle".into(), state(dir.path(), "idle", false))
+                .unwrap();
+            s.admit("one".into(), state(dir.path(), "one", true))
+                .unwrap();
+            s.admit("two".into(), state(dir.path(), "two", true))
+                .unwrap();
+        }
+        // Each pass counts the turns still running and asks them to detach.
+        assert_eq!(detach_running_turns(&shared), 2);
+        assert_eq!(detach_running_turns(&shared), 2, "repeatable");
+        let s = lock_sessions(&shared);
+        assert!(s.get("one").unwrap().cancel.is_detached());
+        assert!(s.get("two").unwrap().cancel.is_detached());
+        assert!(
+            !s.get("idle").unwrap().cancel.is_detached(),
+            "a settled session is not flagged: the flag would detach its next turn"
+        );
+        // A turn that settled stops being counted.
+        *s.get("one").unwrap().busy.lock().unwrap() = false;
+        drop(s);
+        assert_eq!(detach_running_turns(&shared), 1);
     }
 
     #[test]
