@@ -22,6 +22,7 @@ fn snapshot(q: &mut ApprovalsState, rows: Vec<ApprovalRequest>, scope: Scope, no
 /// A state that has loaded the whole list once.
 fn known() -> ApprovalsState {
     let mut q = ApprovalsState::new();
+    q.apply(ApprovalsAction::FetchStarted(Scope::All));
     snapshot(&mut q, vec![], Scope::All, T0 - 1);
     q
 }
@@ -49,6 +50,7 @@ fn an_unloaded_list_is_unknown_not_zero_and_the_box_does_not_claim_nothing_waits
         (Badge::Unknown, 1)
     );
     // A successful fetch does.
+    q.apply(ApprovalsAction::FetchStarted(Scope::All));
     snapshot(&mut q, vec![pending("a", "s2")], Scope::All, T0 + 1);
     assert_eq!(q.waiting_badge(), Badge::Count(1));
     assert_eq!(q.composer("s1"), ComposerState::Open);
@@ -79,6 +81,7 @@ fn a_lost_connection_or_a_failed_fetch_makes_the_list_unknown_until_a_fetch_succ
 #[test]
 fn the_list_of_one_task_opens_only_that_tasks_box() {
     let mut q = ApprovalsState::new();
+    q.apply(ApprovalsAction::FetchStarted(Scope::Session("s1".into())));
     snapshot(&mut q, vec![], Scope::Session("s1".into()), T0);
     assert_eq!(q.composer("s1"), ComposerState::Open);
     assert_eq!(q.composer("s2"), ComposerState::Checking);
@@ -284,7 +287,8 @@ fn a_row_with_a_bad_id_is_refused_and_the_badge_says_so() {
     // A refused decision is not a request nobody can answer.
     resolved(&mut q, "a b", "approved", T0);
     assert_eq!(q.refused(), bad.len() + 1);
-    // A full list is the truth again.
+    // A full list that was asked for after them is the truth again.
+    q.apply(ApprovalsAction::FetchStarted(Scope::All));
     snapshot(&mut q, vec![pending("ok", "s")], Scope::All, T0 + 1);
     assert_eq!((q.refused(), q.waiting_badge()), (0, Badge::Count(1)));
     let row = &q.rows(Tab::Waiting, T0 + 1)[0];
@@ -311,35 +315,41 @@ fn a_status_this_version_does_not_know_is_corrected_by_a_known_one() {
     assert_eq!(outcome(&q, "b", T0 + 7), Some(Outcome::NotAllowed));
 }
 
+fn made_at(id: &str, t: u64) -> ApprovalRequest {
+    let mut r = pending(id, "s");
+    r.created_at_ms = Some(t);
+    r
+}
+
 #[test]
-fn the_selection_always_points_at_a_card_of_the_shown_list() {
+fn the_selection_never_jumps_to_a_card_the_user_did_not_read() {
     let mut q = known();
-    let mut late = pending("late", "s");
-    late.created_at_ms = Some(T0 + 30_000);
-    requested(&mut q, late, T0 + 30_000);
-    requested(&mut q, pending("early", "s"), T0 + 30_000);
-    requested(&mut q, pending("later", "s"), T0 + 31_000);
+    requested(&mut q, made_at("late", T0 + 30_000), T0 + 30_000);
+    requested(&mut q, made_at("early", T0), T0 + 30_000);
+    // A request that appears while nothing is selected is selected; a later
+    // one does not take the selection.
     assert_eq!(q.selected(), Some("late"));
-    // The selected request is decided: the one that waits longest is next.
+    // The selected request is decided: no card is armed, nothing else is.
     resolved(&mut q, "late", "approved", T0 + 40_000);
-    assert_eq!(q.selected(), Some("early"));
-    assert_eq!(q.selected_card(T0).unwrap().id, "early");
-    // A request of the other tab cannot be selected.
-    assert!(!q.apply(ApprovalsAction::Select(Some("late".into()))));
-    assert_eq!(q.selected(), Some("early"));
-    // Another tab, another list: the selection follows (newest decided).
-    q.apply(ApprovalsAction::SelectTab(Tab::Decided));
-    assert_eq!(q.selected(), Some("late"));
-    assert!(q
-        .rows(Tab::Decided, T0)
-        .iter()
-        .all(|r| r.selected == (r.id == "late")));
-    q.apply(ApprovalsAction::SelectTab(Tab::Waiting));
-    assert_eq!(q.selected(), Some("early"));
-    // Nothing waits: no selection.
-    resolved(&mut q, "early", "denied", T0 + 50_000);
-    resolved(&mut q, "later", "denied", T0 + 50_000);
+    assert_eq!((q.selected(), q.selected_card(T0).is_none()), (None, true));
+    assert!(q.rows(Tab::Waiting, T0).iter().all(|r| !r.selected));
+    // The same when the selected request expires on a tick.
+    assert!(q.apply(ApprovalsAction::Select(Some("early".into()))));
+    q.apply(ApprovalsAction::Tick(T0 + 900_000));
     assert_eq!(q.selected(), None);
-    requested(&mut q, pending("new", "s"), T0 + 60_000);
-    assert_eq!(q.selected(), Some("new"));
+    // A request of the other tab cannot be selected.
+    requested(&mut q, made_at("c", T0 + 900_001), T0 + 900_001);
+    assert_eq!(q.selected(), Some("c"));
+    assert!(!q.apply(ApprovalsAction::Select(Some("late".into()))));
+    assert_eq!(q.selected(), Some("c"));
+    // Another tab, another list: the user's move shows its newest card.
+    q.apply(ApprovalsAction::SelectTab(Tab::Decided));
+    assert_eq!(q.selected(), Some("early"));
+    q.apply(ApprovalsAction::SelectTab(Tab::Waiting));
+    assert_eq!(q.selected(), Some("c"));
+    // Deselecting stays deselected until a request appears.
+    q.apply(ApprovalsAction::Select(None));
+    assert_eq!(q.selected(), None);
+    requested(&mut q, made_at("d", T0 + 900_002), T0 + 900_002);
+    assert_eq!(q.selected(), Some("c"), "the one that waits longest");
 }

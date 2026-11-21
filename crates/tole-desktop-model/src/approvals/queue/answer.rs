@@ -22,7 +22,8 @@ impl ApprovalsState {
         }
         if e.wait.expired(now) {
             self.expire(now);
-            self.follow_selection();
+            self.drop_selection();
+            self.refresh_if_room();
             return Err(AnswerError::Expired);
         }
         e.phase = Phase::Waiting {
@@ -65,20 +66,26 @@ impl ApprovalsState {
     }
 
     /// The decision call did not complete. The request waits again only if it
-    /// is still pending and in time; a conflict makes the list stale.
+    /// is still pending and in time; a conflict (someone answered first) makes
+    /// it "no longer waiting" instead, with no buttons, until the server's
+    /// word or the next snapshot says otherwise; and makes the list stale.
     pub(super) fn answer_failed(&mut self, id: &str, conflict: bool, now: u64) -> bool {
         let mut changed = false;
         if let Some(e) = self.entries.get_mut(id) {
             if matches!(e.phase, Phase::Waiting { answering: Some(_) }) {
-                e.phase = if e.wait.expired(now) {
-                    Phase::Decided {
-                        outcome: Outcome::Expired,
+                let outcome = match (conflict, e.wait.expired(now)) {
+                    (true, _) => Some(Outcome::Closed),
+                    (false, true) => Some(Outcome::Expired),
+                    (false, false) => None,
+                };
+                e.phase = match outcome {
+                    Some(outcome) => Phase::Decided {
+                        outcome,
                         at_ms: now,
                         provisional: true,
                         answer_lost: false,
-                    }
-                } else {
-                    Phase::Waiting { answering: None }
+                    },
+                    None => Phase::Waiting { answering: None },
                 };
                 changed = true;
             }

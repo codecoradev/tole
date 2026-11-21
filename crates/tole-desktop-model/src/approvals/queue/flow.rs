@@ -5,10 +5,10 @@ use std::collections::HashSet;
 
 use super::super::request::{ApprovalRequest, Outcome};
 use super::super::wait::Wait;
-use super::ingest::admit;
+use super::ingest::{admit, valid_key, MAX_SESSION_ID_LEN};
 use super::{
-    waiting, ApprovalsState, Entry, Overflow, Phase, Scope, Tombstones, MAX_DECIDED,
-    MAX_KNOWN_SESSIONS, MAX_OVERFLOW, MAX_TOMBSTONES, MAX_WAITING,
+    waiting, ApprovalsState, Entry, Overflow, Phase, Refusal, Scope, Tombstones, MAX_DECIDED,
+    MAX_KNOWN_SESSIONS, MAX_OVERFLOW, MAX_REFUSALS, MAX_TOMBSTONES, MAX_WAITING,
 };
 
 impl Tombstones {
@@ -34,11 +34,57 @@ impl ApprovalsState {
     fn admitted(&mut self, request: ApprovalRequest) -> Option<ApprovalRequest> {
         let pending_like = Outcome::of_status(&request.status).is_none()
             || !Outcome::status_is_known(&request.status);
+        let session = request.session_id.clone();
         let r = admit(request);
         if r.is_none() && pending_like {
-            self.refused = self.refused.saturating_add(1);
+            self.refuse(session);
         }
         r
+    }
+
+    /// Remembers a refused row that may be pending: the task it names is not
+    /// known to be free. An unusable session id could be any task's.
+    fn refuse(&mut self, session: Option<String>) {
+        self.seq += 1;
+        let seq = self.seq;
+        let refusal = match session.filter(|s| !s.is_empty()) {
+            None => Refusal {
+                seq,
+                session: None,
+                any_session: false,
+            },
+            Some(s) if valid_key(&s, MAX_SESSION_ID_LEN) => Refusal {
+                seq,
+                session: Some(s),
+                any_session: false,
+            },
+            Some(_) => Refusal {
+                seq,
+                session: None,
+                any_session: true,
+            },
+        };
+        if self.refusals.len() >= MAX_REFUSALS {
+            // No room to name it: the newest stands for all of them.
+            let last = self.refusals.len() - 1;
+            self.refusals[last] = Refusal {
+                seq,
+                session: None,
+                any_session: true,
+            };
+        } else {
+            self.refusals.push(refusal);
+        }
+    }
+
+    /// Asks for a refresh when room frees while requests over the cap are
+    /// uncounted: the fetch lists them and they get a card.
+    pub(super) fn refresh_if_room(&mut self) -> bool {
+        if self.stale || (self.overflow.is_empty() && self.saturated.is_none()) {
+            return false;
+        }
+        self.stale = self.waiting_listed() < MAX_WAITING;
+        self.stale
     }
 
     pub(super) fn requested(&mut self, request: ApprovalRequest, now: u64) -> bool {
@@ -47,7 +93,13 @@ impl ApprovalsState {
         };
         match Outcome::of_status(&request.status) {
             Some(outcome) => self.decide(request, outcome, now, false, now), // a decision
-            None => self.pending(request, now),
+            None => {
+                let appeared = self.pending(request, now);
+                if appeared {
+                    self.auto_select();
+                }
+                appeared
+            }
         }
     }
 
@@ -96,7 +148,8 @@ impl ApprovalsState {
         let id = request.id.clone();
         match self.entries.get_mut(&id) {
             Some(e) => {
-                e.phase = phase; // revived
+                e.request = request; // revived: the server's pending row
+                e.phase = phase;
                 e.seq = seq;
             }
             None => {
@@ -121,7 +174,8 @@ impl ApprovalsState {
             return false;
         }
         if self.overflow.len() >= MAX_OVERFLOW {
-            return !std::mem::replace(&mut self.overflow_saturated, true);
+            self.seq = seq;
+            return self.saturated.replace(seq).is_none();
         }
         self.seq = seq;
         let session = request.session_id.clone();
@@ -162,6 +216,7 @@ impl ApprovalsState {
                 if final_ || (provisional && !waiting(e)) || e.phase == phase {
                     return changed;
                 }
+                e.request.status = request.status; // the card reads the status too
                 e.phase = phase;
             }
             None if self.tombstones.has(&request.id) => return changed,
@@ -239,38 +294,43 @@ impl ApprovalsState {
 
     /// A whole list from the server. Pending rows are taken first (a request
     /// that needs an answer must not lose its place to history), then decided
-    /// ones, newest first, at most [`MAX_DECIDED`], stamped with the time the
-    /// request was made (the list does not say when it was decided): they never
-    /// push out an answer given here. What the list omits is closed only if
-    /// it was seen before the fetch started.
+    /// ones: those of requests that wait here always, the others newest first
+    /// and at most [`MAX_DECIDED`], stamped with the time the request was made
+    /// (the list does not say when it was decided): they never push out an
+    /// answer given here. A snapshot that answers a `FetchStarted` (a marked
+    /// one) also closes what the list omits and the queue saw before the
+    /// fetch started, discounts the refusals and the overflow of that time,
+    /// and makes the list known. An unmarked one only merges its rows.
     pub(super) fn snapshot(&mut self, rows: Vec<ApprovalRequest>, scope: Scope, now: u64) -> bool {
         let mark = self.marks.remove(&scope);
         let seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         let mut changed = false;
-        if scope == Scope::All {
-            // Rebuilt from the list; what the stream announced since stays.
-            let before = self.overflow.len();
-            self.overflow.retain(|_, o| mark.is_none_or(|m| o.seq > m));
-            changed |= self.overflow.len() != before;
-            changed |= self.refused != 0;
-            self.refused = 0;
-        }
-        // First, so the room it frees is there for the rows of the list.
         if let Some(mark) = mark {
+            changed |= self.account_for(&scope, mark);
+            // First, so the room it frees is there for the rows of the list.
             changed |= self.close_omitted(&scope, &seen, mark, now);
         }
-        let (pending, mut decided): (Vec<_>, Vec<_>) = rows
+        let (pending, decided): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|r| Outcome::of_status(&r.status).is_none());
+        let (mine, mut rest): (Vec<_>, Vec<_>) = decided.into_iter().partition(|r| {
+            (self.entries.get(&r.id)).is_some_and(waiting) || self.overflow.contains_key(&r.id)
+        });
         for row in pending {
-            if let Some(row) = self.admitted(row) {
-                changed |= self.pending(row, now);
-            } else {
-                changed = true;
+            match self.admitted(row) {
+                Some(row) => {
+                    let appeared = self.pending(row, now);
+                    changed |= appeared;
+                    if appeared {
+                        self.auto_select();
+                    }
+                }
+                None => changed = true,
             }
         }
-        decided.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
-        for row in decided.into_iter().take(MAX_DECIDED) {
+        rest.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
+        rest.truncate(MAX_DECIDED);
+        for row in mine.into_iter().chain(rest) {
             let Some(row) = self.admitted(row) else {
                 continue;
             };
@@ -278,15 +338,43 @@ impl ApprovalsState {
             let at = row.created_at_ms.unwrap_or(0).min(now);
             changed |= self.decide(row, outcome, at, false, now);
         }
-        match &scope {
-            Scope::All => changed |= !std::mem::replace(&mut self.known_all, true),
-            Scope::Session(id) if self.known_sessions.len() < MAX_KNOWN_SESSIONS => {
-                changed |= self.known_sessions.insert(id.clone());
+        if mark.is_some() {
+            match &scope {
+                Scope::All => changed |= !std::mem::replace(&mut self.known_all, true),
+                Scope::Session(id) if self.known_sessions.len() < MAX_KNOWN_SESSIONS => {
+                    changed |= self.known_sessions.insert(id.clone());
+                }
+                Scope::Session(_) => {}
             }
-            Scope::Session(_) => {}
+            changed |= std::mem::replace(&mut self.stale, false);
         }
-        changed |= std::mem::replace(&mut self.stale, false);
+        changed |= self.refresh_if_room();
         changed
+    }
+
+    /// What a fetch that started at `mark` accounts for: the requests over the
+    /// cap, the refused rows and the loss of count that it could have listed
+    /// (a full list is rebuilt from the reply; what came later stays).
+    fn account_for(&mut self, scope: &Scope, mark: u64) -> bool {
+        let (over, refused) = (self.overflow.len(), self.refusals.len());
+        match scope {
+            Scope::All => {
+                self.overflow.retain(|_, o| o.seq > mark);
+                self.refusals.retain(|r| r.seq > mark);
+            }
+            Scope::Session(id) => {
+                let ours = |s: Option<&str>| s == Some(id.as_str());
+                self.overflow
+                    .retain(|_, o| o.seq > mark || !ours(o.session.as_deref()));
+                self.refusals
+                    .retain(|r| r.seq > mark || !ours(r.session.as_deref()));
+            }
+        }
+        let lost = *scope == Scope::All && self.saturated.is_some_and(|s| s <= mark);
+        if lost {
+            self.saturated = None;
+        }
+        lost || over != self.overflow.len() || refused != self.refusals.len()
     }
 
     /// Waiting requests of `scope` the list omits and the queue saw before the

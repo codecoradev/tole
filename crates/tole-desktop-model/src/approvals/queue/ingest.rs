@@ -7,7 +7,7 @@ use super::super::summary::{bound, ActionSummary, MAX_DETAIL_CHARS, MAX_DISPLAY_
 /// Longest approval id accepted.
 pub const MAX_ID_LEN: usize = 128;
 /// Longest session id accepted (the core's own rule).
-const MAX_SESSION_ID_LEN: usize = 64;
+pub(super) const MAX_SESSION_ID_LEN: usize = 64;
 /// Longest fingerprint accepted; it is sent back as it came, never cut.
 const MAX_FINGERPRINT_LEN: usize = 256;
 const MAX_CODE_CHARS: usize = 200;

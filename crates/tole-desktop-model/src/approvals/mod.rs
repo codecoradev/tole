@@ -43,4 +43,6 @@ mod fixtures;
 #[cfg(test)]
 mod queue_guard_tests;
 #[cfg(test)]
+mod queue_review_tests;
+#[cfg(test)]
 mod queue_tests;

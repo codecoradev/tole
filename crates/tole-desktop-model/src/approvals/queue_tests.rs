@@ -114,9 +114,20 @@ fn an_answer_is_sent_once_and_the_first_reply_wins() {
         Err(AnswerError::NotWaiting)
     );
     assert!(!q.card("dap-7", T0 + 11).unwrap().answerable());
-    // A failed call gives the request back; a conflict makes the list stale.
-    q.apply(ApprovalsAction::AnswerFailed("dap-7".into(), true, T0 + 12));
-    assert!(q.is_stale() && q.card("dap-7", T0 + 12).unwrap().state == CardState::Waiting);
+    // A failed call gives the request back.
+    q.apply(ApprovalsAction::AnswerFailed(
+        "dap-7".into(),
+        false,
+        T0 + 12,
+    ));
+    assert!(q.card("dap-7", T0 + 12).unwrap().state == CardState::Waiting);
+    // A conflict (someone answered first): no buttons, the list is stale.
+    q.answer("dap-7", Decision::DontAllow, T0 + 13).unwrap();
+    q.apply(ApprovalsAction::AnswerFailed("dap-7".into(), true, T0 + 14));
+    let card = q.card("dap-7", T0 + 15).unwrap();
+    assert!(q.is_stale() && !card.answerable());
+    assert_eq!(card.state, CardState::Decided(Outcome::Closed));
+    q.apply(ApprovalsAction::FetchStarted(Scope::All));
     q.apply(ApprovalsAction::Snapshot(vec![], Scope::All, T0 + 902_000));
     assert!(!q.is_stale());
 }
@@ -157,6 +168,7 @@ fn a_snapshot_decides_what_the_server_no_longer_lists() {
 #[test]
 fn the_composer_is_disabled_while_the_turn_waits() {
     let mut q = ApprovalsState::new();
+    q.apply(ApprovalsAction::FetchStarted(Scope::All));
     q.apply(ApprovalsAction::Snapshot(vec![], Scope::All, T0 - 1));
     assert_eq!(q.composer("s1"), ComposerState::Open);
     requested(&mut q, req("a", "s1", "create_file", "adds"), T0);

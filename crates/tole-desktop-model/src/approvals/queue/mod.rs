@@ -3,12 +3,19 @@
 //! What the queue knows, and what it does not:
 //!
 //! - The list is **Unknown** until a [`ApprovalsAction::Snapshot`] of
-//!   [`Scope::All`] arrives, and again after [`ApprovalsAction::FetchFailed`]
-//!   or [`ApprovalsAction::ConnectionLost`] (frames may have been missed).
-//!   While it is unknown the sidebar badge is [`Badge::Unknown`](crate::skills::Badge::Unknown) (never a
-//!   zero) and the message box of a task with nothing listed is
-//!   [`ComposerState::Checking`]: disabled, with its own hint, until a fetch
-//!   succeeds. The adapter must retry a failed fetch, or the box stays disabled.
+//!   [`Scope::All`] arrives that answers a [`ApprovalsAction::FetchStarted`],
+//!   and again after [`ApprovalsAction::FetchFailed`] or
+//!   [`ApprovalsAction::ConnectionLost`] (frames may have been missed). While
+//!   it is unknown the sidebar badge is
+//!   [`Badge::Unknown`](crate::skills::Badge::Unknown) (never a zero) and the
+//!   message box of a task with nothing listed is [`ComposerState::Checking`]:
+//!   disabled, with its own hint, until a fetch succeeds. The adapter must
+//!   retry a failed fetch, or the box stays disabled.
+//! - Only a snapshot that consumed a `FetchStarted` of its scope, not
+//!   invalidated since by `FetchFailed` or `ConnectionLost`, makes the list
+//!   known. A late reply of a fetch that was in flight at a loss, or a
+//!   snapshot sent without `FetchStarted`, still merges its rows (it only adds
+//!   and updates) but leaves the list as unknown as it was and closes nothing.
 //!
 //! Adapter contract (the reducer has no clock and no network; the `u64` of an
 //! action is `now_ms` of the adapter):
@@ -19,30 +26,41 @@
 //! - An `approval_resolved` missed while disconnected is never sent: after a
 //!   reconnect the adapter sends `ConnectionLost`, then `FetchStarted(scope)`
 //!   before it calls `GET /approvals` and a `Snapshot` (or `FetchFailed`) with
-//!   the reply. A snapshot closes a waiting request it omits only when it saw
-//!   it before the fetch started: a request the stream announced after
-//!   `FetchStarted` is newer than the reply and stays. Without a
-//!   `FetchStarted` of its scope a snapshot closes nothing.
+//!   the reply. One fetch per scope at a time: the adapter drops the reply of a
+//!   fetch it superseded or cancelled. A snapshot closes a waiting request it
+//!   omits only when the queue saw it before the fetch started: a request the
+//!   stream announced after `FetchStarted` is newer than the reply and stays.
 //! - The first server answer wins and is final, except an outcome the local
 //!   clock, a missing row or a status this version does not know only guessed
 //!   (`provisional`): a later server word replaces it, and a `pending` row of
 //!   the server revives a guess that is still inside its wait.
 //! - A request waits up to 900 s, then it counts as denied: a
 //!   [`ApprovalsAction::Tick`] moves it to Decided as Expired without a click,
-//!   also one whose answer was sent and never confirmed.
+//!   also one whose answer was sent and never confirmed. A `409` on an answer
+//!   leaves the request as "no longer waiting" (nobody can answer it again)
+//!   until the server's word or the next snapshot says otherwise.
+//! - [`ApprovalsState::is_stale`] asks for a `GET /approvals`: after a `409`,
+//!   and when room frees while requests over the cap are uncounted (the fetch
+//!   lists them, and they get a card before they expire).
 //!
 //! Bounds: a request is cut to size and checked on the way in ([`ingest`]; ids
-//! outside `[A-Za-z0-9_-]` or too long are refused and counted), at most
-//! [`MAX_WAITING`] waiting requests are kept (more are only counted, and the
-//! badge then is `Unknown`), [`MAX_DECIDED`] decided ones, and the ids of
-//! trimmed decided requests are remembered ([`MAX_TOMBSTONES`]) so a repeated
-//! frame never brings one back as waiting. `apply` never copies the state.
+//! outside `[A-Za-z0-9_-]` or too long are refused and counted, and the task
+//! they name stays `Checking`), at most [`MAX_WAITING`] waiting requests are
+//! kept (more are only counted, and the badge then is `Unknown`),
+//! [`MAX_DECIDED`] decided ones, and the ids of trimmed decided requests are
+//! remembered ([`MAX_TOMBSTONES`]) so a repeated frame never brings one back as
+//! waiting. `apply` never copies the state, and a list row is worked out
+//! without building the card.
 //!
-//! Selection: the selected request is always one the shown tab lists. When the
-//! selected request stops waiting (or its tab is left), the selection moves to
-//! the request that waits longest (Waiting tab; soonest deadline) or the
-//! newest decided one (Decided tab); the detail pane and the keys act on the
-//! selected card, so they always agree with the list.
+//! Selection: the selected request is the card the page draws, and it is
+//! always one the shown tab lists. A request is selected by the user, or
+//! automatically only when it appears while nothing is selected (or the user
+//! changes tab). When the selected request stops waiting the selection becomes
+//! `None`: it never jumps to another request, so no key can act on a card the
+//! user did not read. Keys and buttons must call [`ApprovalsState::answer`]
+//! with the id of the card the user acted on, never with whatever
+//! `selected()` is when the event is handled; with no selection a key answers
+//! nothing.
 
 mod answer;
 mod flow;
@@ -68,6 +86,8 @@ pub const MAX_TOMBSTONES: usize = 2_000;
 const MAX_OVERFLOW: usize = 1_000;
 /// Most sessions whose own list is remembered as known.
 const MAX_KNOWN_SESSIONS: usize = 256;
+/// Most refused rows remembered one by one.
+const MAX_REFUSALS: usize = 256;
 
 /// Whether the message box of a task works. A turn that stopped for an answer
 /// cannot take a new message (board S4); the task view reads this, so it
@@ -188,6 +208,17 @@ struct Overflow {
     seq: u64,
 }
 
+/// A pending-looking row that was refused: a request nobody can see or answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    seq: u64,
+    /// The task it names, when its session id is usable.
+    session: Option<String>,
+    /// Its session id is unusable (or the refusals overflowed): any task may
+    /// be the one.
+    any_session: bool,
+}
+
 /// The ids of decided requests trimmed from the list, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Tombstones {
@@ -230,11 +261,12 @@ pub struct ApprovalsState {
     marks: HashMap<Scope, u64>,
     seq: u64,
     overflow: HashMap<String, Overflow>,
-    /// More requests overflowed than [`MAX_OVERFLOW`] can name.
-    overflow_saturated: bool,
-    /// Pending-looking rows refused (a bad id or field) since the last full
-    /// snapshot.
-    refused: usize,
+    /// `seq` of the last time more requests overflowed than [`MAX_OVERFLOW`]
+    /// can name; a full snapshot that was started after it rebuilds the list.
+    saturated: Option<u64>,
+    /// Pending-looking rows refused (a bad id or field) and not yet accounted
+    /// for by a full snapshot started after them.
+    refusals: Vec<Refusal>,
     tombstones: Tombstones,
 }
 
@@ -254,18 +286,18 @@ impl ApprovalsState {
             ApprovalsAction::FetchFailed(scope) => self.fetch_failed(&scope),
             ApprovalsAction::ConnectionLost => self.connection_lost(),
             ApprovalsAction::Tick(now) => self.expire(now),
-            ApprovalsAction::Select(id) => {
-                let old = self.selected.clone();
-                self.selected = id.filter(|i| self.entries.contains_key(i));
-                self.follow_selection();
-                self.selected != old
+            ApprovalsAction::Select(id) => self.select(id),
+            ApprovalsAction::SelectTab(tab) => {
+                let moved = std::mem::replace(&mut self.tab, tab) != tab;
+                moved | self.drop_selection() | self.auto_select()
             }
-            ApprovalsAction::SelectTab(tab) => std::mem::replace(&mut self.tab, tab) != tab,
             ApprovalsAction::AnswerFailed(id, conflict, now) => {
                 self.answer_failed(&id, conflict, now)
             }
         };
-        self.follow_selection() | changed
+        let dropped = self.drop_selection();
+        let refresh = self.refresh_if_room();
+        changed | dropped | refresh
     }
 
     /// The tab shown; Waiting until the user picks one.
@@ -277,17 +309,19 @@ impl ApprovalsState {
         self.selected.as_deref()
     }
 
-    /// An answer was refused as a conflict and no snapshot came since: the
-    /// adapter should refresh with `GET /approvals`.
+    /// The adapter should refresh with `GET /approvals`: an answer was refused
+    /// as a conflict, or room freed while requests over the cap are uncounted.
+    /// A snapshot that answers a `FetchStarted` clears it.
     pub fn is_stale(&self) -> bool {
         self.stale
     }
 
-    /// Rows refused since the last full snapshot (an id outside the charset,
-    /// a field too long to be true): a protocol problem the adapter may log.
-    /// While any is counted the badge is `Unknown`.
+    /// Rows refused and not yet accounted for by a full snapshot started
+    /// after them (an id outside the charset, a field too long to be true): a
+    /// protocol problem the adapter may log. While any is counted the badge is
+    /// `Unknown` and the tasks they may belong to are `Checking`.
     pub fn refused(&self) -> usize {
-        self.refused
+        self.refusals.len()
     }
 }
 

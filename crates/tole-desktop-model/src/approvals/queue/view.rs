@@ -1,7 +1,8 @@
 //! What the views read: the badge, the composer, the lists and the cards.
 
-use super::super::card::{ApprovalCard, CardState};
+use super::super::card::{headline, ApprovalCard, CardState};
 use super::super::strings;
+use super::super::summary::{bound, ActionSummary, MAX_DISPLAY_CHARS};
 use super::{waiting, ApprovalsState, ComposerState, Entry, Phase, Row, Tab};
 use crate::skills::Badge;
 
@@ -25,8 +26,8 @@ impl ApprovalsState {
     pub fn waiting_badge(&self) -> Badge {
         let complete = self.known_all
             && self.overflow.is_empty()
-            && !self.overflow_saturated
-            && self.refused == 0;
+            && self.saturated.is_none()
+            && self.refusals.is_empty();
         if complete {
             Badge::Count(self.waiting_count())
         } else {
@@ -50,7 +51,8 @@ impl ApprovalsState {
             };
         }
         let known = self.known_all || self.known_sessions.contains(session_id);
-        if known && !self.overflow_saturated {
+        let refused = (self.refusals.iter()).any(|r| r.any_session || mine(r.session.as_deref()));
+        if known && self.saturated.is_none() && !refused {
             ComposerState::Open
         } else {
             ComposerState::Checking
@@ -89,28 +91,39 @@ impl ApprovalsState {
         self.card(self.selected.as_deref()?, now)
     }
 
+    /// A list row: worked out from the summary alone, without the preview and
+    /// the details of a card (a list of 200 large requests stays cheap).
     fn row(&self, e: &Entry, now: u64) -> Row {
-        let card = ApprovalCard::build(&e.request, card_state(e), e.wait, now);
+        let unknown;
+        let summary = match &e.request.summary {
+            Some(s) => s,
+            None => {
+                unknown = ActionSummary::unknown(&e.request.tool, None);
+                &unknown
+            }
+        };
+        let head = headline(&e.request, summary);
         let outcome = match e.phase {
             Phase::Decided { outcome, .. } => Some(outcome),
             Phase::Waiting { .. } => None,
         };
+        let secs = e.wait.remaining_secs(now);
         Row {
             id: e.request.id.clone(),
             session_id: e.request.session_id.clone(),
-            wording: card.wording,
-            care: card.care,
-            title: match card.outside_folder {
+            wording: head.wording,
+            care: head.care,
+            title: match head.outside_folder {
                 true => format!(
                     "{}{}",
-                    strings::list_title(card.wording),
+                    strings::list_title(head.wording),
                     strings::LIST_OUTSIDE_SUFFIX
                 ),
-                false => strings::list_title(card.wording).to_owned(),
+                false => strings::list_title(head.wording).to_owned(),
             },
-            outside_folder: card.outside_folder,
-            subject: card.subject,
-            left: card.left_short.filter(|_| outcome.is_none()),
+            outside_folder: head.outside_folder,
+            subject: bound(&summary.target, MAX_DISPLAY_CHARS).0,
+            left: outcome.is_none().then(|| strings::left_short(secs)),
             outcome,
             outcome_label: outcome.map(strings::outcome_label),
             selected: self.selected.as_deref() == Some(e.request.id.as_str()),
@@ -118,16 +131,42 @@ impl ApprovalsState {
         }
     }
 
-    /// Keeps the selection on a request the shown tab lists (see the module
-    /// doc); `true` when it moved.
-    pub(super) fn follow_selection(&mut self) -> bool {
+    /// The user picks a request of the shown tab; any other id is ignored.
+    pub(super) fn select(&mut self, id: Option<String>) -> bool {
+        let want_waiting = self.tab == Tab::Waiting;
+        let next = match id {
+            None => None,
+            Some(id) => match self.entries.get(&id) {
+                Some(e) if waiting(e) == want_waiting => Some(id),
+                _ => return false,
+            },
+        };
+        std::mem::replace(&mut self.selected, next.clone()) != next
+    }
+
+    /// The selection is cleared when its request no longer is on the shown
+    /// tab (decided, expired, trimmed, or another tab): it never moves to
+    /// another card by itself.
+    pub(super) fn drop_selection(&mut self) -> bool {
         let want_waiting = self.tab == Tab::Waiting;
         let listed = (self.selected.as_deref())
             .and_then(|id| self.entries.get(id))
             .is_some_and(|e| waiting(e) == want_waiting);
-        if listed {
+        if self.selected.is_some() && !listed {
+            self.selected = None;
+            return true;
+        }
+        false
+    }
+
+    /// Selects a request when nothing is selected: the one that waits longest
+    /// on the Waiting tab, the newest on the Decided tab. Called only when a
+    /// request appears or the user changes tab.
+    pub(super) fn auto_select(&mut self) -> bool {
+        if self.selected.is_some() {
             return false;
         }
+        let want_waiting = self.tab == Tab::Waiting;
         let tab = (self.entries.iter()).filter(|(_, e)| waiting(e) == want_waiting);
         let next = if want_waiting {
             tab.min_by_key(|(_, e)| (e.wait.deadline_ms(), e.seq))
@@ -137,10 +176,8 @@ impl ApprovalsState {
                 Phase::Waiting { .. } => (0, e.seq),
             })
         };
-        let next = next.map(|(id, _)| id.clone());
-        let moved = next != self.selected;
-        self.selected = next;
-        moved
+        self.selected = next.map(|(id, _)| id.clone());
+        self.selected.is_some()
     }
 }
 
