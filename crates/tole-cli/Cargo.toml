@@ -80,6 +80,10 @@ url = { version = "2", optional = true }
 # The typed client's contract test (tests/client_contract.rs) drives a real
 # `tole serve` through it. Test-only: tole-client never depends on this crate.
 tole-client = { path = "../tole-client" }
+# The desktop's serve supervisor is tested against the real `tole` binary
+# (tests/desktop_supervisor.rs). Test-only, and one way only: tole-desktop
+# never depends on this crate (scripts/desktop-check.sh enforces it).
+tole-desktop = { path = "../tole-desktop" }
 
 # Offline trace replay scorer (issue #107, gated behind the `replay`
 # feature since #118). Lives under evals/ and is operator-built for
