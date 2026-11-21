@@ -5,6 +5,7 @@
 //! through [`ShellState::apply`] so tests need no window. Nothing here talks
 //! to a serve yet; the typed client (#1040) will feed actions in later.
 
+use crate::tokens::Tone;
 use crate::Section;
 
 /// Stable handle of a folder in [`ShellState::folders`].
@@ -25,8 +26,22 @@ pub struct Folder {
 /// Which server the desktop talks to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// The serve on this machine (the only target before #1044).
+    /// The serve on this machine.
     ThisComputer,
+    /// A saved remote server, by the name the owner gave it (#1044).
+    Remote { name: String },
+}
+
+impl Target {
+    /// The status this target may show. A remote server is never `Connected`
+    /// until a remote client exists (#1044): anything that claims so is read
+    /// as `Connecting`, the less connected reading, whoever sets it.
+    pub fn clamp(&self, status: ConnectionStatus) -> ConnectionStatus {
+        match (self, status) {
+            (Target::Remote { .. }, ConnectionStatus::Connected) => ConnectionStatus::Connecting,
+            (_, status) => status,
+        }
+    }
 }
 
 /// How far the connection to the target is.
@@ -40,6 +55,19 @@ pub enum ConnectionStatus {
     Unreachable,
 }
 
+impl ConnectionStatus {
+    /// The colour meaning of the status dot. A preview claims nothing, so it
+    /// is neutral, and never the colour of "connected".
+    pub fn tone(self) -> Tone {
+        match self {
+            ConnectionStatus::Preview => Tone::Neutral,
+            ConnectionStatus::Connecting => Tone::Attention,
+            ConnectionStatus::Connected => Tone::Good,
+            ConnectionStatus::Unreachable => Tone::Bad,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     pub target: Target,
@@ -50,6 +78,9 @@ pub struct Connection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     SelectSection(Section),
+    /// The "New task" button: goes to the home page. Creating the session
+    /// comes with the typed client (#1040); until then this is all it does.
+    NewTask,
     /// `None` clears the folder selection. An unknown id is ignored.
     SelectFolder(Option<FolderId>),
     /// Adds a folder and selects it; a folder with the same path is selected
@@ -61,7 +92,16 @@ pub enum Action {
     /// Removes a folder; the selection is cleared if it pointed at it.
     RemoveFolder(FolderId),
     SetConnectionStatus(ConnectionStatus),
+    /// Replaces the target and the status together (see
+    /// [`Connection::resolve`]).
+    SetConnection(Connection),
     SetApprovalsPending(usize),
+    /// How many automations are on.
+    SetAutomationsOn(usize),
+    /// How many discussions need the owner.
+    SetDiscussionsNeedYou(usize),
+    /// How many skills and tools are new and not yet reviewed.
+    SetSkillsNew(usize),
     ToggleSidebar,
 }
 
@@ -72,6 +112,9 @@ pub struct ShellState {
     pub selected_folder: Option<FolderId>,
     pub connection: Connection,
     pub approvals_pending: usize,
+    pub automations_on: usize,
+    pub discussions_need_you: usize,
+    pub skills_new: usize,
     pub sidebar_collapsed: bool,
     next_folder_id: u32,
 }
@@ -88,6 +131,9 @@ impl ShellState {
                 status: ConnectionStatus::Connecting,
             },
             approvals_pending: 0,
+            automations_on: 0,
+            discussions_need_you: 0,
+            skills_new: 0,
             sidebar_collapsed: false,
             next_folder_id: 1,
         }
@@ -116,6 +162,7 @@ impl ShellState {
         let before = self.clone();
         match action {
             Action::SelectSection(section) => self.section = section,
+            Action::NewTask => self.section = Section::NewTask,
             Action::SelectFolder(None) => self.selected_folder = None,
             Action::SelectFolder(Some(id)) => {
                 if self.folders.iter().any(|f| f.id == id) {
@@ -129,8 +176,20 @@ impl ShellState {
                     self.selected_folder = None;
                 }
             }
-            Action::SetConnectionStatus(status) => self.connection.status = status,
+            Action::SetConnectionStatus(status) => {
+                self.connection.status = self.connection.target.clamp(status);
+            }
+            Action::SetConnection(connection) => {
+                let status = connection.target.clamp(connection.status);
+                self.connection = Connection {
+                    status,
+                    ..connection
+                };
+            }
             Action::SetApprovalsPending(count) => self.approvals_pending = count,
+            Action::SetAutomationsOn(count) => self.automations_on = count,
+            Action::SetDiscussionsNeedYou(count) => self.discussions_need_you = count,
+            Action::SetSkillsNew(count) => self.skills_new = count,
             Action::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
         }
         *self != before
@@ -172,12 +231,17 @@ impl ShellState {
         self.folders.iter().find(|f| f.id == id)
     }
 
-    /// The count shown next to a sidebar row, if the row has one.
+    /// The count shown next to a sidebar row: only the four rows that have
+    /// one, and only when it is above zero.
     pub fn badge(&self, section: Section) -> Option<usize> {
-        match section {
-            Section::Approvals if self.approvals_pending > 0 => Some(self.approvals_pending),
-            _ => None,
-        }
+        let count = match section {
+            Section::Approvals => self.approvals_pending,
+            Section::Automations => self.automations_on,
+            Section::Discussions => self.discussions_need_you,
+            Section::SkillsAndTools => self.skills_new,
+            Section::NewTask | Section::Search => 0,
+        };
+        (count > 0).then_some(count)
     }
 }
 
@@ -271,6 +335,18 @@ mod tests {
     }
 
     #[test]
+    fn new_task_goes_home_and_keeps_the_folder() {
+        let mut s = ShellState::placeholder();
+        let id = s.folders[0].id;
+        s.apply(Action::SelectFolder(Some(id)));
+        s.apply(Action::SelectSection(Section::Approvals));
+        assert!(s.apply(Action::NewTask));
+        assert_eq!(s.section, Section::NewTask);
+        assert_eq!(s.selected_folder, Some(id));
+        assert!(!s.apply(Action::NewTask));
+    }
+
+    #[test]
     fn add_folder_selects_it_and_ids_are_unique() {
         let mut s = ShellState::new();
         assert!(add(&mut s, "A", "/a"));
@@ -320,16 +396,50 @@ mod tests {
     }
 
     #[test]
-    fn only_approvals_has_a_badge_and_only_when_pending() {
+    fn four_rows_have_a_count_and_show_it_only_above_zero() {
         let mut s = ShellState::new();
-        assert_eq!(s.badge(Section::Approvals), None);
+        let counted = [
+            Section::Approvals,
+            Section::Automations,
+            Section::Discussions,
+            Section::SkillsAndTools,
+        ];
+        for section in counted {
+            assert_eq!(s.badge(section), None, "{section:?} at zero");
+        }
         s.apply(Action::SetApprovalsPending(2));
+        s.apply(Action::SetAutomationsOn(3));
+        s.apply(Action::SetDiscussionsNeedYou(1));
+        s.apply(Action::SetSkillsNew(4));
         assert_eq!(s.badge(Section::Approvals), Some(2));
-        for other in Section::ALL
-            .into_iter()
-            .filter(|x| *x != Section::Approvals)
-        {
-            assert_eq!(s.badge(other), None);
+        assert_eq!(s.badge(Section::Automations), Some(3));
+        assert_eq!(s.badge(Section::Discussions), Some(1));
+        assert_eq!(s.badge(Section::SkillsAndTools), Some(4));
+        assert_eq!(s.badge(Section::NewTask), None);
+        assert_eq!(s.badge(Section::Search), None);
+        // Back to zero hides the count again.
+        s.apply(Action::SetAutomationsOn(0));
+        assert_eq!(s.badge(Section::Automations), None);
+        assert!(!s.apply(Action::SetAutomationsOn(0)));
+    }
+
+    #[test]
+    fn a_preview_status_is_neutral_and_never_the_colour_of_connected() {
+        assert_eq!(ConnectionStatus::Preview.tone(), Tone::Neutral);
+        assert_ne!(
+            ConnectionStatus::Preview.tone(),
+            ConnectionStatus::Connected.tone()
+        );
+        let tones: Vec<_> = [
+            ConnectionStatus::Preview,
+            ConnectionStatus::Connecting,
+            ConnectionStatus::Connected,
+            ConnectionStatus::Unreachable,
+        ]
+        .map(ConnectionStatus::tone)
+        .into();
+        for (i, a) in tones.iter().enumerate() {
+            assert!(tones[i + 1..].iter().all(|b| a != b));
         }
     }
 

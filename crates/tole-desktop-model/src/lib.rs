@@ -13,6 +13,8 @@
 //!   rule for plain `http://` (owner decision D6); a remote entry holds a
 //!   reference to its credential, never the text.
 //! - [`ServeState`]: what the supervisor of the local serve reports.
+//! - [`Indicator`], [`Home`]: the header's connection indicator and the home
+//!   page, derived from [`ShellState`].
 //! - [`FocusTarget`]: the keyboard focus order of the shell.
 //! - [`shell_captures`]: the screens and states the offscreen render harness
 //!   draws, one image each.
@@ -24,6 +26,8 @@ mod connections;
 mod credential;
 mod endpoint;
 mod focus;
+mod header;
+mod home;
 mod section;
 mod serve_state;
 mod shell;
@@ -38,6 +42,8 @@ pub use connections::{
 pub use credential::{CredentialRef, CredentialStore, Secret, StoreError};
 pub use endpoint::{Endpoint, EndpointError, PlainHttp, Scheme};
 pub use focus::FocusTarget;
+pub use header::Indicator;
+pub use home::{Home, HomeFolder};
 pub use section::Section;
 pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};

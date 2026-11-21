@@ -6,7 +6,7 @@
 //! captures of its screen here; `scripts/desktop-render.sh` writes one PNG per
 //! capture (docs/design/desktop/README.md, "Reviewing the UI offscreen").
 
-use crate::{Action, ConnectionStatus, Section, ShellState};
+use crate::{Action, Connection, ConnectionStatus, Section, ShellState, Target};
 
 /// One image to render.
 #[derive(Debug, Clone)]
@@ -21,8 +21,9 @@ pub struct Capture {
     pub state: ShellState,
 }
 
-/// The board of the shell. The main area is still a placeholder, so only the
-/// top bar, the sidebar and the connection footer can be compared.
+/// The board of the shell and of the home page (the composer, "Pick up where
+/// you left off" and "Coming up" are not built yet: compare the header, the
+/// sidebar, the counts, the folders and the connection footer).
 const HOME: &str = "s2-home.png";
 
 fn capture(
@@ -56,6 +57,40 @@ fn status(status: ConnectionStatus) -> ShellState {
     preview_with([Action::SetConnectionStatus(status)])
 }
 
+/// The counts of board S2: 1 approval, 2 automations on, 1 discussion that
+/// needs the owner, 2 new skills and tools.
+fn counts() -> ShellState {
+    preview_with([
+        Action::SetApprovalsPending(1),
+        Action::SetAutomationsOn(2),
+        Action::SetDiscussionsNeedYou(1),
+        Action::SetSkillsNew(2),
+    ])
+}
+
+fn connected() -> ShellState {
+    status(ConnectionStatus::Connected)
+}
+
+/// A real folder and a remote server, both with names longer than the sidebar
+/// and the header can show: they must be cut, never overflow.
+fn long_names() -> ShellState {
+    let mut state = ShellState::new();
+    state.apply(Action::AddFolder {
+        name: "Quarterly invoices and receipts for the whole accounting department".to_owned(),
+        path: "~/Accounting/Quarterly".to_owned(),
+    });
+    state.apply(Action::SetConnection(Connection {
+        target: Target::Remote {
+            name: "Head office server in the main building, second floor".to_owned(),
+        },
+        status: ConnectionStatus::Connecting,
+    }));
+    state.apply(Action::SetApprovalsPending(12));
+    state.apply(Action::SetDiscussionsNeedYou(3));
+    state
+}
+
 /// Every state of the shell the model can produce today that is worth a look.
 pub fn shell_captures() -> Vec<Capture> {
     let first_folder = ShellState::placeholder().folders[0].id;
@@ -65,6 +100,8 @@ pub fn shell_captures() -> Vec<Capture> {
         path: "~/Contracts".to_owned(),
     });
     real.apply(Action::SetConnectionStatus(ConnectionStatus::Connected));
+    let mut empty_connected = ShellState::new();
+    empty_connected.apply(Action::SetConnectionStatus(ConnectionStatus::Connected));
     let preview = ShellState::placeholder;
     vec![
         capture("shell-preview", HOME, "", preview()),
@@ -80,6 +117,25 @@ pub fn shell_captures() -> Vec<Capture> {
             "",
             preview_with([Action::SetApprovalsPending(3)]),
         ),
+        capture("shell-counts", HOME, "", counts()),
+        capture(
+            "shell-sidebar-collapsed",
+            HOME,
+            "",
+            preview_with([Action::ToggleSidebar]),
+        ),
+        capture(
+            "shell-remote-server",
+            HOME,
+            "",
+            preview_with([Action::SetConnection(Connection {
+                target: Target::Remote {
+                    name: "Office server".to_owned(),
+                },
+                status: ConnectionStatus::Connecting,
+            })]),
+        ),
+        capture("shell-long-names", HOME, "", long_names()),
         capture("shell-section-search", HOME, "", section(Section::Search)),
         capture(
             "shell-section-approvals",
@@ -111,12 +167,7 @@ pub fn shell_captures() -> Vec<Capture> {
             "",
             status(ConnectionStatus::Connecting),
         ),
-        capture(
-            "shell-connected",
-            HOME,
-            "",
-            status(ConnectionStatus::Connected),
-        ),
+        capture("shell-connected", HOME, "", connected()),
         capture(
             "shell-unreachable",
             HOME,
@@ -124,13 +175,27 @@ pub fn shell_captures() -> Vec<Capture> {
             status(ConnectionStatus::Unreachable),
         ),
         capture("shell-no-folders", HOME, "", ShellState::new()),
+        capture("shell-no-folders-connected", HOME, "", empty_connected),
         capture("shell-real-folder", HOME, "", real),
-        capture("shell-focus-first-section", HOME, "tab", preview()),
+        capture("shell-focus-sidebar-toggle", HOME, "tab", preview()),
+        capture("shell-focus-first-section", HOME, "tab tab", preview()),
         capture(
             "shell-focus-first-folder",
             HOME,
-            "tab tab tab tab tab tab tab",
+            "tab tab tab tab tab tab tab tab",
             preview(),
+        ),
+        capture(
+            "shell-focus-home-folder",
+            HOME,
+            "tab tab tab tab tab tab tab tab tab tab tab",
+            preview(),
+        ),
+        capture(
+            "shell-focus-new-task",
+            HOME,
+            "tab tab tab tab tab tab tab tab tab tab tab tab tab tab",
+            connected(),
         ),
     ]
 }
@@ -138,6 +203,7 @@ pub fn shell_captures() -> Vec<Capture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FocusTarget;
     use std::collections::HashSet;
 
     #[test]
@@ -193,23 +259,68 @@ mod tests {
     }
 
     #[test]
-    fn the_focus_captures_press_enough_tabs_to_reach_their_row() {
+    fn each_focus_capture_presses_exactly_the_tabs_that_reach_its_control() {
         let captures = shell_captures();
-        let by_name = |n: &str| captures.iter().find(|c| c.name == n).expect("capture");
-        // Tab visits the six sections, then the folders: the 7th stop is the first folder.
-        assert_eq!(
-            by_name("shell-focus-first-section")
-                .keys
-                .split_whitespace()
-                .count(),
-            1
-        );
-        assert_eq!(
-            by_name("shell-focus-first-folder")
-                .keys
-                .split_whitespace()
-                .count(),
-            Section::ALL.len() + 1
-        );
+        let first_folder = ShellState::placeholder().folders[0].id;
+        for (name, target) in [
+            ("shell-focus-sidebar-toggle", FocusTarget::SidebarToggle),
+            (
+                "shell-focus-first-section",
+                FocusTarget::Section(Section::NewTask),
+            ),
+            (
+                "shell-focus-first-folder",
+                FocusTarget::Folder(first_folder),
+            ),
+            (
+                "shell-focus-home-folder",
+                FocusTarget::HomeFolder(first_folder),
+            ),
+            ("shell-focus-new-task", FocusTarget::HomeStart),
+        ] {
+            let c = captures.iter().find(|c| c.name == name).expect(name);
+            let presses = c.keys.split_whitespace().count();
+            assert_eq!(
+                c.state.tab_order().get(presses - 1),
+                Some(&target),
+                "{name}: {presses} tabs"
+            );
+        }
+    }
+
+    #[test]
+    fn every_count_the_shell_can_show_has_a_capture_and_zero_hides_it() {
+        let captures = shell_captures();
+        let counted = [
+            Section::Approvals,
+            Section::Automations,
+            Section::Discussions,
+            Section::SkillsAndTools,
+        ];
+        assert!(captures
+            .iter()
+            .any(|c| counted.iter().all(|s| c.state.badge(*s).is_some())));
+        let preview = &captures[0];
+        assert!(counted.iter().all(|s| preview.state.badge(*s).is_none()));
+    }
+
+    #[test]
+    fn the_header_states_are_captured() {
+        let captures = shell_captures();
+        assert!(captures.iter().any(|c| c.state.sidebar_collapsed));
+        assert!(captures
+            .iter()
+            .any(|c| matches!(c.state.connection.target, Target::Remote { .. })));
+        // A name longer than the sidebar can hold, to see it cut.
+        assert!(captures.iter().any(|c| c
+            .state
+            .folders
+            .iter()
+            .any(|f| f.name.chars().count() > 40)));
+        // The home page with no folder, and one that can start a task.
+        assert!(captures
+            .iter()
+            .any(|c| c.state.folders.is_empty() && c.state.home().can_start));
+        assert!(captures.iter().any(|c| c.state.home().can_start));
     }
 }
