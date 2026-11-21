@@ -167,14 +167,7 @@ fn home(serve: &Serve) -> std::path::PathBuf {
 }
 
 fn spawn(base: &str, env: &[(&str, &str)]) -> Serve {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-images-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = serve_harness::unique_dir("tole-images");
     std::fs::create_dir_all(dir.join("codecora-home")).unwrap();
     let home = dir.join("codecora-home");
     let mut all: Vec<(&str, &str)> = vec![("CODECORA_HOME", home.to_str().unwrap())];
@@ -443,4 +436,14 @@ fn quotas_are_enforced_per_session_and_in_total() {
         .as_str()
         .unwrap()
         .contains("TOLE_SERVE_IMAGE_TOTAL_QUOTA"));
+}
+
+/// Two serves started in the same clock instant never share a directory: a
+/// repeat made one test's `Drop` remove the workspace of another, which then
+/// failed with `No such file or directory` (the same collision as #915).
+#[test]
+fn directories_drawn_in_the_same_instant_are_never_the_same() {
+    let a = serve_harness::unique_dir_at("tole-images", 7);
+    let b = serve_harness::unique_dir_at("tole-images", 7);
+    assert_ne!(a, b);
 }

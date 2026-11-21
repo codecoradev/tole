@@ -29,9 +29,28 @@ pub fn workspace_dir() -> std::path::PathBuf {
 
 /// [`workspace_dir`] for a given clock reading (the test pins it).
 pub fn workspace_dir_at(nanos: u128) -> std::path::PathBuf {
+    unique_dir_at("tole-entries", nanos)
+}
+
+/// A directory name under the temp dir that no other call in this process can
+/// repeat, whatever the clock says: `prefix`, the process id, a per-process
+/// counter and the clock reading. Every test binary that makes its own
+/// workspace goes through this one counter (#915, and the same collision in
+/// `serve_images`, where two tests of one binary drew the same name and one
+/// test's `Drop` removed the directory the other was using).
+pub fn unique_dir(prefix: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    unique_dir_at(prefix, nanos)
+}
+
+/// [`unique_dir`] for a given clock reading (a test pins it).
+pub fn unique_dir_at(prefix: &str, nanos: u128) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tole-entries-{}-{n}-{nanos:x}", std::process::id()))
+    std::env::temp_dir().join(format!("{prefix}-{}-{n}-{nanos:x}", std::process::id()))
 }
 
 /// The HOME and CODECORA_HOME of the serve process over `dir`: a sibling of
