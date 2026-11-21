@@ -33,7 +33,12 @@ pub const EXPIRED_NOTE: &str = "The time ran out. It counted as Don't allow.";
 pub const CLOSED_NOTE: &str =
     "Tole is no longer waiting for an answer, and this app does not know how it ended.";
 
+pub const ANSWER_LOST_NOTE: &str = "The time ran out before your answer was confirmed. It may not have arrived. It counts as Don't allow unless the server says otherwise.";
+
 pub const COMPOSER_WAITING_HINT: &str = "Answer the request above to continue...";
+/// The box of a task whose requests are not known yet: it never claims that
+/// nothing waits.
+pub const COMPOSER_CHECKING_HINT: &str = "Checking whether Tole is waiting for you...";
 
 pub const NOT_REPORTED: &str = "Not reported by this server";
 pub const DETAIL_TOOL: &str = "Tool";
