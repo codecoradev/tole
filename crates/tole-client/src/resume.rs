@@ -39,7 +39,13 @@ impl Default for ReconnectPolicy {
 }
 
 /// What a [`ResumingStream`] yields.
+///
+/// `Event` is much larger than the other variants on some targets (240 bytes
+/// on macOS), which clippy's `large_enum_variant` flags. It is not boxed: the
+/// value is moved once per frame and then matched, and a `Box` would stop
+/// callers from matching `StreamItem::Event(Event::Entry(e))` in one pattern.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamItem {
     Event(Event),
     /// The server's keep-alive; the connection is healthy.

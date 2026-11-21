@@ -7311,6 +7311,8 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "gpui-pre-platform",
+ "libc",
+ "tole-client",
  "tole-desktop-model",
 ]
 

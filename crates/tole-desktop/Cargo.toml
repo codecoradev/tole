@@ -8,11 +8,12 @@ repository.workspace = true
 # Not published: the desktop ships as an application, not as a library.
 publish = false
 
-# No tole dependency yet beyond the desktop's own model crate. When the typed
-# client crate (#1040) is on develop the desktop depends on it and on nothing
-# else from tole: never on `tole-core`, `tole-tui` or `tole-cli` (the session
-# host). `scripts/desktop-check.sh deps` checks the resolved dependency graph
-# (cargo metadata), so renames, target tables and spelling do not matter.
+# The one tole crate this crate depends on is the typed client `tole-client`
+# (#1040), the thin client of `tole serve`: never `tole-core`, `tole-tui` or
+# `tole-cli` (the session host). `tole-core` is in the closure only through
+# `tole-client` (its wire types). `scripts/desktop-check.sh deps` checks the
+# resolved dependency graph (cargo metadata), so renames, target tables and
+# spelling do not matter.
 #
 # The GUI toolkit is behind the `gpui` feature, off by default, so
 # `cargo test --workspace` never builds it. Every pin is exact (`=`),
@@ -27,9 +28,16 @@ gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
 
 [dependencies]
 tole-desktop-model = { version = "0.12.0", path = "../tole-desktop-model" }
+tole-client = { path = "../tole-client" }
 gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", optional = true, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-component = { version = "=0.9.1", optional = true }
+
+# The local serve supervisor (macOS, Linux) needs flock, kill and the peer
+# credentials of a socket, which std does not expose. Already a dependency of
+# tole-core, tole-cli and tole-client at this version: no new package.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lib]
 name = "tole_desktop"
