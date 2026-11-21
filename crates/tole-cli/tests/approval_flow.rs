@@ -213,6 +213,7 @@ fn tool_request_carries_prompt_fields() {
         input: &input,
         description: t.describe(&input),
         target: t.approval_target(&input),
+        summary: None,
     };
     assert_eq!(req.tool, "write_file");
     assert_eq!(req.risk, Risk::Write);

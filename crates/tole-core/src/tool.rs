@@ -7,6 +7,7 @@
 //! cannot be allowlisted). At call time the approver decides per
 //! invocation.
 
+use crate::action_summary::ActionSummary;
 use crate::approval::{Approver, ToolRequest, Verdict};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -80,6 +81,14 @@ pub trait Tool: Send + Sync {
     /// ([`crate::approval::WORKSPACE_GUARD`]) fails closed (prompts) on
     /// `None`. Decorators must forward it.
     fn approval_target(&self, _input: &Value) -> Option<String> {
+        None
+    }
+    /// The structured summary of what this call will do, shown first in every
+    /// approval surface (#1041). Derive it from the tool's own knowledge and
+    /// the input by code, never from model-written text; it never changes
+    /// [`Tool::risk`]. `None` (the default) makes the registry use the neutral
+    /// [`ActionSummary::unknown`]. Decorators must forward it.
+    fn action_summary(&self, _input: &Value) -> Option<ActionSummary> {
         None
     }
     /// Execute with JSON input, return JSON output or a plain error.
@@ -381,14 +390,22 @@ impl ToolRegistry {
     /// registered — the loop calls this only after a successful lookup.
     pub fn decide(&self, name: &str, input: &Value) -> Option<Verdict> {
         let t = self.tools.get(name)?;
+        // Single fan-out point (#327): neutralize control/bidi/separator
+        // chars before any approval surface sees the description.
+        let description = crate::sanitize::sanitize_one_line(&t.describe(input));
+        // A tool with no summary of its own keeps what it said about itself
+        // (the resolved repo, the exact argv, ...): never less than `describe`.
+        let summary = t
+            .action_summary(input)
+            .unwrap_or_else(|| ActionSummary::unknown_with_description(name, input, &description))
+            .finalized(&crate::secrets::process_secrets());
         let req = ToolRequest {
             tool: name,
             risk: t.risk(),
             input,
-            // Single fan-out point (#327): neutralize control/bidi/separator
-            // chars before any approval surface sees the description.
-            description: crate::sanitize::sanitize_one_line(&t.describe(input)),
+            description,
             target: t.approval_target(input),
+            summary: Some(summary),
         };
         self.approver.as_ref().map(|a| a.decide(&req))
     }

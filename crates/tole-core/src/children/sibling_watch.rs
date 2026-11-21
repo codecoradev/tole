@@ -171,6 +171,9 @@ impl Tool for Tracked {
     fn approval_target(&self, input: &Value) -> Option<String> {
         self.inner.approval_target(input)
     }
+    fn action_summary(&self, input: &Value) -> Option<crate::action_summary::ActionSummary> {
+        self.inner.action_summary(input)
+    }
     fn summary(&self) -> String {
         self.inner.summary()
     }

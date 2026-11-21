@@ -426,6 +426,7 @@ fn tool_request(r: &Request) -> ToolRequest<'_> {
         input: &r.input,
         description: r.display.clone(),
         target: r.target.clone(),
+        summary: None,
     }
 }
 
@@ -457,6 +458,7 @@ pub fn has_decide_tool(allow: &[String]) -> bool {
         input: &input,
         description: String::new(),
         target: None,
+        summary: None,
     };
     pattern_verdict(allow, &tr) == PatternVerdict::Allow
 }
