@@ -1,12 +1,20 @@
-//! Discussions over serve (#1042): `GET /discussions`, `GET /discussions/{id}`
-//! and `POST /discussions/estimate`.
+//! Discussions over serve (#1042): `GET /discussions`, `GET /discussions/{id}`,
+//! `POST /discussions/estimate`, `POST /discussions`,
+//! `POST /discussions/{id}/resume` and `POST /discussions/{id}/stop`.
 //!
 //! A thin face over the discussion library, the one `tole discuss` uses
 //! (`tole_cli::discuss`): the list and the show are the audit view
-//! (`audit_discussion`, never a raw contribution, every string redacted), and
-//! the estimate is the dry run of `tole discuss start --dry-run`. This module
-//! only turns a request into the library's `StartArgs` and a library error
-//! into a status.
+//! (`audit_discussion`, never a raw contribution, every string redacted), the
+//! estimate is the dry run of `tole discuss start --dry-run`, and a start or a
+//! resume is `discuss::begin` / `discuss::prepare_resume` driven on a thread by
+//! `discuss::owner::Owner`. This module only turns a request into the library's
+//! `StartArgs` and a library error into a status.
+//!
+//! Starting from here is the owner's action under the server's auth, at depth
+//! 0, with the contract, participant, budget and file rules of `tole discuss
+//! start`. A discussion a model starts with the `discuss` tool is not started
+//! from here: it stays an approval. A `--plan-mode` server starts nothing
+//! (a discussion spends the owner's budget and writes a ledger).
 //!
 //! The request carries what the owner types at the terminal and nothing else:
 //! `question`, `criteria`, `participants`, `budget_tokens`, `max_rounds`,
@@ -37,6 +45,14 @@ fn refused(e: &str) -> (u16, Value) {
     // The library names the ledger directory; the client needs not.
     if e.starts_with("no discussion") {
         return (404, json!({"error": "no such discussion"}));
+    }
+    // A state the request cannot change: an id that is taken, a discussion
+    // that is closed or already running.
+    if e.contains("already has a contract")
+        || e.contains("already running")
+        || e.contains("is closed")
+    {
+        return (409, json!({"error": e}));
     }
     (400, json!({"error": e}))
 }
@@ -104,9 +120,12 @@ pub(super) fn parse(body: &str) -> Result<StartArgs, (u16, Value)> {
 /// Runs `f` with the library's environment: the discussion ledger directory,
 /// the owner's user config (the same file that defines the profiles), the
 /// process secrets and the serve workspace root as the folder background files
-/// are named against. The provider is never called here (`dry`).
+/// are named against. With `dry` the provider is never called and none is
+/// needed (the estimate); otherwise it is the server's own provider
+/// configuration, the one `tole discuss start` uses.
 pub(super) fn with_env<T>(
     state: &State,
+    dry: bool,
     f: impl FnOnce(&Env<'_>) -> Result<T, String>,
 ) -> Result<T, (u16, Value)> {
     let dir = discuss::dir().map_err(|e| (503, json!({"error": e})))?;
@@ -118,8 +137,13 @@ pub(super) fn with_env<T>(
     let base = path.and_then(std::path::Path::parent);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    let provider = if dry {
+        tole_core::openai::OpenAiConfig::new("http://127.0.0.1:1/v1", "dry", "dry")
+    } else {
+        tole_cli::turn_runner::provider_config().map_err(|e| (503, json!({"error": e})))?
+    };
     let make = tole_cli::discussion_host::factory(
-        tole_core::openai::OpenAiConfig::new("http://127.0.0.1:1/v1", "dry", "dry"),
+        provider,
         secrets.clone(),
         tole_cli::config_apply::discussion_timeout(),
     );
@@ -136,7 +160,7 @@ pub(super) fn with_env<T>(
 
 /// `GET /discussions`: the audit list, without the server's directory path.
 pub(super) fn list(state: &State) -> (u16, Value) {
-    match with_env(state, |env| {
+    match with_env(state, true, |env| {
         discuss::audit::discussions_value(env.dir, None, &env.secrets)
     }) {
         Ok(mut v) => {
@@ -155,10 +179,15 @@ pub(super) fn show(state: &State, id: &str) -> (u16, Value) {
     if !tole_core::discussion::id_ok(id) {
         return (400, json!({"error": "invalid discussion id"}));
     }
-    match with_env(state, |env| {
+    match with_env(state, true, |env| {
         discuss::audit::discussions_value(env.dir, Some(id), &env.secrets)
     }) {
-        Ok(v) => (200, v),
+        Ok(mut v) => {
+            // `running` only this process knows; the ledger says the rest.
+            let closed = v["outcome"].is_object();
+            v["state"] = json!(state.discussions.state(id, closed));
+            (200, v)
+        }
         Err(e) => e,
     }
 }
@@ -171,7 +200,64 @@ pub(super) fn estimate(state: &State, body: &str) -> (u16, Value) {
         Ok(a) => a,
         Err(e) => return e,
     };
-    match with_env(state, |env| discuss::estimate(&args, env)) {
+    match with_env(state, true, |env| discuss::estimate(&args, env)) {
+        Ok(v) => (200, v),
+        Err(e) => e,
+    }
+}
+
+/// A server that may not write (plan mode) starts and continues nothing.
+fn writable(state: &State) -> Result<(), (u16, Value)> {
+    if state.plan_mode {
+        return Err((
+            409,
+            json!({"error": "this server runs in plan mode; a discussion spends budget and writes a ledger"}),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /discussions`: `tole discuss start`, returning at once with the id;
+/// read it with `GET /discussions/{id}`. `202`, or the refusals of the
+/// estimate, plus `409` for an id that is taken. Any number may run at once.
+pub(super) fn start(state: &State, body: &str) -> (u16, Value) {
+    if let Err(e) = writable(state) {
+        return e;
+    }
+    let args = match parse(body) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    match with_env(state, false, |env| state.discussions.start(&args, env)) {
+        Ok(v) => (202, v),
+        Err(e) => e,
+    }
+}
+
+/// `POST /discussions/{id}/resume`: `tole discuss resume` for one that was
+/// interrupted (a crash, a failed call). `202`; `409` when it is closed or
+/// already running. Takes no body: there is nothing to change.
+pub(super) fn resume(state: &State, id: &str) -> (u16, Value) {
+    if !tole_core::discussion::id_ok(id) {
+        return (400, json!({"error": "invalid discussion id"}));
+    }
+    if let Err(e) = writable(state) {
+        return e;
+    }
+    match with_env(state, false, |env| state.discussions.resume(id, env)) {
+        Ok(v) => (202, v),
+        Err(e) => e,
+    }
+}
+
+/// `POST /discussions/{id}/stop`: the ledger's own escalation; the
+/// discussion closes with the usual report. Repeating it is harmless.
+pub(super) fn stop(state: &State, id: &str) -> (u16, Value) {
+    if !tole_core::discussion::id_ok(id) {
+        return (400, json!({"error": "invalid discussion id"}));
+    }
+    // A stop only ends spending, so it is allowed on every server.
+    match with_env(state, true, |env| state.discussions.stop(id, env)) {
         Ok(v) => (200, v),
         Err(e) => e,
     }

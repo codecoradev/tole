@@ -145,6 +145,8 @@ struct State {
     missions: Arc<missions::Missions>,
     /// What a client may pick for `GET /models` (#574): the owner's list.
     models: models::ModelCatalog,
+    /// The discussions this process runs for its owner (#1042).
+    discussions: Arc<tole_cli::discuss::owner::Owner>,
     /// The `turn_finished` webhook callback (#962), set once at start-up when a
     /// destination lists the event. Empty, no turn path does anything extra.
     turn_events: std::sync::OnceLock<tole_cli::webhook_out::turn::TurnNotifier>,
@@ -264,6 +266,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         audit_pending: Mutex::default(),
         mission: cfg.mission.clone(),
         missions: Arc::default(),
+        discussions: Arc::default(),
         models: models::ModelCatalog::from_env(),
         turn_events: std::sync::OnceLock::new(),
     });
@@ -1698,6 +1701,16 @@ fn hook_action(
     }
 }
 
+/// The id of a route shaped `{prefix}{id}{suffix}`, or `None` when the path is
+/// not of that shape. The id may be empty (`/discussions//resume`) and the
+/// caller refuses it. A path that is only the suffix after the collection
+/// (`/discussions/resume`) starts with the prefix and ends with the suffix at
+/// once, and slicing it by the two lengths made a reversed range and a panic,
+/// so the prefix is stripped first and the suffix from what is left.
+fn id_between<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)?.strip_suffix(suffix)
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (
@@ -1848,13 +1861,22 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("GET", p) if p.starts_with("/missions/") && !p["/missions/".len()..].contains('/') => {
             missions::status(state, &p["/missions/".len()..])
         }
-        ("POST", p) if p.starts_with("/missions/") && p.ends_with("/cancel") => {
-            let id = &p["/missions/".len()..p.len() - "/cancel".len()];
-            missions::cancel(state, id)
-        }
+        ("POST", p) if id_between(p, "/missions/", "/cancel").is_some() => missions::cancel(
+            state,
+            id_between(p, "/missions/", "/cancel").unwrap_or_default(),
+        ),
         // Discussions (#1042): the owner's `tole discuss`, read and dry run.
         ("GET", "/discussions") => discussions::list(state),
         ("POST", "/discussions/estimate") => discussions::estimate(state, body),
+        ("POST", "/discussions") => discussions::start(state, body),
+        ("POST", p) if id_between(p, "/discussions/", "/resume").is_some() => discussions::resume(
+            state,
+            id_between(p, "/discussions/", "/resume").unwrap_or_default(),
+        ),
+        ("POST", p) if id_between(p, "/discussions/", "/stop").is_some() => discussions::stop(
+            state,
+            id_between(p, "/discussions/", "/stop").unwrap_or_default(),
+        ),
         ("GET", p)
             if p.starts_with("/discussions/") && !p["/discussions/".len()..].contains('/') =>
         {
@@ -2635,6 +2657,7 @@ mod tests {
             audit_pending: Mutex::default(),
             mission: Default::default(),
             missions: Arc::default(),
+            discussions: Arc::default(),
             models: Default::default(),
             turn_events: std::sync::OnceLock::new(),
         }

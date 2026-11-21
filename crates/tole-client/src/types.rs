@@ -312,6 +312,34 @@ wire! {
         pub open_calls: u64,
         pub rounds: Vec<DiscussionRound>,
         pub outcome: Option<DiscussionOutcome>,
+        /// `running` (a thread of this server drives it), `closed`, or
+        /// `interrupted` (open and nobody drives it: resume it).
+        pub state: String,
+    }
+
+    /// The answer to `POST /discussions`: the contract is recorded and the
+    /// discussion runs.
+    pub struct DiscussionStarted {
+        pub id: String,
+        pub status: String,
+        pub plan: String,
+        pub advice: Vec<String>,
+    }
+
+    /// The answer to `POST /discussions/{id}/resume`.
+    pub struct DiscussionResumed {
+        pub id: String,
+        pub status: String,
+    }
+
+    /// The answer to `POST /discussions/{id}/stop`. `state` is `closed` once
+    /// the report is written, `running` while its thread is still closing it.
+    pub struct DiscussionStopped {
+        pub id: String,
+        pub outcome: String,
+        pub state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub note: Option<String>,
     }
 
     /// The body of `POST /discussions/estimate`: what the owner types for

@@ -92,10 +92,11 @@
         "participants": {"items":{"type":"string"},"type":"array"},
         "question": {"type":"string"},
         "rounds": {"items":{"$ref":"#/$defs/DiscussionRound"},"type":"array"},
+        "state": {"description":"`running` (a thread of this server drives it), `closed`, or\n`interrupted` (open and nobody drives it: resume it).","type":"string"},
         "status": {"type":"string"},
         "tokens_used": {"format":"uint64","minimum":0,"type":"integer"}
       },
-      "required": ["id","status","question","criteria","participants","budget","max_rounds","tokens_used","open_calls","rounds"],
+      "required": ["id","status","question","criteria","participants","budget","max_rounds","tokens_used","open_calls","rounds","state"],
       "type": "object"
     },
     "DiscussionEstimate": {
@@ -145,6 +146,15 @@
       "required": ["question","criteria","participants","budget_tokens"],
       "type": "object"
     },
+    "DiscussionResumed": {
+      "description": "The answer to `POST /discussions/{id}/resume`.",
+      "properties": {
+        "id": {"type":"string"},
+        "status": {"type":"string"}
+      },
+      "required": ["id","status"],
+      "type": "object"
+    },
     "DiscussionRound": {
       "description": "One round of a discussion. `summary` is the scribe's digest (decisions,\nclaims, `disagreements`, open questions, actions) or the list of\nspeakers when it was passed on as written; `checklist` is the\nclaim-checker's verdict per criterion. Both stay as the server's JSON.",
       "properties": {
@@ -172,6 +182,28 @@
         "tokens_used": {"format":"uint64","minimum":0,"type":["integer","null"]}
       },
       "required": ["id","status"],
+      "type": "object"
+    },
+    "DiscussionStarted": {
+      "description": "The answer to `POST /discussions`: the contract is recorded and the\ndiscussion runs.",
+      "properties": {
+        "advice": {"items":{"type":"string"},"type":"array"},
+        "id": {"type":"string"},
+        "plan": {"type":"string"},
+        "status": {"type":"string"}
+      },
+      "required": ["id","status","plan","advice"],
+      "type": "object"
+    },
+    "DiscussionStopped": {
+      "description": "The answer to `POST /discussions/{id}/stop`. `state` is `closed` once\nthe report is written, `running` while its thread is still closing it.",
+      "properties": {
+        "id": {"type":"string"},
+        "note": {"type":["string","null"]},
+        "outcome": {"type":"string"},
+        "state": {"type":"string"}
+      },
+      "required": ["id","outcome","state"],
       "type": "object"
     },
     "EntriesPage": {
@@ -409,6 +441,9 @@
         "Discussion": {"$ref":"#/$defs/Discussion"},
         "DiscussionEstimate": {"$ref":"#/$defs/DiscussionEstimate"},
         "DiscussionList": {"$ref":"#/$defs/DiscussionList"},
+        "DiscussionResumed": {"$ref":"#/$defs/DiscussionResumed"},
+        "DiscussionStarted": {"$ref":"#/$defs/DiscussionStarted"},
+        "DiscussionStopped": {"$ref":"#/$defs/DiscussionStopped"},
         "EntriesPage": {"$ref":"#/$defs/EntriesPage"},
         "Health": {"$ref":"#/$defs/Health"},
         "Models": {"$ref":"#/$defs/Models"},
@@ -418,7 +453,7 @@
         "SessionOpened": {"$ref":"#/$defs/SessionOpened"},
         "SessionStatus": {"$ref":"#/$defs/SessionStatus"}
       },
-      "required": ["ApprovalList","CancelReply","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
+      "required": ["ApprovalList","CancelReply","DecisionReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EntriesPage","Health","Models","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus"],
       "type": "object"
     }
   },
@@ -544,6 +579,30 @@
       "query": [],
       "request": "DiscussionRequest",
       "response": "DiscussionEstimate",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/discussions",
+      "query": [],
+      "request": "DiscussionRequest",
+      "response": "DiscussionStarted",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/discussions/{id}/resume",
+      "query": [],
+      "request": null,
+      "response": "DiscussionResumed",
+      "stream": null
+    },
+    {
+      "method": "POST",
+      "path": "/discussions/{id}/stop",
+      "query": [],
+      "request": null,
+      "response": "DiscussionStopped",
       "stream": null
     }
   ]
