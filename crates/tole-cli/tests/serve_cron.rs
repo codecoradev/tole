@@ -186,3 +186,24 @@ fn nothing_else_about_a_job_has_a_route_and_plan_mode_does_not_resume() {
     assert_eq!(c.pause_cron_job("nightly").unwrap().state, "paused");
     assert_eq!(status_of(c.resume_cron_job("nightly")), 409);
 }
+
+/// A path that is only the suffix of a job route (`/cron/jobs/pause`) starts
+/// with the prefix and ends with the suffix at once, with no room for an id
+/// between them. It is an unknown route (404), not a request to pause a job
+/// with an empty name, and the server keeps answering: slicing it by the two
+/// lengths made a reversed range and panicked the connection's thread.
+#[test]
+fn a_path_that_is_only_a_route_suffix_is_not_found_and_does_not_panic() {
+    let (serve, _) = serve(&[]);
+    for path in ["/cron/jobs/pause", "/cron/jobs/resume"] {
+        let (code, body) = serve.http("POST", path, None);
+        assert_eq!(code, 404, "POST {path}: {body}");
+    }
+    // An empty id between the two is a job that does not exist.
+    for path in ["/cron/jobs//pause", "/cron/jobs//resume"] {
+        let (code, body) = serve.http("POST", path, None);
+        assert_eq!(code, 404, "POST {path}: {body}");
+    }
+    let (code, _) = serve.http("GET", "/health", None);
+    assert_eq!(code, 200);
+}

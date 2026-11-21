@@ -1885,14 +1885,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         }
         // Cron jobs (#1042): read, pause, and resume what the owner reviewed.
         ("GET", "/cron/jobs") => cron::list(),
-        ("POST", p) if p.starts_with("/cron/jobs/") && p.ends_with("/pause") => cron::set_paused(
+        ("POST", p) if id_between(p, "/cron/jobs/", "/pause").is_some() => cron::set_paused(
             state,
-            &p["/cron/jobs/".len()..p.len() - "/pause".len()],
+            id_between(p, "/cron/jobs/", "/pause").unwrap_or_default(),
             true,
         ),
-        ("POST", p) if p.starts_with("/cron/jobs/") && p.ends_with("/resume") => cron::set_paused(
+        ("POST", p) if id_between(p, "/cron/jobs/", "/resume").is_some() => cron::set_paused(
             state,
-            &p["/cron/jobs/".len()..p.len() - "/resume".len()],
+            id_between(p, "/cron/jobs/", "/resume").unwrap_or_default(),
             false,
         ),
         // Cron run results (#579, design §9): the pull delivery target.
