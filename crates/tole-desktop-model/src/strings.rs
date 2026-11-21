@@ -10,6 +10,8 @@ use crate::{
     ServeFailure, ServeState, Target,
 };
 
+pub use crate::approvals::strings as approvals;
+
 pub const APP_NAME: &str = "Tole";
 pub const WINDOW_TITLE: &str = "Tole";
 
