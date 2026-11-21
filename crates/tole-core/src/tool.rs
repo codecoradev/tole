@@ -345,6 +345,17 @@ impl ToolRegistry {
         self.tools.retain(|_, t| t.risk() == Risk::ReadOnly);
     }
 
+    /// Plan mode for a discussion participant that its owner allowed some
+    /// connected tools (#1039): [`retain_read_only`](Self::retain_read_only),
+    /// plus the tools in `keep` that are `Write` (never `Destructive`).
+    /// Naming a tool keeps it registered; every call of it still goes through
+    /// the approver.
+    pub fn retain_read_only_and(&mut self, keep: &[String]) {
+        self.tools.retain(|name, t| {
+            t.risk() == Risk::ReadOnly || (t.risk() == Risk::Write && keep.contains(name))
+        });
+    }
+
     /// The highest risk among the registered tools (`ReadOnly` when
     /// empty): the model router's (#586) view of what a run can touch.
     pub fn max_risk(&self) -> Risk {
@@ -543,6 +554,19 @@ mod tests {
         assert!(reg.get("fake_write").is_none());
         assert!(reg.get("fake_destructive").is_none());
         assert!(reg.get("read_file").is_some());
+    }
+
+    /// #1039: naming a tool keeps a Write one beside the ReadOnly ones, never
+    /// a Destructive one, and never a Write tool that was not named.
+    #[test]
+    fn retain_read_only_and_keeps_only_named_write_tools() {
+        let mut reg = registry_with_all_risks();
+        reg.retain_read_only_and(&["fake_write".into(), "fake_destructive".into()]);
+        assert!(reg.get("read_file").is_some() && reg.get("fake_write").is_some());
+        assert!(reg.get("fake_destructive").is_none());
+        let mut none = registry_with_all_risks();
+        none.retain_read_only_and(&["other".into()]);
+        assert!(none.get("read_file").is_some() && none.get("fake_write").is_none());
     }
 
     /// Issue #320: an external `Tool` that predates `summary()` (it
