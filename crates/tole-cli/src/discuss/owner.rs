@@ -29,6 +29,22 @@ struct Live {
     done: Arc<AtomicBool>,
 }
 
+/// Whether a thread of this process still drives `id`.
+fn is_live(live: &BTreeMap<String, Live>, id: &str) -> bool {
+    live.get(id).is_some_and(|l| !l.done.load(Ordering::SeqCst))
+}
+
+/// A registration of the caller as the driver of one discussion; the
+/// discussion counts as running until it is dropped, even if the caller
+/// panics.
+struct Claim(Arc<AtomicBool>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// The discussions this process runs for its owner.
 #[derive(Default)]
 pub struct Owner {
@@ -48,9 +64,26 @@ impl Owner {
 
     /// True while a thread of this process drives `id`.
     pub fn running(&self, id: &str) -> bool {
-        self.lock()
-            .get(id)
-            .is_some_and(|l| !l.done.load(Ordering::SeqCst))
+        is_live(&self.lock(), id)
+    }
+
+    /// Registers the caller as the driver of `id` for as long as the returned
+    /// guard lives, or `None` when this process already drives it. The check
+    /// and the registration are one step under the lock, so `resume`, a second
+    /// `stop` and this caller never drive one discussion at the same time.
+    fn claim(&self, id: &str) -> Option<Claim> {
+        let mut live = self.lock();
+        if is_live(&live, id) {
+            return None;
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        live.insert(
+            id.to_string(),
+            Live {
+                done: Arc::clone(&done),
+            },
+        );
+        Some(Claim(done))
     }
 
     /// `running`, `closed`, or `interrupted` (open, and no thread of this
@@ -84,7 +117,7 @@ impl Owner {
     /// already running is refused.
     pub fn resume(&self, id: &str, env: &Env<'_>) -> Result<Value, String> {
         let mut live = self.lock();
-        if live.get(id).is_some_and(|l| !l.done.load(Ordering::SeqCst)) {
+        if is_live(&live, id) {
             return Err(format!("discussion `{id}` is already running"));
         }
         if DiscussionLog::at(env.dir, id)?.state()?.closed.is_some() {
@@ -107,13 +140,19 @@ impl Owner {
         }
         let gate = log.stop(now_secs())?;
         let mut note = None;
-        if st.closed.is_none() && !self.running(id) {
-            // A profile that is gone cannot be seated again; the stop is
-            // recorded all the same and a later resume closes it.
-            note = super::prepare_resume(id, env)
-                .and_then(|r| r.driver.run())
-                .err()
-                .map(|e| env.secrets.redact(&e).into_owned());
+        if st.closed.is_none() {
+            // Closing here drives the discussion, so it is registered as
+            // running while it does: a resume that arrives meanwhile is
+            // refused, not run next to it. When a thread already drives it,
+            // that thread closes it at its next step.
+            if let Some(_driving) = self.claim(id) {
+                // A profile that is gone cannot be seated again; the stop is
+                // recorded all the same and a later resume closes it.
+                note = super::prepare_resume(id, env)
+                    .and_then(|r| r.driver.run())
+                    .err()
+                    .map(|e| env.secrets.redact(&e).into_owned());
+            }
         }
         let closed = log.state()?.closed.is_some();
         let mut out = json!({
@@ -159,4 +198,65 @@ fn spawn(
         .map_err(|e| format!("cannot start the discussion's thread: {e}"))?;
     live.insert(id, Live { done });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A discussion that a `stop` is closing counts as running, so a `resume`
+    /// or a second `stop` that arrives meanwhile is refused instead of driving
+    /// the same ledger next to it.
+    #[test]
+    fn a_stop_that_closes_a_discussion_holds_it_as_running() {
+        let owner = Owner::default();
+        assert!(!owner.running("d-1"));
+        let first = owner.claim("d-1").expect("nobody drives it yet");
+        assert!(owner.running("d-1"), "the closing stop is the driver");
+        assert!(owner.claim("d-1").is_none(), "a second driver is refused");
+        assert_eq!(owner.state("d-1", false), "running");
+        // Another discussion is not affected.
+        assert!(owner.claim("d-2").is_some());
+        drop(first);
+        assert!(!owner.running("d-1"));
+        assert_eq!(owner.state("d-1", false), "interrupted");
+        assert!(owner.claim("d-1").is_some(), "free again once it ended");
+    }
+
+    /// A panic while closing must not leave the discussion running forever.
+    #[test]
+    fn a_claim_is_released_when_the_closing_panics() {
+        let owner = Owner::default();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _driving = owner.claim("d-3").unwrap();
+            panic!("the close failed");
+        }));
+        assert!(r.is_err());
+        assert!(!owner.running("d-3"));
+    }
+
+    /// Two threads asking at once: exactly one gets the discussion.
+    #[test]
+    fn two_claims_at_once_give_the_discussion_to_one() {
+        let owner = Arc::new(Owner::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let wins: usize = (0..8)
+            .map(|_| {
+                let (owner, barrier) = (Arc::clone(&owner), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let claim = owner.claim("d-4");
+                    let won = claim.is_some();
+                    // Hold it until every thread has asked.
+                    barrier.wait();
+                    drop(claim);
+                    usize::from(won)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        assert_eq!(wins, 1);
+    }
 }
