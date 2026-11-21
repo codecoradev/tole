@@ -13,6 +13,7 @@
 //! escapes inside), double quotes (backslash-escapes `"` `\` `$` and
 //! backtick), and backslash-escaping of the next char outside quotes.
 
+use crate::action_summary::{ActionEffect, ActionKind, ActionSummary};
 use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -115,6 +116,46 @@ impl RunCommandTool {
     }
 }
 
+/// A `command` line as a human must see it: split exactly as the tool splits
+/// it (no shell), each token re-quoted by [`quote_for_display`] so token
+/// boundaries survive (`printf 'a b'` is not `printf a b`, cora full-scan
+/// #16). `Err` carries the split error; the caller flags it as unparsable.
+pub(crate) fn display_command(line: &str) -> Result<String, String> {
+    RunCommandTool::split_argv(line).map(|argv| {
+        argv.iter()
+            .map(|a| quote_for_display(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+/// The summary of a call that runs a program from a `command` line
+/// (`run_command`, `job_start`): the target is the command as `describe` shows
+/// it (same quoting), the preview is `$ ` plus the same text. A line that does
+/// not split is flagged `<unparsable command: ...>` and shown as sent. Never
+/// inside the workspace for the summary's purposes: a program is not confined
+/// by the jail.
+pub(crate) fn command_summary(input: &Value) -> ActionSummary {
+    let line = input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing command>");
+    let (target, preview) = match display_command(line) {
+        Ok(shown) => (shown.clone(), format!("$ {shown}")),
+        Err(e) => (
+            format!("<unparsable command: {e}> {line}"),
+            format!("$ {line}"),
+        ),
+    };
+    ActionSummary::new(
+        ActionKind::RunProgram,
+        target,
+        ActionEffect::RunsProgram,
+        false,
+    )
+    .with_preview([preview])
+}
+
 impl Tool for RunCommandTool {
     fn name(&self) -> &str {
         "run_command"
@@ -125,6 +166,10 @@ impl Tool for RunCommandTool {
         // Destructive is reserved for explicit delete-like tools with
         // their own gates; run_command never classifies itself higher.
         Risk::Write
+    }
+
+    fn action_summary(&self, input: &Value) -> Option<ActionSummary> {
+        Some(command_summary(input))
     }
 
     fn summary(&self) -> String {
@@ -142,18 +187,12 @@ impl Tool for RunCommandTool {
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("<missing command>");
-        match Self::split_argv(line) {
-            // Re-quote tokens with whitespace/quotes/metacharacters so
+        match display_command(line) {
+            // Tokens with whitespace/quotes/metacharacters stay re-quoted so
             // the approval prompt preserves token boundaries (cora
-            // full-scan #16): `printf a b` and `printf a b` (two args)
+            // full-scan #16): `printf 'a b'` and `printf a b` (two args)
             // must render differently.
-            Ok(argv) => format!(
-                "run: {}",
-                argv.iter()
-                    .map(|a| quote_for_display(a))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
+            Ok(shown) => format!("run: {shown}"),
             Err(e) => format!("run: <unparsable command: {e}>"),
         }
     }
@@ -398,6 +437,43 @@ mod tests {
         assert_eq!(semi, r"run: echo 'x; y'");
         let meta = t.describe(&json!({"command": "echo a;b"}));
         assert_eq!(meta, r"run: echo 'a;b'");
+    }
+
+    /// The approval summary keeps the token boundaries `describe` pins
+    /// (cora full-scan #16) and flags a line that does not split.
+    #[test]
+    fn summary_quotes_ambiguous_tokens_like_describe() {
+        let t = RunCommandTool::new(PathBuf::from("/tmp"));
+        for line in [
+            "printf 'a b'",
+            "printf a b",
+            "echo 'x; y'",
+            "echo a;b",
+            "sh -c 'echo ok; rm -rf x'",
+            "ls -la 'my dir'",
+        ] {
+            let input = json!({ "command": line });
+            let s = t.action_summary(&input).unwrap();
+            let described = t.describe(&input);
+            assert_eq!(format!("run: {}", s.target), described, "{line}");
+            assert_eq!(s.preview, [format!("$ {}", s.target)], "{line}");
+        }
+        let one = t
+            .action_summary(&json!({"command": "printf 'a b'"}))
+            .unwrap();
+        let two = t.action_summary(&json!({"command": "printf a b"})).unwrap();
+        assert_ne!(one.target, two.target);
+        assert_eq!(one.target, "printf 'a b'");
+        let sh = t
+            .action_summary(&json!({"command": "sh -c 'echo ok; rm -rf x'"}))
+            .unwrap();
+        assert_eq!(sh.target, "sh -c 'echo ok; rm -rf x'");
+        let bad = t.action_summary(&json!({"command": "echo 'oops"})).unwrap();
+        assert!(bad.target.contains("<unparsable command"), "{}", bad.target);
+        assert!(
+            bad.target.contains("echo 'oops"),
+            "the raw line stays visible"
+        );
     }
 
     #[test]
