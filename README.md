@@ -56,7 +56,7 @@ automation and secrets release:
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
-the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in, with `tole serve --socket <path>` (a Unix socket in a private directory, a per-launch `--token-fd` credential, and `protocol`/`version` on `/health`; macOS and Linux, the Windows named pipe is a follow-up, #1043). The desktop client (a thin client of a local `tole serve`, a remote server later) is un-parked and planned in issues #1028 to #1044 (in so far: the `crates/tole-desktop-model` and `crates/tole-desktop` crates with the app shell window behind the off-by-default `gpui` feature, their guardrails and a `Desktop` CI workflow, and the typed `tole-client`, #1028 and #1040; the pages are not built yet); the design note with the owner's decisions and the screen drafts is [docs/desktop-design.md](docs/desktop-design.md).
+the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in, with `tole serve --socket <path>` (a Unix socket in a private directory, a per-launch `--token-fd` credential, and `protocol`/`version` on `/health`; macOS and Linux, the Windows named pipe is a follow-up, #1043). `tole serve` (both transports) now stops gracefully on SIGTERM and SIGINT on Unix: new requests get 503, running turns are detached and stay resumable, and it exits 0 once drained or non-zero after `--shutdown-grace` (default 20 s) or a second signal, see [docs/mobile-control.md](docs/mobile-control.md) (#1014). The desktop client (a thin client of a local `tole serve`, a remote server later) is un-parked and planned in issues #1028 to #1044 (in so far: the `crates/tole-desktop-model` and `crates/tole-desktop` crates with the app shell window behind the off-by-default `gpui` feature, their guardrails and a `Desktop` CI workflow, and the typed `tole-client`, #1028 and #1040; the pages are not built yet); the design note with the owner's decisions and the screen drafts is [docs/desktop-design.md](docs/desktop-design.md).
 Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), `tole serve` (REST + multi-session
@@ -248,7 +248,7 @@ knowing: `tole cron create --catch-up one --grace-minutes N` runs one late
 occurrence after downtime (default `skip`), `--paused` saves a job disabled,
 `tole cron tick --max-concurrent N`, `tole hook add --rate-per-minute N
 --max-body-bytes N`, `tole route --kind --job --risk --budget-left`, and
-`tole serve --port --bind --transport mcp --cron --token-file`.
+`tole serve --port --bind --transport mcp --cron --token-file --shutdown-grace`.
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
 `--sessions-dir`): append-only, crash-safe, replayable — kill the process

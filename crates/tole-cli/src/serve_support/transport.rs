@@ -122,21 +122,85 @@ pub enum Listener {
 }
 
 impl Listener {
-    pub fn accept(&self) -> io::Result<Conn> {
-        match self {
-            Listener::Tcp(l) => l.accept().map(|(s, _)| Conn::Tcp(s)),
-            #[cfg(unix)]
-            Listener::Unix(u) => u.listener.accept().map(|(s, _)| Conn::Unix(s)),
+    /// Wait up to `wait` for one connection: `Ok(None)` when none came (also when
+    /// a signal interrupted the wait), so the accept loop can look at its flags
+    /// between connections (#1014). The listener is non-blocking from the first
+    /// call on, and the accepted connection is made blocking again (some systems
+    /// let it inherit the flag).
+    pub fn accept_within(&self, wait: Duration) -> io::Result<Option<Conn>> {
+        self.set_nonblocking()?;
+        if !self.readable_within(wait)? {
+            return Ok(None);
         }
+        let conn = match self {
+            Listener::Tcp(l) => l.accept().map(|(s, _)| s).and_then(|s| {
+                s.set_nonblocking(false)?;
+                Ok(Conn::Tcp(s))
+            }),
+            #[cfg(unix)]
+            Listener::Unix(u) => u.listener.accept().map(|(s, _)| s).and_then(|s| {
+                s.set_nonblocking(false)?;
+                Ok(Conn::Unix(s))
+            }),
+        };
+        match conn {
+            Ok(c) => Ok(Some(c)),
+            // The peer left between the wake-up and the accept.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set_nonblocking(&self) -> io::Result<()> {
+        match self {
+            Listener::Tcp(l) => l.set_nonblocking(true),
+            #[cfg(unix)]
+            Listener::Unix(u) => u.listener.set_nonblocking(true),
+        }
+    }
+
+    /// True when a connection is waiting to be accepted.
+    #[cfg(unix)]
+    fn readable_within(&self, wait: Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let fd = match self {
+            Listener::Tcp(l) => l.as_raw_fd(),
+            Listener::Unix(u) => u.listener.as_raw_fd(),
+        };
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = wait.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: one valid `pollfd` for a descriptor this listener owns.
+        let r = unsafe { libc::poll(&mut p, 1, ms) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        Ok(r > 0)
+    }
+
+    /// No `poll` here: sleep in short steps until the deadline.
+    #[cfg(not(unix))]
+    fn readable_within(&self, wait: Duration) -> io::Result<bool> {
+        std::thread::sleep(wait.min(Duration::from_millis(25)));
+        Ok(true)
     }
 }
 
 /// A bound Unix socket. It holds the start-up lock (see [`bind_socket`]) for as
 /// long as it lives. Dropping it removes the socket file, but only the one this
 /// process bound (same device and inode): it never unlinks another serve's
-/// socket. `run_serve` has no signal handler and never returns normally, so a
-/// stop by signal leaves the file behind; the next start removes it (under the
-/// lock) once nothing answers on it.
+/// socket. `run_serve` returns after a SIGTERM or SIGINT drain (#1014), which drops this
+/// and so removes the file and releases the lock; a process that is killed leaves
+/// the file behind, and the next start removes it (under the lock) once nothing
+/// answers on it.
 #[cfg(unix)]
 pub struct UnixSocket {
     listener: std::os::unix::net::UnixListener,
@@ -570,6 +634,57 @@ mod tests {
             !sock.exists(),
             "the socket file goes away with the listener"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `O_NONBLOCK` of a connection, read back from the descriptor.
+    fn is_nonblocking(c: &Conn) -> bool {
+        use std::os::fd::AsRawFd;
+        let fd = match c {
+            Conn::Tcp(s) => s.as_raw_fd(),
+            Conn::Unix(s) => s.as_raw_fd(),
+        };
+        (unsafe { libc::fcntl(fd, libc::F_GETFL) }) & libc::O_NONBLOCK != 0
+    }
+
+    /// The wait of the accept loop (#1014): nothing waiting is `None` after the
+    /// wait, a waiting connection is returned at once, and the connection is a
+    /// plain blocking one.
+    fn exercise_accept_within(l: &Listener, connect: impl Fn()) {
+        let wait = Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        assert!(l.accept_within(wait).unwrap().is_none());
+        assert!(started.elapsed() >= wait, "it returned before the wait");
+        connect();
+        let conn = crate::test_dir::wait_for(Duration::from_secs(30), "the connection", || {
+            l.accept_within(wait).unwrap()
+        });
+        assert!(!is_nonblocking(&conn), "an accepted connection blocks");
+    }
+
+    #[test]
+    fn accept_within_waits_then_returns_a_blocking_connection_on_tcp() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let l = Listener::Tcp(tcp);
+        let held = std::cell::RefCell::new(Vec::new());
+        exercise_accept_within(&l, || {
+            held.borrow_mut().push(TcpStream::connect(addr).unwrap())
+        });
+    }
+
+    #[test]
+    fn accept_within_waits_then_returns_a_blocking_connection_on_a_socket() {
+        let root = scratch("accept");
+        let sock = root.join("s.sock");
+        let l = bind_socket(&sock).unwrap();
+        let held = std::cell::RefCell::new(Vec::new());
+        exercise_accept_within(&l, || {
+            held.borrow_mut()
+                .push(std::os::unix::net::UnixStream::connect(&sock).unwrap())
+        });
+        drop(l);
+        assert!(!sock.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

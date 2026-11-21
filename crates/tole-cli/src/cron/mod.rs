@@ -1167,9 +1167,15 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
 /// another process are seen at the next pass). Each pass runs on its own
 /// thread, so a long run never delays the next minute's jobs (a job whose
 /// run is still going is not due again). Agent runs park non-allowlisted
-/// Writes in `approvals`. Never returns; a failed pass is logged.
-pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::ApprovalQueue>) {
-    loop {
+/// Writes in `approvals`. Returns once `stop` is set (#1014): no new pass
+/// starts, and a pass already running is not waited for (the ledger recovers a
+/// run it cut short, as after a crash). A failed pass is logged.
+pub fn serve_ticker(
+    dir: &Path,
+    approvals: std::sync::Arc<crate::approvals::ApprovalQueue>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         let opts = TickOptions {
             max_concurrent: max_concurrent(None),
             approvals: Some(std::sync::Arc::clone(&approvals)),
@@ -1179,7 +1185,10 @@ pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::Appr
         let dir = dir.to_path_buf();
         std::thread::spawn(move || pass(&dir, &opts));
         let wait = 60 - now().rem_euclid(60) + 1;
-        std::thread::sleep(std::time::Duration::from_secs(wait as u64));
+        crate::serve_support::shutdown::sleep_unless(
+            stop,
+            std::time::Duration::from_secs(wait as u64),
+        );
     }
 }
 

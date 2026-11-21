@@ -51,7 +51,10 @@ where
     }
 }
 
-/// Serve MCP over Streamable HTTP. Blocks until the listener errors.
+/// Serve MCP over Streamable HTTP. Blocks until a SIGTERM or SIGINT drains it
+/// (#1014): the listener is closed, running turns are detached through the
+/// session host's detach path, and it returns `Ok` once none is left, or an
+/// error when `shutdown_grace` runs out or a second signal arrives.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mcp_http(
     bind: &str,
@@ -63,11 +66,15 @@ pub async fn run_mcp_http(
     workspace: Option<&String>,
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
+    shutdown_grace: std::time::Duration,
 ) -> Result<()> {
     use hyper_util::rt::TokioIo;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+    use tole_cli::serve_support::shutdown;
 
+    // Before the listener is reported ready (#1014).
+    shutdown::install().context("installing the SIGTERM and SIGINT handlers")?;
     let addr = format!("{bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -137,10 +144,18 @@ pub async fn run_mcp_http(
     // Failed-auth limiter shared by every connection (same policy as REST).
     let limiter = Arc::new(tole_cli::auth::AuthLimiter::new());
     loop {
+        if shutdown::requested() {
+            break;
+        }
         // A transient accept error (EMFILE, ECONNABORTED, ...) must not end
         // the server and drop every session: report it and keep serving,
-        // with a short pause so resource exhaustion does not spin.
-        let (stream, peer) = match listener.accept().await {
+        // with a short pause so resource exhaustion does not spin. The accept
+        // wakes up every few tens of milliseconds to look at the shutdown flag.
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = tokio::time::sleep(shutdown::POLL) => continue,
+        };
+        let (stream, peer) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("tole serve (mcp): accept failed (continuing): {e}");
@@ -301,6 +316,35 @@ pub async fn run_mcp_http(
                 .await;
         });
     }
+
+    // Shutting down (#1014). No listener: a new client is refused by the system
+    // instead of waiting on a queue nobody serves. A turn is ended through the
+    // session host's detach path, exactly as the REST face does; it is asked again
+    // on every pass, for one that started after the last sweep.
+    drop(listener);
+    let sessions = Arc::clone(&session_state.sessions);
+    let running = tole_cli::session_host::detach_running_turns(&sessions);
+    eprintln!(
+        "tole serve (mcp): shutting down (grace {}s): {running} running turn(s) asked to detach",
+        shutdown_grace.as_secs()
+    );
+    let countdown = shutdown::Countdown::start(shutdown_grace);
+    let ending = loop {
+        let running = tole_cli::session_host::detach_running_turns(&sessions);
+        if let Some(ending) = countdown.check(running == 0) {
+            break ending;
+        }
+        tokio::time::sleep(shutdown::POLL).await;
+    };
+    if ending == shutdown::Ending::Clean {
+        eprintln!("tole serve (mcp): drained, exiting");
+    }
+    ending.into_result("tole serve (mcp)", shutdown_grace, || {
+        format!(
+            "{} running turn(s)",
+            tole_cli::session_host::detach_running_turns(&sessions)
+        )
+    })
 }
 
 #[cfg(test)]

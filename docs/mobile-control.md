@@ -463,9 +463,10 @@ curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
   or has any group or other permission (so `/tmp` itself is refused: use a private
   subdirectory), when the socket path is a link or any file that is not a socket, and when the path
   is longer than a socket address holds (103 bytes on macOS, 107 on Linux). The socket file is
-  set to `0600`. Serve has no signal handler: a stop by Ctrl-C, SIGTERM or `kill` leaves the
-  socket file behind (it is removed only if serve returns on its own, and then only the file it
-  bound). The next start removes it, as below.
+  set to `0600`. A stop by SIGTERM or SIGINT drains and then removes the socket file (only the
+  file this serve bound; also when the grace runs out or a second signal arrives, see
+  [Shutdown](#shutdown-on-sigterm-and-sigint-1014)). A serve that is killed (SIGKILL, a crash)
+  leaves the file behind, and the next start removes it, as below.
 - **One serve per socket path.** A start takes an exclusive `flock` on `<socket>.lock` in the
   same private directory and holds it for the life of the process (the kernel drops it when
   the process ends, however it ends; the lock file itself stays). A second start on the same
@@ -515,6 +516,27 @@ No auth. Besides `{"status":"ok"}` it reports what a client needs to decide whet
 only for a change a client written against the previous number cannot handle, never for a new
 route or field. `version` is the `tole` binary's version. A client refuses a serve whose
 `protocol` it does not know. The fields are on both listeners.
+
+## Shutdown on SIGTERM and SIGINT (#1014)
+
+`tole serve` (REST and `--transport mcp`) handles SIGTERM and SIGINT (Unix; on Windows Ctrl+C
+still ends the process at once). The handler only counts the signal; the rest runs on ordinary
+threads. From then on every new request is answered `503` (`GET /health` too, with
+`Retry-After: 1`), event streams end once their turn has settled, the cron ticker and the
+webhook senders stop (a delivery attempt already in flight is finished, a cron run already
+started is not waited for and is recovered from the ledger at the next start, as after a
+crash), and every running turn is ended through the existing detach path: its prompt answers
+`stopReason: "detached"`, the log stays append-only and the session resumes with a new
+prompt (a running mission is cancelled the way `POST /missions/{id}/cancel` does). A detach
+takes effect when the model call or tool that is running settles, so the wait is as long as
+that call, up to the grace period: `--shutdown-grace <secs>` (or `TOLE_SERVE_SHUTDOWN_GRACE`;
+default 20, `0` does not wait, at most 3600). Serve exits `0` once nothing is left running, and
+`1` when the grace runs out (the stderr line says what was left; the turn is cut where it
+stands, as a kill would cut it) or when a second signal arrives. On the local socket the
+socket file is removed and `<socket>.lock` is released only after the drain, so a supervisor
+that waits for the lock never sees a serve that is still finishing a turn. Set the stop timeout
+of the process manager above the grace (`docker stop` waits 10 s by default, `systemctl stop`
+90 s) or lower the grace to fit it. Without a signal nothing changes.
 
 ## HTTP Basic auth (#742, first slice)
 

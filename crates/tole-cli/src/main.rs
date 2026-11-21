@@ -672,6 +672,13 @@ enum Command {
         /// Writes in this server's `/approvals` queue (never auto-approved).
         #[arg(long)]
         cron: bool,
+
+        /// Seconds a SIGTERM/SIGINT shutdown waits for running turns (they are
+        /// detached and stay resumable) before exiting anyway with a non-zero
+        /// code (#1014). Falls back to TOLE_SERVE_SHUTDOWN_GRACE; default 20;
+        /// 0 does not wait. Applies to both transports.
+        #[arg(long, value_name = "SECS")]
+        shutdown_grace: Option<u64>,
     },
     /// Print a password hash for `tole serve --auth basic` (#742): reads the
     /// password from stdin (a terminal is asked without echo, twice).
@@ -2037,7 +2044,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             memory,
             cron,
+            shutdown_grace,
         } => {
+            // Read first so a bad value stops the start-up, not the shutdown.
+            let shutdown_grace = tole_cli::serve_support::shutdown::grace(
+                shutdown_grace,
+                std::env::var(tole_cli::serve_support::shutdown::GRACE_ENV).ok(),
+            )
+            .map_err(anyhow::Error::msg)?;
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Loud bails, same rule as `tole mcp`/`tole acp`: these host
             // flags have no server-face wiring, and a silent no-op is
@@ -2129,7 +2143,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "mcp-http")]
                 {
                     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-                    return rt.block_on(crate::mcp_http::run_mcp_http(
+                    let result = rt.block_on(crate::mcp_http::run_mcp_http(
                         &bind,
                         port,
                         auth,
@@ -2139,7 +2153,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                         workspace.as_ref(),
                         sessions_dir_override.clone(),
                         host.on_turnend.clone(),
+                        shutdown_grace,
                     ));
+                    // Dropping the runtime waits for blocking tasks (a turn that
+                    // outlived the grace period): do not, the drain has already
+                    // given its verdict (#1014).
+                    rt.shutdown_timeout(std::time::Duration::ZERO);
+                    return result;
                 }
                 #[cfg(not(feature = "mcp-http"))]
                 anyhow::bail!("--transport mcp requires the mcp-http feature");
@@ -2189,6 +2209,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     ),
                     compaction: host.compaction,
                 },
+                shutdown_grace,
             })
         }
         Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),
