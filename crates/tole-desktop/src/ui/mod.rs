@@ -18,7 +18,13 @@ mod adapter;
 #[cfg(feature = "render-harness")]
 pub mod harness;
 #[cfg(feature = "gpui")]
+mod header;
+#[cfg(feature = "gpui")]
+mod home;
+#[cfg(feature = "gpui")]
 mod shell;
+#[cfg(feature = "gpui")]
+mod sidebar;
 
 /// Why [`run`] could not open a window.
 #[derive(Debug)]

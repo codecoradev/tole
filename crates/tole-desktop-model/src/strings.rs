@@ -40,14 +40,43 @@ pub const FOLDERS_CAPTION: &str = "FOLDERS";
 pub const FOLDERS_SAMPLE_NOTE: &str = "Sample folders (preview)";
 pub const FOLDERS_EMPTY: &str = "No folders yet";
 
+/// The name of the header button while the sidebar is shown (what a press does).
+pub const SIDEBAR_HIDE: &str = "Hide the sidebar";
+/// The name of the header button while the sidebar is hidden.
+pub const SIDEBAR_SHOW: &str = "Show the sidebar";
+
+/// The count beside a sidebar row, in words: "3" for approvals, then "2 on",
+/// "1 needs you" and "2 new" as in board S2. Sections without a count get the
+/// bare number.
+pub fn badge_label(section: Section, count: usize) -> String {
+    match section {
+        Section::Automations => format!("{count} on"),
+        Section::Discussions => format!("{count} needs you"),
+        Section::SkillsAndTools => format!("{count} new"),
+        _ => count.to_string(),
+    }
+}
+
+/// Caption above the folder chips of the home page.
+pub const HOME_FOLDERS_CAPTION: &str = "Working folder";
+/// Home page, no folders yet.
+pub const HOME_FOLDERS_EMPTY: &str =
+    "You have no working folders yet. Add one to give Tole a place to work.";
+/// The primary button of the home page.
+pub const HOME_START: &str = "New task";
+/// Under the button while it cannot be pressed.
+pub const HOME_START_BLOCKED: &str = "Tole is not connected yet, so a task cannot start.";
+
 pub const HOME_TITLE: &str = "What would you like Tole to do?";
 pub const HOME_SUBTITLE: &str =
     "Describe it in your own words. Tole shows its plan and asks before it changes anything.";
 
-/// Where the desktop is connected.
-pub fn target_label(target: &Target) -> &'static str {
+/// Where the desktop is connected: this computer, or the remote server by the
+/// name the owner gave it.
+pub fn target_label(target: &Target) -> String {
     match target {
-        Target::ThisComputer => "This computer",
+        Target::ThisComputer => "This computer".to_owned(),
+        Target::Remote { name } => format!("{name} (remote server)"),
     }
 }
 
@@ -239,5 +268,21 @@ mod tests {
     #[test]
     fn this_computer_wording_is_the_design_wording() {
         assert_eq!(target_label(&Target::ThisComputer), "This computer");
+    }
+
+    #[test]
+    fn a_remote_server_is_labelled_by_its_name() {
+        let label = target_label(&Target::Remote {
+            name: "Office".to_owned(),
+        });
+        assert!(label.contains("Office") && label.contains("remote"));
+    }
+
+    #[test]
+    fn counts_read_as_on_the_board() {
+        assert_eq!(badge_label(Section::Approvals, 1), "1");
+        assert_eq!(badge_label(Section::Automations, 2), "2 on");
+        assert_eq!(badge_label(Section::Discussions, 1), "1 needs you");
+        assert_eq!(badge_label(Section::SkillsAndTools, 2), "2 new");
     }
 }

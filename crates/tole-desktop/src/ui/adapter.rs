@@ -11,7 +11,7 @@ use std::rc::Rc;
 use tole_desktop_model::tokens::Rgb;
 
 pub use gpui::prelude::*;
-pub use gpui::{div, App, Context, FocusHandle, Hsla, Pixels, Rgba, Window};
+pub use gpui::{div, App, Context, FocusHandle, Hsla, Pixels, Rgba, Role, Window};
 
 // Tab and Shift+Tab: nothing in GPUI binds them, so the app does (see `init`).
 gpui::actions!(tole_desktop, [FocusNextRow, FocusPrevRow]);
