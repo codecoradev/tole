@@ -12,7 +12,7 @@
 //! | entry `message`, role `assistant` | [`TaskEvent::AnswerEntry`] |
 //! | entry `intent` | [`TaskEvent::ToolIntent`] (`id` = entry id, `target` = path or command of `payload.input`) |
 //! | entry `tool_result` or `error` | [`TaskEvent::ToolSettled`] (`intent_id` = `parent_id`, `ok` = it is a `tool_result`) |
-//! | `update_plan` intent (input `entries`), `todo_write` result (output list) | also [`TaskEvent::PlanUpdated`], the full list |
+//! | `update_plan` intent (input `entries`), `todo_write` result (output list) | also [`TaskEvent::PlanUpdated`], the full list, `seq` of that same entry, sent right after its own event |
 //! | `text_delta`, `reasoning` | [`TaskEvent::TextDelta`], [`TaskEvent::Reasoning`] (text not kept) |
 //! | `ready`, or `busy` of `GET /status` | [`TaskEvent::Ready`] |
 //! | `approval_requested`, `approval_resolved` | [`TaskEvent::ApprovalRequested`], [`TaskEvent::ApprovalResolved`] (`approved` = status `approved`) |
@@ -30,13 +30,25 @@
 //! raw: the renderer must not run HTML or open links by itself.
 //!
 //! **After an allow** (`approved` resolved) the resumed turn has no prompt
-//! call to wait for, so the adapter must send [`TaskEvent::Ready`] from
-//! `GET /status` (and again when it changes), and [`TaskEvent::ResumeTimedOut`]
-//! if nothing confirmed the turn after a few seconds. The model does not rely
-//! on it: until something confirms, the phase is `Resuming` (Stop works, steering
-//! does not), and an answer, a tool entry or text confirms or ends it. For a Stop
-//! the adapter sends `Ready{busy:false}` when cancel answers `cancelled: false`,
-//! and calls `TaskState::stop_failed` when the call fails.
+//! call to wait for ("unobserved": `Run::unobserved`). The adapter must send
+//! [`TaskEvent::Ready`] from `GET /status` and keep polling it until it says
+//! not busy, and [`TaskEvent::ResumeTimedOut`] if nothing confirmed the turn
+//! after a few seconds or the polling is lost. The model does not rely on it:
+//! until something confirms, the phase is `Resuming` (Stop works, steering does
+//! not), and `ResumeTimedOut` ends an unobserved turn at any time until it ends.
+//! For a Stop the adapter sends `Ready{busy:false}` when cancel answers
+//! `cancelled: false`, and calls `TaskState::stop_failed` when the call fails.
+//!
+//! **Late and old frames.** Text and reasoning frames after the turn ended, or
+//! after its answer, are ignored until the next prompt, a `Ready{busy:true}` or
+//! an allow. A [`TaskEvent::PlanUpdated`] older than the newest entry seen is
+//! ignored. The adapter must call `TaskState::history_complete` once it fed the
+//! whole history (a new session has none to load); until then the status says
+//! "No changes seen", never "Nothing was changed", because earlier writes may be
+//! on a page it did not read. Fetch `GET /approvals` once after opening the
+//! stream and send it as [`TaskEvent::ApprovalsRefreshed`]: approvals the
+//! stream announced meanwhile are kept, and ones decided meanwhile are not
+//! brought back.
 
 use crate::plain::printable;
 
@@ -140,8 +152,9 @@ pub enum TaskEvent {
     /// A tool call was recorded; `id` is the intent entry id.
     ToolIntent { seq: u64, id: String, tool: String, target: Option<String> },
     ToolSettled { seq: u64, intent_id: String, ok: bool },
-    /// The full plan list; replaces the plan of the current turn.
-    PlanUpdated { items: Vec<PlanItem> },
+    /// The full plan list, from the entry `seq`; replaces the plan of the
+    /// current turn, and is ignored when older than the newest entry seen.
+    PlanUpdated { seq: u64, items: Vec<PlanItem> },
     /// Best effort: a piece of the answer being written.
     TextDelta { text: String },
     /// Best effort: the model is thinking.
@@ -153,7 +166,8 @@ pub enum TaskEvent {
     ApprovalResolved { id: String, approved: bool },
     /// The queue as the server holds it now.
     ApprovalsRefreshed { pending: Vec<ApprovalInfo> },
-    /// An allowed turn was not confirmed running in time (see the module docs).
+    /// An unobserved (allowed) turn was not confirmed running in time (see the
+    /// module docs): it ends.
     ResumeTimedOut,
     /// The stream dropped ephemeral frames.
     Resync,

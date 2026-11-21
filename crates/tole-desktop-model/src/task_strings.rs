@@ -29,6 +29,8 @@ pub fn status_text(row: &StatusRow) -> String {
     let (n, unsure) = (row.counts.changed, row.counts.unsure);
     let made = plural(n, "change", "changes");
     let changes = match (n, unsure, done) {
+        (0, 0, false) if !row.complete => "No changes seen yet.".to_string(),
+        (0, 0, true) if !row.complete => "No changes seen.".to_string(),
         (0, 0, false) => "Nothing has been changed yet.".to_string(),
         (0, 0, true) => "Nothing was changed.".to_string(),
         (0, _, _) => "Something may have been changed.".to_string(),
@@ -110,14 +112,14 @@ mod tests {
     #[rustfmt::skip]
     fn row_for(phase: Phase) -> StatusRow {
         let counts = Counts { read: 0, changed: 0, unsure: 0 };
-        StatusRow { phase, counts, steps: 0, look_only: false, started: true, can_stop: false, send: SendMode::Send }
+        StatusRow { phase, counts, steps: 0, look_only: false, started: true, complete: true, can_stop: false, send: SendMode::Send }
     }
 
     #[rustfmt::skip]
     fn said(phase: Phase, changed: u32, started: bool) -> String {
         let counts = Counts { read: 0, changed, unsure: 0 };
         let send = SendMode::Send;
-        status_text(&StatusRow { phase, counts, steps: 0, look_only: false, started, can_stop: false, send })
+        status_text(&StatusRow { phase, counts, steps: 0, look_only: false, started, complete: true, can_stop: false, send })
     }
 
     #[test]

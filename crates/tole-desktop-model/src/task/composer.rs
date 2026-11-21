@@ -7,7 +7,9 @@
 //! - An image is at most [`MAX_IMAGE_BYTES`] and named like a png, jpg, jpeg,
 //!   gif or webp (a courtesy: serve sniffs the bytes).
 
+use super::event::MAX_TARGET_CHARS;
 use super::status::SendMode;
+use crate::plain::printable;
 
 /// 10 MiB, `tole_core::image::MAX_IMAGE_BYTES`, which this crate cannot name.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -100,7 +102,7 @@ impl Composer {
         }
         let id = AttachmentId(self.next_id);
         self.next_id += 1;
-        let name = name.to_string();
+        let name = printable(name, MAX_TARGET_CHARS);
         self.attachments.push(Attachment { id, name, bytes });
         Ok(id)
     }
@@ -146,6 +148,7 @@ impl Composer {
         }
         let mut back = sent.attachments;
         back.append(&mut self.attachments);
+        back.truncate(MAX_IMAGES); // the restored ones first
         self.attachments = back;
     }
 }

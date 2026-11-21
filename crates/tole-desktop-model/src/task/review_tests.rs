@@ -95,10 +95,9 @@ fn nothing_was_changed_is_not_said_after_a_write_that_did_not_settle_cleanly() {
         settled(2, 1, true),
         answer(3, "x"),
     ];
-    assert_eq!(
-        status_text(&task(clean.to_vec()).status()),
-        "Done. Nothing was changed."
-    );
+    let mut t = task(clean.to_vec());
+    t.history_complete = true;
+    assert_eq!(status_text(&t.status()), "Done. Nothing was changed.");
 }
 
 // Review 3: nothing a model wrote reaches the screen raw.

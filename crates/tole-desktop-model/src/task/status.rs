@@ -49,11 +49,18 @@ pub struct StatusRow {
     pub look_only: bool,
     /// The task has at least one row.
     pub started: bool,
+    /// The whole history was fed: only then can "nothing changed" be said.
+    pub complete: bool,
     pub can_stop: bool,
     pub send: SendMode,
 }
 
-pub fn status_row(transcript: &Transcript, run: &Run, look_only: bool) -> StatusRow {
+pub fn status_row(
+    transcript: &Transcript,
+    run: &Run,
+    look_only: bool,
+    complete: bool,
+) -> StatusRow {
     let phase = if run.closed {
         Phase::Closed
     } else if run.link == Link::Lost {
@@ -80,6 +87,7 @@ pub fn status_row(transcript: &Transcript, run: &Run, look_only: bool) -> Status
         steps: transcript.step_count(),
         look_only,
         started: !transcript.items.is_empty(),
+        complete,
         can_stop: matches!(phase, Phase::Working | Phase::Resuming),
         send,
     }
@@ -99,7 +107,7 @@ mod tests {
             t.apply(e);
             r.apply(e);
         }
-        status_row(&t, &r, false)
+        status_row(&t, &r, false, true)
     }
 
     #[rustfmt::skip]

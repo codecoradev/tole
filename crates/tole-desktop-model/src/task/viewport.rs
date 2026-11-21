@@ -100,6 +100,11 @@ pub struct Visible {
 /// The rows a window of `viewport` height at `scroll_top` shows, plus
 /// `overscan` pixels each side so a fast scroll shows no gap.
 pub fn visible(layout: &ListLayout, scroll_top: f32, viewport: f32, overscan: f32) -> Visible {
+    let overscan = if overscan.is_finite() {
+        overscan.max(0.0)
+    } else {
+        0.0
+    };
     let (start, end) = if layout.is_empty() {
         (0, 0)
     } else {

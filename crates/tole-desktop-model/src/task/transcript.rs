@@ -76,7 +76,8 @@ pub enum Item {
     Plan(Vec<PlanItem>),
 }
 
-/// "38 read · 0 changed", for the whole task.
+/// "38 read · 0 changed", for the events fed so far: the whole task only when
+/// the history was fed completely (see `TaskState::history_complete`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counts {
     pub read: u32,
@@ -127,8 +128,10 @@ impl Transcript {
         }
     }
 
-    /// The turn is over: a step still running will not be settled.
+    /// The turn is over without an answer entry in hand: a step still running
+    /// will not be settled, and a draft stops growing.
     pub fn abandon_running(&mut self) {
+        self.finish_draft();
         let steps = self.items.iter_mut().filter_map(|i| match i {
             Item::Work(g) => Some(&mut g.steps),
             _ => None,
@@ -201,7 +204,13 @@ impl Transcript {
                 }
                 self.settle_step(intent_id, *ok);
             }
-            TaskEvent::PlanUpdated { items } => self.set_plan(items),
+            TaskEvent::PlanUpdated { seq, items } => {
+                // Same entry as the intent just seen is fine; an older one is a replay.
+                if self.last_seq.is_some_and(|last| *seq < last) {
+                    return false;
+                }
+                self.set_plan(items);
+            }
             TaskEvent::TextDelta { text } => match self.items.last_mut() {
                 Some(Item::Answer {
                     markdown,

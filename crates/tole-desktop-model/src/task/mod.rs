@@ -8,6 +8,8 @@
 mod composer;
 mod event;
 #[cfg(test)]
+mod late_tests;
+#[cfg(test)]
 mod review_tests;
 mod run;
 mod status;
@@ -38,6 +40,9 @@ pub struct TaskState {
     pub composer: Composer,
     /// Opened in plan mode (`SessionOpened::plan_mode`); fixed for the session.
     pub look_only: bool,
+    /// The adapter fed the whole history (set it for a new session, or after
+    /// the last page); until then the status never says "nothing changed".
+    pub history_complete: bool,
 }
 
 impl TaskState {
@@ -48,13 +53,15 @@ impl TaskState {
             layout: ListLayout::new(64.0), /* assumed row height, px */
             composer: Composer::default(),
             look_only,
+            history_complete: false,
         }
     }
 
     /// Fold in one event, from a history page or the live stream.
     pub fn apply(&mut self, event: TaskEvent) {
-        if matches!(event, TaskEvent::TextDelta { .. }) && self.run.discard_text {
-            return;
+        let text = matches!(event, TaskEvent::TextDelta { .. } | TaskEvent::Reasoning);
+        if text && !self.run.text_accepted() {
+            return; // late or stale: see the rules of `Run`
         }
         if !self.transcript.apply(&event) {
             return; // an old entry: it must not move the run state either
@@ -64,7 +71,10 @@ impl TaskState {
         let ends = match event {
             TaskEvent::Ready { busy } => !busy,
             TaskEvent::AnswerEntry { .. } | TaskEvent::TurnEnded | TaskEvent::Closed => true,
-            TaskEvent::ResumeTimedOut => true,
+            TaskEvent::ResumeTimedOut
+            | TaskEvent::ApprovalResolved {
+                approved: false, ..
+            } => true,
             _ => false,
         };
         if ends && !self.run.busy {
@@ -73,7 +83,12 @@ impl TaskState {
     }
 
     pub fn status(&self) -> StatusRow {
-        status_row(&self.transcript, &self.run, self.look_only)
+        status_row(
+            &self.transcript,
+            &self.run,
+            self.look_only,
+            self.history_complete,
+        )
     }
 
     /// Row `index` is a "Working" group that is going on: one of its calls

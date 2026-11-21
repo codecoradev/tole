@@ -27,7 +27,7 @@ fn call(seq: u64, tool: &str, ok: Option<bool>) -> Vec<E> {
 
 #[rustfmt::skip]
 fn plan(status: PlanStatus) -> E {
-    E::PlanUpdated { items: vec![PlanItem { text: "one".into(), status }] }
+    E::PlanUpdated { seq: u64::MAX, items: vec![PlanItem { text: "one".into(), status }] }
 }
 
 fn run(parts: Vec<Vec<E>>) -> Transcript {
