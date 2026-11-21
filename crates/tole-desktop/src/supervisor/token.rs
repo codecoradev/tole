@@ -82,12 +82,25 @@ pub fn write(dir: &Path, token: &Token) -> io::Result<()> {
 /// to group or other, too large or not a token).
 pub fn read(dir: &Path) -> io::Result<Option<Token>> {
     let path = token_path(dir);
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(m) => m,
+    let bad = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, why.to_owned());
+    // The file is opened first and judged through the descriptor, so what is
+    // checked is what is read: a swap between a check of the path and the open
+    // cannot slip another file in. `O_NOFOLLOW` makes the open itself refuse a
+    // link; `O_NONBLOCK` keeps the open of a named pipe from waiting for a
+    // writer (the type check below then refuses it).
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(bad("the credential file is not a regular file"));
+        }
         Err(e) => return Err(e),
     };
-    let bad = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, why.to_owned());
+    let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(bad("the credential file is not a regular file"));
     }
@@ -98,12 +111,7 @@ pub fn read(dir: &Path) -> io::Result<Option<Token>> {
         return Err(bad("the credential file is open to other users"));
     }
     let mut text = String::new();
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)?
-        .take(MAX_LEN + 1)
-        .read_to_string(&mut text)?;
+    file.take(MAX_LEN + 1).read_to_string(&mut text)?;
     if text.len() as u64 > MAX_LEN {
         return Err(bad("the credential file is too large"));
     }
@@ -184,6 +192,43 @@ mod tests {
             .contains("does not hold a token"));
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
+        assert!(read(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        // A link to nothing is refused the same way, not read as "no token".
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), &path).unwrap();
+        assert!(read(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A named pipe or a directory in the place of the file is refused at
+    /// once. Opening a pipe for reading would otherwise wait for a writer
+    /// that never comes, and the supervisor would hang on its own credential.
+    #[test]
+    fn a_pipe_or_a_directory_in_place_of_the_file_is_refused_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("kind");
+        let path = token_path(&dir);
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the whole call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&d).map(|t| t.is_some()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read returned instead of waiting for a writer");
+        assert!(got.unwrap_err().to_string().contains("not a regular file"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(read(&dir)
             .unwrap_err()
             .to_string()
