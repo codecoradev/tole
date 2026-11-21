@@ -29,9 +29,11 @@ pub enum Probe {
     },
     /// Something is there that does not answer like a serve.
     NotTole,
-    /// The client refused to use the socket (a directory that is not owner-only,
-    /// a path too long): nothing was sent. The text says why.
-    Refused(String),
+    /// The client refused to use the socket because its directory or file is not
+    /// the owner's alone: nothing was sent. The text says why.
+    Insecure(String),
+    /// The socket path cannot be used at all (too long for a socket address).
+    Invalid(String),
 }
 
 /// A client for the socket, with the answer bounded.
@@ -44,7 +46,8 @@ pub fn probe(socket: &Path) -> Probe {
     let client = match client(socket, None) {
         Ok(c) => c,
         Err(Error::Connect(_)) => return Probe::Absent,
-        Err(e) => return Probe::Refused(e.to_string()),
+        Err(Error::InsecureSocket { reason, .. }) => return Probe::Insecure(reason),
+        Err(e) => return Probe::Invalid(e.to_string()),
     };
     match client.health() {
         Ok(h) if h.status == "ok" => Probe::Serve {
@@ -53,7 +56,7 @@ pub fn probe(socket: &Path) -> Probe {
         },
         Ok(_) => Probe::NotTole,
         Err(Error::Connect(_)) => Probe::Absent,
-        Err(Error::InsecureSocket { reason, .. }) => Probe::Refused(reason),
+        Err(Error::InsecureSocket { reason, .. }) => Probe::Insecure(reason),
         Err(_) => Probe::NotTole,
     }
 }
