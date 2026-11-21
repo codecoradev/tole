@@ -10,6 +10,11 @@
 //!   to touch on an upgrade). The toolkit is behind the `gpui` feature.
 //!
 //! The desktop is a client of `tole serve`. It never embeds the session host
-//! and holds no agent logic (docs/desktop-design.md section 0, D2).
+//! and holds no agent logic (docs/desktop-design.md section 0, D2). Its one tole
+//! dependency is the typed client `tole-client`.
+//!
+//! - [`supervisor`] (macOS and Linux): attaches to or starts the local serve.
 
+#[cfg(unix)]
+pub mod supervisor;
 pub mod ui;
