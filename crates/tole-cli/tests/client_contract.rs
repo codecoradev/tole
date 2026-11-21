@@ -19,7 +19,8 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 use tole_client::{
-    Client, Decision, Error, Event, IndexQuery, NewSession, PromptRequest, ReconnectPolicy, Route,
+    Client, Decision, EffortRequest, Error, Event, ForkRequest, IndexQuery, InterruptRequest,
+    MissionRequest, ModelRequest, NameRequest, NewSession, PromptRequest, ReconnectPolicy, Route,
     StreamItem,
 };
 
@@ -55,7 +56,13 @@ impl Target {
 }
 
 fn tcp_target() -> Target {
-    let serve = Rc::new(Serve::spawn(&spawn_mock(0)));
+    tcp_target_slow(0)
+}
+
+/// A serve over a provider mock that holds every request mentioning "slow"
+/// for `slow_ms`, so a turn or a mission stays running while the test acts.
+fn tcp_target_slow(slow_ms: u64) -> Target {
+    let serve = Rc::new(Serve::spawn(&spawn_mock(slow_ms)));
     let url = format!("http://127.0.0.1:{}", serve.port);
     let client = |token: &str| Client::connect_tcp(&url, Some(token.into()), false).unwrap();
     let s = Rc::clone(&serve);
@@ -381,6 +388,229 @@ fn an_approval_is_listed_decided_and_resumed_through_the_client(t: &Target) {
     ));
 }
 
+// A 1x1 PNG (header + IHDR; serve sniffs the type, it does not decode).
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0,
+    1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89,
+];
+
+fn status_of(e: Result<impl std::fmt::Debug, Error>) -> u16 {
+    match e {
+        Err(Error::Status { status, .. }) => status,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// The key set of a typed answer and of the server's raw JSON must be the
+/// same, for an answer whose values differ between two calls (a new id).
+fn same_keys<T: Serialize>(what: &str, typed: &T, raw: &Value) {
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        keys(&serde_json::to_value(typed).unwrap()),
+        keys(raw),
+        "{what}"
+    );
+}
+
+fn name_model_effort_compact_fork_and_tree_round_trip_through_the_client(t: &Target) {
+    let c = &t.client;
+    let id = c.create_session(&NewSession::default()).unwrap().session_id;
+    c.prompt(&id, &PromptRequest::text("hello")).unwrap();
+    let sess = |tail: &str| format!("/sessions/{id}/{tail}");
+
+    // Name: the trimmed label, and the status shows it.
+    let named = c
+        .set_name(&id, &NameRequest::new("  Plan the work  "))
+        .unwrap();
+    assert_eq!(named.name, "Plan the work");
+    lossless(
+        "name",
+        &named,
+        &t.raw(
+            "POST",
+            &sess("name"),
+            Some(&json!({"name": "Plan the work"}).to_string()),
+        ),
+    );
+    assert_eq!(
+        c.status(&id).unwrap().name.as_deref(),
+        Some("Plan the work")
+    );
+    assert_eq!(status_of(c.set_name(&id, &NameRequest::new("  "))), 400);
+
+    // Model: one the owner allows; anything else is a 400.
+    let models = c.models().unwrap();
+    let pick = models.default.clone().expect("a default model");
+    let set = c.set_model(&id, &ModelRequest::new(&pick)).unwrap();
+    assert_eq!(set.model, pick);
+    lossless(
+        "model",
+        &set,
+        &t.raw(
+            "POST",
+            &sess("model"),
+            Some(&json!({"model": pick}).to_string()),
+        ),
+    );
+    assert_eq!(c.status(&id).unwrap().model.as_deref(), Some(pick.as_str()));
+    assert_eq!(
+        status_of(c.set_model(&id, &ModelRequest::new("not-a-listed-model"))),
+        400
+    );
+
+    // Effort: a level, then cleared with an explicit null.
+    let high = c
+        .set_effort(&id, &EffortRequest::new(Some("high")))
+        .unwrap();
+    assert_eq!(high.effort.as_deref(), Some("high"));
+    lossless(
+        "effort",
+        &high,
+        &t.raw(
+            "POST",
+            &sess("effort"),
+            Some(&json!({"effort": "high"}).to_string()),
+        ),
+    );
+    assert_eq!(c.status(&id).unwrap().effort.as_deref(), Some("high"));
+    let cleared = c.set_effort(&id, &EffortRequest::new(None)).unwrap();
+    assert_eq!(cleared.effort, None);
+    lossless(
+        "effort cleared",
+        &cleared,
+        &t.raw(
+            "POST",
+            &sess("effort"),
+            Some(&json!({"effort": null}).to_string()),
+        ),
+    );
+    assert_eq!(
+        status_of(c.set_effort(&id, &EffortRequest::new(Some("turbo")))),
+        400
+    );
+
+    // Compact: a request for the next prompt.
+    let compact = c.compact(&id).unwrap();
+    assert_eq!(compact.compaction, "requested");
+    lossless("compact", &compact, &t.raw("POST", &sess("compact"), None));
+
+    // Fork: a new, not live session cut at the last settled entry, which the
+    // tree then shows below this one and which can be resumed.
+    let fork = c.fork(&id, &ForkRequest::default()).unwrap();
+    assert_eq!(fork.forked_from, id);
+    assert_ne!(fork.id, id);
+    assert!(fork.seq.is_some(), "{fork:?}");
+    let raw_fork = t.raw("POST", &sess("fork"), Some("{}"));
+    same_keys("fork", &fork, &raw_fork);
+    assert_eq!(raw_fork["forkedFrom"], json!(id));
+    // Cut at the same entry by its seq: the same cut point.
+    let at = c.fork(&id, &ForkRequest::at(fork.seq.unwrap())).unwrap();
+    assert_eq!((at.at.as_str(), at.seq), (fork.at.as_str(), fork.seq));
+    assert_eq!(
+        status_of(c.fork(&id, &ForkRequest::at(u64::MAX >> 12))),
+        400
+    );
+    assert!(!c
+        .sessions()
+        .unwrap()
+        .sessions
+        .iter()
+        .any(|s| s.id == fork.id));
+
+    let tree = c.tree(&id).unwrap();
+    lossless("tree", &tree, &t.raw("GET", &sess("tree"), None));
+    let me = tree
+        .tree
+        .iter()
+        .find(|n| n.current)
+        .expect("the current session");
+    assert_eq!(me.id, id);
+    let child = tree
+        .tree
+        .iter()
+        .find(|n| n.id == fork.id)
+        .expect("the fork");
+    assert_eq!(
+        (child.parent.as_deref(), child.depth, child.current),
+        (Some(id.as_str()), me.depth + 1, false)
+    );
+    assert_eq!(status_of(c.tree("nope")), 404);
+
+    let opened = c.resume_session(&fork.id).unwrap();
+    assert_eq!(opened.session_id, fork.id);
+    assert!(c
+        .sessions()
+        .unwrap()
+        .sessions
+        .iter()
+        .any(|s| s.id == fork.id));
+}
+
+fn an_image_is_uploaded_prompted_and_read_back_through_the_client(t: &Target) {
+    let c = &t.client;
+    let id = c.create_session(&NewSession::default()).unwrap().session_id;
+
+    let up = c.upload_image(&id, PNG).unwrap();
+    assert_eq!(
+        (up.mime.as_str(), up.bytes),
+        ("image/png", PNG.len() as u64)
+    );
+    assert_eq!(up.id, up.fnv1a64);
+    // The same bytes are the same image: the same reference, as the server sent it.
+    let again = c.upload_image(&id, PNG).unwrap();
+    assert_eq!(again, up);
+
+    // Only an image the log records can be read: the prompt records it.
+    assert_eq!(status_of(c.image(&id, &up.fnv1a64)), 404);
+    let reply = c
+        .prompt(
+            &id,
+            &PromptRequest {
+                text: "look".into(),
+                images: vec![up.id.clone()],
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.text.as_deref(), Some("ENTRIES-ANSWER"), "{reply:?}");
+    let img = c.image(&id, &up.fnv1a64).unwrap();
+    assert_eq!((img.mime.as_str(), img.data.as_slice()), ("image/png", PNG));
+
+    // Refusals are typed: not an image (415), an unknown session (404).
+    assert_eq!(status_of(c.upload_image(&id, b"not an image")), 415);
+    assert_eq!(status_of(c.upload_image("nope", PNG)), 404);
+    assert_eq!(status_of(c.image("nope", &up.fnv1a64)), 404);
+}
+
+fn a_mission_runs_to_its_budget_and_reports_through_the_client(t: &Target) {
+    let c = &t.client;
+    let mut req = MissionRequest::goal("tidy up");
+    req.max_steps = Some(2);
+    let started = c.start_mission(&req).unwrap();
+    assert!(started.id.starts_with("mission-") && started.status == "running");
+
+    let done = common::wait_for(common::WAIT, "the mission to end", || {
+        let m = c.mission(&started.id).unwrap();
+        (!m.running).then_some(m)
+    });
+    assert_eq!(done.status, "exhausted_steps", "{done:?}");
+    assert!(
+        done.turns.unwrap() >= 1 && done.steps.unwrap() >= 2,
+        "{done:?}"
+    );
+    assert_eq!(done.summary.as_ref().unwrap()["goal"], "tidy up");
+    lossless(
+        "mission",
+        &done,
+        &t.raw("GET", &format!("/missions/{}", started.id), None),
+    );
+
+    // Ended: it cannot be cancelled; unknown ones and bad requests are typed.
+    assert_eq!(status_of(c.cancel_mission(&started.id)), 409);
+    assert_eq!(status_of(c.mission("mission-nope")), 404);
+    assert_eq!(status_of(c.cancel_mission("mission-nope")), 404);
+    assert_eq!(status_of(c.start_mission(&MissionRequest::goal(""))), 400);
+}
+
 mod tcp {
     use super::*;
 
@@ -392,6 +622,86 @@ mod tcp {
     #[test]
     fn an_approval_is_listed_decided_and_resumed_through_the_client() {
         super::an_approval_is_listed_decided_and_resumed_through_the_client(&tcp_target());
+    }
+
+    #[test]
+    fn name_model_effort_compact_fork_and_tree_round_trip_through_the_client() {
+        super::name_model_effort_compact_fork_and_tree_round_trip_through_the_client(&tcp_target());
+    }
+
+    #[test]
+    fn an_image_is_uploaded_prompted_and_read_back_through_the_client() {
+        super::an_image_is_uploaded_prompted_and_read_back_through_the_client(&tcp_target());
+    }
+
+    #[test]
+    fn a_mission_runs_to_its_budget_and_reports_through_the_client() {
+        super::a_mission_runs_to_its_budget_and_reports_through_the_client(&tcp_target());
+    }
+
+    /// A turn that is running is steered and then detached, and a mission that
+    /// is running is cancelled; idle, both refusals are a typed 409.
+    #[test]
+    fn a_running_turn_is_steered_and_detached_and_a_running_mission_cancelled() {
+        let t = tcp_target_slow(3_000);
+        let c = &t.client;
+        let id = c.create_session(&NewSession::default()).unwrap().session_id;
+
+        assert_eq!(
+            status_of(c.interrupt(&id, &InterruptRequest::text("x"))),
+            409
+        );
+        assert_eq!(status_of(c.detach(&id)), 409);
+        assert_eq!(
+            status_of(c.interrupt("nope", &InterruptRequest::text("x"))),
+            404
+        );
+
+        let turn = {
+            let (c, id) = (c.clone(), id.clone());
+            std::thread::spawn(move || c.prompt(&id, &PromptRequest::text("slow turn")))
+        };
+        common::wait_until(common::WAIT, "the turn to start", || {
+            c.status(&id).is_ok_and(|s| s.busy)
+        });
+        let steered = c
+            .interrupt(&id, &InterruptRequest::text("prefer approach Y"))
+            .unwrap();
+        assert!(steered.queued && !steered.urgent && steered.session_id == id);
+        // The same answer from the wire (a `202`, which `raw` does not take).
+        let (code, raw) = (t.http)(
+            "POST",
+            &format!("/sessions/{id}/interrupt"),
+            Some(&json!({"text": "and keep it short"}).to_string()),
+        );
+        assert_eq!(code, 202, "{raw}");
+        lossless("interrupt", &steered, &raw);
+        let detached = c.detach(&id).unwrap();
+        assert!(detached.detached && detached.session_id == id);
+        // The prompt that was waiting answers: the turn ended detached.
+        let reply = turn.join().unwrap().unwrap();
+        assert_eq!(reply.stop_reason, "detached", "{reply:?}");
+
+        // A mission in flight: one at a time, and a cancel ends it `stopped`.
+        let started = c.start_mission(&MissionRequest::goal("slow work")).unwrap();
+        let running = c.mission(&started.id).unwrap();
+        assert!(running.running && running.status == "running" && running.turns.is_none());
+        lossless(
+            "mission running",
+            &running,
+            &t.raw("GET", &format!("/missions/{}", started.id), None),
+        );
+        assert_eq!(
+            status_of(c.start_mission(&MissionRequest::goal("second"))),
+            409
+        );
+        let cancelled = c.cancel_mission(&started.id).unwrap();
+        assert!(cancelled.cancelled && cancelled.id == started.id);
+        let done = common::wait_for(common::WAIT, "the cancelled mission to end", || {
+            let m = c.mission(&started.id).unwrap();
+            (!m.running).then_some(m)
+        });
+        assert_eq!(done.status, "stopped", "{done:?}");
     }
 }
 
@@ -409,6 +719,23 @@ mod over_a_socket {
     #[test]
     fn an_approval_is_listed_decided_and_resumed_through_the_client() {
         super::an_approval_is_listed_decided_and_resumed_through_the_client(&socket::target());
+    }
+
+    #[test]
+    fn name_model_effort_compact_fork_and_tree_round_trip_through_the_client() {
+        super::name_model_effort_compact_fork_and_tree_round_trip_through_the_client(
+            &socket::target(),
+        );
+    }
+
+    #[test]
+    fn an_image_is_uploaded_prompted_and_read_back_through_the_client() {
+        super::an_image_is_uploaded_prompted_and_read_back_through_the_client(&socket::target());
+    }
+
+    #[test]
+    fn a_mission_runs_to_its_budget_and_reports_through_the_client() {
+        super::a_mission_runs_to_its_budget_and_reports_through_the_client(&socket::target());
     }
 
     #[test]
@@ -442,13 +769,16 @@ mod over_a_socket {
 
 /// Every route the client has a method for exists on the server: a rename or
 /// removal there fails here. (The reverse, a server route with no client
-/// method, is the next slice: the client covers the desktop's first set.)
-/// Routes do not depend on the transport, so TCP is enough.
+/// method, is `client_routes.rs`.) Routes do not depend on the transport, so
+/// TCP is enough.
 #[test]
 fn every_client_route_exists_on_the_server() {
     let serve = Serve::spawn(&spawn_mock(0));
     for route in Route::ALL {
-        let path = route.template().replace("{id}", "nope");
+        let path = route
+            .template()
+            .replace("{id}", "nope")
+            .replace("{hash}", "0123456789abcdef");
         let body = (route.method() == "POST").then_some("{}");
         let (code, v) = serve.http(route.method(), &path, body);
         let route_missing = code == 404 && v["error"] == "not found";

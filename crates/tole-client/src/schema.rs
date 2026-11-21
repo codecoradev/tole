@@ -63,6 +63,12 @@ fn sorted(v: Value) -> Value {
 /// the root `events` group, keyed by event name.
 const EVENT_STREAM: &str = "events";
 
+/// What `route_types` names for the answer of the image read: the bytes of an
+/// image (`image/png`, `image/jpeg`, `image/gif` or `image/webp`), not JSON.
+/// The image upload takes the same bytes as its request body; the route entry's
+/// `rawBody` says which side is raw.
+const IMAGE_BYTES: &str = "image";
+
 /// `(request type, response type, query parameters)` of a route. Exhaustive,
 /// so a new `Route` does not compile until it is described here. The query
 /// parameter names are listed by hand beside the client methods that send them.
@@ -93,6 +99,19 @@ fn route_types(r: Route) -> (Option<&'static str>, &'static str, &'static [&'sta
         Route::Profiles => (None, "Profiles", &[]),
         Route::Skills => (None, "SkillsState", &[]),
         Route::Tools => (None, "ToolsState", &[]),
+        Route::Interrupt => (Some("InterruptRequest"), "InterruptReply", &[]),
+        Route::Detach => (None, "DetachReply", &[]),
+        Route::Fork => (Some("ForkRequest"), "ForkReply", &[]),
+        Route::Tree => (None, "SessionTree", &[]),
+        Route::Compact => (None, "CompactReply", &[]),
+        Route::Name => (Some("NameRequest"), "NameReply", &[]),
+        Route::SetModel => (Some("ModelRequest"), "ModelReply", &[]),
+        Route::Effort => (Some("EffortRequest"), "EffortReply", &[]),
+        Route::UploadImage => (None, "ImageUploaded", &[]),
+        Route::ReadImage => (None, IMAGE_BYTES, &[]),
+        Route::StartMission => (Some("MissionRequest"), "MissionStarted", &[]),
+        Route::Mission => (None, "Mission", &[]),
+        Route::CancelMission => (None, "MissionCancelled", &[]),
     }
 }
 
@@ -114,6 +133,12 @@ pub(crate) fn generate() -> Value {
         ("PromptRequest", g.subschema_for::<PromptRequest>()),
         ("DecisionRequest", g.subschema_for::<DecisionRequest>()),
         ("DiscussionRequest", g.subschema_for::<DiscussionRequest>()),
+        ("InterruptRequest", g.subschema_for::<InterruptRequest>()),
+        ("ForkRequest", g.subschema_for::<ForkRequest>()),
+        ("NameRequest", g.subschema_for::<NameRequest>()),
+        ("ModelRequest", g.subschema_for::<ModelRequest>()),
+        ("EffortRequest", g.subschema_for::<EffortRequest>()),
+        ("MissionRequest", g.subschema_for::<MissionRequest>()),
     ]);
     let responses = group(vec![
         ("Health", g.subschema_for::<Health>()),
@@ -142,6 +167,18 @@ pub(crate) fn generate() -> Value {
         ("Profiles", g.subschema_for::<Profiles>()),
         ("SkillsState", g.subschema_for::<SkillsState>()),
         ("ToolsState", g.subschema_for::<ToolsState>()),
+        ("InterruptReply", g.subschema_for::<InterruptReply>()),
+        ("DetachReply", g.subschema_for::<DetachReply>()),
+        ("ForkReply", g.subschema_for::<ForkReply>()),
+        ("SessionTree", g.subschema_for::<SessionTree>()),
+        ("CompactReply", g.subschema_for::<CompactReply>()),
+        ("NameReply", g.subschema_for::<NameReply>()),
+        ("ModelReply", g.subschema_for::<ModelReply>()),
+        ("EffortReply", g.subschema_for::<EffortReply>()),
+        ("ImageUploaded", g.subschema_for::<ImageUploaded>()),
+        ("MissionStarted", g.subschema_for::<MissionStarted>()),
+        ("Mission", g.subschema_for::<Mission>()),
+        ("MissionCancelled", g.subschema_for::<MissionCancelled>()),
     ]);
     // Keyed by the SSE event name; the value is the JSON in the frame's `data:`.
     let events = group(vec![
@@ -160,10 +197,16 @@ pub(crate) fn generate() -> Value {
         .iter()
         .map(|&r| {
             let (req, res, query) = route_types(r);
-            let (response, stream) = if res == EVENT_STREAM {
-                (Value::Null, json!(EVENT_STREAM))
-            } else {
-                (json!(res), Value::Null)
+            let (response, stream) = match res {
+                EVENT_STREAM => (Value::Null, json!(EVENT_STREAM)),
+                IMAGE_BYTES => (Value::Null, Value::Null),
+                _ => (json!(res), Value::Null),
+            };
+            // The one side of a route whose body is the bytes of an image.
+            let raw_body = match r {
+                Route::UploadImage => json!("request"),
+                Route::ReadImage => json!("response"),
+                _ => Value::Null,
             };
             json!({
                 "method": r.method(),
@@ -171,6 +214,7 @@ pub(crate) fn generate() -> Value {
                 "request": req,
                 "response": response,
                 "stream": stream,
+                "rawBody": raw_body,
                 "query": query,
             })
         })
@@ -179,7 +223,7 @@ pub(crate) fn generate() -> Value {
     sorted(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "tole serve client protocol",
-        "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what.",
+        "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
         "type": "object",
         "properties": {"requests": requests, "responses": responses, "events": events},
         "required": ["requests", "responses", "events"],
@@ -278,6 +322,26 @@ fn every_route_names_types_that_the_document_defines() {
     let streams: Vec<&str> = routes.iter().filter_map(|r| r["stream"].as_str()).collect();
     assert_eq!(streams, [EVENT_STREAM], "exactly the event route streams");
     assert!(doc["properties"][EVENT_STREAM].is_object());
+    // The raw side of an image route has no JSON type; the other side does.
+    let raw: Vec<(&str, &str)> = routes
+        .iter()
+        .filter_map(|r| Some((r["path"].as_str()?, r["rawBody"].as_str()?)))
+        .collect();
+    assert_eq!(
+        raw,
+        [
+            ("/sessions/{id}/images", "request"),
+            ("/sessions/{id}/images/{hash}", "response")
+        ]
+    );
+    for r in routes {
+        assert!(
+            r["response"].is_string() || r["stream"].is_string() || r["rawBody"] == "response",
+            "{} {} has no answer type",
+            r["method"],
+            r["path"]
+        );
+    }
     assert_eq!(routes.len(), Route::ALL.len());
 }
 
