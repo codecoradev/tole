@@ -62,7 +62,17 @@ fn tcp_target() -> Target {
 /// A serve over a provider mock that holds every request mentioning "slow"
 /// for `slow_ms`, so a turn or a mission stays running while the test acts.
 fn tcp_target_slow(slow_ms: u64) -> Target {
-    let serve = Rc::new(Serve::spawn(&spawn_mock(slow_ms)));
+    tcp_target_with(&spawn_mock(slow_ms))
+}
+
+/// A serve over a provider mock that holds a request at a gate (#812): a
+/// request whose body contains a marker waits until the test opens that gate.
+fn tcp_target_gated(gates: Vec<(&'static str, std::sync::Arc<common::Gate>)>) -> Target {
+    tcp_target_with(&serve_harness::spawn_mock_gated(0, gates))
+}
+
+fn tcp_target_with(base: &str) -> Target {
+    let serve = Rc::new(Serve::spawn(base));
     let url = format!("http://127.0.0.1:{}", serve.port);
     let client = |token: &str| Client::connect_tcp(&url, Some(token.into()), false).unwrap();
     let s = Rc::clone(&serve);
@@ -640,10 +650,17 @@ mod tcp {
     }
 
     /// A turn that is running is steered and then detached, and a mission that
-    /// is running is cancelled; idle, both refusals are a typed 409.
+    /// is running is cancelled; idle, both refusals are a typed 409. The
+    /// provider holds each request at a gate (#812), not for a fixed time: a
+    /// fixed 3 s window let the turn end by itself on a loaded runner before
+    /// `detach` reached it.
     #[test]
     fn a_running_turn_is_steered_and_detached_and_a_running_mission_cancelled() {
-        let t = tcp_target_slow(3_000);
+        let (turn_gate, mission_gate) = (common::Gate::new(), common::Gate::new());
+        let t = tcp_target_gated(vec![
+            ("slow turn", turn_gate.clone()),
+            ("slow work", mission_gate.clone()),
+        ]);
         let c = &t.client;
         let id = c.create_session(&NewSession::default()).unwrap().session_id;
 
@@ -661,9 +678,8 @@ mod tcp {
             let (c, id) = (c.clone(), id.clone());
             std::thread::spawn(move || c.prompt(&id, &PromptRequest::text("slow turn")))
         };
-        common::wait_until(common::WAIT, "the turn to start", || {
-            c.status(&id).is_ok_and(|s| s.busy)
-        });
+        turn_gate.wait_entered();
+        assert!(c.status(&id).unwrap().busy, "the turn is at the provider");
         let steered = c
             .interrupt(&id, &InterruptRequest::text("prefer approach Y"))
             .unwrap();
@@ -678,12 +694,15 @@ mod tcp {
         lossless("interrupt", &steered, &raw);
         let detached = c.detach(&id).unwrap();
         assert!(detached.detached && detached.session_id == id);
+        // The provider answers only now, after the detach was asked for.
+        turn_gate.open();
         // The prompt that was waiting answers: the turn ended detached.
         let reply = turn.join().unwrap().unwrap();
         assert_eq!(reply.stop_reason, "detached", "{reply:?}");
 
         // A mission in flight: one at a time, and a cancel ends it `stopped`.
         let started = c.start_mission(&MissionRequest::goal("slow work")).unwrap();
+        mission_gate.wait_entered();
         let running = c.mission(&started.id).unwrap();
         assert!(running.running && running.status == "running" && running.turns.is_none());
         lossless(
@@ -697,6 +716,7 @@ mod tcp {
         );
         let cancelled = c.cancel_mission(&started.id).unwrap();
         assert!(cancelled.cancelled && cancelled.id == started.id);
+        mission_gate.open();
         let done = common::wait_for(common::WAIT, "the cancelled mission to end", || {
             let m = c.mission(&started.id).unwrap();
             (!m.running).then_some(m)

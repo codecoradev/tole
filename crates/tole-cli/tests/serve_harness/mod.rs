@@ -212,10 +212,24 @@ impl Drop for Serve {
 /// triggers: "UNKNOWN_TOOL" asks for an unregistered tool, "LOOP_TOOL"
 /// repeats one identical read-only call, "PROVIDER_FAIL" answers HTTP 400.
 pub fn spawn_mock(slow_ms: u64) -> String {
+    spawn_mock_gated(slow_ms, Vec::new())
+}
+
+/// [`spawn_mock`] with gates (#812): a request whose body contains a gate's
+/// marker is held at that gate until the test opens it, not for a fixed time,
+/// so the test acts while the turn is certainly still at the provider, however
+/// loaded the machine is. A request that matches no marker behaves as in
+/// [`spawn_mock`].
+pub fn spawn_mock_gated(
+    slow_ms: u64,
+    gates: Vec<(&'static str, std::sync::Arc<common::Gate>)>,
+) -> String {
+    let gates = std::sync::Arc::new(gates);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let gates = std::sync::Arc::clone(&gates);
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -236,7 +250,10 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                     }
                 }
                 let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
-                if body.to_string().contains("slow") {
+                let seen = body.to_string();
+                if let Some((_, gate)) = gates.iter().find(|(marker, _)| seen.contains(marker)) {
+                    gate.hold();
+                } else if seen.contains("slow") {
                     std::thread::sleep(Duration::from_millis(slow_ms));
                 }
                 let text = "ENTRIES-ANSWER";
