@@ -5,7 +5,7 @@
 //! own. Wording follows the design draft (plain words for people who are not
 //! technical) and is still a draft.
 
-use crate::{ConnectionStatus, Section, Target};
+use crate::{ConnectionStatus, ConnectionsError, EndpointError, PlainHttp, Section, Target};
 
 pub const APP_NAME: &str = "Tole";
 pub const WINDOW_TITLE: &str = "Tole";
@@ -58,9 +58,78 @@ pub fn status_label(status: ConnectionStatus) -> &'static str {
     }
 }
 
+/// Why a server address was refused, in words for the owner.
+pub fn endpoint_error_text(error: &EndpointError) -> String {
+    match error {
+        EndpointError::Empty => "Enter the address of the server.".to_owned(),
+        EndpointError::Scheme => {
+            "The address must start with https:// (or http:// for a trusted private network)."
+                .to_owned()
+        }
+        EndpointError::CredentialInUrl => {
+            "Leave the password or token out of the address. Enter it in the credential field."
+                .to_owned()
+        }
+        EndpointError::QueryOrFragment => "The address of a server has no ? or # part.".to_owned(),
+        EndpointError::Host => {
+            "The address needs a server name or an IP address, for example https://tole.example.com."
+                .to_owned()
+        }
+        EndpointError::Port => "The port must be a number from 1 to 65535.".to_owned(),
+        EndpointError::Path => {
+            "The address has a space or a control character in its path.".to_owned()
+        }
+        EndpointError::PlainHttp {
+            host,
+            why: PlainHttp::NotTrusted,
+        } => format!(
+            "http:// sends your credential in the clear, so it is only for this computer. For \
+             {host}, use https://, or mark it as a trusted private network (a VPN or a network \
+             you control)."
+        ),
+        EndpointError::PlainHttp {
+            host,
+            why: PlainHttp::PublicAddress,
+        } => format!(
+            "{host} is a public address. http:// is never used with one, even when marked \
+             trusted. Use https://."
+        ),
+    }
+}
+
+/// Why a server entry was refused.
+pub fn connections_error_text(error: &ConnectionsError) -> String {
+    match error {
+        ConnectionsError::RemoteDisabled => "Remote servers are turned off in Settings.".to_owned(),
+        ConnectionsError::NameEmpty => "Give the server a name.".to_owned(),
+        ConnectionsError::NameTooLong => {
+            "The name is too long or has a control character.".to_owned()
+        }
+        ConnectionsError::NameTaken => "Another server has this name.".to_owned(),
+        ConnectionsError::TooMany => "There are too many servers. Remove one first.".to_owned(),
+        ConnectionsError::UnknownRemote => "That server is no longer in the list.".to_owned(),
+        ConnectionsError::Endpoint(e) => endpoint_error_text(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_http_refusal_says_why_and_what_to_do() {
+        let untrusted = endpoint_error_text(&EndpointError::PlainHttp {
+            host: "10.0.0.5".into(),
+            why: PlainHttp::NotTrusted,
+        });
+        assert!(untrusted.contains("10.0.0.5") && untrusted.contains("https://"));
+        assert!(untrusted.contains("trusted private network"));
+        let public = endpoint_error_text(&EndpointError::PlainHttp {
+            host: "203.0.113.9".into(),
+            why: PlainHttp::PublicAddress,
+        });
+        assert!(public.contains("public") && !public.contains("mark it"));
+    }
 
     #[test]
     fn every_section_has_a_distinct_nonempty_label() {
