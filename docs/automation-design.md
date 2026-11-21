@@ -824,8 +824,8 @@ working folder (the folder `tole discuss` is run in) instead.
 
 A discussion's helpers cannot look anything up today: inline voices hold no
 tools and an independent reviewer runs in plan mode. This section is the
-design of a per-discussion tool allowance; the ledger side below exists, the
-rest is listed as not yet built.
+design of a per-discussion tool allowance; what exists is listed under "Built
+so far", the rest under "Not built yet".
 
 **Owner decision (2026-11-20): one approval per tool per discussion.** The
 allowance is set only by the owner when the discussion starts, never by model
@@ -835,7 +835,7 @@ this discussion" is a rule bound to that discussion and that tool. It ends
 when the discussion closes or is stopped, is never allow-always, is never
 `Destructive`, and is never carried to another discussion or session.
 
-Built so far (ledger and display only):
+Built so far:
 
 - **The allowance is in the contract.** `Contract.tools` holds up to 8 registry
   names of connected (MCP) tools (`mcp_<server>_<tool>`, at most 64 characters),
@@ -865,8 +865,58 @@ Built so far (ledger and display only):
   tools refuses a contract that allows some (`Driver::start` and `Driver::run`),
   loudly, instead of running its helpers inline with no tools.
 
-Not built yet: the helper child that can call the named tools, the owner's
-prompt and the grant check around a call, and the `--tool` flag.
+- **The helper child keeps the named tools, and only those.** An independent
+  helper (a `consult` child, #704) runs in plan mode, which removes every
+  `Write` tool. When the host launches it with a scope
+  (`Delegator::consult_participant(.., Some(scope))`, from the ledger, never
+  from model output) the child's environment carries the discussion id, the
+  allowed tools and the ones already approved
+  (`TOLE_DISCUSSION_ID`, `TOLE_DISCUSSION_TOOLS`, `TOLE_DISCUSSION_GRANTED`; read
+  by `child_env::discussion_scope`, which needs the participant marker and drops
+  any malformed or non-connected name). Plan mode then keeps the `ReadOnly`
+  tools plus exactly those named connected tools
+  (`ToolRegistry::retain_read_only_and`: `Write` only, never `Destructive`), so
+  there is still no `write_file`, `run_command`, `git`, `delegate` or any
+  other connected tool. The scope is carried in the queued extras of the
+  delegation host, which only the host writes (data dir, outside every
+  workspace); an ordinary `delegate` child never gets one, whatever its input
+  says.
+- **Built-in read-only tools were already there.** Plan mode keeps every
+  `ReadOnly` tool, so a helper that runs as its own copy already has file
+  reading, search and, where configured, web search and page fetch
+  (`web_builtin` is `Risk::ReadOnly`); the allowance adds nothing for them. A
+  test starts the real binary as a participant and checks the tools offered to
+  the model: `read_file` yes, `write_file`, `edit_file`, `run_command`,
+  `delete_file` and `git` no.
+- **One approval per tool per discussion, at the call.** The helper's approver
+  (`delegated_approver`) for such a child decides alone: a tool outside the
+  allowance is denied without a request, `Destructive` is denied, `ReadOnly`
+  runs, no allow pattern (the report tool's own apart) and no `--yes` applies (it has none and could not widen
+  it). For a tool the owner named, the first call is a request in the durable
+  approvals queue (#714), which is owner-only for a connected tool (an external
+  effect), and the owner's prompt names the discussion and says that allow
+  covers every call of this tool in this discussion. An allow runs the call and
+  marks the tool approved in this process; later calls of it do not ask. A tool
+  the launch scope lists as already granted does not ask
+  either. Denial, no answer in the window and a failed request all deny, and
+  nothing is remembered from them. Another tool, another discussion and another
+  helper process start with what their host granted them, so they ask. This
+  approver exists only with `[delegation] approvals` set to `owner` or
+  `chain`; with `off` the helper keeps today's deny-at-EOF approver, so the
+  tool is registered and every call is denied.
+- **A fix found on the way: helpers could not start.** `tole mission` refused
+  `--plan-mode` for every caller ("missions mutate by definition"), and the
+  host launches an independent helper as `mission --plan-mode`, so a reviewer
+  (#704) never got as far as its first model call (the unit tests checked the
+  command line, never the binary). The refusal now stands for every mission
+  except one carrying the participant marker, which the host sets and which only
+  removes tools.
+
+Not built yet: the discussion driver recording the owner's decisions in the
+ledger and passing the grants to each helper, running every helper of a
+discussion that has an allowance as an independent child, and the
+`tole discuss start --tool` flag. A contract that allows tools is therefore
+still refused by the driver.
 
 ## 12. Non-goals
 

@@ -134,6 +134,9 @@ pub fn fenced(r: &Report) -> String {
     format!("{BEGIN}\n{body}\n{END}")
 }
 
+/// The name of the report tool.
+pub const REPORT_TOOL: &str = "delegate_report";
+
 /// `delegate_report`: the delegated child's one completion report. Write
 /// tier; its parent adds exactly this name to the child's allow list, which
 /// is safe because it writes one capped, validated file at a fixed path and
@@ -150,7 +153,7 @@ impl DelegateReportTool {
 
 impl Tool for DelegateReportTool {
     fn name(&self) -> &str {
-        "delegate_report"
+        REPORT_TOOL
     }
     fn risk(&self) -> Risk {
         Risk::Write

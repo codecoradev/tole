@@ -290,3 +290,4 @@ mod tests {
 }
 
 pub mod automations;
+pub mod skills;

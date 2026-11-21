@@ -138,6 +138,11 @@ struct Extras {
     role: Option<String>,
     consumes: Option<Value>,
     keep_mailbox: bool,
+    /// The tools a discussion's owner allowed this participant (#1039).
+    /// Set only by [`Delegator::consult_participant`]; a queued extras file
+    /// is written by this host alone, in the data dir outside every workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discussion: Option<tole_core::child_env::DiscussionScope>,
 }
 
 /// Everything needed to start one child, built from the recorded node.
@@ -159,6 +164,8 @@ struct Spec {
     keep_mailbox: bool,
     /// An independent discussion participant (#704), read from the node.
     participant: bool,
+    /// Its allowed tools (#1039); only ever read for a participant.
+    discussion: Option<tole_core::child_env::DiscussionScope>,
 }
 
 /// One session's delegation host.
@@ -424,14 +431,19 @@ impl Delegator {
     }
 
     fn delegate(&self, input: &Value) -> Result<Value, String> {
-        self.delegate_as(input, false)
+        self.delegate_as(input, false, None)
     }
 
     /// `delegate`, as an independent discussion participant when
     /// `participant` (#704): the child's allow list is empty (the profile's
     /// patterns are not carried over, so nothing of the profile or the
     /// caller's allow list can approve a Write) and it launches read-only.
-    fn delegate_as(&self, input: &Value, participant: bool) -> Result<Value, String> {
+    fn delegate_as(
+        &self,
+        input: &Value,
+        participant: bool,
+        scope: Option<&tole_core::child_env::DiscussionScope>,
+    ) -> Result<Value, String> {
         let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
         let task = tole_core::action_summary::task_text(input, &["task", "prompt"])
             .ok_or("delegate: missing or empty 'task'")?;
@@ -506,6 +518,7 @@ impl Delegator {
                 role: s("role"),
                 consumes: input.get("consumes").cloned(),
                 keep_mailbox: input.get("keep_mailbox").and_then(Value::as_bool) == Some(true),
+                discussion: scope.filter(|_| participant).cloned(),
             };
             let mut out = json!({
                 "node": h.node_id, "depth": h.depth, "mode": mode,
@@ -602,6 +615,7 @@ impl Delegator {
             consumes: x.consumes.clone(),
             keep_mailbox: x.keep_mailbox,
             participant: n.mode == Mode::Consult && n.task.starts_with(PARTICIPANT_MARKER),
+            discussion: x.discussion.clone(),
         })
     }
 
@@ -736,11 +750,17 @@ impl Delegator {
     /// read-only: plan mode, an empty allow list and the participant marker
     /// in its environment. Any Write it wants is denied (fail closed); the
     /// owner's approval surface for it is #714. Returns the node id.
+    ///
+    /// With `scope` (#1039) the child is also told which connected tools its
+    /// owner allowed it and which are already approved for this discussion;
+    /// it keeps those tools registered, asks the owner for the first call of
+    /// each and may not use any other. Everything else about it is unchanged.
     pub fn consult_participant(
         &self,
         profile: &str,
         task: &str,
         tokens: u64,
+        scope: Option<&tole_core::child_env::DiscussionScope>,
     ) -> Result<String, String> {
         if !task.starts_with(PARTICIPANT_MARKER) {
             return Err("delegate: a participant's task starts with its call marker".into());
@@ -751,6 +771,7 @@ impl Delegator {
                 "budget": {"tokens": tokens},
             }),
             true,
+            scope,
         )?;
         out["node"]
             .as_str()
@@ -1088,6 +1109,8 @@ fn launch(
         keep_secrets: spec.keep_secrets.clone(),
         nice: Some(nice),
         participant: spec.participant,
+        // Only a participant has a scope (see `Extras::discussion`).
+        discussion: spec.discussion.clone().filter(|_| spec.participant),
     };
     let mut input = json!({"prompt": spec.task, "keep_mailbox": spec.keep_mailbox});
     if let Some(r) = &spec.role {

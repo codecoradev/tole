@@ -34,6 +34,7 @@ mod plain;
 mod section;
 mod serve_state;
 mod shell;
+mod skills;
 pub mod strings;
 pub mod tokens;
 
@@ -57,3 +58,8 @@ pub use plain::Load;
 pub use section::Section;
 pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};
+pub use skills::{
+    ApprovedSkill, ArchivedSkill, Badge, BlockedReason, BlockedSkill, RawArchived, RawDraft,
+    RawSkill, RawTool, ReviewItem, ReviewReason, SkillsPageState, SkillsView, Tab, ToolChange,
+    ToolRow, ToolTrust,
+};
