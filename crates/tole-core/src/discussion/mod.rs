@@ -80,6 +80,12 @@ pub const MAX_CONTRIBUTION_CHARS: usize = 8000;
 pub const MAX_BACKGROUND_FILES: usize = 4;
 pub const MAX_BACKGROUND_PATH_CHARS: usize = 200;
 pub const MAX_BACKGROUND_EXCERPT_CHARS: usize = 12_000;
+/// Most connected tools a contract may allow its helpers (#1039), and the
+/// longest tool name: the registry-facing name providers accept (64).
+pub const MAX_ALLOWED_TOOLS: usize = 8;
+pub const MAX_TOOL_NAME_CHARS: usize = 64;
+/// Longest approval request id kept in a ledger record.
+pub const MAX_APPROVAL_REQ_CHARS: usize = 64;
 /// Longest digest line, and most lines in one digest section.
 pub const MAX_LINE_CHARS: usize = 600;
 pub const MAX_LINES: usize = 24;
@@ -190,6 +196,52 @@ pub struct Contract {
     /// evidence. Digests and names only: the ledger never holds the content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_sha256: Vec<String>,
+    /// The connected (MCP) tools the owner allows the helpers of this
+    /// discussion to ask for (#1039), by registry name (`mcp_<server>_<tool>`).
+    /// Set only by the owner when the discussion starts, never by model
+    /// output. Naming a tool allows nothing by itself: the first call of each
+    /// one in a discussion still goes to the owner's approval surface
+    /// ([`ToolApproval`]). A contract without any is written exactly as before
+    /// and a ledger from before the field replays unchanged; a binary from
+    /// before it ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+}
+
+/// What the owner decided about a helper's first call of an allowed tool
+/// (#1039), as the host saw it and the ledger records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolVerdict {
+    /// "Allow for this discussion": every later call of this tool in this
+    /// discussion runs without asking, until it closes or is stopped.
+    Allow,
+    Deny,
+    /// Nobody answered in time: no answer is a denial.
+    Expired,
+}
+
+/// One approval decision about an allowed tool, folded from the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApproval {
+    /// The approvals-queue request this answers (its id), so a decision is
+    /// recorded once however often the host sees it.
+    pub req: String,
+    pub tool: String,
+    pub verdict: ToolVerdict,
+}
+
+/// Whether `name` is a registry name of a connected tool a contract may
+/// allow: `mcp_` and then letters, digits, `_` and `-`, at most
+/// [`MAX_TOOL_NAME_CHARS`]. Only connected tools qualify: they are always
+/// `Write`, so every one is asked about; a built-in is never named here.
+pub fn tool_name_ok(name: &str) -> bool {
+    name.len() <= MAX_TOOL_NAME_CHARS
+        && name.len() > 4
+        && name.starts_with("mcp_")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A background file as an inline voice sees it: read from the working
@@ -210,6 +262,32 @@ pub struct Background {
 }
 
 impl Contract {
+    /// This contract allowing its helpers to ask for `tools` (#1039): at most
+    /// [`MAX_ALLOWED_TOOLS`] registry names that pass [`tool_name_ok`], none
+    /// twice. The host has checked them against the configured servers.
+    pub fn with_tools(mut self, tools: &[String]) -> Result<Self, String> {
+        if tools.len() > MAX_ALLOWED_TOOLS {
+            return Err(format!(
+                "{} tools: at most {MAX_ALLOWED_TOOLS} may be allowed",
+                tools.len()
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for t in tools {
+            if !tool_name_ok(t) {
+                return Err(format!(
+                    "tool {t:?} is not a connected tool name (`mcp_<server>_<tool>`: letters, \
+                     digits, `_` and `-`, up to {MAX_TOOL_NAME_CHARS} characters)"
+                ));
+            }
+            if !seen.insert(t.as_str()) {
+                return Err(format!("tool {t:?} is listed twice"));
+            }
+        }
+        self.tools = tools.to_vec();
+        Ok(self)
+    }
+
     /// This contract naming `files` as background (#1038), with the SHA-256
     /// of each (`sha256`, one per file): at most [`MAX_BACKGROUND_FILES`],
     /// each a name that passes [`background_name_ok`], none twice. The host
@@ -364,6 +442,7 @@ impl Contract {
             max_rounds,
             files: Vec::new(),
             file_sha256: Vec::new(),
+            tools: Vec::new(),
         })
     }
 }
@@ -893,3 +972,6 @@ pub fn checker_request(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tools_tests;
