@@ -47,9 +47,11 @@ ALLOWED_VIA_CLIENT = {"tole-core"}
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 EXACT_REQ = re.compile(r"=\d+\.\d+\.\d+(-[0-9A-Za-z.\-]+)?")
 MAX_FILE_LINES = 500
-# Owner rule D1 (2026-11-20): a crate's ideal size is 1,500 to 2,500 lines, the
-# hard ceiling 4,000. The 500-line per-file cap is unchanged.
-MAX_CRATE_LINES = 4000
+# Owner rule D1 (2026-11-20) set a hard ceiling of 4,000 lines per crate; the
+# owner raised it to 12,000 on 2026-11-21 because the pages of #1030 to #1037
+# need more than that in one crate. The 500-line per-file cap is unchanged and
+# is what keeps the modules small.
+MAX_CRATE_LINES = 12000
 
 findings = []  # (severity, text)
 
