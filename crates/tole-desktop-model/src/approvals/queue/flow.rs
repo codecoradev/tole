@@ -2,7 +2,7 @@
 //! snapshots, the knowledge of the list, the bounds and the tombstones.
 
 use super::super::request::{ApprovalRequest, Outcome};
-use super::super::wait::{Wait, SKEW_MS};
+use super::super::wait::{Wait, EXPIRY_SECS, SKEW_MS};
 use super::ingest::{admit, valid_key, MAX_SESSION_ID_LEN};
 use super::{
     waiting, ApprovalsState, Entry, Overflow, Phase, Rank, Refusal, Tombstones, MAX_DECIDED,
@@ -39,47 +39,54 @@ impl Tombstones {
 
 impl ApprovalsState {
     /// A row that passed [`admit`], or a count of the refusal (only a row that
-    /// may be pending matters: it could be a request nobody can answer).
-    pub(super) fn admitted(&mut self, request: ApprovalRequest) -> Option<ApprovalRequest> {
+    /// may be pending matters: it could be a request nobody can answer). Such
+    /// a request cannot wait past the rule's 900 s (plus the skew of the two
+    /// clocks) from `now`, so the refusal is forgotten then.
+    pub(super) fn admitted(
+        &mut self,
+        request: ApprovalRequest,
+        now: u64,
+    ) -> Option<ApprovalRequest> {
         let pending_like = Outcome::of_status(&request.status).is_none()
             || !Outcome::status_is_known(&request.status);
         let session = request.session_id.clone();
         let r = admit(request);
         if r.is_none() && pending_like {
-            self.refuse(session);
+            let until = now.saturating_add(EXPIRY_SECS * 1000 + SKEW_MS);
+            self.refuse(session, until);
         }
         r
     }
 
     /// Remembers a refused row that may be pending: the task it names is not
-    /// known to be free. An unusable session id could be any task's.
-    fn refuse(&mut self, session: Option<String>) {
-        self.seq += 1;
-        let seq = self.seq;
-        let refusal = match session.filter(|s| !s.is_empty()) {
-            None => Refusal {
-                seq,
-                session: None,
-                any_session: false,
-            },
-            Some(s) if valid_key(&s, MAX_SESSION_ID_LEN) => Refusal {
-                seq,
-                session: Some(s),
-                any_session: false,
-            },
-            Some(_) => Refusal {
-                seq,
-                session: None,
-                any_session: true,
-            },
+    /// known to be free. An unusable session id could be any task's. `until`
+    /// is when the request can no longer be pending (`now_ms`).
+    fn refuse(&mut self, session: Option<String>, until: u64) {
+        let (session, any_session) = match session.filter(|s| !s.is_empty()) {
+            None => (None, false),
+            Some(s) if valid_key(&s, MAX_SESSION_ID_LEN) => (Some(s), false),
+            Some(_) => (None, true),
         };
+        self.add_refusal(Refusal {
+            seq: 0,
+            session,
+            any_session,
+            until,
+        });
+    }
+
+    fn add_refusal(&mut self, mut refusal: Refusal) {
+        self.seq += 1;
+        refusal.seq = self.seq;
         if self.refusals.len() >= MAX_REFUSALS {
-            // No room to name it: the newest stands for all of them.
+            // No room to name it: the newest stands for all of them, and for
+            // as long as the longest of the two.
             let last = self.refusals.len() - 1;
+            refusal.until = refusal.until.max(self.refusals[last].until);
             self.refusals[last] = Refusal {
-                seq,
                 session: None,
                 any_session: true,
+                ..refusal
             };
         } else {
             self.refusals.push(refusal);
@@ -97,13 +104,13 @@ impl ApprovalsState {
     }
 
     pub(super) fn requested(&mut self, request: ApprovalRequest, now: u64) -> bool {
-        let Some(request) = self.admitted(request) else {
+        let Some(request) = self.admitted(request, now) else {
             return true; // counted
         };
         match Outcome::of_status(&request.status) {
             Some(outcome) => self.decide_here(request, outcome, now), // a decision
             None => {
-                let appeared = self.pending(request, now, false);
+                let appeared = self.pending(request, now, None);
                 if appeared {
                     self.auto_select();
                 }
@@ -113,7 +120,7 @@ impl ApprovalsState {
     }
 
     pub(super) fn resolved(&mut self, request: ApprovalRequest, now: u64) -> bool {
-        let Some(request) = self.admitted(request) else {
+        let Some(request) = self.admitted(request, now) else {
             return true;
         };
         // A frame that says "pending" is not a decision.
@@ -129,16 +136,20 @@ impl ApprovalsState {
 
     /// A request the server says is pending. A repeat changes nothing; a
     /// decision that was only a guess and is still inside its wait is revived;
-    /// a trimmed id never comes back. `server_word`: the row is in the reply of
-    /// the current fetch, the server's word after the fetch started: it also
-    /// revives a guess whose wait is over (the local clock may run ahead) and
-    /// an id trimmed as a guess, with the skew as grace.
+    /// a trimmed id never comes back. `fetch`: the row is in the reply of the
+    /// current fetch that started at this `seq`, the server's word after that
+    /// start: it also revives a guess whose wait is over (the local clock may
+    /// run ahead) and an id trimmed as a guess, with the skew as grace; but
+    /// not a request this queue settled itself after the fetch started (a
+    /// conflict, `settled`): the reply cannot know it. A guess that only
+    /// entered the queue after the start is revived.
     pub(super) fn pending(
         &mut self,
         request: ApprovalRequest,
         now: u64,
-        server_word: bool,
+        fetch: Option<u64>,
     ) -> bool {
+        let server_word = fetch.is_some();
         let seq = self.seq + 1; // taken only if the request is kept
         let full = self.waiting_listed() >= MAX_WAITING;
         let id = request.id.clone();
@@ -150,12 +161,14 @@ impl ApprovalsState {
                     ..
                 }
             );
-            (guess, e.wait)
+            (guess, e.wait, e.settled)
         });
         let mut contradicted = false;
         let wait =
             match known {
-                Some((true, wait)) if server_word || !wait.expired(now) => {
+                Some((true, wait, settled))
+                    if fetch.map_or(!wait.expired(now), |mark| settled <= mark) =>
+                {
                     contradicted = wait.expired(now);
                     wait
                 }
@@ -187,6 +200,7 @@ impl ApprovalsState {
                 e.wait = wait;
                 e.phase = phase;
                 e.seq = seq;
+                e.settled = 0;
             }
             None => {
                 self.tombstones.remove(&id);
@@ -197,6 +211,7 @@ impl ApprovalsState {
                         wait,
                         phase,
                         seq,
+                        settled: 0,
                     },
                 );
             }
@@ -285,6 +300,7 @@ impl ApprovalsState {
                         wait,
                         phase,
                         seq,
+                        settled: 0,
                     },
                 );
             }
@@ -326,10 +342,13 @@ impl ApprovalsState {
                 }
             );
             if guess && !Outcome::status_is_known(&e.request.status) {
-                self.refuse(None);
-                if let Some(r) = self.refusals.last_mut() {
-                    r.any_session = true;
-                }
+                // It may have been pending, for any task, until its wait ends.
+                self.add_refusal(Refusal {
+                    seq: 0,
+                    session: None,
+                    any_session: true,
+                    until: e.wait.deadline_ms().saturating_add(SKEW_MS),
+                });
             }
             self.tombstones.add(id, guess);
         }

@@ -7,21 +7,33 @@
 //! fetch that fails, times out or is cancelled must end in [`failed`], or the
 //! queue stays waiting for a reply that never comes.
 //!
-//! The queue never asks for a retry: after [`failed`] the whole list is unknown
-//! again and `ApprovalsState::is_stale` stays false, and [`follow_up`] has no
-//! clock, so it gives nothing for a failure. The driver retries itself: after
-//! each failed fetch of everything it waits for [`Backoff::failed`] (1 s, then
+//! The queue asks for a fetch of everything in two ways, and [`due`] reads
+//! both: `ApprovalsState::is_stale` (a `409`, or room that freed while
+//! requests over the cap are uncounted) and `ApprovalsState::needs_fetch` (the
+//! queue gave up a fetch that had neither a reply nor a failure, or a reply
+//! left something it could not account for). Both are false while a fetch of
+//! everything runs. It does not ask after [`failed`] or a loss: after
+//! [`failed`] the whole list is unknown again and [`follow_up`] has no clock,
+//! so it gives nothing for a failure. The driver retries itself: after each
+//! failed fetch of everything it waits for [`Backoff::failed`] (1 s, then
 //! doubling up to 30 s), starts a new fetch with [`FetchIds::start`] and calls
 //! `GET /approvals` again, until one succeeds ([`Backoff::succeeded`]). It
 //! never gives up, because until a fetch succeeds every message box is
 //! `Checking` (disabled) and the badge `Unknown`; the cap keeps that to at most
 //! one call per 30 s. A loss ([`follow_up`]) starts a fetch at once and begins
 //! a new sequence ([`Backoff::succeeded`] or a new `Backoff`).
+//!
+//! The driver must send `ApprovalsAction::Tick` at least every [`TICK_MAX`]
+//! (5 s) for as long as the app runs, not only for the next request deadline:
+//! the watchdog that gives up a fetch after `FETCH_TIMEOUT_SECS`, the deadlines
+//! of refusals and the expiry of requests run only on a `Tick`. After each
+//! applied action (a `Tick` included) it calls [`due`] and starts the fetch it
+//! returns.
 
 use std::time::Duration;
 
 use tole_client::ApprovalList;
-use tole_desktop_model::approvals::{ApprovalsAction, FetchId, Scope};
+use tole_desktop_model::approvals::{ApprovalsAction, ApprovalsState, FetchId, Scope};
 
 use super::requests;
 
@@ -68,6 +80,8 @@ impl FetchIds {
     }
 }
 
+/// The longest gap between two `Tick` actions the driver may leave.
+pub const TICK_MAX: Duration = Duration::from_secs(5);
 /// The shortest wait before a retry of a failed fetch.
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 /// The longest wait before a retry: the delay stops growing here.
@@ -129,6 +143,17 @@ pub fn follow_up(
         ApprovalsAction::ConnectionLost => ids.start(Scope::All),
         _ => None,
     }
+}
+
+/// The fetch the queue asks for by itself: a new fetch of everything when
+/// `needs_fetch` or `is_stale` says so (both are false while one runs), with
+/// the `FetchStarted` action to apply before the call; `None` when nothing is
+/// asked, or the counter is spent. Call it after every applied action.
+pub fn due(queue: &ApprovalsState, ids: &mut FetchIds) -> Option<(FetchId, ApprovalsAction)> {
+    if queue.needs_fetch() || queue.is_stale() {
+        return ids.start(Scope::All);
+    }
+    None
 }
 
 /// The `session` argument of `Client::approvals` for a scope.

@@ -1,7 +1,7 @@
 //! The answer flow: a click, a failed call, the wait running out.
 
 use super::super::request::{Decision, DecisionIntent, Outcome};
-use super::{AnswerError, ApprovalsState, Phase};
+use super::{waiting, AnswerError, ApprovalsState, Entry, Phase};
 
 impl ApprovalsState {
     /// The user pressed a button. On `Ok` the adapter sends the intent; the
@@ -9,7 +9,10 @@ impl ApprovalsState {
     /// [`super::ApprovalsAction::Resolved`] or the call fails with
     /// [`super::ApprovalsAction::AnswerFailed`]. Refused when the request is
     /// not waiting, is being answered, or its time is up (it is then moved to
-    /// Decided as Expired): a stale click never allows anything.
+    /// Decided as Expired): a stale click never allows anything. `Err(Expired)`
+    /// has changed the state (the request left Waiting, the selection may be
+    /// gone, room may have freed): the adapter re-renders after it, as after
+    /// any applied action.
     pub fn answer(
         &mut self,
         id: &str,
@@ -37,40 +40,57 @@ impl ApprovalsState {
         })
     }
 
+    /// The ids of the entries `pick` accepts in arrival order (`seq`, then id),
+    /// so a rank given in this order does not depend on the map's order.
+    pub(super) fn ordered(&self, pick: impl Fn(&str, &Entry) -> bool) -> Vec<String> {
+        let mut ids: Vec<(u64, &String)> = (self.entries.iter())
+            .filter(|(id, e)| pick(id, e))
+            .map(|(id, e)| (e.seq, id))
+            .collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|(_, id)| id.clone()).collect()
+    }
+
     /// Requests whose time is up are Decided as Expired, not yet confirmed by
     /// the server (a later `Resolved` replaces it). One whose answer was on
     /// its way is Expired too, and says the answer may not have arrived: the
     /// reply never came, and the server has expired it by now.
     pub(super) fn expire(&mut self, now: u64) -> bool {
         let mut changed = false;
-        let mut n = self.decided_seq;
-        for e in self.entries.values_mut() {
-            match e.phase {
-                Phase::Waiting { answering } if e.wait.expired(now) => {
-                    n += 1;
-                    e.phase = Phase::Decided {
-                        outcome: Outcome::Expired,
-                        rank: (true, n),
-                        provisional: true,
-                        answer_lost: answering.is_some(),
-                    };
-                    changed = true;
-                }
-                // Its time is over at the server too: it is no longer pending,
-                // whatever status this version could not read.
-                Phase::Decided {
-                    provisional: true, ..
-                } if e.wait.expired(now) && !Outcome::status_is_known(&e.request.status) => {
-                    e.request.status = "closed".to_owned();
-                    changed = true;
-                }
-                _ => {}
+        let due = self.ordered(|_, e| waiting(e) && e.wait.expired(now));
+        for id in due {
+            let rank = self.local_rank();
+            if let Some(e) = self.entries.get_mut(&id) {
+                let answering = matches!(e.phase, Phase::Waiting { answering: Some(_) });
+                e.phase = Phase::Decided {
+                    outcome: Outcome::Expired,
+                    rank,
+                    provisional: true,
+                    answer_lost: answering,
+                };
+                changed = true;
             }
         }
-        self.decided_seq = n;
-        let before = self.overflow.len();
+        for e in self.entries.values_mut() {
+            // Its time is over at the server too: it is no longer pending,
+            // whatever status this version could not read.
+            let guess = matches!(
+                e.phase,
+                Phase::Decided {
+                    provisional: true,
+                    ..
+                }
+            );
+            if guess && e.wait.expired(now) && !Outcome::status_is_known(&e.request.status) {
+                e.request.status = "closed".to_owned();
+                changed = true;
+            }
+        }
+        let before = (self.overflow.len(), self.refusals.len());
         self.overflow.retain(|_, o| !o.wait.expired(now));
-        changed |= self.overflow.len() != before;
+        // A refused request cannot be pending past its deadline.
+        self.refusals.retain(|r| now < r.until);
+        changed |= before != (self.overflow.len(), self.refusals.len());
         if changed {
             self.trim_decided();
         }
@@ -85,6 +105,7 @@ impl ApprovalsState {
         let mut changed = false;
         let mut ranked = false;
         let rank = (true, self.decided_seq + 1);
+        let conflict_seq = self.seq + 1;
         if let Some(e) = self.entries.get_mut(id) {
             if matches!(e.phase, Phase::Waiting { answering: Some(_) }) {
                 let outcome = match (conflict, e.wait.expired(now)) {
@@ -103,7 +124,15 @@ impl ApprovalsState {
                 };
                 changed = true;
                 ranked = matches!(e.phase, Phase::Decided { .. });
+                if ranked && conflict {
+                    // Newer than any fetch that already started: its reply
+                    // cannot know the conflict (see `pending`).
+                    e.settled = conflict_seq;
+                }
             }
+        }
+        if conflict {
+            self.seq = conflict_seq;
         }
         if ranked {
             self.decided_seq += 1;
@@ -111,7 +140,10 @@ impl ApprovalsState {
         if changed {
             self.trim_decided();
         }
-        changed |= conflict && !std::mem::replace(&mut self.stale, true);
+        if conflict {
+            self.stale_since = conflict_seq;
+            changed |= !std::mem::replace(&mut self.stale, true);
+        }
         changed
     }
 }
