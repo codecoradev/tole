@@ -349,3 +349,20 @@ impl Engine {
         moved
     }
 }
+
+#[cfg(test)]
+mod input_mapping {
+    use super::{DriverInput, Input};
+
+    /// A wrong mapping would compile and silently stop a thread panic from
+    /// ending the driver, so the three are pinned.
+    #[test]
+    fn the_shared_thread_bodies_get_the_inputs_they_mean() {
+        assert!(matches!(<Input as DriverInput>::tick(), Input::Tick));
+        assert!(matches!(<Input as DriverInput>::wake(), Input::Wake));
+        assert!(matches!(
+            <Input as DriverInput>::thread_failed(),
+            Input::ThreadFailed
+        ));
+    }
+}
