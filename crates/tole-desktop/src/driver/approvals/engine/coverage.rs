@@ -12,7 +12,9 @@
 //! stream the serve refuses again and again (404 after a serve restart, until
 //! the owner resumes the session; `closed`; 429 when the serve's stream slots
 //! are taken) must not hold the whole app unknown, but must not be forgotten
-//! either: it is listed in the view and its reader probes it slowly.
+//! either: it is listed in the view and its reader probes it slowly. A session
+//! that waits for a reader (`Cover::Pending`, see `sessions`) counts the same
+//! way.
 
 use super::{Cover, Engine, Now};
 
@@ -27,22 +29,37 @@ impl Engine {
         self.all_up() && epoch == self.epoch
     }
 
-    fn set_cover(&mut self, session: &str, to: Cover) -> bool {
-        let Some(cover) = self.followed.get_mut(session) else {
-            return false;
-        };
-        *cover = to;
-        self.epoch = self.epoch.wrapping_add(1);
+    /// Whether `session` is followed and has a reader of its own. What a
+    /// reader says about any other session (one that was removed, or is waiting
+    /// for its next reader) is not about the stream the list depends on.
+    pub(super) fn has_reader(&self, session: &str) -> bool {
+        matches!(self.followed.get(session), Some(c) if *c != Cover::Pending)
+    }
+
+    /// Tell the view which sessions are covered by the refresh only.
+    pub(super) fn publish_parked(&self) -> bool {
         let parked: Vec<String> = (self.followed.iter())
-            .filter(|(_, c)| **c == Cover::Parked)
+            .filter(|(_, c)| matches!(c, Cover::Parked | Cover::Pending))
             .map(|(s, _)| s.clone())
             .collect();
         self.store.set_parked(parked)
     }
 
+    fn set_cover(&mut self, session: &str, to: Cover) -> bool {
+        if !self.has_reader(session) {
+            return false;
+        }
+        self.followed.insert(session.to_owned(), to);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.publish_parked()
+    }
+
     /// The stream delivered its first item, so it is subscribed: a fetch from
     /// now on covers everything raised before it. A parked session rejoins.
     pub(super) fn stream_up(&mut self, session: &str) -> bool {
+        if !self.has_reader(session) {
+            return false;
+        }
         let changed = self.set_cover(session, Cover::Up);
         if self.all_up() {
             self.want = true;
@@ -53,7 +70,7 @@ impl Engine {
     /// The stream ended or failed: knowledge is lost until it is back up and a
     /// fetch has followed.
     pub(super) fn stream_down(&mut self, session: &str, now: Now) -> bool {
-        if !self.followed.contains_key(session) {
+        if !self.has_reader(session) {
             return false;
         }
         let parked = self.set_cover(session, Cover::Down);
@@ -65,6 +82,9 @@ impl Engine {
     /// interval late; the view lists it (`parked_sessions`) so a page can say
     /// so. Its reader keeps probing and rejoins with `stream_up`.
     pub(super) fn stream_parked(&mut self, session: &str) -> bool {
+        if !self.has_reader(session) {
+            return false;
+        }
         let changed = self.set_cover(session, Cover::Parked);
         if self.all_up() {
             self.want = true;

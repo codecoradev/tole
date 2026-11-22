@@ -19,6 +19,9 @@ pub(in crate::driver::approvals) struct Store {
     failures: AtomicU32,
     /// Followed sessions covered by the refresh only (`ApprovalsView::parked_sessions`).
     parked: Mutex<Vec<String>>,
+    /// The newest set of sessions the UI asked to follow, until the worker
+    /// takes it: a flood of calls is one change, the last word.
+    wanted: Mutex<Option<Vec<String>>>,
 }
 
 impl Store {
@@ -40,6 +43,18 @@ impl Store {
         *self.lock() = ApprovalsState::new();
         self.failures.store(0, Ordering::SeqCst);
         self.set_parked(Vec::new());
+        self.take_wanted();
+    }
+
+    /// Leave `sessions` for the worker, replacing one it has not taken yet.
+    /// `true` when none was waiting, so the worker has to be woken.
+    pub(super) fn put_wanted(&self, sessions: Vec<String>) -> bool {
+        let mut wanted = self.wanted.lock().unwrap_or_else(|p| p.into_inner());
+        wanted.replace(sessions).is_none()
+    }
+
+    pub(super) fn take_wanted(&self) -> Option<Vec<String>> {
+        (self.wanted.lock().unwrap_or_else(|p| p.into_inner())).take()
     }
 
     /// The view as of the wall-clock time `now`.

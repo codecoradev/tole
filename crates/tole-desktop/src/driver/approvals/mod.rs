@@ -16,7 +16,7 @@
 //! | thread | does | blocks on |
 //! |---|---|---|
 //! | `worker` (1) | reads one bounded inbox, runs `Engine::step`, hands the effects to the I/O threads, tells the UI | the inbox |
-//! | `reader` (1 per followed session, at most [`MAX_STREAMS`]) | follows a session's event stream, reopens it with a backoff, retires after repeated "gone" answers | the stream |
+//! | `reader` (1 per followed session; at most [`MAX_STREAMS`] alive, ones being retired included) | follows a session's event stream, reopens it with a backoff, parks after repeated "gone" answers; started and retired by the worker | the stream |
 //! | `fetcher` (1) | `GET /approvals`, one at a time | the call |
 //! | `decider` (1) | `POST .../decision`, one at a time | the call |
 //! | `ticker` (1) | wakes the worker once a second | the clock |
@@ -55,8 +55,9 @@
 //!
 //! The serve announces approvals on a session's stream, one stream per
 //! session, so the driver follows the sessions in [`Config::sessions`] (at most
-//! [`MAX_STREAMS`]; the set is fixed for the life of the driver, restart it to
-//! change it). The badge is a number and a box is open only when:
+//! [`MAX_STREAMS`]), and the app changes them with [`Handle::set_sessions`]
+//! (see "Changing the followed sessions"). The badge is a number and a box is
+//! open only when:
 //!
 //! - a fetch of the whole list that STARTED after every followed stream was
 //!   up has succeeded (a stream that dropped keeps the view `Unknown` until it
@@ -85,17 +86,51 @@
 //! not known until a fetch says so. A stream a remote serve dropped during the
 //! sleep is noticed by its reader's error, within the stream's idle timeout.
 //!
+//! # Changing the followed sessions
+//!
+//! [`Handle::set_sessions`] replaces the followed set while the driver runs:
+//! the app calls it when a task is opened or closed. What a change does:
+//!
+//! - **A session added** gets a reader and counts like a stream that has not
+//!   come up yet: the badge reads `Unknown` (never zero; `waiting_at_least`
+//!   keeps what is listed) until its stream is up and a fetch that STARTED
+//!   after that has succeeded, so a list read that began before the new
+//!   stream was up never makes the list known for the new set. That is
+//!   normally a second or two.
+//! - **A session removed** loses nothing: it only lowers what the list must
+//!   prove, so the view stays as it was. Its reader is retired, but the client
+//!   cannot cancel a read: the reader ends at its next frame (a heartbeat, at
+//!   most 15 s, or the 45 s idle timeout) and holds its stream slot on the
+//!   serve until then.
+//! - **The cap.** The serve allows 8 streams for all its clients, and the task
+//!   drivers take up to `task::MAX_OPEN_TASKS` (3), so the driver never has
+//!   more than [`MAX_STREAMS`] (4) readers alive, retired ones included. A
+//!   session added while the slots are full waits (listed in
+//!   [`ApprovalsView::parked_sessions`], covered by the refresh only) and
+//!   starts as soon as a slot is free. It also waits for the end of its own
+//!   previous reader, if it was removed and added again at once. Ids the serve
+//!   cannot have given (see [`Handle::set_sessions`]) and ids past the cap are
+//!   ignored.
+//! - **The same set again** (in any order) changes nothing, and a flood of
+//!   calls is one change: the last. The call is not an inbox message, so it is
+//!   never refused for a full inbox, only after the driver stopped.
+//! - A reader that cannot be started (the system has no thread for it) ends
+//!   the driver, like a thread that died: the view reads `Unknown` and
+//!   [`Handle::is_running`] is false.
+//!
 //! # Limits
 //!
 //! - A reader blocked in a read is detached at shutdown and keeps its stream
 //!   slot on the serve until its next frame (a heartbeat, at most 15 s) or the
 //!   45 s idle timeout, so a driver restarted at once may find its streams
-//!   refused (429) and park them until the old ones let go.
+//!   refused (429) and park them until the old ones let go. A retired reader
+//!   does the same while the driver runs (see above).
 //! - One `GET /approvals` is out at a time, so after a loss a hung one (the
 //!   client bounds it at about a minute) delays the next; the view stays
 //!   `Unknown` meanwhile.
 
 mod engine;
+mod readers;
 mod store;
 mod threads;
 mod view;
@@ -118,15 +153,16 @@ mod rig;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tole_desktop_model::approvals::{ComposerState, Decision, Tab};
 
 use self::engine::{Engine, Input, TICK_EVERY};
+use self::readers::Readers;
 use self::store::Store;
-use self::threads::{decider, fetcher, reader};
+use self::threads::{decider, fetcher};
 pub use self::view::ApprovalsView;
 use self::worker::Worker;
 use super::api::Api;
@@ -156,19 +192,36 @@ pub(super) fn effective_refresh(refresh: Duration, ceiling: Duration) -> Duratio
     clamp_refresh(refresh, MIN_REFRESH, ceiling)
 }
 
-/// The sessions to follow: no empty id, none twice (two readers of one session
-/// would share one coverage flag and one stream slot of the serve's eight), in
-/// the given order, at most [`MAX_STREAMS`].
+/// The longest session id followed (the core's own rule, as the model's).
+const MAX_SESSION_ID_LEN: usize = 64;
+
+/// The sessions to follow: only ids the serve can have given (`[A-Za-z0-9_-]`,
+/// 1 to 64 bytes, as the model keeps them: an id with a control character or
+/// a megabyte of text is never put in a URL), none twice (two readers of one
+/// session would share one coverage flag and one stream slot of the serve's
+/// eight), in the given order, at most [`MAX_STREAMS`]. An id it refuses costs
+/// no more than its length check (a huge one is never scanned).
 pub(super) fn followed_sessions(sessions: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    (sessions.into_iter())
-        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-        .take(MAX_STREAMS)
-        .collect()
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.len() <= MAX_SESSION_ID_LEN
+            && (s.chars()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    let mut followed: Vec<String> = Vec::new();
+    for s in sessions {
+        if valid(&s) && !followed.contains(&s) {
+            followed.push(s);
+            if followed.len() == MAX_STREAMS {
+                break;
+            }
+        }
+    }
+    followed
 }
 
 pub struct Config {
-    /// The sessions whose streams carry approval frames. Streams past
+    /// The sessions whose streams carry approval frames at the start; the app
+    /// changes them with [`Handle::set_sessions`]. Streams past
     /// [`MAX_STREAMS`] are ignored.
     pub sessions: Vec<String>,
     /// `GET /approvals` this often when nothing failed (held between
@@ -225,6 +278,29 @@ impl Handle {
         self.send(Input::SelectTab(tab))
     }
 
+    /// Follow these sessions from now on, in place of the ones followed so far
+    /// (see "Changing the followed sessions" in the module docs for what each
+    /// change does to the view). The ids are cut to size first
+    /// (`[A-Za-z0-9_-]`, up to 64 bytes, none twice, the first
+    /// [`MAX_STREAMS`]; the rest are ignored). The same set again, in any
+    /// order, changes nothing.
+    ///
+    /// `Err(Busy)` only when the driver is stopped. A full inbox is not a
+    /// failure: the set is left for the worker, which takes it at its next
+    /// input (a tick at the latest), and a later call before then replaces it,
+    /// so a flood of calls costs one change, the last.
+    pub fn set_sessions(&self, sessions: Vec<String>) -> Result<(), Busy> {
+        if !self.is_running() {
+            return Err(Busy);
+        }
+        if self.store.put_wanted(followed_sessions(sessions)) {
+            if let Err(TrySendError::Disconnected(_)) = self.inbox.try_send(Input::Wake) {
+                return Err(Busy);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the worker is running.
     pub fn is_running(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
@@ -239,6 +315,7 @@ impl Handle {
 pub struct ApprovalsDriver {
     handle: Handle,
     stop: Shutdown,
+    readers: Arc<Readers>,
     threads: Threads,
 }
 
@@ -271,10 +348,18 @@ impl ApprovalsDriver {
             clock: Arc::clone(&clock),
             alive: Arc::clone(&alive),
         };
+        let threads = Threads::new();
+        let readers = Arc::new(Readers::new(
+            Arc::clone(&api),
+            Arc::clone(&clock),
+            inbox.clone(),
+            threads.spawner(),
+        ));
         let mut driver = ApprovalsDriver {
             handle,
             stop: stop.clone(),
-            threads: Threads::new(),
+            readers: Arc::clone(&readers),
+            threads,
         };
         let sessions = followed_sessions(cfg.sessions);
         let started = (|| {
@@ -282,7 +367,7 @@ impl ApprovalsDriver {
             let worker = Worker {
                 engine: Engine::new(
                     Arc::clone(&store),
-                    sessions.clone(),
+                    sessions,
                     effective_refresh(cfg.refresh, ceiling),
                 ),
                 inbox: inbox_rx,
@@ -292,6 +377,7 @@ impl ApprovalsDriver {
                 stop: stop.clone(),
                 store: Arc::clone(&store),
                 alive,
+                readers,
                 on_change: cfg.on_change,
             };
             t.spawn("approvals-worker", move || worker.run())?;
@@ -305,17 +391,6 @@ impl ApprovalsDriver {
             })?;
             let (i, c, s) = (inbox.clone(), Arc::clone(&clock), stop.clone());
             spawn_ticker(t, "approvals-tick", i, c, s, TICK_EVERY)?;
-            for session in sessions {
-                let (a, i, c, s) = (
-                    Arc::clone(&api),
-                    inbox.clone(),
-                    Arc::clone(&clock),
-                    stop.clone(),
-                );
-                t.spawn("approvals-stream", move || {
-                    run_guarded(&i.clone(), || reader(a, session, i, c, s))
-                })?;
-            }
             io::Result::Ok(())
         })();
         match started {
@@ -339,6 +414,8 @@ impl ApprovalsDriver {
     }
 
     fn stop(&mut self, timeout: Duration) -> JoinReport {
+        self.stop.trigger();
+        self.readers.close();
         stop_threads(&self.stop, &self.handle.inbox, &mut self.threads, timeout)
     }
 }
