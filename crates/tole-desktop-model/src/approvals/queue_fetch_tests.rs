@@ -77,7 +77,9 @@ fn a_reply_that_is_not_the_current_fetch_never_restores_what_is_known() {
     reply(&mut q, vec![pending("a", "s")], Scope::All, 2, T0);
     assert_eq!(q.waiting_badge(), Badge::Unknown);
     assert_eq!(q.composer("other"), ComposerState::Checking);
-    assert_eq!(q.waiting_count(), 1, "its rows are merged");
+    // Its rows are merged only when no fetch runs: the current one could not
+    // close what the stale reply creates now (#1116).
+    assert_eq!(q.waiting_count(), 0);
     reply(&mut q, vec![pending("a", "s")], Scope::All, 3, T0 + 1);
     assert_eq!(q.waiting_badge(), Badge::Count(1));
     // The failure of a superseded fetch says nothing about the current one.

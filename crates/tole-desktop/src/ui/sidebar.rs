@@ -10,16 +10,13 @@ impl ShellView {
     fn section_row(&self, section: Section, cx: &mut Context<Self>) -> impl IntoElement {
         let p = DARK;
         let selected = self.state.section == section;
-        let badge = self.state.badge(section).map(|count| {
+        let badge = self.state.badge_text(section).map(|label| {
             let tone = if section.asks_owner() {
                 p.amber
             } else {
                 p.text_faint
             };
-            div()
-                .flex_none()
-                .text_color(color(tone))
-                .child(strings::badge_label(section, count))
+            div().flex_none().text_color(color(tone)).child(label)
         });
         let row = div()
             .id(section.index())

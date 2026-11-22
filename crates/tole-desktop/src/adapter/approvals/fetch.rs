@@ -13,7 +13,10 @@
 //! each failed fetch of everything it waits for [`Backoff::failed`] (1 s, then
 //! doubling up to 30 s), starts a new fetch with [`FetchIds::start`] and calls
 //! `GET /approvals` again, until one succeeds ([`Backoff::succeeded`]). It
-//! never gives up, because until a fetch succeeds every message box is
+//! never gives up, except that `ApprovalsState::needs_fetch` also asks for a
+//! new fetch when the queue gave up one that had no reply and no failure
+//! (`FETCH_TIMEOUT_SECS`, checked on each `Tick`), so a lost request is not
+//! waited for forever. It never gives up, because until a fetch succeeds every message box is
 //! `Checking` (disabled) and the badge `Unknown`; the cap keeps that to at most
 //! one call per 30 s. A loss ([`follow_up`]) starts a fetch at once and begins
 //! a new sequence ([`Backoff::succeeded`] or a new `Backoff`).

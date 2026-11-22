@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use super::super::request::ApprovalRequest;
 use super::super::request::Outcome;
 use super::{
-    waiting, ApprovalsState, FetchId, Mark, Phase, Scope, MAX_DECIDED, MAX_KNOWN_SESSIONS,
+    waiting, ApprovalsState, FetchId, Mark, Phase, Scope, FETCH_TIMEOUT_MS, MAX_DECIDED,
+    MAX_KNOWN_SESSIONS,
 };
 
 impl ApprovalsState {
@@ -15,18 +16,72 @@ impl ApprovalsState {
             && !self.marks.contains_key(&scope)
             && self.marks.len() >= MAX_KNOWN_SESSIONS
         {
-            return false; // no room to tell: its snapshot will close nothing
+            // No room: the oldest session fetch is given up (its reply is
+            // untrusted from now on, so it can only fail toward unknown).
+            let oldest = (self.marks.iter())
+                .filter(|(s, _)| matches!(s, Scope::Session(_)))
+                .min_by_key(|(_, m)| (m.seq, m.id.0))
+                .map(|(s, _)| s.clone());
+            match oldest {
+                Some(old) => self.marks.remove(&old),
+                None => return false,
+            };
+        }
+        if scope == Scope::All {
+            self.refetch = false;
         }
         let seq = self.seq;
         match self.marks.get_mut(&scope) {
             // A second fetch while one runs: its reply is the current one, but
             // what it may close is what the older mark could justify.
-            Some(m) => std::mem::replace(&mut m.id, id) != id,
+            Some(m) => {
+                m.latest = seq;
+                m.since = None;
+                std::mem::replace(&mut m.id, id) != id
+            }
             None => {
-                self.marks.insert(scope, Mark { seq, id });
+                let (latest, since) = (seq, None);
+                self.marks.insert(
+                    scope,
+                    Mark {
+                        seq,
+                        latest,
+                        id,
+                        since,
+                    },
+                );
                 true
             }
         }
+    }
+
+    /// Gives up the fetches that were started a `FETCH_TIMEOUT_SECS` ago
+    /// and never ended: as after `FetchFailed`, what they cover is unknown
+    /// and a late reply is not trusted, and the adapter is asked for a new
+    /// fetch (`ApprovalsState::needs_fetch`). Without it a reply that never
+    /// comes would leave every message box `Checking` and fill the table of
+    /// marks.
+    pub(super) fn watchdog(&mut self, now: u64) -> bool {
+        let mut lapsed = Vec::new();
+        for (scope, m) in &mut self.marks {
+            match m.since {
+                Some(t) if now >= t.saturating_add(FETCH_TIMEOUT_MS) => lapsed.push(scope.clone()),
+                // A clock that stepped back times the fetch from here.
+                Some(t) if now >= t => {}
+                _ => m.since = Some(now),
+            }
+        }
+        for scope in &lapsed {
+            self.marks.remove(scope);
+            match scope {
+                Scope::All => self.known_all = false,
+                Scope::Session(id) => {
+                    self.known_sessions.remove(id);
+                }
+            }
+        }
+        self.refetch |= !lapsed.is_empty();
+        !lapsed.is_empty()
     }
 
     pub(super) fn fetch_failed(&mut self, scope: &Scope, id: FetchId) -> bool {
@@ -66,12 +121,10 @@ impl ApprovalsState {
         now: u64,
     ) -> bool {
         let current = self.marks.get(&scope).is_some_and(|m| m.id == id);
-        let mark = if current {
-            self.marks.remove(&scope)
-        } else {
-            None
-        }
-        .map(|m| m.seq);
+        let (mark, latest) = match current.then(|| self.marks.remove(&scope)).flatten() {
+            Some(m) => (Some(m.seq), m.latest),
+            None => (None, 0),
+        };
         let had_selection = self.selected.is_some();
         let seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         let mut changed = false;
@@ -96,9 +149,19 @@ impl ApprovalsState {
             }) || self.overflow.contains_key(&r.id)
         });
         for row in pending {
-            match self.admitted(row) {
+            match self.admitted(row, now) {
+                // A reply that is not the current fetch is older than the
+                // queue's own knowledge. It revives nothing, and while a
+                // current fetch runs it adds nothing either: a request it
+                // lists as pending may be decided already, and that fetch
+                // could not close what is created after it started. The
+                // stream and the current reply show what is pending.
+                Some(row)
+                    if mark.is_none()
+                        && (self.entries.contains_key(&row.id)
+                            || self.fetch_outstanding(row.session_id.as_deref())) => {}
                 Some(row) => {
-                    let appeared = self.pending(row, now, mark.is_some());
+                    let appeared = self.pending(row, now, mark);
                     changed |= appeared;
                     // A selection this snapshot is about to clear is not
                     // replaced by another card: nobody read that one.
@@ -115,7 +178,7 @@ impl ApprovalsState {
         let rows =
             (mine.into_iter().map(|r| (r, true))).chain(rest.into_iter().map(|r| (r, false)));
         for (row, here) in rows {
-            let Some(row) = self.admitted(row) else {
+            let Some(row) = self.admitted(row, now) else {
                 continue;
             };
             let outcome = Outcome::of_status(&row.status).unwrap_or(Outcome::Closed);
@@ -126,11 +189,15 @@ impl ApprovalsState {
             };
             changed |= self.decide(row, outcome, rank, false, now);
         }
-        if mark.is_some() {
+        if let Some(mark) = mark {
             match &scope {
                 Scope::All => {
                     changed |= !std::mem::replace(&mut self.known_all, true);
-                    changed |= std::mem::replace(&mut self.stale, false);
+                    // A conflict after the fetch started is not in its reply.
+                    if mark >= self.stale_since {
+                        changed |= std::mem::replace(&mut self.stale, false);
+                    }
+                    self.refetch |= self.left_between(mark, latest, &seen);
                 }
                 Scope::Session(id) if self.known_sessions.len() < MAX_KNOWN_SESSIONS => {
                     changed |= self.known_sessions.insert(id.clone());
@@ -140,6 +207,28 @@ impl ApprovalsState {
         }
         changed |= self.refresh_if_room();
         changed
+    }
+
+    /// Whether a fetch that covers `session` runs: its reply is the one that
+    /// closes what is created now, if it were created below its mark.
+    fn fetch_outstanding(&self, session: Option<&str>) -> bool {
+        !self.marks.is_empty()
+            && (self.marks.contains_key(&Scope::All)
+                || session.is_some_and(|s| self.marks.contains_key(&Scope::Session(s.to_owned()))))
+    }
+
+    /// Whether something that came between the first start (`mark`) and the
+    /// newest (`latest`) of overlapping fetches is still unaccounted for after
+    /// the reply of the newest: a refusal, a request over the cap, or a waiting
+    /// request the reply omits. Only the older mark is trusted for those, so
+    /// the adapter is asked for one more fetch.
+    fn left_between(&self, mark: u64, latest: u64, seen: &HashSet<String>) -> bool {
+        let between = |seq: u64| seq > mark && seq <= latest;
+        latest > mark
+            && (self.refusals.iter().any(|r| between(r.seq))
+                || self.overflow.values().any(|o| between(o.seq))
+                || (self.entries.iter())
+                    .any(|(id, e)| waiting(e) && between(e.seq) && !seen.contains(id)))
     }
 
     /// What a fetch that started at `mark` accounts for: the requests over the
@@ -178,24 +267,24 @@ impl ApprovalsState {
         self.overflow
             .retain(|id, o| seen.contains(id) || o.seq > mark || !in_scope(o.session.as_deref()));
         let mut changed = self.overflow.len() != before;
-        let mut n = self.decided_seq;
-        for (id, e) in &mut self.entries {
-            if waiting(e)
+        let omitted = self.ordered(|id, e| {
+            waiting(e)
                 && e.seq <= mark
                 && !seen.contains(id)
                 && in_scope(e.request.session_id.as_deref())
-            {
-                n += 1;
+        });
+        for id in omitted {
+            let rank = self.local_rank();
+            if let Some(e) = self.entries.get_mut(&id) {
                 e.phase = Phase::Decided {
                     outcome: Outcome::Closed,
-                    rank: (true, n),
+                    rank,
                     provisional: true,
                     answer_lost: false,
                 };
                 changed = true;
             }
         }
-        self.decided_seq = n;
         self.trim_decided();
         changed
     }

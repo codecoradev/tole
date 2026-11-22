@@ -6,6 +6,7 @@
 //! captures of its screen here; `scripts/desktop-render.sh` writes one PNG per
 //! capture (docs/design/desktop/README.md, "Reviewing the UI offscreen").
 
+use crate::skills::Badge;
 use crate::{Action, Connection, ConnectionStatus, Section, ShellState, Target};
 
 /// One image to render.
@@ -61,7 +62,7 @@ fn status(status: ConnectionStatus) -> ShellState {
 /// needs the owner, 2 new skills and tools.
 fn counts() -> ShellState {
     preview_with([
-        Action::SetApprovalsPending(1),
+        Action::SetApprovalsPending(Badge::Count(1)),
         Action::SetAutomationsOn(2),
         Action::SetDiscussionsNeedYou(1),
         Action::SetSkillsNew(2),
@@ -86,7 +87,7 @@ fn long_names() -> ShellState {
         },
         status: ConnectionStatus::Connecting,
     }));
-    state.apply(Action::SetApprovalsPending(12));
+    state.apply(Action::SetApprovalsPending(Badge::Count(12)));
     state.apply(Action::SetDiscussionsNeedYou(3));
     state
 }
@@ -115,7 +116,7 @@ pub fn shell_captures() -> Vec<Capture> {
             "shell-approvals-pending",
             "s5-approvals.png",
             "",
-            preview_with([Action::SetApprovalsPending(3)]),
+            preview_with([Action::SetApprovalsPending(Badge::Count(3))]),
         ),
         capture("shell-counts", HOME, "", counts()),
         capture(

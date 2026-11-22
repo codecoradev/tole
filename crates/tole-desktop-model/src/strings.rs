@@ -47,6 +47,9 @@ pub const SIDEBAR_HIDE: &str = "Hide the sidebar";
 /// The name of the header button while the sidebar is hidden.
 pub const SIDEBAR_SHOW: &str = "Show the sidebar";
 
+/// Beside the approvals row while the list is not known (never a zero).
+pub const BADGE_UNKNOWN: &str = "?";
+
 /// The count beside a sidebar row, in words: "3" for approvals, then "2 on",
 /// "1 needs you" and "2 new" as in board S2. Sections without a count get the
 /// bare number.

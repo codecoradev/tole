@@ -21,10 +21,25 @@
 //!   updates) and leaves the state as unknown as it was; a failure of such a
 //!   fetch is ignored. So a violation of the adapter contract always fails
 //!   toward Unknown, never toward a count or an open box. When a second fetch
-//!   starts while one runs, the older one's mark of "seen before" is kept.
+//!   starts while one runs, the older one's mark of "seen before" is kept (and
+//!   [`ApprovalsState::needs_fetch`] asks for one more fetch when the reply
+//!   left something that came between the two starts unaccounted for). A
+//!   reply that is not the current fetch merges its decided rows, adds no
+//!   waiting request while a fetch that could close it runs, and revives
+//!   nothing: a request it lists as pending may be decided already.
 //! - A request whose status this version does not know may be pending: while
 //!   one is listed the badge is `Unknown` and its task is `Checking`, until a
 //!   known status arrives (or its wait is over).
+//! - A refusal (a refused row, a cut guess) lasts only as long as the request
+//!   it stands for can wait: 900 s plus the skew from the frame, the cut
+//!   entry's own deadline. A [`ApprovalsAction::Tick`] forgets it then, so one
+//!   malformed frame does not leave the badge `Unknown` until the next
+//!   reconnect. Likewise a fetch that has neither a reply nor `FetchFailed`
+//!   after [`FETCH_TIMEOUT_SECS`] is given up by a `Tick` (it counts from the
+//!   first `Tick` after its `FetchStarted`): the list stays unknown, a late
+//!   reply is untrusted, and `needs_fetch` is true until the adapter starts
+//!   the next fetch of everything. The table of session marks is bounded:
+//!   past 256 sessions the oldest session fetch is given up.
 //!
 //! Adapter contract (the reducer has no clock and no network; the `u64` of an
 //! action is `now_ms` of the adapter):
@@ -51,7 +66,11 @@
 //!   [`ApprovalsAction::Tick`] moves it to Decided as Expired without a click,
 //!   also one whose answer was sent and never confirmed. A `409` on an answer
 //!   leaves the request as "no longer waiting" (nobody can answer it again)
-//!   until the server's word or the next snapshot says otherwise.
+//!   until the server's word or the next snapshot says otherwise. A fetch that
+//!   started before the conflict cannot revive it or settle `is_stale`.
+//! - [`ApprovalsState::answer`] returns `Err(AnswerError::Expired)` AFTER it
+//!   moved the request to Decided (the wait was over): the adapter re-renders
+//!   as after any applied action. `NotWaiting` and `Unknown` change nothing.
 //! - [`ApprovalsState::is_stale`] asks for a `GET /approvals` of everything
 //!   and is false while one runs: after a `409`, and when room frees while
 //!   requests over the cap are uncounted (the fetch lists them, and they get a
@@ -110,6 +129,12 @@ const MAX_OVERFLOW: usize = 1_000;
 const MAX_KNOWN_SESSIONS: usize = 256;
 /// Most refused rows remembered one by one.
 const MAX_REFUSALS: usize = 256;
+/// How long a fetch may run without a reply or a `FetchFailed` before a
+/// [`ApprovalsAction::Tick`] gives it up. The clock of a fetch starts at the
+/// first `Tick` after its `FetchStarted` (the action has no time), so it may
+/// run one tick interval longer.
+pub const FETCH_TIMEOUT_SECS: u64 = 120;
+const FETCH_TIMEOUT_MS: u64 = FETCH_TIMEOUT_SECS * 1000;
 
 /// Whether the message box of a task works. A turn that stopped for an answer
 /// cannot take a new message (board S4); the task view reads this, so it
@@ -251,6 +276,9 @@ struct Refusal {
     /// Its session id is unusable (or the refusals overflowed): any task may
     /// be the one.
     any_session: bool,
+    /// When the request it stands for cannot wait any more (`now_ms`): a
+    /// [`ApprovalsAction::Tick`] at or past it forgets the refusal.
+    until: u64,
 }
 
 /// The ids of decided requests trimmed from the list, oldest first, and
@@ -261,11 +289,15 @@ struct Tombstones {
     order: VecDeque<String>,
 }
 
-/// An outstanding fetch: the `seq` the queue had when it began, and its id.
+/// An outstanding fetch: the `seq` the queue had when it began (the oldest
+/// start while fetches overlap), the `seq` of the newest start, and its id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mark {
     seq: u64,
+    latest: u64,
     id: FetchId,
+    /// The time of the first `Tick` after the start: when the watchdog counts.
+    since: Option<u64>,
 }
 
 /// One row of a list. `id` and `session_id` passed the id charset check on
@@ -295,6 +327,12 @@ pub struct ApprovalsState {
     selected: Option<String>,
     tab: Tab,
     stale: bool,
+    /// `seq` of the conflict that set `stale`: a fetch that started before it
+    /// cannot settle it.
+    stale_since: u64,
+    /// A fetch was given up, or its reply left something it could not
+    /// account for: see [`ApprovalsState::needs_fetch`].
+    refetch: bool,
     /// The whole list is known (a snapshot of everything since the last loss).
     known_all: bool,
     /// Sessions whose own list is known without the whole one.
@@ -329,7 +367,7 @@ impl ApprovalsState {
             ApprovalsAction::FetchStarted(scope, id) => self.fetch_started(scope, id),
             ApprovalsAction::FetchFailed(scope, id) => self.fetch_failed(&scope, id),
             ApprovalsAction::ConnectionLost => self.connection_lost(),
-            ApprovalsAction::Tick(now) => self.expire(now),
+            ApprovalsAction::Tick(now) => self.watchdog(now) | self.expire(now),
             ApprovalsAction::Select(id) => self.select(id),
             ApprovalsAction::SelectTab(tab) => {
                 let moved = std::mem::replace(&mut self.tab, tab) != tab;
@@ -347,6 +385,17 @@ impl ApprovalsState {
     /// The tab shown; Waiting until the user picks one.
     pub fn tab(&self) -> Tab {
         self.tab
+    }
+
+    /// The adapter should start a new `GET /approvals` of everything: a fetch
+    /// was given up after [`FETCH_TIMEOUT_SECS`] (a [`ApprovalsAction::Tick`]
+    /// found no reply and no `FetchFailed`), or its reply could not account
+    /// for something that came between two starts. False while a fetch of
+    /// everything runs; cleared by the next `FetchStarted(Scope::All, ..)`.
+    /// A loss of the stream and a failed fetch are not signalled here: the
+    /// adapter sees those itself.
+    pub fn needs_fetch(&self) -> bool {
+        self.refetch && !self.marks.contains_key(&Scope::All)
     }
 
     pub fn selected(&self) -> Option<&str> {
