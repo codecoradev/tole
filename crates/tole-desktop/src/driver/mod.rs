@@ -41,9 +41,13 @@ pub mod runtime;
 pub mod task;
 
 #[cfg(test)]
+mod api_tests;
+#[cfg(test)]
 mod fake;
 #[cfg(test)]
 mod foundation_tests;
+#[cfg(test)]
+mod runtime_tests;
 
 pub use api::{Api, ClientApi, EventSource};
 pub use clock::{Clock, ManualClock, Shutdown, Slept, SystemClock};
