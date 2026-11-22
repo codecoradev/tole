@@ -50,7 +50,7 @@ pub enum PromptOutcome {
 }
 
 /// Whether a failed call may have been received by the server.
-fn may_have_been_received(e: &Error) -> bool {
+pub fn may_have_been_received(e: &Error) -> bool {
     match e {
         Error::Io(_) | Error::Protocol(_) | Error::Decode(_) => true,
         Error::Status { status, .. } => matches!(status, 408 | 409 | 500..=599),
