@@ -100,6 +100,24 @@
 
 mod calls;
 mod engine;
+#[cfg(test)]
+mod engine_cadence_tests;
+#[cfg(test)]
+mod engine_history_tests;
+#[cfg(test)]
+mod engine_ids_tests;
+#[cfg(test)]
+mod engine_live_tests;
+#[cfg(test)]
+mod engine_send_tests;
+#[cfg(test)]
+mod engine_stop_tests;
+#[cfg(test)]
+mod engine_watch_tests;
+#[cfg(test)]
+mod fixtures;
+#[cfg(test)]
+mod sim;
 mod store;
 mod threads;
 mod view;
