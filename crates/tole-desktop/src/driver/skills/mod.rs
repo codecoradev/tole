@@ -85,6 +85,11 @@ mod threads;
 mod view;
 mod worker;
 
+#[cfg(test)]
+mod engine_tests;
+#[cfg(test)]
+mod fixtures;
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
