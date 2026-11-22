@@ -47,6 +47,12 @@ impl FetchIds {
         Self::default()
     }
 
+    /// A counter that has already given out `last` (for the exhaustion test).
+    #[cfg(test)]
+    pub(super) fn after(last: u64) -> Self {
+        Self { last }
+    }
+
     /// The next id (the first is 1), or `None` when the counter is spent.
     pub fn next_id(&mut self) -> Option<FetchId> {
         let next = self.last.checked_add(1)?;
@@ -77,6 +83,12 @@ pub struct Backoff {
 impl Backoff {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A sequence that already failed `failures` times (for the bound test).
+    #[cfg(test)]
+    pub(super) fn after(failures: u32) -> Self {
+        Self { failures }
     }
 
     /// A fetch failed: how long to wait before the next one. [`RETRY_MIN`]
