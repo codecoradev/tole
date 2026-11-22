@@ -37,8 +37,16 @@
 
 mod decision;
 mod fetch;
+#[cfg(test)]
+mod frame_tests;
+#[cfg(test)]
+mod queue_fixtures;
+#[cfg(test)]
+mod queue_tests;
 mod stream;
 mod summary;
+#[cfg(test)]
+mod tests;
 
 use tole_client::{Approval, ApprovalList, DecisionReply};
 use tole_desktop_model::approvals::ApprovalRequest;

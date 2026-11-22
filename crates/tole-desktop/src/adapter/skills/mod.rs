@@ -45,6 +45,11 @@
 
 mod load;
 
+#[cfg(test)]
+mod bounds_tests;
+#[cfg(test)]
+mod tests;
+
 pub use load::{LoadId, LoadIds};
 
 use tole_client::{
