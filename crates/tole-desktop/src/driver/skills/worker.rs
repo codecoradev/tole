@@ -10,6 +10,7 @@ use super::store::Store;
 use super::OnChange;
 use crate::adapter::skills::LoadId;
 use crate::driver::clock::{Clock, Shutdown};
+use crate::driver::shared::handle;
 
 /// The worker thread's state: the engine and where its effects go.
 pub(super) struct Worker {
@@ -37,10 +38,7 @@ impl Worker {
     }
 
     fn now(&self) -> Now {
-        Now {
-            wall: self.clock.now_ms(),
-            mono: self.clock.monotonic_ms(),
-        }
+        Now::read(&*self.clock)
     }
 
     fn work(&mut self) {
@@ -78,9 +76,6 @@ impl Worker {
     }
 
     fn changed(&self) {
-        if let Some(notify) = &self.on_change {
-            // The UI's callback must not take the worker down with it.
-            let _ = catch_unwind(AssertUnwindSafe(|| notify()));
-        }
+        handle::notify(&self.on_change);
     }
 }

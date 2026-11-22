@@ -47,6 +47,7 @@ use super::calls::{Call, Lane, Reply};
 use super::store::Store;
 use super::Config;
 use crate::adapter::task::EntryMapper;
+use crate::driver::shared::thread::DriverInput;
 
 /// The worker wakes the engine this often when nothing else does (the polls
 /// of a watcher are 500 ms apart).
@@ -98,13 +99,7 @@ pub(in crate::driver::task) struct Out {
     pub fatal: bool,
 }
 
-/// The two readings of time at one moment. Deadlines use `mono`; the wall
-/// clock only feeds the suspend check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::driver::task) struct Now {
-    pub wall: u64,
-    pub mono: u64,
-}
+pub(in crate::driver::task) use crate::driver::shared::now::Now;
 
 /// What a view shows of the model that a poll could change.
 #[derive(PartialEq)]
@@ -117,8 +112,18 @@ struct Glance {
     undecidable: Vec<String>,
 }
 
-pub(super) fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+pub(super) use crate::driver::clock::millis;
+
+impl DriverInput for Input {
+    fn tick() -> Self {
+        Input::Tick
+    }
+    fn wake() -> Self {
+        Input::Wake
+    }
+    fn thread_failed() -> Self {
+        Input::ThreadFailed
+    }
 }
 
 pub(in crate::driver::task) struct Engine {

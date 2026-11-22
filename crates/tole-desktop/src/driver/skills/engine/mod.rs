@@ -43,6 +43,7 @@ use self::lane::Lane;
 pub(super) use self::loading::Reply;
 use super::store::Store;
 use crate::adapter::skills::{LoadId, LoadIds};
+use crate::driver::shared::thread::DriverInput;
 
 /// The worker wakes at least this often (a refresh, a backoff or the age of the
 /// rows can fall due while the inbox is silent).
@@ -101,16 +102,20 @@ pub(super) struct Out {
     pub fatal: bool,
 }
 
-/// The two readings of time at one moment. Deadlines use `mono`; `wall` only
-/// shows a jump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Now {
-    pub wall: u64,
-    pub mono: u64,
-}
+pub(super) use crate::driver::shared::now::Now;
 
-pub(super) fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+pub(super) use crate::driver::clock::millis;
+
+impl DriverInput for Input {
+    fn tick() -> Self {
+        Input::Tick
+    }
+    fn wake() -> Self {
+        Input::Wake
+    }
+    fn thread_failed() -> Self {
+        Input::ThreadFailed
+    }
 }
 
 pub(super) struct Engine {

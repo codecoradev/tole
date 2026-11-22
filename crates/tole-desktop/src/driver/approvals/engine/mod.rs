@@ -40,6 +40,7 @@ use tole_desktop_model::approvals::{ApprovalsAction, Decision, DecisionIntent, F
 
 use super::store::Store;
 use crate::adapter::approvals::{stream_actions, FetchIds, TICK_MAX};
+use crate::driver::shared::thread::DriverInput;
 
 /// The model hears the time this often (at most [`TICK_MAX`]).
 pub(super) const TICK_EVERY: Duration = Duration::from_secs(1);
@@ -105,13 +106,7 @@ pub(super) enum Cover {
 /// between two steps was suspended or corrected: what was known is lost.
 pub(super) const JUMP_GAP_MS: u64 = 5_000;
 
-/// The two readings of time at one moment. Deadlines use `mono`; only the model
-/// is given `wall`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::driver::approvals) struct Now {
-    pub wall: u64,
-    pub mono: u64,
-}
+pub(super) use crate::driver::shared::now::Now;
 
 pub(in crate::driver::approvals) struct Engine {
     store: Arc<Store>,
@@ -150,8 +145,18 @@ pub(in crate::driver::approvals) struct Engine {
     decide_queue: VecDeque<DecisionIntent>,
 }
 
-pub(super) fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+pub(super) use crate::driver::clock::millis;
+
+impl DriverInput for Input {
+    fn tick() -> Self {
+        Input::Tick
+    }
+    fn wake() -> Self {
+        Input::Wake
+    }
+    fn thread_failed() -> Self {
+        Input::ThreadFailed
+    }
 }
 
 impl Engine {

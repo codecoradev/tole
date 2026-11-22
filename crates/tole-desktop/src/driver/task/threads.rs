@@ -5,40 +5,23 @@
 //! Each ends when the stop signal is raised, or when the worker is gone (its
 //! inbox, or the channel it feeds this thread through, is closed). A panic
 //! inside an `Api` call is that call's failure (`calls::run`, and the stream's
-//! own guard below); a panic anywhere else is caught by [`run_guarded`], which
+//! own guard below); a panic anywhere else is caught by `run_guarded` (`driver::shared::thread`), which
 //! tells the worker (`ThreadFailed`), and the worker ends the driver.
 
 use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 use tole_client::{Error, Event, StreamItem};
 
 use super::calls::{self, Call, Lane};
-use super::engine::{Input, TICK_EVERY};
+use super::engine::Input;
 use crate::adapter::approvals::{Backoff, RETRY_MAX};
 use crate::driver::api::Api;
-use crate::driver::clock::{Clock, Shutdown, Slept};
+use crate::driver::clock::{millis, Clock, Shutdown, Slept};
 use crate::driver::guard::{guarded, panicked, probe_wait, refused, PARK_AFTER};
 use crate::driver::runtime::Spawner;
-
-/// Run a thread body; if it panics, tell the worker so the driver ends.
-pub(super) fn run_guarded(inbox: &SyncSender<Input>, body: impl FnOnce()) {
-    if catch_unwind(AssertUnwindSafe(body)).is_err() {
-        let _ = inbox.send(Input::ThreadFailed);
-    }
-}
-
-pub(super) fn ticker(inbox: SyncSender<Input>, clock: Arc<dyn Clock>, stop: Shutdown) {
-    while clock.sleep(TICK_EVERY, &stop) == Slept::Elapsed {
-        // A full inbox drops the tick: the worker is busy and reads the clock
-        // itself at every input.
-        if let Err(TrySendError::Disconnected(_)) = inbox.try_send(Input::Tick) {
-            return;
-        }
-    }
-}
+use crate::driver::shared::thread::run_guarded;
 
 /// Start the thread of `kind`, to take its calls from `jobs`.
 pub(super) fn spawn_lane(
@@ -99,7 +82,7 @@ pub(super) fn reader(
 ) {
     // The history decides where the stream starts; no `go` means it never will.
     let Ok(mut last) = go.recv() else { return };
-    let healthy_ms = u64::try_from(RETRY_MAX.as_millis()).unwrap_or(u64::MAX);
+    let healthy_ms = millis(RETRY_MAX);
     let mut backoff = Backoff::new();
     let (mut refusals, mut probes) = (0u32, 0u32);
     let (mut parked, mut had_loss) = (false, false);

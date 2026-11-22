@@ -15,6 +15,9 @@
 //!   [`Shutdown`] signal that interrupts every sleep.
 //! - [`runtime`]: starting threads together and stopping them with a timeout.
 //! - [`guard`]: containing a panic in a call, and the probing of a refused stream.
+//! - `shared`: what the drivers have in common below that: the `Now` pair of
+//!   clock readings, the tick, guarded-thread and stop sequence, and the UI
+//!   side's `Busy`, `OnChange` and refresh clamp.
 //! - [`approvals`]: the approvals queue (the first driver).
 //! - [`skills`]: the Skills and Connected tools pages (read-only).
 //! - [`task`]: one task, that is one session: its history, live stream, prompt,
@@ -39,6 +42,7 @@ pub mod approvals;
 pub mod clock;
 pub mod guard;
 pub mod runtime;
+pub(crate) mod shared;
 pub mod skills;
 pub mod task;
 
