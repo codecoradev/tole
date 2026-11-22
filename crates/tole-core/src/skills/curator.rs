@@ -256,9 +256,17 @@ fn append_line<T: Serialize>(path: &Path, rec: &T) -> Result<(), String> {
 /// The parseable lines of a JSONL file, oldest first. A missing file is
 /// empty; past [`MAX_LEDGER_BYTES`] only the tail is read.
 fn read_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
+    read_lines_checked(path).unwrap_or_default()
+}
+
+/// As [`read_lines`], but a file that exists and cannot be opened or read is
+/// an error, where a missing file is still empty.
+fn read_lines_checked<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut skipped_head = false;
@@ -266,18 +274,18 @@ fn read_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
         skipped_head = true;
     }
     let mut raw = Vec::new();
-    if f.take(MAX_LEDGER_BYTES).read_to_end(&mut raw).is_err() {
-        return Vec::new();
+    if let Err(e) = f.take(MAX_LEDGER_BYTES).read_to_end(&mut raw) {
+        return Err(format!("{}: {e}", path.display()));
     }
     let text = String::from_utf8_lossy(&raw);
     let mut lines = text.lines();
     if skipped_head {
         lines.next(); // a cut line
     }
-    lines
+    Ok(lines
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+        .collect())
 }
 
 /// Curator settings the owner can change; the rest is derived.
@@ -536,8 +544,18 @@ impl Archive {
     /// The archived packages not restored since: the latest `Archive`
     /// mutation per skill when no later `Restore` follows it.
     pub fn archived(&self) -> Vec<Mutation> {
+        Self::fold_archived(self.mutations())
+    }
+
+    /// As [`Archive::archived`], but a ledger that exists and cannot be read
+    /// is an error instead of an empty archive. A missing ledger is empty.
+    pub fn archived_checked(&self) -> Result<Vec<Mutation>, String> {
+        read_lines_checked(&self.ledger).map(Self::fold_archived)
+    }
+
+    fn fold_archived(mutations: Vec<Mutation>) -> Vec<Mutation> {
         let mut by_skill: BTreeMap<String, Mutation> = BTreeMap::new();
-        for m in self.mutations() {
+        for m in mutations {
             match m.kind {
                 MutationKind::Archive => {
                     by_skill.insert(m.skill.clone(), m);

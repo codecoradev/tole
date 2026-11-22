@@ -229,6 +229,35 @@ fn an_unreadable_draft_is_skipped_by_list() {
     assert_eq!(store.list().len(), 1);
 }
 
+#[test]
+fn list_checked_tells_an_empty_store_from_an_unreadable_one() {
+    let scratch = tmp("checked");
+    // No directory yet: an empty store, not an error.
+    let missing = DraftStore::new(scratch.join("never-created"));
+    assert_eq!(missing.list_checked().unwrap(), DraftListing::default());
+
+    // A store path that is a file cannot be listed: an error, while the
+    // unchecked `list` still answers empty.
+    let file = scratch.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    let broken = DraftStore::new(&file);
+    assert!(broken.list_checked().is_err());
+    assert!(broken.list().is_empty());
+
+    // A broken entry is counted, a stray file is not, the good draft stays.
+    let root = scratch.join(DRAFTS_DIR);
+    let store = DraftStore::new(&root);
+    let (d, md) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
+    store.create(&d, &md).unwrap();
+    std::fs::create_dir_all(root.join("dbroken")).unwrap();
+    std::fs::write(root.join("dbroken").join(DRAFT_FILE), "{").unwrap();
+    std::fs::write(root.join(".DS_Store"), "x").unwrap();
+    let l = store.list_checked().unwrap();
+    assert_eq!(l.drafts, vec![d]);
+    assert_eq!(l.unreadable.len(), 1, "{:?}", l.unreadable);
+    assert!(l.unreadable[0].contains("dbroken"));
+}
+
 fn promotion() -> Promotion {
     Promotion {
         package_hash: "sha256:abc".into(),
