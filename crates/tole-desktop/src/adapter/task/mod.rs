@@ -28,6 +28,8 @@ mod history;
 mod live;
 mod plan;
 mod prompt;
+#[cfg(test)]
+mod tests;
 
 pub use approval::{
     approval_info, approval_requested, approval_resolved, approvals_backoff, approvals_refreshed,
