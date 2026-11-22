@@ -14,6 +14,8 @@
 //! dependency is the typed client `tole-client`.
 //!
 //! - [`supervisor`] (macOS and Linux): attaches to or starts the local serve.
+//! - [`adapter`]: pure functions from the typed client's values to the model's
+//!   mirror types (no I/O, no toolkit).
 
 pub mod adapter;
 #[cfg(unix)]

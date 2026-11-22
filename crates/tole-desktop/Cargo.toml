@@ -36,8 +36,10 @@ render-harness = ["gpui"]
 [dependencies]
 tole-desktop-model = { version = "0.12.0", path = "../tole-desktop-model" }
 tole-client = { path = "../tole-client" }
-# `Entry::payload` is a `serde_json::Value`, and the adapter reads it. Already in
-# the tree (tole-client uses it): no new package.
+# The client keeps the JSON of a frame it could not decode (`Event::Other`), of the
+# fields it does not model (`Approval::extra`) and of an entry (`Entry::payload`)
+# as `serde_json::Value`; the adapter reads them. Already a dependency of
+# tole-client at the same requirement: no new package.
 serde_json = { workspace = true }
 gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", optional = true, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
