@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use tole_desktop_model::approvals::{DecisionIntent, FetchId};
 
-use super::engine::{Effect, Engine, Input, Now, Out};
+use super::engine::{Effect, Engine, Input, Now, Out, ReaderOp};
+use super::readers::Readers;
 use super::store::Store;
 use super::OnChange;
 use crate::driver::clock::{Clock, Shutdown};
@@ -23,6 +24,7 @@ pub(super) struct Worker {
     pub stop: Shutdown,
     pub store: Arc<Store>,
     pub alive: Arc<AtomicBool>,
+    pub readers: Arc<Readers>,
     pub on_change: Option<OnChange>,
 }
 
@@ -33,6 +35,7 @@ impl Worker {
         // the other threads are told to stop.
         let _ = catch_unwind(AssertUnwindSafe(|| self.work()));
         self.stop.trigger();
+        self.readers.close();
         self.store.clear();
         self.alive.store(false, Ordering::SeqCst);
         self.changed();
@@ -51,6 +54,14 @@ impl Worker {
             if self.stop.is_set() {
                 return;
             }
+            // The app's newest wish for the followed sessions, if it left one:
+            // a change of its own, before whatever woke the worker.
+            if let Some(sessions) = self.store.take_wanted() {
+                let out = self.engine.step(Input::SetSessions(sessions), self.now());
+                if !self.carry_out(out) {
+                    return;
+                }
+            }
             let out = self.engine.step(input, self.now());
             if !self.carry_out(out) {
                 return;
@@ -58,18 +69,27 @@ impl Worker {
         }
     }
 
-    /// Hand the effects to the I/O threads and tell the UI. `false` when the
-    /// driver must end: a thread is gone.
+    /// Hand the effects to the I/O threads, start and retire readers, and tell
+    /// the UI. `false` when the driver must end: a thread is gone, or a reader
+    /// cannot be started.
     fn carry_out(&self, out: Out) -> bool {
         let Out {
             changed,
             effects,
+            readers,
             fatal,
         } = out;
         if changed {
             self.changed();
         }
         !fatal
+            && readers.into_iter().all(|op| match op {
+                ReaderOp::Start(id, session) => self.readers.start(id, session).is_ok(),
+                ReaderOp::Retire(id) => {
+                    self.readers.retire(id);
+                    true
+                }
+            })
             && effects.into_iter().all(|effect| match effect {
                 Effect::Fetch(id) => self.fetch.send(id).is_ok(),
                 Effect::Send(intent) => self.send.send(intent).is_ok(),

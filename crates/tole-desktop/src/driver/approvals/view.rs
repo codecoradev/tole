@@ -22,6 +22,9 @@ pub struct ApprovalsView {
     /// task is resumed, `closed`, 429): the list is known without them, and a
     /// request of theirs can be up to one refresh interval late. A page can say
     /// "checked every N seconds" for these. Their streams are probed slowly.
+    /// Also the sessions added with `Handle::set_sessions` that wait for a
+    /// free stream slot (see "Changing the followed sessions" in the module
+    /// docs of the driver).
     pub parked_sessions: Vec<String>,
     /// The tab shown.
     pub tab: Tab,

@@ -17,6 +17,12 @@
 //!   every followed session's stream was up (or is parked) has succeeded
 //!   (`coverage`), and not
 //!   when the last success is older than twice the refresh interval.
+//! - **Sessions.** The followed set can change while the driver runs
+//!   ([`Input::SetSessions`], see `sessions`): a new session is not covered
+//!   until its stream is up and a fetch has followed, a removed one's reader is
+//!   retired but keeps its stream slot until it ends, and never more than
+//!   [`MAX_STREAMS`](super::MAX_STREAMS) readers are alive, retired ones
+//!   included.
 //! - **Answers.** A decision goes through `ApprovalsState::answer`, so it is
 //!   sent once; before it leaves the queue it is checked against the model
 //!   again (`deciding`), and what comes back is applied as the server's word or
@@ -30,6 +36,7 @@
 mod coverage;
 mod deciding;
 mod fetching;
+mod sessions;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -62,6 +69,12 @@ pub(in crate::driver::approvals) enum Input {
     Tick,
     /// The reply of the `GET /approvals` the engine asked for with this id.
     Fetched(FetchId, Result<ApprovalList, Error>),
+    /// The app wants these sessions followed, in place of the ones followed so
+    /// far (already cut to size by `followed_sessions`, which the engine
+    /// applies again).
+    SetSessions(Vec<String>),
+    /// A reader thread ended (its stream is closed, its slot is free).
+    ReaderEnded(ReaderId),
     /// The owner pressed a button.
     Decide(String, Decision),
     /// The reply of the decision call the engine asked for.
@@ -83,11 +96,27 @@ pub(in crate::driver::approvals) enum Effect {
     Send(DecisionIntent),
 }
 
+/// Names one reader thread for its whole life, so that a late message of a
+/// reader that was replaced cannot be taken for the new one's.
+pub(in crate::driver::approvals) type ReaderId = u64;
+
+/// What the worker must do with the reader threads.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::driver::approvals) enum ReaderOp {
+    /// Start a reader for this session; it ends with [`Input::ReaderEnded`].
+    Start(ReaderId, String),
+    /// Tell this reader its session is no longer followed. It cannot be
+    /// interrupted inside a read: it ends at its next frame, and its stream
+    /// slot is held until then.
+    Retire(ReaderId),
+}
+
 #[derive(Default)]
 pub(in crate::driver::approvals) struct Out {
     /// Something a view shows changed.
     pub changed: bool,
     pub effects: Vec<Effect>,
+    pub readers: Vec<ReaderOp>,
     /// The driver must end (a thread is gone).
     pub fatal: bool,
 }
@@ -100,6 +129,17 @@ pub(super) enum Cover {
     Down,
     /// Refused again and again: covered by the refresh only (see `coverage`).
     Parked,
+    /// Wanted, but with no reader yet: no stream slot is free, or the session's
+    /// previous reader is still ending. Covered by the refresh only, like
+    /// `Parked`, and ignores every stream message (none can be its own).
+    Pending,
+}
+
+/// A reader thread that is alive.
+struct Alive {
+    session: String,
+    /// Its session is no longer followed: it holds its slot until it ends.
+    retired: bool,
 }
 
 /// A wall clock that moves further than the monotonic one by more than this
@@ -140,6 +180,10 @@ pub(in crate::driver::approvals) struct Engine {
     followed: BTreeMap<String, Cover>,
     /// Counts every change of which streams are up.
     epoch: u64,
+    /// The reader threads that are alive, retired ones included: they hold the
+    /// serve's stream slots, so the cap counts them (see `sessions`).
+    readers: BTreeMap<ReaderId, Alive>,
+    next_reader: ReaderId,
     // deciding
     decide_busy: bool,
     decide_queue: VecDeque<DecisionIntent>,
@@ -181,8 +225,10 @@ impl Engine {
             next_refresh: None,
             refresh_asap: false,
             last_seen: None,
-            followed: sessions.into_iter().map(|s| (s, Cover::Down)).collect(),
+            followed: sessions.into_iter().map(|s| (s, Cover::Pending)).collect(),
             epoch: 0,
+            readers: BTreeMap::new(),
+            next_reader: 0,
             decide_busy: false,
             decide_queue: VecDeque::new(),
         }
@@ -210,6 +256,8 @@ impl Engine {
             Input::StreamUp(session) => self.stream_up(&session),
             Input::StreamDown(session) => self.stream_down(&session, now),
             Input::StreamParked(session) => self.stream_parked(&session),
+            Input::SetSessions(sessions) => self.set_sessions(sessions, &mut out),
+            Input::ReaderEnded(id) => self.reader_ended(id),
             Input::Fetched(id, reply) => self.fetched(id, reply, now),
             Input::Decide(id, decision) => self.decide(&id, decision, now),
             Input::Decided(intent, reply) => self.decided(intent, reply, now),
@@ -254,6 +302,7 @@ impl Engine {
             self.want = true;
             self.next_refresh = None;
         }
+        changed |= self.start_readers(now, out);
         changed |= self.maybe_fetch(now, out);
         changed |= self.dispatch_decisions(now, out);
         changed
