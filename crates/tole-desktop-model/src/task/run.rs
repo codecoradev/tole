@@ -89,6 +89,14 @@ impl Run {
         self.text_closed = false;
     }
 
+    /// The prompt call returned. It is no longer going out, so a not-busy
+    /// snapshot is final again: without this, a reply that carried no row (a
+    /// bare `approval_required`) and whose user entry the stream never
+    /// delivered would leave the turn busy until the owner pressed Stop.
+    pub fn prompt_returned(&mut self) {
+        self.sending = false;
+    }
+
     /// The prompt was refused or failed; `server_busy` is true for a 409.
     pub fn prompt_failed(&mut self, server_busy: bool) {
         self.sending = false;
@@ -326,6 +334,17 @@ mod tests {
         r.stop_requested();
         r.apply(&TaskEvent::Ready { busy: false });
         assert!(!r.stopping && !r.busy);
+    }
+
+    #[test]
+    fn a_not_busy_snapshot_is_final_once_the_prompt_call_returned() {
+        let mut r = Run::default();
+        r.prompt_sent();
+        r.apply(&TaskEvent::Ready { busy: false });
+        assert!(r.busy, "the prompt is still going out");
+        r.prompt_returned();
+        r.apply(&TaskEvent::Ready { busy: false });
+        assert!(!r.busy);
     }
 
     #[test]

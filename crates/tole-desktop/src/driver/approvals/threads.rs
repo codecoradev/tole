@@ -11,15 +11,11 @@
 //! caught by [`run_guarded`], which tells the worker (`ThreadFailed`); the
 //! worker then ends the driver, which leaves the view `Unknown`.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
 
-use tole_client::{Error, Event, StreamItem};
+use tole_client::{Event, StreamItem};
 use tole_desktop_model::approvals::{DecisionIntent, FetchId};
 
 use super::engine::{Input, TICK_EVERY};
@@ -28,27 +24,13 @@ use crate::adapter::approvals::{
 };
 use crate::driver::api::{Api, NO_REPLAY};
 use crate::driver::clock::{Clock, Shutdown, Slept};
-
-/// Consecutive refusals (a 404, a 429, a `closed` frame) after which a reader
-/// parks its session.
-pub(super) const PARK_AFTER: u32 = 3;
-/// How often a parked session's stream is probed (plus a spread of up to 10 s).
-pub(super) const PROBE_EVERY: Duration = Duration::from_secs(30);
+use crate::driver::guard::{guarded, panicked, probe_wait, refused, PARK_AFTER};
 
 /// Run a thread body; if it panics, tell the worker so the driver ends.
 pub(super) fn run_guarded(inbox: &SyncSender<Input>, body: impl FnOnce()) {
     if catch_unwind(AssertUnwindSafe(body)).is_err() {
         let _ = inbox.send(Input::ThreadFailed);
     }
-}
-
-/// A call into the `Api`, with a panic turned into `None`.
-fn guarded<T>(call: impl FnOnce() -> T) -> Option<T> {
-    catch_unwind(AssertUnwindSafe(call)).ok()
-}
-
-fn panicked() -> Error {
-    Error::Io(io::Error::other("the call panicked"))
 }
 
 pub(super) fn ticker(inbox: SyncSender<Input>, clock: Arc<dyn Clock>, stop: Shutdown) {
@@ -99,33 +81,18 @@ pub(super) fn decider(
     }
 }
 
-/// Whether the serve refused the stream (404 unknown session, 429 no free
-/// stream slot, any other status), as opposed to a network failure.
-fn refused(e: &Error) -> bool {
-    matches!(e, Error::Status { .. })
-}
-
-/// The wait between two probes of a parked session: [`PROBE_EVERY`] plus a
-/// spread of up to 10 s that depends on the session and the attempt, so
-/// readers that parked together do not probe together.
-fn probe_wait(session: &str, attempt: u32) -> Duration {
-    let mut h = DefaultHasher::new();
-    (session, attempt).hash(&mut h);
-    PROBE_EVERY + Duration::from_millis(h.finish() % 10_000)
-}
-
 /// Follows one session's stream for the approval frames and opens it again,
 /// with a growing wait, whenever it ends or fails. The worker is told when the
 /// stream is up (its first item arrived) and when it is down, and the wait
 /// keeps a server that closes at once from being hammered; it starts over only
 /// after a connection that lived as long as the longest retry wait.
 ///
-/// A reader never gives up its session. After [`PARK_AFTER`] attempts in a row
+/// A reader never gives up its session. After `PARK_AFTER` attempts in a row
 /// that the serve refused (404 after a serve restart until the owner resumes
 /// the task, a `closed` frame, 429 when the serve's stream slots are taken, any
 /// other status) it parks: the worker stops waiting for that stream (the
 /// session is covered by the refresh only, and the view lists it), and the
-/// reader probes it every [`PROBE_EVERY`] or so, silently, until a stream opens
+/// reader probes it every `PROBE_EVERY` or so, silently, until a stream opens
 /// again, when it tells the worker and the session rejoins the coverage. Any
 /// attempt that is not a refusal starts the count over.
 pub(super) fn reader(

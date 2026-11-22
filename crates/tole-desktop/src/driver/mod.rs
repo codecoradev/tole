@@ -14,6 +14,7 @@
 //! - [`clock`]: the [`Clock`] a driver reads and sleeps on, and the
 //!   [`Shutdown`] signal that interrupts every sleep.
 //! - [`runtime`]: starting threads together and stopping them with a timeout.
+//! - [`guard`]: containing a panic in a call, and the probing of a refused stream.
 //! - [`approvals`]: the approvals queue (the first driver).
 //!
 //! Rules every driver keeps (the thread model of each is in its module docs):
@@ -33,12 +34,17 @@
 pub mod api;
 pub mod approvals;
 pub mod clock;
+pub mod guard;
 pub mod runtime;
 
+#[cfg(test)]
+mod api_tests;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
 mod foundation_tests;
+#[cfg(test)]
+mod runtime_tests;
 
 pub use api::{Api, ClientApi, EventSource};
 pub use clock::{Clock, ManualClock, Shutdown, Slept, SystemClock};

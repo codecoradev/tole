@@ -140,7 +140,7 @@ pub struct ApprovalInfo {
 
 impl ApprovalInfo {
     /// The same approval with every text made printable and cut.
-    pub(crate) fn cleaned(&self) -> ApprovalInfo {
+    pub fn cleaned(&self) -> ApprovalInfo {
         let summary = self.summary.as_deref();
         ApprovalInfo {
             id: printable(&self.id, MAX_TOOL_CHARS),
