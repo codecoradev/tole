@@ -16,6 +16,7 @@
 //! - [`runtime`]: starting threads together and stopping them with a timeout.
 //! - [`guard`]: containing a panic in a call, and the probing of a refused stream.
 //! - [`approvals`]: the approvals queue (the first driver).
+//! - [`skills`]: the Skills and Connected tools pages (read-only).
 //! - [`task`]: one task, that is one session: its history, live stream and the
 //!   queue of approvals of that session.
 //!
@@ -38,6 +39,7 @@ pub mod approvals;
 pub mod clock;
 pub mod guard;
 pub mod runtime;
+pub mod skills;
 pub mod task;
 
 #[cfg(test)]
