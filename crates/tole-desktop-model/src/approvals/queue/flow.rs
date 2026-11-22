@@ -140,8 +140,9 @@ impl ApprovalsState {
     /// current fetch that started at this `seq`, the server's word after that
     /// start: it also revives a guess whose wait is over (the local clock may
     /// run ahead) and an id trimmed as a guess, with the skew as grace; but
-    /// not a request this queue settled after the fetch started (a conflict):
-    /// the reply cannot know it.
+    /// not a request this queue settled itself after the fetch started (a
+    /// conflict, `settled`): the reply cannot know it. A guess that only
+    /// entered the queue after the start is revived.
     pub(super) fn pending(
         &mut self,
         request: ApprovalRequest,
@@ -160,12 +161,14 @@ impl ApprovalsState {
                     ..
                 }
             );
-            (guess, e.wait, e.seq)
+            (guess, e.wait, e.settled)
         });
         let mut contradicted = false;
         let wait =
             match known {
-                Some((true, wait, seq)) if fetch.map_or(!wait.expired(now), |mark| seq <= mark) => {
+                Some((true, wait, settled))
+                    if fetch.map_or(!wait.expired(now), |mark| settled <= mark) =>
+                {
                     contradicted = wait.expired(now);
                     wait
                 }
@@ -197,6 +200,7 @@ impl ApprovalsState {
                 e.wait = wait;
                 e.phase = phase;
                 e.seq = seq;
+                e.settled = 0;
             }
             None => {
                 self.tombstones.remove(&id);
@@ -207,6 +211,7 @@ impl ApprovalsState {
                         wait,
                         phase,
                         seq,
+                        settled: 0,
                     },
                 );
             }
@@ -295,6 +300,7 @@ impl ApprovalsState {
                         wait,
                         phase,
                         seq,
+                        settled: 0,
                     },
                 );
             }
@@ -341,7 +347,7 @@ impl ApprovalsState {
                     seq: 0,
                     session: None,
                     any_session: true,
-                    until: e.wait.deadline_ms(),
+                    until: e.wait.deadline_ms().saturating_add(SKEW_MS),
                 });
             }
             self.tombstones.add(id, guess);

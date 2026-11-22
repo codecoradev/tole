@@ -133,7 +133,8 @@ impl ShellState {
                 target: Target::ThisComputer,
                 status: ConnectionStatus::Connecting,
             },
-            approvals_pending: Badge::Count(0),
+            // Not known until the approvals queue says so: never a zero.
+            approvals_pending: Badge::Unknown,
             automations_on: 0,
             discussions_need_you: 0,
             skills_new: 0,
@@ -156,6 +157,8 @@ impl ShellState {
         }
         state.apply(Action::SelectFolder(None));
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Preview));
+        // A preview shows sample data: a quiet sidebar, not a list it lacks.
+        state.apply(Action::SetApprovalsPending(Badge::Count(0)));
         state
     }
 
@@ -447,6 +450,9 @@ mod tests {
     #[test]
     fn an_unknown_approvals_list_shows_a_mark_not_a_zero() {
         let mut s = ShellState::new();
+        assert_eq!(s.approvals_pending, Badge::Unknown, "a new shell");
+        assert_eq!(s.badge_text(Section::Approvals).as_deref(), Some("?"));
+        s.apply(Action::SetApprovalsPending(Badge::Count(0)));
         assert_eq!(s.badge_text(Section::Approvals), None, "a known zero");
         s.apply(Action::SetApprovalsPending(Badge::Unknown));
         assert_eq!(s.badge(Section::Approvals), None);

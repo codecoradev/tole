@@ -127,7 +127,7 @@ impl ApprovalsState {
                 if ranked && conflict {
                     // Newer than any fetch that already started: its reply
                     // cannot know the conflict (see `pending`).
-                    e.seq = conflict_seq;
+                    e.settled = conflict_seq;
                 }
             }
         }

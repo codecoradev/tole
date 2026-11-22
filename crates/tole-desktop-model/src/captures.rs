@@ -101,8 +101,12 @@ pub fn shell_captures() -> Vec<Capture> {
         path: "~/Contracts".to_owned(),
     });
     real.apply(Action::SetConnectionStatus(ConnectionStatus::Connected));
+    real.apply(Action::SetApprovalsPending(Badge::Count(0)));
     let mut empty_connected = ShellState::new();
     empty_connected.apply(Action::SetConnectionStatus(ConnectionStatus::Connected));
+    empty_connected.apply(Action::SetApprovalsPending(Badge::Count(0)));
+    let mut no_folders = ShellState::new();
+    no_folders.apply(Action::SetApprovalsPending(Badge::Count(0)));
     let preview = ShellState::placeholder;
     vec![
         capture("shell-preview", HOME, "", preview()),
@@ -117,6 +121,12 @@ pub fn shell_captures() -> Vec<Capture> {
             "s5-approvals.png",
             "",
             preview_with([Action::SetApprovalsPending(Badge::Count(3))]),
+        ),
+        capture(
+            "shell-approvals-unknown",
+            HOME,
+            "",
+            preview_with([Action::SetApprovalsPending(Badge::Unknown)]),
         ),
         capture("shell-counts", HOME, "", counts()),
         capture(
@@ -175,7 +185,7 @@ pub fn shell_captures() -> Vec<Capture> {
             "",
             status(ConnectionStatus::Unreachable),
         ),
-        capture("shell-no-folders", HOME, "", ShellState::new()),
+        capture("shell-no-folders", HOME, "", no_folders),
         capture("shell-no-folders-connected", HOME, "", empty_connected),
         capture("shell-real-folder", HOME, "", real),
         capture("shell-focus-sidebar-toggle", HOME, "tab", preview()),

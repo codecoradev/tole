@@ -225,3 +225,30 @@ fn an_unknown_status_frame_is_never_pending_or_allowed() {
         "never worded as allowed"
     );
 }
+
+#[test]
+fn the_queue_asks_for_a_fetch_by_itself_when_one_is_given_up_or_the_list_is_stale() {
+    let mut ids = FetchIds::new();
+    let mut q = ApprovalsState::new();
+    assert!(due(&q, &mut ids).is_none(), "nothing is asked at the start");
+    let (_, start) = ids.start(Scope::All).expect("id");
+    q.apply(start);
+    // The reply never comes and nothing says it failed: the clock gives up.
+    q.apply(ApprovalsAction::Tick(NOW));
+    assert!(due(&q, &mut ids).is_none(), "a fetch runs");
+    let wait = tole_desktop_model::approvals::FETCH_TIMEOUT_SECS * 1000;
+    q.apply(ApprovalsAction::Tick(NOW + wait));
+    let (id, start) = due(&q, &mut ids).expect("a new fetch is asked for");
+    q.apply(start);
+    assert!(due(&q, &mut ids).is_none(), "and it runs now");
+    let rows = list(vec![serve_row()]);
+    q.apply(snapshot(&rows, Scope::All, id, NOW + wait + 1));
+    assert_eq!(q.waiting_badge(), Badge::Count(1));
+    assert!(due(&q, &mut ids).is_none());
+    // A conflict makes the list stale.
+    q.answer("apr-1", Decision::AllowOnce, NOW + wait + 3)
+        .expect("answerable");
+    let failed = ApprovalsAction::AnswerFailed("apr-1".into(), true, NOW + wait + 4);
+    q.apply(failed);
+    assert!(due(&q, &mut ids).is_some());
+}

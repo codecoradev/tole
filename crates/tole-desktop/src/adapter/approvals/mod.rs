@@ -33,7 +33,9 @@
 //! until a fetch succeeds the badge is `Unknown` and the message box of every
 //! task is `Checking`. A loss while a fetch runs makes that fetch's reply
 //! untrusted: start a new one. A fetch that fails is retried by the driver with
-//! `Backoff` (the queue never asks again; see `fetch`).
+//! `Backoff` (the queue does not ask after a failure). A fetch the queue gave
+//! up (no reply, no failure) or a stale list is asked for by `due`, and the
+//! driver sends a `Tick` at least every `TICK_MAX`; see `fetch`.
 
 mod decision;
 mod fetch;
@@ -55,7 +57,8 @@ use super::wire::extra_text;
 
 pub use decision::{decision_request, decision_to_client, row_for_decision};
 pub use fetch::{
-    failed, follow_up, scope_session, snapshot, Backoff, FetchIds, RETRY_MAX, RETRY_MIN,
+    due, failed, follow_up, scope_session, snapshot, Backoff, FetchIds, RETRY_MAX, RETRY_MIN,
+    TICK_MAX,
 };
 pub use stream::{event_actions, stream_actions, stream_ended, stream_error};
 pub use summary::summary;

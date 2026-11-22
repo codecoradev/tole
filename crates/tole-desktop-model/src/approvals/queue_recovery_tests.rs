@@ -73,9 +73,9 @@ fn a_cut_guess_stops_counting_when_its_own_wait_is_over() {
         1,
         "one guess was cut and may have been pending"
     );
-    tick(&mut q, T0 + WAIT_MS - 1);
-    assert_eq!(q.waiting_badge(), Badge::Unknown);
-    tick(&mut q, T0 + WAIT_MS);
+    tick(&mut q, T0 + WAIT_MS + SKEW_MS - 1);
+    assert_eq!(q.waiting_badge(), Badge::Unknown, "with the skew as grace");
+    tick(&mut q, T0 + WAIT_MS + SKEW_MS);
     assert_eq!((q.refused(), q.waiting_badge()), (0, Badge::Count(0)));
     assert_eq!(q.composer("s"), ComposerState::Open);
 }
@@ -226,4 +226,51 @@ fn an_answer_refused_as_expired_has_already_moved_the_request() {
     );
     assert_eq!(decided_ids(&q), ["p"]);
     assert_eq!(q.waiting_count(), 0);
+}
+
+fn unreadable(id: &str) -> ApprovalRequest {
+    let mut r = pending(id, "s");
+    r.status = "awaiting".into();
+    r
+}
+
+#[test]
+fn a_guess_that_entered_after_the_fetch_started_is_revived_by_its_reply() {
+    let mut q = known();
+    started(&mut q, Scope::All, 2);
+    requested(&mut q, unreadable("r"), T0);
+    assert_eq!(q.composer("s"), ComposerState::Checking);
+    reply(&mut q, vec![pending("r", "s")], Scope::All, 2, T0 + 1);
+    assert_eq!(q.waiting_badge(), Badge::Count(1));
+    assert!(q.answer("r", Decision::AllowOnce, T0 + 2).is_ok());
+}
+
+#[test]
+fn a_malformed_row_of_a_stale_reply_leaves_no_refusal_the_current_one_cannot_clear() {
+    let mut q = lost_then_fetching(2);
+    let stale = vec![pending("p", "bad/session")];
+    reply(&mut q, stale, Scope::All, 1, T0);
+    assert_eq!(q.refused(), 0);
+    reply(&mut q, vec![], Scope::All, 2, T0 + 1);
+    assert_eq!(q.waiting_badge(), Badge::Count(0));
+    assert_eq!(q.composer("s"), ComposerState::Open);
+    // With no fetch running the row is refused as before, and the next fetch
+    // settles it.
+    let mut q = known();
+    reply(&mut q, vec![pending("p", "bad/session")], Scope::All, 9, T0);
+    assert_eq!(q.refused(), 1);
+    started(&mut q, Scope::All, 2);
+    reply(&mut q, vec![], Scope::All, 2, T0 + 1);
+    assert_eq!((q.refused(), q.waiting_badge()), (0, Badge::Count(0)));
+}
+
+#[test]
+fn a_reply_that_is_not_a_fetch_merges_its_rows_when_none_runs() {
+    let mut q = known();
+    reply(&mut q, vec![pending("p", "s")], Scope::All, 9, T0);
+    assert_eq!(q.waiting_count(), 1);
+    // The next fetch closes it when it omits it: it was seen before the start.
+    started(&mut q, Scope::All, 2);
+    reply(&mut q, vec![], Scope::All, 2, T0 + 1);
+    assert_eq!((q.waiting_count(), q.waiting_badge()), (0, Badge::Count(0)));
 }

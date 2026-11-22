@@ -24,9 +24,12 @@
 //!   starts while one runs, the older one's mark of "seen before" is kept (and
 //!   [`ApprovalsState::needs_fetch`] asks for one more fetch when the reply
 //!   left something that came between the two starts unaccounted for). A
-//!   reply that is not the current fetch merges its decided rows, adds no
-//!   waiting request while a fetch that could close it runs, and revives
-//!   nothing: a request it lists as pending may be decided already.
+//!   reply that is not the current fetch merges its decided rows; its pending
+//!   rows add no waiting request and no refusal while a fetch that could
+//!   close or account for them runs (the current reply and the stream show
+//!   them again), and revive nothing, since a request it lists as pending may
+//!   be decided already. With no fetch running it merges them (the next
+//!   fetch closes what the reply omits).
 //! - A request whose status this version does not know may be pending: while
 //!   one is listed the badge is `Unknown` and its task is `Checking`, until a
 //!   known status arrives (or its wait is over).
@@ -39,7 +42,11 @@
 //!   first `Tick` after its `FetchStarted`): the list stays unknown, a late
 //!   reply is untrusted, and `needs_fetch` is true until the adapter starts
 //!   the next fetch of everything. The table of session marks is bounded:
-//!   past 256 sessions the oldest session fetch is given up.
+//!   past 256 sessions the oldest session fetch is given up. The adapter
+//!   must send `Tick` at least every 5 s for as long as the app runs: the
+//!   watchdog, the refusal deadlines and the expiry of requests all run only
+//!   on a `Tick`, and a driver that ticks only for the next request deadline
+//!   never gives up a lost fetch or forgets a refusal.
 //!
 //! Adapter contract (the reducer has no clock and no network; the `u64` of an
 //! action is `now_ms` of the adapter):
@@ -67,7 +74,13 @@
 //!   also one whose answer was sent and never confirmed. A `409` on an answer
 //!   leaves the request as "no longer waiting" (nobody can answer it again)
 //!   until the server's word or the next snapshot says otherwise. A fetch that
-//!   started before the conflict cannot revive it or settle `is_stale`.
+//!   started before the conflict cannot revive it or settle `is_stale` (a
+//!   guess that only entered the queue after a fetch started is revived by
+//!   that fetch's reply). Known limit: once the conflicted request has been
+//!   trimmed from the history (more than [`MAX_DECIDED`] decisions during one
+//!   fetch) its tombstone no longer remembers the conflict, and the reply of
+//!   that fetch shows it as waiting again; a press is arbitrated by the
+//!   server (`409`) and `is_stale` asks for the next fetch.
 //! - [`ApprovalsState::answer`] returns `Err(AnswerError::Expired)` AFTER it
 //!   moved the request to Decided (the wait was over): the adapter re-renders
 //!   as after any applied action. `NotWaiting` and `Unknown` change nothing.
@@ -256,6 +269,9 @@ struct Entry {
     /// When the queue first saw it (or last revived it): a snapshot only
     /// closes what it saw before its fetch started.
     seq: u64,
+    /// When this queue itself settled it after a conflict (`seq` clock): a
+    /// reply of a fetch that started before cannot revive it. 0 when never.
+    settled: u64,
 }
 
 /// A waiting request beyond [`MAX_WAITING`]: only enough kept to count it,

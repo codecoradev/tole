@@ -137,7 +137,8 @@ fn a_request_closed_by_omission_comes_back_when_the_server_says_pending() {
     q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![], Scope::All, T0 + 3);
     assert_eq!(q.waiting_count(), 0);
-    // (A reply that answers no fetch revives nothing: #1116.)
+    // A reply that answers no fetch revives nothing (#1116), so a fetch is
+    // started and its reply lists it pending.
     q.apply(ApprovalsAction::FetchStarted(Scope::All, FetchId(1)));
     snapshot(&mut q, vec![pending("a", "s")], Scope::All, T0 + 4);
     assert_eq!(q.waiting_count(), 1);

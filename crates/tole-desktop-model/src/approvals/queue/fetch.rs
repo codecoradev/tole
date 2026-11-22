@@ -149,17 +149,20 @@ impl ApprovalsState {
             }) || self.overflow.contains_key(&r.id)
         });
         for row in pending {
+            // A reply that is not the current fetch is older than the queue's
+            // own knowledge. It revives nothing, and while a current fetch
+            // runs it adds nothing and refuses nothing either: a request it
+            // lists as pending may be decided already, and that fetch could
+            // not close (or account for) what is created after it started.
+            // The stream and the current reply show what is pending, and
+            // refuse what is malformed.
+            if mark.is_none()
+                && (self.entries.contains_key(&row.id)
+                    || self.fetch_outstanding(row.session_id.as_deref()))
+            {
+                continue;
+            }
             match self.admitted(row, now) {
-                // A reply that is not the current fetch is older than the
-                // queue's own knowledge. It revives nothing, and while a
-                // current fetch runs it adds nothing either: a request it
-                // lists as pending may be decided already, and that fetch
-                // could not close what is created after it started. The
-                // stream and the current reply show what is pending.
-                Some(row)
-                    if mark.is_none()
-                        && (self.entries.contains_key(&row.id)
-                            || self.fetch_outstanding(row.session_id.as_deref())) => {}
                 Some(row) => {
                     let appeared = self.pending(row, now, mark);
                     changed |= appeared;
