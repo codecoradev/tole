@@ -141,25 +141,25 @@ mod worker_tests;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tole_desktop_model::approvals::Decision;
 
 use self::calls::{Call, LANES};
-use self::engine::{Engine, Input};
+use self::engine::{Engine, Input, TICK_EVERY};
 use self::store::Store;
-use self::threads::{reader, run_guarded, spawn_lane, ticker};
+use self::threads::{reader, spawn_lane};
 pub use self::view::{LinkState, TaskView};
 use self::worker::Worker;
 use super::api::Api;
-pub use super::approvals::{Busy, OnChange};
 use super::clock::{Clock, Shutdown};
 use super::runtime::{JoinReport, Threads};
+use super::shared::handle;
+pub use super::shared::handle::{Busy, OnChange};
+use super::shared::thread::{run_guarded, spawn_ticker, stop_threads, DROP_JOIN};
 
-/// How long dropping a driver waits for its threads.
-const DROP_JOIN: Duration = Duration::from_millis(500);
 /// The room in the worker's inbox.
 const INBOX: usize = 256;
 
@@ -280,10 +280,7 @@ impl Handle {
         if !self.is_running() {
             return Err(Busy);
         }
-        match self.inbox.try_send(input) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(Busy),
-        }
+        handle::queue(&self.inbox, input)
     }
 }
 
@@ -341,9 +338,7 @@ impl TaskDriver {
             };
             t.spawn("task-worker", move || worker.run())?;
             let (i, c, s) = (inbox.clone(), Arc::clone(&clock), stop.clone());
-            t.spawn("task-tick", move || {
-                run_guarded(&i.clone(), || ticker(i, c, s))
-            })?;
+            spawn_ticker(t, "task-tick", i, c, s, TICK_EVERY)?;
             for (kind, jobs) in LANES.into_iter().zip(lane_rx.drain(..)) {
                 let ends = (inbox.clone(), stop.clone());
                 spawn_lane(
@@ -388,9 +383,7 @@ impl TaskDriver {
     }
 
     fn stop(&mut self, timeout: Duration) -> JoinReport {
-        self.stop.trigger();
-        let _ = self.handle.inbox.try_send(Input::Wake);
-        self.threads.join(timeout)
+        stop_threads(&self.stop, &self.handle.inbox, &mut self.threads, timeout)
     }
 }
 

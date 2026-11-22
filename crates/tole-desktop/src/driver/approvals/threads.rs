@@ -8,40 +8,23 @@
 //! the call is made and becomes the failure of that call (`Fetched` or
 //! `Decided` with an error, a lost stream), so the thread goes on and the
 //! engine releases its slot and retries. A panic anywhere else in a thread is
-//! caught by [`run_guarded`], which tells the worker (`ThreadFailed`); the
+//! caught by `run_guarded` (`driver::shared::thread`), which tells the worker (`ThreadFailed`); the
 //! worker then ends the driver, which leaves the view `Unknown`.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 use tole_client::{Event, StreamItem};
 use tole_desktop_model::approvals::{DecisionIntent, FetchId};
 
-use super::engine::{Input, TICK_EVERY};
+use super::engine::Input;
 use crate::adapter::approvals::{
     decision_to_client, row_for_decision, stream_actions, Backoff, RETRY_MAX,
 };
 use crate::driver::api::{Api, NO_REPLAY};
 use crate::driver::clock::{Clock, Shutdown, Slept};
 use crate::driver::guard::{guarded, panicked, probe_wait, refused, PARK_AFTER};
-
-/// Run a thread body; if it panics, tell the worker so the driver ends.
-pub(super) fn run_guarded(inbox: &SyncSender<Input>, body: impl FnOnce()) {
-    if catch_unwind(AssertUnwindSafe(body)).is_err() {
-        let _ = inbox.send(Input::ThreadFailed);
-    }
-}
-
-pub(super) fn ticker(inbox: SyncSender<Input>, clock: Arc<dyn Clock>, stop: Shutdown) {
-    while clock.sleep(TICK_EVERY, &stop) == Slept::Elapsed {
-        // A full inbox drops the tick: the worker keeps its own time and
-        // ticks the model between inputs, so this only wakes it when idle.
-        if let Err(TrySendError::Disconnected(_)) = inbox.try_send(Input::Tick) {
-            return;
-        }
-    }
-}
+use crate::driver::shared::now::millis;
 
 /// Runs the `GET /approvals` calls the engine asks for, one at a time.
 pub(super) fn fetcher(
@@ -102,7 +85,7 @@ pub(super) fn reader(
     clock: Arc<dyn Clock>,
     stop: Shutdown,
 ) {
-    let healthy_ms = u64::try_from(RETRY_MAX.as_millis()).unwrap_or(u64::MAX);
+    let healthy_ms = millis(RETRY_MAX);
     let mut backoff = Backoff::new();
     let mut refusals = 0u32;
     let mut parked = false;

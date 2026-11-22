@@ -118,20 +118,23 @@ mod rig;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tole_desktop_model::approvals::{ComposerState, Decision, Tab};
 
-use self::engine::{Engine, Input};
+use self::engine::{Engine, Input, TICK_EVERY};
 use self::store::Store;
-use self::threads::{decider, fetcher, reader, run_guarded, ticker};
+use self::threads::{decider, fetcher, reader};
 pub use self::view::ApprovalsView;
 use self::worker::Worker;
 use super::api::Api;
 use super::clock::{Clock, Shutdown};
 use super::runtime::{JoinReport, Threads};
+use super::shared::handle::{self, clamp_refresh};
+pub use super::shared::handle::{Busy, OnChange};
+use super::shared::thread::{run_guarded, spawn_ticker, stop_threads, DROP_JOIN};
 
 /// Most event streams one driver holds. The serve allows 8 for all its
 /// clients together, so a desktop with many tasks open must not take them all.
@@ -144,15 +147,13 @@ pub const MIN_REFRESH: Duration = Duration::from_secs(1);
 /// refresh and the age rule that follows it (a list older than twice the
 /// refresh is not known) would otherwise mean nothing.
 pub const MAX_REFRESH: Duration = Duration::from_secs(60);
-/// How long dropping a driver waits for its threads.
-const DROP_JOIN: Duration = Duration::from_millis(500);
 /// The room in the worker's inbox.
 const INBOX: usize = 256;
 
 /// The refresh a driver uses: `refresh` held between [`MIN_REFRESH`] and
 /// [`MAX_REFRESH`].
 pub(super) fn effective_refresh(refresh: Duration, ceiling: Duration) -> Duration {
-    refresh.clamp(MIN_REFRESH, ceiling.max(MIN_REFRESH))
+    clamp_refresh(refresh, MIN_REFRESH, ceiling)
 }
 
 /// The sessions to follow: no empty id, none twice (two readers of one session
@@ -165,11 +166,6 @@ pub(super) fn followed_sessions(sessions: Vec<String>) -> Vec<String> {
         .take(MAX_STREAMS)
         .collect()
 }
-
-/// What the UI calls when the view changed; runs on the worker thread, with no
-/// lock held, so it should only ask the UI to repaint (and read
-/// [`Handle::snapshot`] there).
-pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 
 pub struct Config {
     /// The sessions whose streams carry approval frames. Streams past
@@ -192,10 +188,6 @@ impl Default for Config {
         }
     }
 }
-
-/// The driver is stopped, or its inbox is full: the call did nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Busy;
 
 /// The UI's side of the driver: cheap to clone, usable from any thread.
 #[derive(Clone)]
@@ -239,10 +231,7 @@ impl Handle {
     }
 
     fn send(&self, input: Input) -> Result<(), Busy> {
-        match self.inbox.try_send(input) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(Busy),
-        }
+        handle::queue(&self.inbox, input)
     }
 }
 
@@ -315,9 +304,7 @@ impl ApprovalsDriver {
                 run_guarded(&i.clone(), || decider(a, send_rx, i, s))
             })?;
             let (i, c, s) = (inbox.clone(), Arc::clone(&clock), stop.clone());
-            t.spawn("approvals-tick", move || {
-                run_guarded(&i.clone(), || ticker(i, c, s))
-            })?;
+            spawn_ticker(t, "approvals-tick", i, c, s, TICK_EVERY)?;
             for session in sessions {
                 let (a, i, c, s) = (
                     Arc::clone(&api),
@@ -352,9 +339,7 @@ impl ApprovalsDriver {
     }
 
     fn stop(&mut self, timeout: Duration) -> JoinReport {
-        self.stop.trigger();
-        let _ = self.handle.inbox.try_send(Input::Wake);
-        self.threads.join(timeout)
+        stop_threads(&self.stop, &self.handle.inbox, &mut self.threads, timeout)
     }
 }
 
