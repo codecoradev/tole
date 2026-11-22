@@ -322,8 +322,11 @@ pub struct ApprovalsDriver {
 impl ApprovalsDriver {
     /// Start the threads. The first thing the worker does is fetch the whole
     /// list; until that succeeds the view is `Unknown` and every box `Checking`.
-    /// `Err` only when the system cannot start a thread (nothing is left
-    /// running then).
+    /// `Err` only when the system cannot start one of the five fixed threads
+    /// (nothing is left running then). The readers of the followed sessions
+    /// are started by the worker: one that cannot be started ends the driver
+    /// like a dead thread, so a caller that must know checks
+    /// [`Handle::is_running`] (a stopped driver reads `Unknown`).
     pub fn start(api: Arc<dyn Api>, clock: Arc<dyn Clock>, cfg: Config) -> io::Result<Self> {
         Self::start_with_ceiling(api, clock, cfg, MAX_REFRESH)
     }
