@@ -88,12 +88,19 @@ fn a_session_closed_for_good_stays_parked_and_costs_one_probe_per_interval() {
         assert!(rig.clock.wait_sleepers(2, super::rig::PATIENCE));
         rig.tick();
     }
+    // The probe happened at or just before this reading of the clock.
+    let probed_at = rig.clock.monotonic_ms();
     rig.sync();
     assert_eq!(parked(&rig), vec!["s1".to_owned()], "still parked");
-    assert!(counted(&rig.handle.snapshot(), 0), "the list stays known");
-    // The next probe is another interval away.
-    let probed_at = rig.clock.monotonic_ms();
-    while rig.clock.monotonic_ms() < probed_at + 29_000 {
+    // The fetch that was out when the stream went down may return after the
+    // clock ticks above; the driver converges, so wait for it by condition,
+    // without moving the clock (moving it would run the next probe due).
+    rig.until("the list is known without the parked session", |v| {
+        counted(v, 0)
+    });
+    // The next probe is another interval (30 s to 40 s) away: the clock is read
+    // after the probe, so stop well inside the interval and not at its edge.
+    while rig.clock.monotonic_ms() < probed_at + 20_000 {
         assert!(rig.clock.wait_sleepers(2, super::rig::PATIENCE));
         rig.tick();
     }
