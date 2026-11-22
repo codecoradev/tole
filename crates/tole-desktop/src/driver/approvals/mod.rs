@@ -150,6 +150,8 @@ mod engine_tests;
 mod parked_tests;
 #[cfg(test)]
 mod rig;
+#[cfg(test)]
+mod sessions_engine_tests;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
