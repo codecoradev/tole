@@ -27,7 +27,8 @@ pub enum LinkState {
 pub struct TaskView {
     /// The status sentence's inputs: phase, counts, steps, `can_stop` and
     /// `send` (the model's rules, then the driver's: nothing can be sent while
-    /// the history is read or no stream is up, or after the driver stopped).
+    /// the history is read, while the previous prompt call is still out, or
+    /// after the driver stopped).
     pub status: StatusRow,
     pub link: LinkState,
     /// The serve keeps refusing the stream (404 until the task is resumed,
@@ -45,6 +46,23 @@ pub struct TaskView {
     pub total_rows: usize,
     /// Waiting for the owner, oldest first.
     pub approvals: Vec<ApprovalInfo>,
+    /// The ids of `approvals` whose answer is queued or on its way: show their
+    /// buttons as busy.
+    pub deciding: Vec<String>,
+    /// The ids of `approvals` that can only be answered elsewhere (the serve's
+    /// id of the request is not certain, or two requests look the same once
+    /// made printable): the card should say so and offer no buttons. Stop is
+    /// offered while they wait.
+    pub undecidable: Vec<String>,
+    /// The last message was given up on (its call never answered) with no sign
+    /// that the serve got it: it may or may not have been sent, and it may
+    /// still run. Its words are back in `draft`; say so before a resend.
+    pub last_send_uncertain: bool,
+    /// Commands the driver refused so far (a send while a turn runs, an answer
+    /// for a card it cannot answer, ...). `Handle` commands return `Ok` once
+    /// queued: a UI keeps the text it typed until the transcript shows it, and
+    /// reads a rise of this number as "the last command did nothing".
+    pub ignored: u64,
     /// The queue was lost with the stream and not read again yet: the cards
     /// may be out of date.
     pub approvals_stale: bool,
@@ -60,6 +78,10 @@ impl TaskView {
         let blocked = |status: &mut StatusRow, phase: Phase| {
             status.send = SendMode::Disabled(phase);
         };
+        let stuck = status.phase == Phase::WaitingApproval && !facts.undecidable.is_empty();
+        if stuck {
+            status.can_stop = true; // the cards cannot be answered here: Stop cancels
+        }
         if !alive {
             status.phase = Phase::Offline;
             status.can_stop = false;
@@ -68,6 +90,10 @@ impl TaskView {
             // Answers and entries come on the stream: nothing is sent without
             // one (Stop is the model's, and works on what a REST read found).
             blocked(&mut status, Phase::Offline);
+        } else if (status.send == SendMode::Send && facts.prompting)
+            || (status.send == SendMode::Steer && facts.steering)
+        {
+            blocked(&mut status, Phase::Working);
         }
         // The link is the stream's: a status read over REST sets the model's
         // own link back to live, and says nothing of whether answers can come.
@@ -94,6 +120,10 @@ impl TaskView {
             window,
             total_rows: task.transcript.items.len(),
             approvals: task.run.approvals.clone(),
+            deciding: facts.deciding.clone(),
+            undecidable: facts.undecidable.clone(),
+            last_send_uncertain: facts.unsent,
+            ignored: facts.ignored,
             approvals_stale: task.run.approvals_stale,
             draft: task.composer.text.clone(),
         }

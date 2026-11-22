@@ -19,8 +19,21 @@ pub(super) struct Facts {
     pub connected: bool,
     /// A stream is up now (a REST read says nothing of that).
     pub stream_up: bool,
+    /// The last message was given up on with no sign that it was sent: its
+    /// words are back in the draft.
+    pub unsent: bool,
     /// The serve keeps refusing the stream: it is probed slowly.
     pub parked: bool,
+    /// The prompt call is out (the turn it serves has not been reported over).
+    pub prompting: bool,
+    /// A steer note is out.
+    pub steering: bool,
+    /// Approval ids queued for an answer or being answered.
+    pub deciding: Vec<String>,
+    /// Cards the driver cannot answer (see `engine::ids`).
+    pub undecidable: Vec<String>,
+    /// Commands the engine refused, ever (see `TaskView::ignored`).
+    pub ignored: u64,
 }
 
 /// The rows the UI shows: scroll offset and height of its list, in pixels.
