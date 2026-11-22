@@ -18,9 +18,10 @@ use super::calls::{self, Call, Lane};
 use super::engine::Input;
 use crate::adapter::approvals::{Backoff, RETRY_MAX};
 use crate::driver::api::Api;
-use crate::driver::clock::{millis, Clock, Shutdown, Slept};
+use crate::driver::clock::{Clock, Shutdown, Slept};
 use crate::driver::guard::{guarded, panicked, probe_wait, refused, PARK_AFTER};
 use crate::driver::runtime::Spawner;
+use crate::driver::shared::now::millis;
 use crate::driver::shared::thread::run_guarded;
 
 /// Start the thread of `kind`, to take its calls from `jobs`.

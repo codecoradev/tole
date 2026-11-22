@@ -145,7 +145,7 @@ pub(in crate::driver::approvals) struct Engine {
     decide_queue: VecDeque<DecisionIntent>,
 }
 
-pub(super) use crate::driver::clock::millis;
+pub(super) use crate::driver::shared::now::millis;
 
 impl DriverInput for Input {
     fn tick() -> Self {

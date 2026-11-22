@@ -98,8 +98,7 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, d: Duration, stop: &Shutdown) -> Slept;
 }
 
-/// A duration in milliseconds, saturating.
-pub(crate) fn millis(d: Duration) -> u64 {
+fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 

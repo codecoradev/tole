@@ -104,7 +104,7 @@ pub(super) struct Out {
 
 pub(super) use crate::driver::shared::now::Now;
 
-pub(super) use crate::driver::clock::millis;
+pub(super) use crate::driver::shared::now::millis;
 
 impl DriverInput for Input {
     fn tick() -> Self {

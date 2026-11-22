@@ -22,8 +22,9 @@ use crate::adapter::approvals::{
     decision_to_client, row_for_decision, stream_actions, Backoff, RETRY_MAX,
 };
 use crate::driver::api::{Api, NO_REPLAY};
-use crate::driver::clock::{millis, Clock, Shutdown, Slept};
+use crate::driver::clock::{Clock, Shutdown, Slept};
 use crate::driver::guard::{guarded, panicked, probe_wait, refused, PARK_AFTER};
+use crate::driver::shared::now::millis;
 
 /// Runs the `GET /approvals` calls the engine asks for, one at a time.
 pub(super) fn fetcher(
