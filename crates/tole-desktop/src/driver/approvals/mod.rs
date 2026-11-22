@@ -151,6 +151,8 @@ mod parked_tests;
 #[cfg(test)]
 mod rig;
 #[cfg(test)]
+mod sessions_e2e_tests;
+#[cfg(test)]
 mod sessions_engine_tests;
 
 use std::io;
