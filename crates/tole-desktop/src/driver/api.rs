@@ -12,14 +12,21 @@
 //! read and per body, so a driver never calls one on the thread that owns its
 //! state or while holding a lock.
 //!
+//! The prompt call is the exception to the bounds: it answers when its turn
+//! ends, which takes minutes, so [`ClientApi`] makes it on a clone of the client
+//! with a read timeout of [`PROMPT_TIMEOUT`] (two hours) instead of
+//! [`CALL_TIMEOUT`]. A turn that runs longer is reported as a failed call, which
+//! the task driver answers by asking the serve whether the turn still runs.
+//!
 //! Each driver adds the calls it needs below the marker; a method that no
 //! driver calls yet is not here.
 
 use std::time::Duration;
 
 use tole_client::{
-    Approval, ApprovalList, Client, Decision, DecisionReply, Error, ReconnectPolicy,
-    ResumingStream, StreamItem,
+    Approval, ApprovalList, CancelReply, Client, Decision, DecisionReply, EntriesPage, Error,
+    InterruptReply, InterruptRequest, PromptReply, PromptRequest, ReconnectPolicy, ResumingStream,
+    SessionStatus, StreamItem,
 };
 
 /// One session's event stream, as a source of items. It reconnects by itself
@@ -55,40 +62,107 @@ pub trait Api: Send + Sync + 'static {
     /// block: the connection is made by the first `next_item`.
     fn follow_events(&self, session: &str, after: u64) -> Box<dyn EventSource>;
 
-    // ---- room for the task driver (prompt, cancel, entries, status) and the
-    // ---- skills driver (skills, tools): each adds its calls here.
+    // ---- the task driver: one session ----
+
+    /// `GET /sessions/{id}/entries`: the entries after `after`.
+    fn entries(
+        &self,
+        session: &str,
+        after: u64,
+        limit: Option<usize>,
+    ) -> Result<EntriesPage, Error>;
+
+    /// `GET /sessions/{id}/status`.
+    fn status(&self, session: &str) -> Result<SessionStatus, Error>;
+
+    /// `POST /sessions/{id}/prompt`. Answers when the turn stops, so it may
+    /// block for minutes (see the module docs).
+    fn prompt(&self, session: &str, req: &PromptRequest) -> Result<PromptReply, Error>;
+
+    /// `POST /sessions/{id}/cancel`.
+    fn cancel(&self, session: &str) -> Result<CancelReply, Error>;
+
+    /// `POST /sessions/{id}/interrupt`: a note to the running turn.
+    fn interrupt(&self, session: &str, req: &InterruptRequest) -> Result<InterruptReply, Error>;
+
+    /// `POST /approvals/{id}/decision` of a serve row (no fingerprint; a
+    /// delegated child's row goes through [`Api::decide_row`]).
+    fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error>;
+
+    // ---- room for the skills driver (skills, tools): it adds its calls here.
 }
 
 /// The longest one blocking read of a call, and one answer's body, may take.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The longest a prompt call may wait for its turn to end.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// The real client as an [`Api`], with the call bounds applied.
-pub struct ClientApi(Client);
+pub struct ClientApi {
+    /// Every call but the prompt: bounded reads and bodies.
+    short: Client,
+    /// The prompt: reads bounded by [`PROMPT_TIMEOUT`], a bounded body.
+    long: Client,
+}
 
 impl ClientApi {
     /// Wrap `client`, bounding each read of a call and each body by
     /// [`CALL_TIMEOUT`] (a call is then over after about a minute at worst).
+    /// The prompt call waits up to [`PROMPT_TIMEOUT`] for its turn.
     pub fn new(client: Client) -> Result<Self, Error> {
-        let client = client
+        let long = (client.clone())
+            .with_request_timeout(PROMPT_TIMEOUT)?
+            .with_body_deadline(CALL_TIMEOUT)?;
+        let short = client
             .with_request_timeout(CALL_TIMEOUT)?
             .with_body_deadline(CALL_TIMEOUT)?;
-        Ok(ClientApi(client))
+        Ok(ClientApi { short, long })
     }
 }
 
 impl Api for ClientApi {
     fn approvals(&self, session: Option<&str>) -> Result<ApprovalList, Error> {
-        self.0.approvals(session)
+        self.short.approvals(session)
     }
 
     fn decide_row(&self, row: &Approval, decision: Decision) -> Result<DecisionReply, Error> {
-        self.0.decide_row(row, decision)
+        self.short.decide_row(row, decision)
     }
 
     fn follow_events(&self, session: &str, after: u64) -> Box<dyn EventSource> {
         Box::new(
-            self.0
+            self.short
                 .follow_events(session, after, ReconnectPolicy::default()),
         )
+    }
+
+    fn entries(
+        &self,
+        session: &str,
+        after: u64,
+        limit: Option<usize>,
+    ) -> Result<EntriesPage, Error> {
+        self.short.entries(session, after, limit)
+    }
+
+    fn status(&self, session: &str) -> Result<SessionStatus, Error> {
+        self.short.status(session)
+    }
+
+    fn prompt(&self, session: &str, req: &PromptRequest) -> Result<PromptReply, Error> {
+        self.long.prompt(session, req)
+    }
+
+    fn cancel(&self, session: &str) -> Result<CancelReply, Error> {
+        self.short.cancel(session)
+    }
+
+    fn interrupt(&self, session: &str, req: &InterruptRequest) -> Result<InterruptReply, Error> {
+        self.short.interrupt(session, req)
+    }
+
+    fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error> {
+        self.short.decide(approval_id, decision)
     }
 }

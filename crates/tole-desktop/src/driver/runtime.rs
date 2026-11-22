@@ -41,10 +41,64 @@ impl Drop for ExitGuard {
     }
 }
 
+/// The threads started, the ones already joined, and whether `join` began.
+#[derive(Default)]
+struct Set {
+    closed: bool,
+    live: Vec<(JoinHandle<()>, Arc<AtomicBool>)>,
+    /// Ended threads joined early (see [`Spawner::spawn`]), and how many of
+    /// them panicked: `join` still counts them.
+    reaped: usize,
+    reaped_panics: usize,
+}
+
+type Handles = Arc<Mutex<Set>>;
+
+/// Starts threads that [`Threads::join`] will account for, from a thread that
+/// is itself one of them (a worker that replaces a lane whose call it
+/// abandoned). Cheap to clone.
+#[derive(Clone)]
+pub struct Spawner {
+    handles: Handles,
+    exits: Arc<Exits>,
+}
+
+impl Spawner {
+    /// Start a named thread. `Err` when the system cannot make one, and once
+    /// [`Threads::join`] has begun: it counts the threads it finds then, so a
+    /// thread started after that would be counted by nobody.
+    pub fn spawn(&self, name: &str, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
+        let mut set = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        if set.closed {
+            return Err(io::Error::other("the driver is stopping"));
+        }
+        // A thread that ended is joined now, not held until `join`: a long
+        // driver that abandons calls would keep one finished thread each.
+        let (ended, live): (Vec<_>, Vec<_>) = std::mem::take(&mut set.live)
+            .into_iter()
+            .partition(|(_, flag)| flag.load(Ordering::SeqCst));
+        set.live = live;
+        for (handle, _) in ended {
+            set.reaped += 1;
+            set.reaped_panics += usize::from(handle.join().is_err());
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = ExitGuard(Arc::clone(&self.exits), Arc::clone(&flag));
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _guard = guard;
+                body();
+            })?;
+        set.live.push((handle, flag));
+        Ok(())
+    }
+}
+
 /// The threads of one driver.
 #[derive(Default)]
 pub struct Threads {
-    handles: Vec<(JoinHandle<()>, Arc<AtomicBool>)>,
+    handles: Handles,
     exits: Arc<Exits>,
 }
 
@@ -53,24 +107,32 @@ impl Threads {
         Self::default()
     }
 
+    /// A handle that starts threads of this set from other threads.
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
+            handles: Arc::clone(&self.handles),
+            exits: Arc::clone(&self.exits),
+        }
+    }
+
     /// Start a named thread. `Err` only when the system cannot make one.
     pub fn spawn(&mut self, name: &str, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
-        let ended = Arc::new(AtomicBool::new(false));
-        let guard = ExitGuard(Arc::clone(&self.exits), Arc::clone(&ended));
-        let handle = std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || {
-                let _guard = guard;
-                body();
-            })?;
-        self.handles.push((handle, ended));
-        Ok(())
+        self.spawner().spawn(name, body)
     }
 
     /// Wait up to `timeout` for every thread to end, join the ones that did and
     /// let go of the rest. Raise the driver's stop signal first.
     pub fn join(&mut self, timeout: Duration) -> JoinReport {
-        let total = self.handles.len();
+        let (taken, reaped, reaped_panics) = {
+            let mut set = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+            set.closed = true;
+            (
+                std::mem::take(&mut set.live),
+                std::mem::take(&mut set.reaped),
+                std::mem::take(&mut set.reaped_panics),
+            )
+        };
+        let total = taken.len() + reaped;
         {
             let done = self.exits.done.lock().unwrap_or_else(|p| p.into_inner());
             let _ = self
@@ -78,8 +140,12 @@ impl Threads {
                 .changed
                 .wait_timeout_while(done, timeout, |n| *n < total);
         }
-        let mut report = JoinReport::default();
-        for (handle, ended) in self.handles.drain(..) {
+        let mut report = JoinReport {
+            joined: reaped,
+            panicked: reaped_panics,
+            detached: 0,
+        };
+        for (handle, ended) in taken {
             // The flag is set as the thread's last act: the join is instant.
             if ended.load(Ordering::SeqCst) {
                 report.joined += 1;
