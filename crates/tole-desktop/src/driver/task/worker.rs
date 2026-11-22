@@ -2,14 +2,17 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 
-use super::calls::Call;
+use super::calls::{Call, Lane};
 use super::engine::{Effect, Engine, Input, Now, Out};
 use super::store::Store;
+use super::threads::spawn_lane;
 use super::OnChange;
+use crate::driver::api::Api;
 use crate::driver::clock::{Clock, Shutdown};
+use crate::driver::runtime::Spawner;
 
 /// The worker thread's state: the engine and where its effects go.
 pub(super) struct Worker {
@@ -25,6 +28,11 @@ pub(super) struct Worker {
     pub store: Arc<Store>,
     pub alive: Arc<AtomicBool>,
     pub on_change: Option<OnChange>,
+    /// What a replacement lane thread needs (see `Effect::ReplaceLane`).
+    pub spawner: Spawner,
+    pub api: Arc<dyn Api>,
+    pub session: String,
+    pub inbox_tx: SyncSender<Input>,
 }
 
 impl Worker {
@@ -64,7 +72,7 @@ impl Worker {
 
     /// Hand the effects to the I/O threads and tell the UI. `false` when the
     /// driver must end: a thread is gone.
-    fn carry_out(&self, out: Out) -> bool {
+    fn carry_out(&mut self, out: Out) -> bool {
         let Out {
             changed,
             effects,
@@ -79,7 +87,26 @@ impl Worker {
                     (self.lanes.get(lane.index())).is_some_and(|tx| tx.send(call).is_ok())
                 }
                 Effect::OpenStream(after) => self.open.send(after).is_ok(),
+                Effect::ReplaceLane(lane) => self.replace(lane),
             })
+    }
+
+    /// The thread of `lane` is stuck in a call that was given up: its channel
+    /// is closed (it ends when the call returns) and a new thread takes over.
+    /// Once the driver is stopping nothing is started.
+    pub(super) fn replace(&mut self, lane: Lane) -> bool {
+        if self.stop.is_set() {
+            return true;
+        }
+        let (tx, rx) = sync_channel::<Call>(1);
+        let Some(slot) = self.lanes.get_mut(lane.index()) else {
+            return false;
+        };
+        *slot = tx;
+        let (api, session) = (Arc::clone(&self.api), self.session.clone());
+        let ends = (self.inbox_tx.clone(), self.stop.clone());
+        // A spawn refused because the driver began to stop is not a failure.
+        spawn_lane(&self.spawner, api, session, lane, rx, ends).is_ok() || self.stop.is_set()
     }
 
     fn changed(&self) {

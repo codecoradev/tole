@@ -16,8 +16,8 @@
 //! - [`runtime`]: starting threads together and stopping them with a timeout.
 //! - [`guard`]: containing a panic in a call, and the probing of a refused stream.
 //! - [`approvals`]: the approvals queue (the first driver).
-//! - [`task`]: one task, that is one session: its history, live stream and the
-//!   queue of approvals of that session.
+//! - [`task`]: one task, that is one session: its history, live stream, prompt,
+//!   Stop, steer and the approvals of that session.
 //!
 //! Rules every driver keeps (the thread model of each is in its module docs):
 //!
