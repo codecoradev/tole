@@ -95,7 +95,13 @@
 //!   client bounds it at about a minute) delays the next; the view stays
 //!   `Unknown` meanwhile.
 
+#[cfg(test)]
+mod coverage_tests;
+#[cfg(test)]
+mod decision_tests;
 mod engine;
+#[cfg(test)]
+mod engine_tests;
 mod store;
 mod threads;
 mod view;

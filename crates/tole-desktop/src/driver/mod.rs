@@ -33,6 +33,8 @@
 pub mod api;
 pub mod approvals;
 pub mod clock;
+#[cfg(test)]
+mod foundation_tests;
 pub mod runtime;
 
 pub use api::{Api, ClientApi, EventSource};
