@@ -45,6 +45,8 @@ mod queue_fetch_tests;
 #[cfg(test)]
 mod queue_guard_tests;
 #[cfg(test)]
+mod queue_recovery_tests;
+#[cfg(test)]
 mod queue_review_tests;
 #[cfg(test)]
 mod queue_tests;
