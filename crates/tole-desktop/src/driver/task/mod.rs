@@ -101,7 +101,13 @@
 mod calls;
 mod engine;
 #[cfg(test)]
+mod engine_abandon_tests;
+#[cfg(test)]
 mod engine_cadence_tests;
+#[cfg(test)]
+mod engine_failed_tests;
+#[cfg(test)]
+mod engine_guard_tests;
 #[cfg(test)]
 mod engine_history_tests;
 #[cfg(test)]
@@ -122,6 +128,8 @@ mod store;
 mod threads;
 mod view;
 mod worker;
+#[cfg(test)]
+mod worker_tests;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
