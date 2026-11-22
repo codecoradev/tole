@@ -653,6 +653,14 @@ pub fn gate(
     Ok((draft, p.skill_md.clone()))
 }
 
+/// What [`DraftStore::list_checked`] found: the readable drafts, oldest
+/// first, and one message per draft entry that could not be read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DraftListing {
+    pub drafts: Vec<Draft>,
+    pub unreadable: Vec<String>,
+}
+
 /// The drafts directory: one subdirectory per draft.
 #[derive(Debug, Clone)]
 pub struct DraftStore {
@@ -709,18 +717,52 @@ impl DraftStore {
         String::from_utf8(raw).map_err(|_| format!("{}: not UTF-8", path.display()))
     }
 
-    /// Every readable draft, oldest first. An unreadable one is skipped.
+    /// Every readable draft, oldest first. An unreadable one is skipped, and
+    /// so is a store that cannot be listed; a caller that must tell an empty
+    /// store from an unreadable one uses [`DraftStore::list_checked`].
     pub fn list(&self) -> Vec<Draft> {
-        let Ok(rd) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+        self.list_checked().map(|l| l.drafts).unwrap_or_default()
+    }
+
+    /// As [`DraftStore::list`], but says what it could not read. A store
+    /// directory that does not exist yet is an empty store; one that exists
+    /// and cannot be listed is an error. An entry named like a draft whose
+    /// record cannot be read is skipped and reported in `unreadable`; an
+    /// entry that cannot be a draft (a stray file) is ignored.
+    pub fn list_checked(&self) -> Result<DraftListing, String> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DraftListing::default());
+            }
+            Err(e) => return Err(format!("{}: {e}", self.dir.display())),
         };
-        let mut out: Vec<Draft> = rd
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter_map(|id| self.get(&id).ok())
-            .collect();
-        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-        out
+        let mut listing = DraftListing::default();
+        for entry in rd {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    listing
+                        .unreadable
+                        .push(format!("{}: {e}", self.dir.display()));
+                    continue;
+                }
+            };
+            let Ok(id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if self.draft_dir(&id).is_err() {
+                continue;
+            }
+            match self.get(&id) {
+                Ok(d) => listing.drafts.push(d),
+                Err(e) => listing.unreadable.push(e),
+            }
+        }
+        listing
+            .drafts
+            .sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(listing)
     }
 
     /// Reject a pending draft (the owner's call). A decided draft does not

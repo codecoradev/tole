@@ -28,16 +28,47 @@ fn text(s: &str) -> String {
 /// `skills` (state is `approved`, `changed`, `not_approved`, `refused`,
 /// `unreadable`), `drafts` (pending, oldest first) and `archived`, for the
 /// skills discovered from `workspace`. A part that cannot be read is a line in
-/// `notes`, not a failure of the rest.
+/// `notes`, not a failure of the rest. A non-empty `notes` is the partial
+/// marker: the lists may be incomplete, so a client shows unknown, not zero.
 pub fn state_json(workspace: Option<&Path>, secrets: &tole_core::secrets::SecretSet) -> Value {
     let mut notes: Vec<String> = Vec::new();
     let skills = super::approve::audit_rows(workspace).unwrap_or_else(|e| {
         notes.push(format!("skills not read: {e}"));
         Vec::new()
     });
-    let drafts: Vec<Value> = DraftStore::default_store()
-        .map(|s| s.list())
-        .unwrap_or_default()
+    let drafts = drafts_json(DraftStore::default_store(), &mut notes);
+    let archived = archived_json(Archive::default_archive(), &mut notes);
+    secrets.redact_value(&json!({
+        "skills": skills,
+        "drafts": drafts,
+        "archived": archived,
+        "notes": notes,
+    }))
+}
+
+/// The pending drafts of `store`. A store that cannot be listed, or a draft
+/// that cannot be read, adds a "drafts not read" note; `None` is a data
+/// directory that cannot be resolved.
+fn drafts_json(store: Option<DraftStore>, notes: &mut Vec<String>) -> Vec<Value> {
+    let Some(store) = store else {
+        notes.push(format!("drafts not read: {NO_DATA_DIR}"));
+        return Vec::new();
+    };
+    let listing = match store.list_checked() {
+        Ok(l) => l,
+        Err(e) => {
+            notes.push(format!("drafts not read: {e}"));
+            return Vec::new();
+        }
+    };
+    if let Some(first) = listing.unreadable.first() {
+        notes.push(format!(
+            "drafts not read: {} unreadable, first: {first}",
+            listing.unreadable.len()
+        ));
+    }
+    listing
+        .drafts
         .into_iter()
         .filter(|d| d.status == DraftStatus::Pending)
         .map(|d| {
@@ -52,10 +83,21 @@ pub fn state_json(workspace: Option<&Path>, secrets: &tole_core::secrets::Secret
                 "nearest": d.dedup.nearest.as_deref().map(text),
             })
         })
-        .collect();
-    let archived: Vec<Value> = Archive::default_archive()
-        .map(|a| a.archived())
-        .unwrap_or_default()
+        .collect()
+}
+
+/// The archived skills of `archive`. A ledger that cannot be read adds an
+/// "archive not read" note; `None` is a data directory that cannot be resolved.
+fn archived_json(archive: Option<Archive>, notes: &mut Vec<String>) -> Vec<Value> {
+    let Some(archive) = archive else {
+        notes.push(format!("archive not read: {NO_DATA_DIR}"));
+        return Vec::new();
+    };
+    let archived = archive.archived_checked().unwrap_or_else(|e| {
+        notes.push(format!("archive not read: {e}"));
+        Vec::new()
+    });
+    archived
         .into_iter()
         .map(|m| {
             json!({
@@ -65,11 +107,11 @@ pub fn state_json(workspace: Option<&Path>, secrets: &tole_core::secrets::Secret
                 "reason": text(&m.reason),
             })
         })
-        .collect();
-    secrets.redact_value(&json!({
-        "skills": skills,
-        "drafts": drafts,
-        "archived": archived,
-        "notes": notes,
-    }))
+        .collect()
 }
+
+const NO_DATA_DIR: &str = "the tole data directory cannot be resolved";
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;

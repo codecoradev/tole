@@ -17,11 +17,13 @@
 //!   cut is itself a note (see Bounds). If
 //!   the server ever gets a separate flag, the client type needs the field
 //!   first.
-//! - **Notes cover the skills audit only (server side, #1117).** `GET /skills`
-//!   adds a "skills not read" note when the audit of the skill files fails, but
-//!   it drops an unreadable draft or archive entry without a note. A store with
-//!   one corrupt draft answers no drafts and no notes, and the page then says
-//!   "nothing to review". The adapter cannot see that; the server has to say it.
+//! - **What a note covers (server side, #1117).** `GET /skills` adds a note
+//!   when the skill audit fails ("skills not read"), when the draft store
+//!   cannot be listed or holds a draft it cannot read ("drafts not read") and
+//!   when the archive ledger cannot be read ("archive not read"). A store or
+//!   ledger that does not exist yet is an empty list, with no note. A server
+//!   that predates #1117 drops an unreadable draft or archive without a note,
+//!   and the page then says "nothing to review"; the adapter cannot see that.
 //! - Unmapped on purpose, because the model has no field for them: a skill's
 //!   `approved_hash`, `source` (its text form `source_text` is used) and
 //!   `history`; a draft's none; an archived skill's `entry`; a tool's

@@ -240,6 +240,32 @@ fn the_skills_are_listed_by_state_and_never_trusted_by_reading() {
     );
 }
 
+/// #1117: a draft store or an archive ledger that cannot be read is a line in
+/// `notes` (the partial marker), not an empty list that reads as "nothing".
+#[test]
+fn an_unreadable_draft_store_and_archive_are_notes_not_empty_lists() {
+    let (serve, _) = serve();
+    let c = client(&serve);
+    let clean = c.skills().unwrap();
+    assert!(clean.notes.is_empty(), "{:?}", clean.notes);
+
+    // Turn the drafts directory into a file and the ledger into a directory:
+    // both fail to read for any user, root included.
+    let data = home_of(&serve.dir).join("tole");
+    std::fs::remove_dir_all(data.join("skill-drafts")).unwrap();
+    std::fs::write(data.join("skill-drafts"), "not a directory").unwrap();
+    std::fs::remove_file(data.join("skill-curator-ledger.jsonl")).unwrap();
+    std::fs::create_dir(data.join("skill-curator-ledger.jsonl")).unwrap();
+
+    let state = c.skills().unwrap();
+    assert!(state.drafts.is_empty() && state.archived.is_empty());
+    assert_eq!(state.notes.len(), 2, "{:?}", state.notes);
+    assert!(state.notes[0].starts_with("drafts not read: "));
+    assert!(state.notes[1].starts_with("archive not read: "));
+    let (_, raw) = serve.http("GET", "/skills", None);
+    lossless("skills", &state, &raw);
+}
+
 #[cfg(feature = "mcp")]
 #[test]
 fn the_tools_state_comes_from_the_lock_and_starts_no_server() {
