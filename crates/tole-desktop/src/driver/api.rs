@@ -26,7 +26,7 @@ use std::time::Duration;
 use tole_client::{
     Approval, ApprovalList, CancelReply, Client, Decision, DecisionReply, EntriesPage, Error,
     InterruptReply, InterruptRequest, PromptReply, PromptRequest, ReconnectPolicy, ResumingStream,
-    SessionStatus, StreamItem,
+    SessionStatus, SkillsState, StreamItem, ToolsState,
 };
 
 /// One session's event stream, as a source of items. It reconnects by itself
@@ -89,7 +89,15 @@ pub trait Api: Send + Sync + 'static {
     /// delegated child's row goes through [`Api::decide_row`]).
     fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error>;
 
-    // ---- room for the skills driver (skills, tools): it adds its calls here.
+    // ---- the skills driver: the Skills and Connected tools pages (read-only) ----
+
+    /// `GET /skills`: the skills with their approval state, the drafts waiting
+    /// for review and the archive. A `notes` line says part of it was unreadable.
+    fn skills(&self) -> Result<SkillsState, Error>;
+
+    /// `GET /tools`: the connected tools with their trust state. No server is
+    /// started to answer it.
+    fn tools(&self) -> Result<ToolsState, Error>;
 }
 
 /// The longest one blocking read of a call, and one answer's body, may take.
@@ -164,5 +172,13 @@ impl Api for ClientApi {
 
     fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error> {
         self.short.decide(approval_id, decision)
+    }
+
+    fn skills(&self) -> Result<SkillsState, Error> {
+        self.short.skills()
+    }
+
+    fn tools(&self) -> Result<ToolsState, Error> {
+        self.short.tools()
     }
 }
