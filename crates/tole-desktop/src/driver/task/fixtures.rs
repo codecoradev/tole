@@ -33,6 +33,23 @@ pub(super) fn answer(seq: u64, text: &str) -> Entry {
     entry(seq, &format!("e{seq}"), None, "message", payload)
 }
 
+pub(super) fn intent(seq: u64, tool: &str) -> Entry {
+    let payload = json!({"tool": tool, "input": {"path": "a.txt"}});
+    entry(seq, &format!("i{seq}"), None, "intent", payload)
+}
+
+pub(super) fn settled(seq: u64, of: u64) -> Entry {
+    let payload = json!({"ok": true, "output": "done"});
+    let parent = format!("i{of}");
+    entry(
+        seq,
+        &format!("r{seq}"),
+        Some(&parent),
+        "tool_result",
+        payload,
+    )
+}
+
 /// A page cut after `after` holding `entries`, as serve's `page_of` makes it.
 pub(super) fn page(entries: Vec<Entry>, after: u64, has_more: bool, last_seq: u64) -> EntriesPage {
     let next_after = entries.last().map_or(after, |e| e.seq);
