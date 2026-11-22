@@ -99,6 +99,10 @@
 //!   shows again after the next reconnect).
 
 mod calls;
+#[cfg(test)]
+mod e2e_fault_tests;
+#[cfg(test)]
+mod e2e_tests;
 mod engine;
 #[cfg(test)]
 mod engine_abandon_tests;
@@ -122,6 +126,10 @@ mod engine_stop_tests;
 mod engine_watch_tests;
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod hostile_tests;
+#[cfg(test)]
+mod rig;
 #[cfg(test)]
 mod sim;
 mod store;
