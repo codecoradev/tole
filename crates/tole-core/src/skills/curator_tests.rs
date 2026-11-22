@@ -207,6 +207,29 @@ fn skill_pkg(root: &Path, name: &str) -> PathBuf {
 }
 
 #[test]
+fn archived_checked_tells_an_empty_archive_from_an_unreadable_ledger() {
+    let root = tmp("checked");
+    // No ledger yet: empty, not an error.
+    let a = Archive::new(root.join(MUTATION_FILE), root.join(ARCHIVE_DIR));
+    assert_eq!(a.archived_checked(), Ok(Vec::new()));
+
+    let dir = skill_pkg(&root, "demo");
+    a.archive("demo", &dir, "unused", NOW).unwrap();
+    assert_eq!(a.archived_checked().unwrap().len(), 1);
+
+    // A ledger path that is a directory cannot be read.
+    let ledger_dir = root.join("ledger-is-a-dir");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    let broken = Archive::new(&ledger_dir, root.join(ARCHIVE_DIR));
+    let err = broken.archived_checked().unwrap_err();
+    assert!(err.contains("ledger-is-a-dir"), "{err}");
+    assert!(
+        broken.archived().is_empty(),
+        "the unchecked read stays empty"
+    );
+}
+
+#[test]
 fn archiving_moves_the_whole_package_and_restoring_puts_it_back() {
     let root = tmp("move");
     let dir = skill_pkg(&root, "demo");
