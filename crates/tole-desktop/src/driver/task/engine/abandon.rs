@@ -12,7 +12,7 @@
 //! shutdown if it has not. The words of the call come back to the draft unless
 //! the transcript already shows them (`give_back`).
 
-use tole_desktop_model::task::{Item, Submission};
+use tole_desktop_model::task::{Item, SendMode, Submission};
 
 use super::{Effect, Engine, Now, Out};
 use crate::driver::task::calls::Lane;
@@ -24,14 +24,17 @@ const ABANDON_AFTER_MS: u64 = 30_000;
 const ABANDON_AFTER_SUSPEND_MS: u64 = 3_000;
 
 impl Engine {
-    /// The words of an abandoned call: when no row of the transcript is the
-    /// owner's message with that text, they go back to the draft and the view
-    /// says the message may not have been sent (the old request cannot be
-    /// cancelled: it may still reach the serve).
-    fn give_back(&mut self, sub: Submission) {
+    /// The words of an abandoned call, or of a failed one that may have
+    /// reached the serve: when no row of the transcript is the owner's message
+    /// with that text, they go back to the draft and the view says the message
+    /// may not have been sent (the old request cannot be cancelled: it may
+    /// still reach the serve).
+    pub(super) fn give_back(&mut self, sub: Submission) {
         let mut shared = self.store.lock();
-        let shown = (shared.task.transcript.items.iter().rev().take(32))
-            .any(|row| matches!(row, Item::User { text, steer: false, .. } if *text == sub.text));
+        let steer = sub.mode == SendMode::Steer;
+        let shown = (shared.task.transcript.items.iter().rev().take(32)).any(
+            |row| matches!(row, Item::User { text, steer: s, .. } if *s == steer && *text == sub.text),
+        );
         if !shown {
             shared.task.send_failed(sub, false);
             shared.facts.unsent = true;

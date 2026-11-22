@@ -57,12 +57,19 @@ impl ListLayout {
 
     /// Record the measured height of row `i`, at most [`MAX_ROW_HEIGHT`] so a
     /// sum of rows cannot overflow. A row out of range, or a height that is
-    /// not a finite number of at least zero, changes nothing.
-    pub fn set_height(&mut self, i: usize, height: f32) {
-        if i < self.heights.len() && height.is_finite() && height >= 0.0 {
-            self.heights[i] = height.min(MAX_ROW_HEIGHT);
-            self.rebuild(i);
+    /// not a finite number of at least zero, changes nothing. Whether a height
+    /// moved.
+    pub fn set_height(&mut self, i: usize, height: f32) -> bool {
+        if i >= self.heights.len() || !height.is_finite() || height < 0.0 {
+            return false;
         }
+        let height = height.min(MAX_ROW_HEIGHT);
+        if self.heights[i] == height {
+            return false;
+        }
+        self.heights[i] = height;
+        self.rebuild(i);
+        true
     }
 
     /// The row containing offset `y`, clamped to the first and last row.
@@ -146,9 +153,9 @@ mod tests {
     #[test]
     fn the_window_covers_every_pixel_of_the_viewport() {
         let mut l = layout(500, 30.0);
-        (0..500)
-            .step_by(7)
-            .for_each(|i| l.set_height(i, 90.0 + i as f32 % 13.0));
+        (0..500).step_by(7).for_each(|i| {
+            l.set_height(i, 90.0 + i as f32 % 13.0);
+        });
         for top in [0.0, 1.0, 999.5, 4_321.0, l.total() - 600.0] {
             let v = visible(&l, top, 600.0, 0.0);
             assert!(l.top(v.start) <= top && l.top(v.end) >= (top + 600.0).min(l.total()));
@@ -164,7 +171,7 @@ mod tests {
         assert_eq!((l.top(2), l.total()), (35.0, 115.0));
         [(99, 5.0), (0, f32::NAN), (0, -1.0)]
             .iter()
-            .for_each(|(i, h)| l.set_height(*i, *h));
+            .for_each(|(i, h)| assert!(!l.set_height(*i, *h)));
         assert_eq!(l.total(), 115.0);
         assert_eq!(visible(&ListLayout::new(40.0), 0.0, 800.0, 100.0).end, 0);
     }
@@ -172,15 +179,30 @@ mod tests {
     #[test]
     fn zero_height_rows_a_zero_viewport_and_huge_heights_stay_sane() {
         let mut l = layout(5, 10.0);
-        [1, 2, 3].iter().for_each(|i| l.set_height(*i, 0.0));
+        [1, 2, 3].iter().for_each(|i| {
+            l.set_height(*i, 0.0);
+        });
         let v = visible(&l, 10.0, 0.0, 0.0);
         let built = l.top(v.end) - l.top(v.start);
         assert!(v.start < v.end && v.before + built + v.after == l.total());
         let flat = layout(4, 0.0001);
         (0..4).for_each(|i| assert!(flat.index_at(flat.top(i)) < 4));
         let mut big = layout(3, 10.0);
-        (0..3).for_each(|i| big.set_height(i, f32::MAX));
+        (0..3).for_each(|i| {
+            big.set_height(i, f32::MAX);
+        });
         let v = visible(&big, 5.0, 100.0, 0.0);
         assert!(big.total().is_finite() && v.after.is_finite() && v.start == 0);
+    }
+
+    #[test]
+    fn a_height_reports_whether_it_moved() {
+        let mut l = layout(3, 10.0);
+        assert!(!l.set_height(1, 10.0), "the same height is no change");
+        assert!(l.set_height(1, 12.0));
+        assert!(!l.set_height(1, 12.0));
+        assert!(!l.set_height(9, 12.0) && !l.set_height(0, f32::NAN));
+        assert!(l.set_height(2, f32::MAX), "clamped, and it moved");
+        assert!(!l.set_height(2, f32::MAX), "clamped to the same value");
     }
 }

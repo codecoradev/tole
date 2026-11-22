@@ -295,9 +295,17 @@ impl Engine {
     /// Fold events into the model, under one lock. Returns whether there were any.
     fn apply(&self, events: Vec<TaskEvent>) -> bool {
         let any = !events.is_empty();
+        // Text deltas and reasoning marks never touch the queue of cards: the
+        // hot path of a long answer skips the pass over the cards.
+        let cards_untouched = events
+            .iter()
+            .all(|e| matches!(e, TaskEvent::TextDelta { .. } | TaskEvent::Reasoning));
         self.ids.borrow_mut().note(&events);
         let mut shared = self.store.lock();
         events.into_iter().for_each(|e| shared.task.apply(e));
+        if cards_untouched {
+            return any;
+        }
         let live: Vec<String> = shared
             .task
             .run
@@ -327,9 +335,12 @@ impl Engine {
     fn heights(&mut self, heights: &[(usize, f32)]) -> bool {
         let mut shared = self.store.lock();
         // A bounded batch: the UI measures the rows it built, a few dozen.
+        // Only a height that moved is a change: a repaint that measures the
+        // same rows again must not ask for another repaint.
+        let mut moved = false;
         for (row, height) in heights.iter().take(1_000) {
-            shared.task.layout.set_height(*row, *height);
+            moved |= shared.task.layout.set_height(*row, *height);
         }
-        true
+        moved
     }
 }

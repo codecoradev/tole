@@ -31,7 +31,9 @@ use tole_desktop_model::task::{Enter, EnterOutcome, Phase, SendMode, Submission,
 
 use super::watching::Mode;
 use super::{Effect, Engine, Now, Out};
-use crate::adapter::task::{prompt_outcome, stop_step, PromptOutcome, StopStep};
+use crate::adapter::task::{
+    may_have_been_received, prompt_outcome, stop_step, PromptOutcome, StopStep,
+};
 use crate::driver::task::calls::{Call, Gate, Lane};
 
 const ENTER: Enter = Enter {
@@ -198,7 +200,14 @@ impl Engine {
                 check_status,
             } => {
                 if let Some(sub) = sub {
-                    self.store.lock().task.send_failed(sub, server_busy);
+                    // A failure that may have come after the request reached
+                    // the serve: the turn can run, and the stream may already
+                    // show the words, so they are not put back blindly.
+                    if check_status && !server_busy {
+                        self.give_back(sub);
+                    } else {
+                        self.store.lock().task.send_failed(sub, server_busy);
+                    }
                 }
                 if check_status && !server_busy {
                     self.watch.check_soon(now);
@@ -214,7 +223,11 @@ impl Engine {
         let (Err(error), Some(sub)) = (result, self.sending.steer.take()) else {
             return true;
         };
-        self.store.lock().task.send_failed(sub, false);
+        if may_have_been_received(&error) {
+            self.give_back(sub);
+        } else {
+            self.store.lock().task.send_failed(sub, false);
+        }
         // A 409 says no turn runs: the model may be wrong that one does.
         if matches!(error, Error::Status { status: 409, .. }) {
             self.watch.check_soon(now);

@@ -43,4 +43,4 @@ pub use effects::{
 pub use entry::EntryMapper;
 pub use history::{history_page, HistoryPage, PageStep, MAX_HISTORY_PAGES};
 pub use live::{status_ready, stream_item, stream_result};
-pub use prompt::{prompt_outcome, PromptOutcome};
+pub use prompt::{may_have_been_received, prompt_outcome, PromptOutcome};
