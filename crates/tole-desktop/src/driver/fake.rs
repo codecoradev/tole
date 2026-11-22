@@ -23,7 +23,7 @@ use std::time::Duration;
 use tole_client::{
     Approval, ApprovalList, CancelReply, Decision, DecisionReply, EntriesPage, Error,
     InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result, SessionStatus,
-    StreamItem,
+    SkillsState, StreamItem, ToolsState,
 };
 
 use super::api::{Api, EventSource};
@@ -84,6 +84,8 @@ struct Script {
     cancels: Queue<CancelReply>,
     interrupts: Queue<InterruptReply>,
     decides: Queue<DecisionReply>,
+    skills: Queue<SkillsState>,
+    tools: Queue<ToolsState>,
     always_status: Option<SessionStatus>,
     streams: HashMap<String, VecDeque<Receiver<Frame>>>,
     /// Senders of streams nobody scripted: they stay silent, open.
@@ -96,6 +98,8 @@ struct Script {
     cancel_calls: usize,
     interrupt_calls: Vec<String>,
     decide_calls: Vec<(String, Decision)>,
+    skills_calls: usize,
+    tools_calls: usize,
     opens: HashMap<String, usize>,
     afters: Vec<u64>,
 }
@@ -189,6 +193,8 @@ impl FakeApi {
         gate_decide,
         panic_decide
     );
+    scripted!(skills, SkillsState, reply_skills, gate_skills, panic_skills);
+    scripted!(tools, ToolsState, reply_tools, gate_tools, panic_tools);
 
     /// A status call with nothing queued answers this (a poll that goes on).
     pub(crate) fn always_status(&self, status: SessionStatus) {
@@ -248,6 +254,16 @@ impl FakeApi {
         self.script().decide_calls.clone()
     }
 
+    /// How many `GET /skills` calls were made.
+    pub(crate) fn skills_calls(&self) -> usize {
+        self.script().skills_calls
+    }
+
+    /// How many `GET /tools` calls were made.
+    pub(crate) fn tools_calls(&self) -> usize {
+        self.script().tools_calls
+    }
+
     pub(crate) fn opens(&self, session: &str) -> usize {
         self.script().opens.get(session).copied().unwrap_or(0)
     }
@@ -301,6 +317,14 @@ impl FakeApi {
 
     pub(crate) fn wait_decides(&self, n: usize) {
         self.wait("decide calls", n, |s| s.decide_calls.len());
+    }
+
+    pub(crate) fn wait_skills(&self, n: usize) {
+        self.wait("GET /skills calls", n, |s| s.skills_calls);
+    }
+
+    pub(crate) fn wait_tools(&self, n: usize) {
+        self.wait("GET /tools calls", n, |s| s.tools_calls);
     }
 
     pub(crate) fn wait_opens(&self, session: &str, n: usize) {
@@ -399,5 +423,13 @@ impl Api for FakeApi {
             |s| s.decide_calls.push((id, decision)),
             |s| s.decides.pop_front(),
         )
+    }
+
+    fn skills(&self) -> Result<SkillsState> {
+        self.call(|s| s.skills_calls += 1, |s| s.skills.pop_front())
+    }
+
+    fn tools(&self) -> Result<ToolsState> {
+        self.call(|s| s.tools_calls += 1, |s| s.tools.pop_front())
     }
 }

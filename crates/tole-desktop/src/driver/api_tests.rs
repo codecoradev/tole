@@ -71,6 +71,8 @@ fn answer(mut conn: TcpStream, seen: &Mutex<Vec<String>>) {
         "/sessions/s1/interrupt" => r#"{"queued":true,"urgent":false,"sessionId":"s1"}"#,
         "/approvals/a1/decision" => r#"{"id":"a1","status":"approved"}"#,
         "/approvals" => r#"{"approvals":[]}"#,
+        "/skills" => r#"{"skills":[],"drafts":[],"archived":[],"notes":["drafts not read: x"]}"#,
+        "/tools" => r#"{"servers":[],"notes":[],"probed":false}"#,
         _ => r#"{"error":"no such route"}"#,
     };
     let ok = !reply.contains("no such route");
@@ -133,4 +135,19 @@ fn every_call_of_the_task_driver_reaches_its_route_and_is_decoded() {
         assert_eq!(got, want);
     }
     assert_eq!(seen.len(), wanted.len() + 1);
+}
+
+#[test]
+fn the_skills_and_tools_calls_reach_their_routes_and_are_decoded() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let client = Client::connect_tcp(&serve(Arc::clone(&seen)), None, false).expect("client");
+    let api = ClientApi::new(client).expect("bounded");
+
+    let skills = api.skills().expect("skills");
+    assert_eq!(skills.notes, ["drafts not read: x"]);
+    assert!(skills.skills.is_empty() && skills.drafts.is_empty());
+    let tools = api.tools().expect("tools");
+    assert!(tools.servers.is_empty() && !tools.probed);
+
+    assert_eq!(*seen.lock().unwrap(), ["GET /skills ", "GET /tools "]);
 }
