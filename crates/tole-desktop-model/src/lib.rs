@@ -56,7 +56,7 @@ pub use endpoint::{Endpoint, EndpointError, PlainHttp, Scheme};
 pub use focus::FocusTarget;
 pub use header::Indicator;
 pub use home::{Home, HomeFolder};
-pub use plain::Load;
+pub use plain::{printable, Load};
 pub use section::Section;
 pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};
