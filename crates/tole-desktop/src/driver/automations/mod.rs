@@ -97,14 +97,223 @@
 //!   driver is restarted (`page.resume_blocked` is the model's and is never
 //!   cleared by it); a pause still works.
 
-// The handle these docs name comes with the worker in the next change.
-#![allow(rustdoc::broken_intra_doc_links)]
-
-// The worker, the threads and the handle that drive these three are the next
-// change; until then nothing outside them uses them.
-#[allow(dead_code, unused_imports)]
 mod engine;
-#[allow(dead_code, unused_imports)]
 mod store;
-#[allow(dead_code, unused_imports)]
+mod threads;
 mod view;
+mod worker;
+
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::Arc;
+use std::time::Duration;
+
+use self::engine::{Engine, Input, TICK_EVERY};
+use self::store::Store;
+pub use self::store::{Feed, History};
+use self::threads::{jobs_loader, runs_loader, toggler};
+pub use self::view::AutomationsView;
+use self::worker::Worker;
+use super::api::Api;
+use super::clock::{Clock, Shutdown};
+use super::runtime::{JoinReport, Threads};
+use super::shared::handle::{self, clamp_refresh};
+pub use super::shared::handle::{Busy, OnChange};
+use super::shared::thread::{run_guarded, spawn_ticker, stop_threads, DROP_JOIN};
+
+/// The refresh a driver makes when [`Config::refresh`] is left alone.
+pub const DEFAULT_REFRESH: Duration = Duration::from_secs(30);
+/// The shortest refresh a driver accepts (a shorter one is raised to this).
+pub const MIN_REFRESH: Duration = Duration::from_secs(5);
+/// The longest refresh a driver accepts (a longer one is lowered to this): the
+/// age rule (rows older than twice the refresh are marked failed) would
+/// otherwise mean nothing.
+pub const MAX_REFRESH: Duration = Duration::from_secs(300);
+/// The room in the worker's inbox.
+const INBOX: usize = 64;
+
+/// The refresh a driver uses: `refresh` held between [`MIN_REFRESH`] and
+/// `ceiling` ([`MAX_REFRESH`] but in a test).
+fn effective_refresh(refresh: Duration, ceiling: Duration) -> Duration {
+    clamp_refresh(refresh, MIN_REFRESH, ceiling)
+}
+
+pub struct Config {
+    /// Load again this often after an answer (held between [`MIN_REFRESH`] and
+    /// [`MAX_REFRESH`]). Not optional: it is the only way a job changed at the
+    /// terminal shows up, and rows older than twice this are marked failed.
+    pub refresh: Duration,
+    pub on_change: Option<OnChange>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            refresh: DEFAULT_REFRESH,
+            on_change: None,
+        }
+    }
+}
+
+/// The UI's side of the driver: cheap to clone, usable from any thread.
+#[derive(Clone)]
+pub struct Handle {
+    store: Arc<Store>,
+    inbox: SyncSender<Input>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Handle {
+    /// The page as of now: not loaded until the first answer comes.
+    pub fn snapshot(&self) -> AutomationsView {
+        self.store.view()
+    }
+
+    /// Load the list (and the open history) again as soon as the pace allows
+    /// (one call of a route a second at most, and any number of requests before
+    /// it starts are one). A call that is already out does not satisfy it. A
+    /// failing route is tried at once instead of after its backoff wait.
+    pub fn refresh(&self) -> Result<(), Busy> {
+        self.send(Input::Refresh)
+    }
+
+    /// The owner used the switch of the job `id` (its exact id, as
+    /// `AutomationId::as_str` gives it) to make it `enabled`. At most one pause
+    /// or resume is sent for it, once, and only when the row is not already in
+    /// that state, the list is known and the model allows it; the row changes
+    /// when the serve answers, and the outcome (a refusal, a failure) is in the
+    /// view. A second press while a call is out is ignored, not queued. `Busy`
+    /// when the inbox is full or the driver stopped: nothing was sent, press
+    /// again.
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), Busy> {
+        self.send(Input::SetEnabled(id.to_owned(), enabled))
+    }
+
+    /// Show the history of the automation `id` (a row of the page). Selecting
+    /// the open one reads it again; an id that is not a row selects nothing.
+    pub fn select(&self, id: &str) -> Result<(), Busy> {
+        self.send(Input::Select(Some(id.to_owned())))
+    }
+
+    /// Close the history.
+    pub fn close_history(&self) -> Result<(), Busy> {
+        self.send(Input::Select(None))
+    }
+
+    /// Dismiss the notice under the table.
+    pub fn dismiss_notice(&self) -> Result<(), Busy> {
+        self.send(Input::DismissNotice)
+    }
+
+    /// Whether the worker is running.
+    pub fn is_running(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn send(&self, input: Input) -> Result<(), Busy> {
+        handle::queue(&self.inbox, input)
+    }
+}
+
+/// The running driver: owns its threads.
+pub struct AutomationsDriver {
+    handle: Handle,
+    stop: Shutdown,
+    threads: Threads,
+}
+
+impl AutomationsDriver {
+    /// Start the threads. The first thing the worker does is ask for the list;
+    /// until it answers the view is not loaded (no rows). `Err` only when the
+    /// system cannot start a thread (nothing is left running then).
+    pub fn start(api: Arc<dyn Api>, clock: Arc<dyn Clock>, cfg: Config) -> io::Result<Self> {
+        Self::start_with_ceiling(api, clock, cfg, MAX_REFRESH)
+    }
+
+    /// [`start`](Self::start) with another ceiling for the refresh: for a test
+    /// whose clock is moved fast and must not reach the refresh by accident.
+    pub(super) fn start_with_ceiling(
+        api: Arc<dyn Api>,
+        clock: Arc<dyn Clock>,
+        cfg: Config,
+        ceiling: Duration,
+    ) -> io::Result<Self> {
+        let store = Arc::new(Store::default());
+        let stop = Shutdown::new();
+        let alive = Arc::new(AtomicBool::new(true));
+        let (inbox, inbox_rx) = sync_channel::<Input>(INBOX);
+        let (jobs_tx, jobs_rx) = sync_channel(1);
+        let (runs_tx, runs_rx) = sync_channel(1);
+        let (toggle_tx, toggle_rx) = sync_channel(1);
+        let handle = Handle {
+            store: Arc::clone(&store),
+            inbox: inbox.clone(),
+            alive: Arc::clone(&alive),
+        };
+        let mut driver = AutomationsDriver {
+            handle,
+            stop: stop.clone(),
+            threads: Threads::new(),
+        };
+        let started = (|| {
+            let t = &mut driver.threads;
+            let worker = Worker {
+                engine: Engine::new(Arc::clone(&store), effective_refresh(cfg.refresh, ceiling)),
+                inbox: inbox_rx,
+                jobs: jobs_tx,
+                runs: runs_tx,
+                toggle: toggle_tx,
+                clock: Arc::clone(&clock),
+                stop: stop.clone(),
+                store: Arc::clone(&store),
+                alive,
+                on_change: cfg.on_change,
+            };
+            t.spawn("automations-worker", move || worker.run())?;
+            let (a, i, s) = (Arc::clone(&api), inbox.clone(), stop.clone());
+            t.spawn("automations-jobs", move || {
+                run_guarded(&i.clone(), || jobs_loader(a, jobs_rx, i, s))
+            })?;
+            let (a, i, s) = (Arc::clone(&api), inbox.clone(), stop.clone());
+            t.spawn("automations-runs", move || {
+                run_guarded(&i.clone(), || runs_loader(a, runs_rx, i, s))
+            })?;
+            let (a, i, s) = (Arc::clone(&api), inbox.clone(), stop.clone());
+            t.spawn("automations-toggle", move || {
+                run_guarded(&i.clone(), || toggler(a, toggle_rx, i, s))
+            })?;
+            let (i, c, s) = (inbox.clone(), Arc::clone(&clock), stop.clone());
+            spawn_ticker(t, "automations-tick", i, c, s, TICK_EVERY)?;
+            io::Result::Ok(())
+        })();
+        match started {
+            Ok(()) => Ok(driver),
+            Err(e) => {
+                driver.stop(DROP_JOIN);
+                Err(e)
+            }
+        }
+    }
+
+    /// The UI's side. Clones stay usable after the driver stops: they read a
+    /// page that is not loaded and refuse commands.
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
+    /// Stop every thread and wait up to `timeout` for them.
+    pub fn shutdown(mut self, timeout: Duration) -> JoinReport {
+        self.stop(timeout)
+    }
+
+    fn stop(&mut self, timeout: Duration) -> JoinReport {
+        stop_threads(&self.stop, &self.handle.inbox, &mut self.threads, timeout)
+    }
+}
+
+impl Drop for AutomationsDriver {
+    fn drop(&mut self) {
+        self.stop(DROP_JOIN);
+    }
+}
