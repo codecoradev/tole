@@ -73,6 +73,11 @@ fn answer(mut conn: TcpStream, seen: &Mutex<Vec<String>>) {
         "/approvals" => r#"{"approvals":[]}"#,
         "/skills" => r#"{"skills":[],"drafts":[],"archived":[],"notes":["drafts not read: x"]}"#,
         "/tools" => r#"{"servers":[],"notes":[],"probed":false}"#,
+        "/cron/jobs" => r#"{"jobs":[],"scheduler":{"alive":true,"host":"serve","age_seconds":2}}"#,
+        "/cron/runs" => r#"{"runs":[]}"#,
+        "/cron/jobs/night/pause" => r#"{"id":"night","state":"paused"}"#,
+        "/cron/jobs/night/resume" => r#"{"id":"night","state":"active"}"#,
+        "/cron/jobs/a%20b%2Fc/pause" => r#"{"id":"a b/c","state":"paused"}"#,
         _ => r#"{"error":"no such route"}"#,
     };
     let ok = !reply.contains("no such route");
@@ -150,4 +155,36 @@ fn the_skills_and_tools_calls_reach_their_routes_and_are_decoded() {
     assert!(tools.servers.is_empty() && !tools.probed);
 
     assert_eq!(*seen.lock().unwrap(), ["GET /skills ", "GET /tools "]);
+}
+
+#[test]
+fn the_cron_calls_reach_their_routes_and_an_id_is_one_path_segment() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let client = Client::connect_tcp(&serve(Arc::clone(&seen)), None, false).expect("client");
+    let api = ClientApi::new(client).expect("bounded");
+
+    let jobs = api.cron_jobs().expect("jobs");
+    assert!(jobs.jobs.is_empty() && jobs.scheduler.alive);
+    assert!(api.cron_runs("night", 101).expect("runs").runs.is_empty());
+    let paused = api.pause_cron_job("night").expect("pause");
+    assert_eq!(
+        (paused.id.as_str(), paused.state.as_str()),
+        ("night", "paused")
+    );
+    let resumed = api.resume_cron_job("night").expect("resume");
+    assert_eq!(resumed.state, "active");
+    assert_eq!(api.pause_cron_job("a b/c").expect("pause").id, "a b/c");
+    assert!(api.resume_cron_job("nope").is_err());
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            "GET /cron/jobs ",
+            "GET /cron/runs?job=night&limit=101 ",
+            "POST /cron/jobs/night/pause ",
+            "POST /cron/jobs/night/resume ",
+            "POST /cron/jobs/a%20b%2Fc/pause ",
+            "POST /cron/jobs/nope/resume ",
+        ]
+    );
 }
