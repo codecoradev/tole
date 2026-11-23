@@ -13,7 +13,7 @@ use tole_desktop_model::{
 use super::fake::{launcher_of, running, wait_until, Counts, FakeServe, Gate};
 use super::launch::{Launcher, Serve};
 use super::signal::Signal;
-use super::App;
+use super::{App, Boot, StartError, Workspace};
 use crate::backend::shell;
 use crate::driver::SystemClock;
 
@@ -252,6 +252,27 @@ fn a_backend_that_cannot_start_leaves_no_serve_behind() {
     assert!(result.is_err());
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(launched.load(Ordering::SeqCst), 0, "a launch began");
+}
+
+#[test]
+fn a_folder_that_is_not_a_workspace_starts_nothing() {
+    let boot = |workspace: &str, home: &str| Boot {
+        workspace: workspace.into(),
+        runtime_dir: "/nonexistent/run".into(),
+        home: Some(home.into()),
+    };
+    // The refusal comes before anything is built; the runtime directory above
+    // does not exist, so a serve that did start would fail loudly elsewhere.
+    for (boot, expected) in [
+        (boot("/", "/home/me"), Workspace::Root),
+        (boot("/home/me", "/home/me"), Workspace::Home),
+    ] {
+        match App::start(&boot) {
+            Err(StartError::Workspace(why)) => assert_eq!(why, expected),
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the app started in {:?}", boot.workspace),
+        }
+    }
 }
 
 #[test]
