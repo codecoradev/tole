@@ -32,6 +32,16 @@ pub(crate) fn notify(on_change: &Option<OnChange>) {
     }
 }
 
+/// What the driver knows about one route's loads, beside the page state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Feed {
+    /// Loads that failed in a row, 0 when the last one worked (or none was
+    /// tried). The retry waits 1 s, then doubles up to 30 s.
+    pub failures: u32,
+    /// A call is out now. The rows shown (if any) are from the one before.
+    pub loading: bool,
+}
+
 /// The refresh a driver uses: `refresh` held between `min` and `ceiling` (the
 /// driver's maximum, but in a test). A ceiling below `min` is `min`.
 pub(crate) fn clamp_refresh(refresh: Duration, min: Duration, ceiling: Duration) -> Duration {
