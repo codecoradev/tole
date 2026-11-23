@@ -34,6 +34,8 @@ mod plain;
 mod section;
 mod serve_state;
 mod shell;
+#[cfg(test)]
+mod shell_badge_tests;
 mod skills;
 pub mod strings;
 pub mod task;

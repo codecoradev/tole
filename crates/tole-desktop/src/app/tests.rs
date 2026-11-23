@@ -85,10 +85,14 @@ fn the_counts_reach_the_shell_and_unknown_is_never_written_as_zero() {
     let mut shell_state = ShellState::new();
 
     wait_until("the launch to begin", || gate.arrivals() == 1);
-    let applied = shell::apply(&mut shell_state, &app.view());
+    shell::apply(&mut shell_state, &app.view());
     assert_eq!(shell_state.connection.status, ConnectionStatus::Connecting);
     assert_eq!(shell_state.approvals_pending, Badge::Unknown);
-    assert!(applied.skills_unknown, "the skills count is not known yet");
+    assert_eq!(
+        shell_state.skills_new,
+        Badge::Unknown,
+        "the skills count is not known yet"
+    );
 
     gate.open();
     wait_until("the approvals to be counted", || {
@@ -97,11 +101,10 @@ fn the_counts_reach_the_shell_and_unknown_is_never_written_as_zero() {
     wait_until("the skills and tools to be counted", || {
         shell::skills_badge(&app.view()) == Badge::Count(3)
     });
-    let applied = shell::apply(&mut shell_state, &app.view());
-    assert!(!applied.skills_unknown);
+    shell::apply(&mut shell_state, &app.view());
     assert_eq!(shell_state.connection.status, ConnectionStatus::Connected);
     assert_eq!(shell_state.approvals_pending, Badge::Count(2));
-    assert_eq!(shell_state.skills_new, 3);
+    assert_eq!(shell_state.skills_new, Badge::Count(3));
     finish(app);
 }
 

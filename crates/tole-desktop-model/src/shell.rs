@@ -103,8 +103,8 @@ pub enum Action {
     SetAutomationsOn(usize),
     /// How many discussions need the owner.
     SetDiscussionsNeedYou(usize),
-    /// How many skills and tools are new and not yet reviewed.
-    SetSkillsNew(usize),
+    /// How many skills and tools are new and not yet reviewed (never a zero).
+    SetSkillsNew(Badge),
     ToggleSidebar,
 }
 
@@ -117,7 +117,7 @@ pub struct ShellState {
     pub approvals_pending: Badge,
     pub automations_on: usize,
     pub discussions_need_you: usize,
-    pub skills_new: usize,
+    pub skills_new: Badge,
     pub sidebar_collapsed: bool,
     next_folder_id: u32,
 }
@@ -137,7 +137,7 @@ impl ShellState {
             approvals_pending: Badge::Unknown,
             automations_on: 0,
             discussions_need_you: 0,
-            skills_new: 0,
+            skills_new: Badge::Unknown,
             sidebar_collapsed: false,
             next_folder_id: 1,
         }
@@ -159,6 +159,7 @@ impl ShellState {
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Preview));
         // A preview shows sample data: a quiet sidebar, not a list it lacks.
         state.apply(Action::SetApprovalsPending(Badge::Count(0)));
+        state.apply(Action::SetSkillsNew(Badge::Count(0)));
         state
     }
 
@@ -195,7 +196,7 @@ impl ShellState {
             Action::SetApprovalsPending(badge) => self.approvals_pending = badge,
             Action::SetAutomationsOn(count) => self.automations_on = count,
             Action::SetDiscussionsNeedYou(count) => self.discussions_need_you = count,
-            Action::SetSkillsNew(count) => self.skills_new = count,
+            Action::SetSkillsNew(badge) => self.skills_new = badge,
             Action::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
         }
         *self != before
@@ -245,7 +246,7 @@ impl ShellState {
             Section::Approvals => self.approvals_pending.shown().unwrap_or(0),
             Section::Automations => self.automations_on,
             Section::Discussions => self.discussions_need_you,
-            Section::SkillsAndTools => self.skills_new,
+            Section::SkillsAndTools => self.skills_new.shown().unwrap_or(0),
             Section::NewTask | Section::Search => 0,
         };
         (count > 0).then_some(count)
@@ -253,10 +254,11 @@ impl ShellState {
 }
 
 impl ShellState {
-    /// The row has no count because it cannot be known now (approvals only):
-    /// the sidebar shows a mark instead of nothing, which would read as zero.
+    /// The row has no count because it cannot be known now (approvals, skills
+    /// and tools): the sidebar shows a mark, not a nothing that reads as zero.
     pub fn badge_unknown(&self, section: Section) -> bool {
-        section == Section::Approvals && self.approvals_pending == Badge::Unknown
+        (section == Section::Approvals && self.approvals_pending == Badge::Unknown)
+            || (section == Section::SkillsAndTools && self.skills_new == Badge::Unknown)
     }
 
     /// What the sidebar draws beside a row: the count in words, the unknown
@@ -434,7 +436,7 @@ mod tests {
         s.apply(Action::SetApprovalsPending(Badge::Count(2)));
         s.apply(Action::SetAutomationsOn(3));
         s.apply(Action::SetDiscussionsNeedYou(1));
-        s.apply(Action::SetSkillsNew(4));
+        s.apply(Action::SetSkillsNew(Badge::Count(4)));
         assert_eq!(s.badge(Section::Approvals), Some(2));
         assert_eq!(s.badge(Section::Automations), Some(3));
         assert_eq!(s.badge(Section::Discussions), Some(1));
