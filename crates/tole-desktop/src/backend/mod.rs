@@ -118,11 +118,19 @@
 //! is the supervisor's `close_window`.
 
 mod engine;
+#[cfg(test)]
+mod engine_tasks_tests;
+#[cfg(test)]
+mod engine_tests;
 mod link;
 mod live;
 mod reap;
 mod shared;
 pub mod shell;
+#[cfg(test)]
+mod shell_tests;
+#[cfg(test)]
+mod sim;
 mod tasks;
 mod view;
 mod worker;
