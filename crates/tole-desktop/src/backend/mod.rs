@@ -128,7 +128,11 @@ mod engine_tasks_tests;
 mod engine_tests;
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod hostile_tests;
 mod link;
+#[cfg(test)]
+mod link_tests;
 mod live;
 mod reap;
 #[cfg(test)]
@@ -140,6 +144,8 @@ mod shell_tests;
 #[cfg(test)]
 mod sim;
 mod tasks;
+#[cfg(test)]
+mod units_tests;
 mod view;
 mod worker;
 

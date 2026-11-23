@@ -110,7 +110,9 @@ impl Rig {
         while !ok(self.backend()) {
             assert!(Instant::now() < end, "timed out waiting for: {why}");
             self.tick();
-            std::thread::yield_now();
+            // Slowly, so that the clock does not run far ahead of work that
+            // takes real time (a driver that is stopped is waited for).
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
