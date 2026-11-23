@@ -10,7 +10,7 @@ impl ShellView {
     fn section_row(&self, section: Section, cx: &mut Context<Self>) -> impl IntoElement {
         let p = DARK;
         let selected = self.state.section == section;
-        let badge = self.state.badge_text(section).map(|label| {
+        let badge = self.badge_text(section).map(|label| {
             let tone = if section.asks_owner() {
                 p.amber
             } else {

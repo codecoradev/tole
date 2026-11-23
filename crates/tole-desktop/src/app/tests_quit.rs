@@ -169,6 +169,8 @@ fn a_close_that_panics_is_reported_as_failed() {
         }
     }
     impl Serve for Panics {
+        fn retry(&self) {}
+        fn restart_serve(&self) {}
         fn close_window(self: Arc<Self>) -> CloseOutcome {
             panic!("the supervisor broke");
         }

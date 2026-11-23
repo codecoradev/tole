@@ -7,7 +7,9 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
+use tole_desktop_model::strings;
 use tole_desktop_model::tokens::Rgb;
 
 pub use gpui::prelude::*;
@@ -29,6 +31,35 @@ pub fn transparent() -> Hsla {
 /// A token length as a GPUI length.
 pub fn len(v: f32) -> Pixels {
     gpui::px(v)
+}
+
+/// A repeating call on the window's thread; it stops when this is dropped.
+pub struct Every {
+    _task: gpui::Task<()>,
+}
+
+/// Calls `f` on the view every `period` (on the window's thread, between two
+/// frames), for as long as the returned handle lives and the view does. The
+/// first call comes after one period.
+pub fn every<V: 'static>(
+    cx: &mut Context<V>,
+    period: Duration,
+    mut f: impl FnMut(&mut V, &mut Context<V>) + 'static,
+) -> Every {
+    let task = cx.spawn(async move |this, cx| loop {
+        cx.background_executor().timer(period).await;
+        if this.update(cx, |view, cx| f(view, cx)).is_err() {
+            // The view is gone: the window closed.
+            break;
+        }
+    });
+    Every { _task: task }
+}
+
+/// Runs `f` once when the view is released (the window closed), before the
+/// application ends.
+pub fn on_release<V: 'static>(cx: &mut Context<V>, f: impl FnOnce(&mut V) + 'static) {
+    cx.on_release(|view, _cx| f(view)).detach();
 }
 
 /// Whether `handle` is the focused element of `window` (for the render harness).
@@ -68,6 +99,16 @@ fn move_focus(cx: &mut App, forward: bool) {
     });
 }
 
+/// Ends the application from inside its loop. A `quit` made before the
+/// platform's loop runs (while the app is still launching) is lost, so this
+/// makes it from a task, which only runs once the loop does.
+fn quit_when_running(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
+}
+
 /// Opens one window showing the view `build` makes and runs the application
 /// until the window closes. Returns the reason if the window could not open.
 pub fn launch<V: Render>(
@@ -84,6 +125,14 @@ pub fn launch<V: Render>(
     gpui_platform::application()
         .with_quit_mode(gpui::QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
+            // With no display server GPUI starts headless: a window "opens"
+            // and nothing is ever drawn, and the process would wait for ever.
+            // Say so and end, before the view (and the app behind it) is built.
+            if cx.displays().is_empty() {
+                *report.borrow_mut() = Some(strings::NO_DISPLAY.to_owned());
+                quit_when_running(cx);
+                return;
+            }
             init(cx);
             let bounds = gpui::Bounds::centered(None, gpui::size(len(width), len(height)), cx);
             let options = gpui::WindowOptions {
@@ -102,7 +151,7 @@ pub fn launch<V: Render>(
                 Ok(_) => cx.activate(true),
                 Err(err) => {
                     *report.borrow_mut() = Some(err.to_string());
-                    cx.quit();
+                    quit_when_running(cx);
                 }
             }
         });

@@ -5,21 +5,96 @@
 use std::collections::HashMap;
 
 use super::adapter::*;
+use super::status::{badge_text, Source, Status, LOOK_EVERY};
 use tole_desktop_model::tokens::{font, size, DARK};
-use tole_desktop_model::{strings, Action, FocusTarget, Section, ShellState};
+use tole_desktop_model::{strings, Action, FocusTarget, OwnerAction, Section, ShellState};
+
+/// The app behind the window and the repeating look at it.
+struct Live {
+    source: Box<dyn Source>,
+    _look: Every,
+}
 
 pub struct ShellView {
     pub(super) state: ShellState,
     /// One focus handle per control that Tab visits (`ShellState::tab_order`).
     pub(super) focus: HashMap<FocusTarget, FocusHandle>,
+    /// What the app says besides the shell state; `None` for a preview.
+    pub(super) status: Option<Status>,
+    /// The button of the notice, a tab stop while there is one.
+    pub(super) notice_focus: Option<FocusHandle>,
+    live: Option<Live>,
 }
 
 impl ShellView {
+    /// A window with nothing behind it: `state` is shown as it is.
     pub fn new(state: ShellState) -> Self {
         ShellView {
             state,
             focus: HashMap::new(),
+            status: None,
+            notice_focus: None,
+            live: None,
         }
+    }
+
+    /// A window that shows `source`: its state now, and again on every change
+    /// the source reports (looked for every [`LOOK_EVERY`], on this thread).
+    /// The source is let go when the window closes, so its owner can end it.
+    pub fn live(state: ShellState, source: Box<dyn Source>, cx: &mut Context<Self>) -> Self {
+        let mut view = ShellView::new(state);
+        // A change from before the window existed is shown by this read.
+        let _ = source.changed();
+        view.status = Some(source.refresh(&mut view.state));
+        let look = every(cx, LOOK_EVERY, |this: &mut ShellView, cx| this.look(cx));
+        on_release(cx, |this: &mut ShellView| this.live = None);
+        view.live = Some(Live {
+            source,
+            _look: look,
+        });
+        view
+    }
+
+    /// A window whose app could not start: `status` says so, with the
+    /// connection shown as it reads.
+    pub fn failed(state: ShellState, status: Status) -> Self {
+        let mut view = ShellView::new(state);
+        view.state.apply(Action::SetConnectionStatus(
+            status.serve.connection_status(),
+        ));
+        view.status = Some(status);
+        view
+    }
+
+    /// A window showing `status` with no app behind it (for the render harness).
+    #[cfg(feature = "render-harness")]
+    pub fn with_status(state: ShellState, status: Status) -> Self {
+        let mut view = ShellView::new(state);
+        view.status = Some(status);
+        view
+    }
+
+    /// On the repeating timer: read the app again when it says it changed.
+    fn look(&mut self, cx: &mut Context<Self>) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        if live.source.changed() {
+            self.status = Some(live.source.refresh(&mut self.state));
+            cx.notify();
+        }
+    }
+
+    /// The button of the notice was pressed.
+    pub(super) fn owner_action(&mut self, action: OwnerAction) {
+        if let Some(live) = &self.live {
+            live.source.owner_action(action);
+        }
+    }
+
+    /// What the sidebar draws beside a row.
+    pub(super) fn badge_text(&self, section: Section) -> Option<String> {
+        badge_text(self.status.as_ref(), &self.state, section)
     }
 
     /// The control that has keyboard focus in `window`, if any (for the render harness).
@@ -40,6 +115,12 @@ impl ShellView {
             self.focus
                 .entry(target)
                 .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
+        if self.offer().is_some() {
+            self.notice_focus
+                .get_or_insert_with(|| cx.focus_handle().tab_stop(true));
+        } else {
+            self.notice_focus = None;
         }
     }
 
@@ -104,7 +185,15 @@ impl Render for ShellView {
                     .min_h(len(0.0))
                     .flex()
                     .children(sidebar)
-                    .child(self.main_area(cx)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(len(0.0))
+                            .flex()
+                            .flex_col()
+                            .children(self.notice(cx))
+                            .child(self.main_area(cx)),
+                    ),
             )
     }
 }

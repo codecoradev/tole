@@ -181,7 +181,11 @@ pub(super) struct FakeServe {
     state: Mutex<ServeState>,
     epoch: AtomicU64,
     counts: Mutex<Option<Counts>>,
+    pub retries: AtomicUsize,
+    pub restarts: AtomicUsize,
     pub closes: AtomicUsize,
+    /// `retry` and `restart_serve` wait here, when set.
+    pub command_gate: Mutex<Option<Arc<Gate>>>,
     /// `close_window` waits here, when set.
     pub close_gate: Mutex<Option<Arc<Gate>>>,
     pub dropped: Arc<AtomicBool>,
@@ -201,7 +205,10 @@ impl FakeServe {
             state: Mutex::new(state),
             epoch: AtomicU64::new(1),
             counts: Mutex::new(counts),
+            retries: AtomicUsize::new(0),
+            restarts: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
+            command_gate: Mutex::new(None),
             close_gate: Mutex::new(None),
             dropped: Arc::new(AtomicBool::new(false)),
             close_outcome: Mutex::new(CloseOutcome::Closed),
@@ -245,6 +252,16 @@ impl ServeLink for FakeServe {
 }
 
 impl Serve for FakeServe {
+    fn retry(&self) {
+        self.retries.fetch_add(1, Ordering::SeqCst);
+        FakeServe::hold(&self.command_gate);
+    }
+
+    fn restart_serve(&self) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+        FakeServe::hold(&self.command_gate);
+    }
+
     fn close_window(self: Arc<Self>) -> CloseOutcome {
         self.closes.fetch_add(1, Ordering::SeqCst);
         FakeServe::hold(&self.close_gate);

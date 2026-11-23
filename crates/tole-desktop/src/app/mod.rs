@@ -3,7 +3,8 @@
 //! No toolkit type is here and no window: [`App`] starts the local serve off
 //! the window's thread, keeps the [`Backend`] following it, and gives the
 //! window three things: [`App::view`] (plain data), [`App::take_change`] (a
-//! change since the last look) and [`App::quit`].
+//! change since the last look) and the few commands the window may call
+//! ([`App::owner_action`] and [`App::quit`]).
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -24,11 +25,13 @@
 //!
 //! | thread | does | blocks on |
 //! |---|---|---|
-//! | `tole-desktop-launch` (1) | `SupervisorLink::launch` | the serve's start-up, up to the supervisor's timeouts |
+//! | `tole-desktop-launch` (1, again after a failed launch) | `SupervisorLink::launch` | the serve's start-up, up to the supervisor's timeouts |
+//! | `tole-desktop-command` (at most 1, short-lived) | the supervisor's `retry` or `restart_serve` | the supervisor's engine lock, the old serve stopping |
 //! | the backend's (`backend` module docs) | the drivers | their calls |
 //!
 //! The window's thread blocks on none of them: [`App::view`] reads the backend's
-//! snapshot and [`App::take_change`] is one atomic swap.
+//! snapshot, [`App::take_change`] is one atomic swap and the commands return at
+//! once.
 //!
 //! # The wake-up
 //!
@@ -41,10 +44,12 @@
 //! # A launch that fails
 //!
 //! A supervisor that cannot start the serve reports it as a state
-//! (`Failed(...)`). A launch that panics, or that cannot get a thread, is the
-//! same kind of state (`Failed(StartFailed { detail })`). Neither is a panic of
-//! the app and neither leaves the window blank: the window shows `Starting` from
-//! its first frame.
+//! (`Failed(...)`), which the window shows with the button
+//! [`ServeState::owner_action`](tole_desktop_model::ServeState::owner_action)
+//! calls for. A launch that panics, or that cannot get a thread, is the same
+//! kind of state (`Failed(StartFailed { detail })`), and "Try again" launches
+//! once more. Neither is a panic of the app and neither leaves the window blank:
+//! the window shows `Starting` from its first frame.
 //!
 //! # Not starting
 //!
@@ -69,6 +74,7 @@ mod boot;
 mod launch;
 mod quit;
 mod signal;
+mod window;
 
 #[cfg(test)]
 mod fake;
@@ -79,6 +85,8 @@ mod tests_quit;
 
 use std::io;
 use std::sync::Arc;
+
+use tole_desktop_model::OwnerAction;
 
 pub use self::boot::Boot;
 pub use self::launch::Serve;
@@ -155,6 +163,18 @@ impl App {
     /// mechanism.
     pub fn signal(&self) -> Signal {
         self.signal.clone()
+    }
+
+    /// The button of a failure: [`OwnerAction::Retry`] or
+    /// [`OwnerAction::RestartServe`]. Returns at once; the work is on a thread
+    /// of its own and the result is the next view. One command runs at a time:
+    /// a press while one runs is ignored, so the button looks dead until it
+    /// ends.
+    pub fn owner_action(&self, action: OwnerAction) {
+        match action {
+            OwnerAction::Retry => self.link.retry(),
+            OwnerAction::RestartServe => self.link.restart_serve(),
+        }
     }
 
     /// Whether the backend still runs (false after a panic ended it).
