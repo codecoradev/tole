@@ -7,12 +7,15 @@
 
 mod composer;
 mod event;
+mod follow;
 #[cfg(test)]
 mod late_tests;
+mod mark;
 #[cfg(test)]
 mod review_tests;
 mod run;
 mod status;
+mod tabs;
 #[cfg(test)]
 mod text_tests;
 mod transcript;
@@ -25,8 +28,11 @@ pub use composer::{
     MAX_IMAGES, MAX_IMAGE_BYTES,
 };
 pub use event::{tool_effect, ApprovalInfo, PlanItem, PlanStatus, TaskEvent, ToolEffect, UserKind};
+pub use follow::{Anchor, Follow, Laid, Step as FollowStep, NEAR};
+pub use mark::{mark, Mark};
 pub use run::{Link, Run};
 pub use status::{status_row, Phase, SendMode, StatusRow};
+pub use tabs::{title, Tabs, MAX_TITLE_CHARS};
 pub use transcript::{Counts, Item, Step, StepState, Transcript, WorkGroup};
 pub use viewport::{visible, ListLayout, Visible, MAX_ROW_HEIGHT};
 

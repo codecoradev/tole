@@ -4,7 +4,8 @@
 //! a sentence live in `crate::task`; these functions turn a state into words.
 
 use crate::task::{
-    AttachError, Counts, Phase, SendMode, StatusRow, Step, ToolEffect, MAX_IMAGES, MAX_IMAGE_BYTES,
+    AttachError, Counts, Mark, Phase, PlanStatus, SendMode, StatusRow, Step, StepState, ToolEffect,
+    MAX_IMAGES, MAX_IMAGE_BYTES,
 };
 
 fn plural(n: u32, one: &str, many: &str) -> String {
@@ -103,6 +104,88 @@ pub fn attach_error_text(error: AttachError) -> String {
         AttachError::NotAnImage => "Tole can read PNG, JPEG, GIF and WebP images.".to_string(),
     }
 }
+
+/// The link under an opened "Working" group (board S3).
+pub const TECH_SHOW: &str = "Show technical details";
+pub const TECH_HIDE: &str = "Hide technical details";
+
+/// How a step stands, at the end of its row.
+pub fn step_state(state: StepState) -> &'static str {
+    match state {
+        StepState::Running => "working",
+        StepState::Done => "done",
+        StepState::Failed => "did not work",
+        StepState::Unfinished => "stopped",
+    }
+}
+
+/// How a plan item stands: the mark before its text.
+pub fn plan_mark(status: PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Pending => "To do",
+        PlanStatus::InProgress => "Doing",
+        PlanStatus::Completed => "Done",
+    }
+}
+
+/// The caption above a plan list.
+pub const PLAN_CAPTION: &str = "Plan";
+
+/// The mark at the foot of a running transcript.
+pub fn mark_label(mark: Mark) -> &'static str {
+    match mark {
+        Mark::Thinking => "Thinking...",
+        Mark::Writing => "Writing...",
+    }
+}
+
+/// The button that returns a list scrolled up to its end.
+pub const JUMP_TO_LATEST: &str = "Jump to latest";
+
+/// Above a note the owner sent to a running turn.
+pub const STEER_LABEL: &str = "Your note to Tole";
+/// Above Tole's own note to the model (a refused call, a stop gate).
+pub const NOTE_LABEL: &str = "Note from Tole";
+/// Under an answer that hit the length limit.
+pub const ANSWER_CUT: &str = "This answer was very long, so only the first part is shown.";
+
+/// Under a message that came with pictures.
+pub fn images_label(count: u32) -> String {
+    format!("{} attached", plural(count, "image", "images"))
+}
+
+/// Shown while the history of a task is being read.
+pub const LOADING: &str = "Opening the task...";
+/// Shown by a task that has no words yet.
+pub const EMPTY_TASK: &str =
+    "Tell Tole what you would like done. It shows its plan and asks before it changes anything.";
+/// The tab of a task that has no first message yet.
+pub const NEW_TASK_TAB: &str = "New task";
+/// The tab button that closes a task.
+pub const CLOSE_TAB: &str = "Close this task";
+/// The tab button that starts another.
+pub const ADD_TAB: &str = "New task";
+/// A fourth task was asked for while three are open.
+pub fn too_many_tasks(max: usize) -> String {
+    format!("{max} tasks are open. Close one to open another.")
+}
+
+/// The button that sends the composer's text.
+pub fn send_label(mode: SendMode) -> &'static str {
+    match mode {
+        SendMode::Steer => "Send the note",
+        _ => "Send",
+    }
+}
+/// The composer while a text is not sendable yet: the keys it takes.
+pub const COMPOSER_KEYS: &str = "Enter to send, Shift+Enter for a new line";
+/// Under the status line while Tole waits for an OK: where to answer.
+pub const OPEN_APPROVALS: &str = "Open Approvals";
+/// The send was refused (the task is not connected): the words stay.
+pub const SEND_REFUSED: &str = "Tole could not take that just now. Your words are still here.";
+/// A send that may or may not have arrived (see `TaskView::last_send_uncertain`).
+pub const SEND_UNCERTAIN: &str =
+    "Tole may or may not have received your last message. Check the conversation before you send it again.";
 
 #[cfg(test)]
 mod tests {
@@ -208,5 +291,27 @@ mod tests {
             composer_placeholder(SendMode::Steer)
         );
         assert!(attach_error_text(AttachError::TooLarge { bytes: 1 }).contains("10 MB"));
+    }
+    #[test]
+    fn step_plan_and_mark_words_are_distinct_and_the_failure_is_not_hidden() {
+        let steps = [
+            StepState::Running,
+            StepState::Done,
+            StepState::Failed,
+            StepState::Unfinished,
+        ];
+        let words: Vec<_> = steps.iter().map(|s| step_state(*s)).collect();
+        assert_eq!(words, ["working", "done", "did not work", "stopped"]);
+        assert_ne!(mark_label(Mark::Thinking), mark_label(Mark::Writing));
+        assert_eq!(images_label(1), "1 image attached");
+        assert_eq!(images_label(3), "3 images attached");
+        assert!(too_many_tasks(3).starts_with("3 tasks"));
+        assert_ne!(send_label(SendMode::Send), send_label(SendMode::Steer));
+        let marks = [
+            PlanStatus::Pending,
+            PlanStatus::InProgress,
+            PlanStatus::Completed,
+        ];
+        assert_eq!(marks.map(plan_mark), ["To do", "Doing", "Done"]);
     }
 }
