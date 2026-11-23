@@ -117,14 +117,22 @@
 //! at most 15 s) or the 45 s idle timeout. The serve is left alone: closing it
 //! is the supervisor's `close_window`.
 
+#[cfg(test)]
+mod e2e_tasks_tests;
+#[cfg(test)]
+mod e2e_tests;
 mod engine;
 #[cfg(test)]
 mod engine_tasks_tests;
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod fake;
 mod link;
 mod live;
 mod reap;
+#[cfg(test)]
+mod rig;
 mod shared;
 pub mod shell;
 #[cfg(test)]
