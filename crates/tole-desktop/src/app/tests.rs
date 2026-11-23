@@ -323,7 +323,7 @@ fn the_buttons_call_the_supervisor_off_the_windows_thread_one_at_a_time() {
 
 #[test]
 fn the_window_reads_the_app_through_its_source() {
-    use crate::ui::Source;
+    use crate::ui::{badge_text, Source, Status};
     use tole_desktop_model::Section;
 
     let serve = FakeServe::new(running(), Some(COUNTS));
@@ -331,29 +331,34 @@ fn the_window_reads_the_app_through_its_source() {
     let app = start(launcher_of(serve, Some(gate.clone())));
     let mut shell_state = ShellState::new();
     wait_until("the launch to begin", || gate.arrivals() == 1);
-    let shown = |shell: &ShellState, section| shell.badge_text(section).unwrap_or_default();
+    let shown = |status: &Status, shell: &ShellState, section| {
+        badge_text(Some(status), shell, section).unwrap_or_default()
+    };
 
     // Before the serve is there: connecting, and nothing counted as zero.
     let status = app.refresh(&mut shell_state);
     assert_eq!(status.serve, ServeState::Starting);
+    assert!(status.skills_unknown);
     let notice = status
         .notice()
         .expect("a serve that is starting is said so");
     assert_eq!(notice.offer, None);
-    assert_eq!(shown(&shell_state, Section::Approvals), "?");
-    assert_eq!(shown(&shell_state, Section::SkillsAndTools), "?");
+    assert_eq!(shown(&status, &shell_state, Section::Approvals), "?");
+    assert_eq!(shown(&status, &shell_state, Section::SkillsAndTools), "?");
 
     gate.open();
     wait_until("the counts", || {
-        app.refresh(&mut shell_state);
-        shell_state.skills_new == Badge::Count(3)
-            && shell_state.approvals_pending == Badge::Count(2)
+        let status = app.refresh(&mut shell_state);
+        !status.skills_unknown && shell_state.approvals_pending == Badge::Count(2)
     });
     let status = app.refresh(&mut shell_state);
     assert_eq!(status.serve, running());
     assert_eq!(status.notice(), None, "a ready serve has no notice");
     assert_eq!(shell_state.connection.status, ConnectionStatus::Connected);
-    assert_eq!(shown(&shell_state, Section::SkillsAndTools), "3 new");
+    assert_eq!(
+        shown(&status, &shell_state, Section::SkillsAndTools),
+        "3 new"
+    );
     assert!(app.changed(), "the window was told of every step");
     finish(app);
 }

@@ -13,7 +13,7 @@ use std::fmt;
 
 use tole_desktop_model::{strings, ShellState};
 
-pub use self::status::{Notice, Offer, Source, Status, LOOK_EVERY};
+pub use self::status::{badge_text, Notice, Offer, Source, Status, LOOK_EVERY};
 
 #[cfg(feature = "gpui")]
 mod adapter;

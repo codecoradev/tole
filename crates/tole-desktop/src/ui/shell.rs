@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use super::adapter::*;
-use super::status::{Source, Status, LOOK_EVERY};
+use super::status::{badge_text, Source, Status, LOOK_EVERY};
 use tole_desktop_model::tokens::{font, size, DARK};
 use tole_desktop_model::{strings, Action, FocusTarget, OwnerAction, Section, ShellState};
 
@@ -94,7 +94,7 @@ impl ShellView {
 
     /// What the sidebar draws beside a row.
     pub(super) fn badge_text(&self, section: Section) -> Option<String> {
-        self.state.badge_text(section)
+        badge_text(self.status.as_ref(), &self.state, section)
     }
 
     /// The control that has keyboard focus in `window`, if any (for the render harness).

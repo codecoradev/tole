@@ -1,6 +1,6 @@
 //! The app as the window's source: what the window reads, in the window's terms.
 
-use tole_desktop_model::{Action, Badge, ConnectionStatus, OwnerAction, ShellState};
+use tole_desktop_model::{Action, Badge, ConnectionStatus, OwnerAction, Section, ShellState};
 
 use super::{App, Boot};
 use crate::backend::{shell, BackendView};
@@ -35,6 +35,7 @@ impl Boot {
 /// must not keep showing a connected serve it no longer follows.
 pub(super) fn refresh(state: &mut ShellState, view: BackendView, running: bool) -> Status {
     shell::apply(state, &view);
+    let skills_unknown = state.badge_unknown(Section::SkillsAndTools);
     if !running {
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Unreachable));
         state.apply(Action::SetApprovalsPending(Badge::Unknown));
@@ -43,6 +44,7 @@ pub(super) fn refresh(state: &mut ShellState, view: BackendView, running: bool) 
     }
     Status {
         serve: view.serve,
+        skills_unknown,
         actionable: true,
     }
 }
