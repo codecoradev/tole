@@ -59,8 +59,14 @@
 //! `driver::automations` does not apply a reply it no longer trusts.
 
 mod apply;
+#[cfg(test)]
+mod bounds_tests;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod jobs;
 mod runs;
+#[cfg(test)]
+mod tests;
 mod text;
 mod toggle;
 
