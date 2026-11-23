@@ -22,7 +22,7 @@ fn secs(n: u64) -> Duration {
 }
 
 /// The history of a session with nothing in it.
-fn empty_page(session: &str) -> EntriesPage {
+pub(super) fn empty_page(session: &str) -> EntriesPage {
     serde_json::from_value(json!({
         "id": session, "entries": [], "nextAfter": 0, "hasMore": false, "lastSeq": 0
     }))

@@ -89,6 +89,12 @@ impl FakeLink {
         }
     }
 
+    /// The serve is now in `state`, and the epoch does not move: a link that
+    /// breaks its contract (the state of the view must still not outlive it).
+    pub(super) fn set_without_epoch(&self, state: ServeState) {
+        self.inner().state = state;
+    }
+
     /// The api the next attach that has none queued before it gets.
     pub(super) fn queue_api(&self, api: Arc<FakeApi>) {
         self.inner().queued.push_back(api);
