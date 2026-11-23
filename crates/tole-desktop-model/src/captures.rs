@@ -65,7 +65,7 @@ fn counts() -> ShellState {
         Action::SetApprovalsPending(Badge::Count(1)),
         Action::SetAutomationsOn(2),
         Action::SetDiscussionsNeedYou(1),
-        Action::SetSkillsNew(2),
+        Action::SetSkillsNew(Badge::Count(2)),
     ])
 }
 

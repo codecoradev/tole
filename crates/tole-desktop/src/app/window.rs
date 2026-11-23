@@ -34,15 +34,15 @@ impl Boot {
 /// unknown, but the link may still say the serve is ready, and the window
 /// must not keep showing a connected serve it no longer follows.
 pub(super) fn refresh(state: &mut ShellState, view: BackendView, running: bool) -> Status {
-    let applied = shell::apply(state, &view);
+    shell::apply(state, &view);
     if !running {
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Unreachable));
         state.apply(Action::SetApprovalsPending(Badge::Unknown));
+        state.apply(Action::SetSkillsNew(Badge::Unknown));
         return Status::backend_ended();
     }
     Status {
         serve: view.serve,
-        skills_unknown: applied.skills_unknown,
         actionable: true,
     }
 }
@@ -135,7 +135,7 @@ mod tests {
         let status = refresh(&mut shell, view, false);
         assert_eq!(shell.connection.status, ConnectionStatus::Unreachable);
         assert!(matches!(status.serve, ServeState::Failed(_)));
-        assert!(status.skills_unknown);
+        assert_eq!(shell.skills_new, Badge::Unknown);
         assert_eq!(shell.approvals_pending, Badge::Unknown);
         assert!(!status.actionable, "there is nothing to press it on");
         let notice = status.notice().expect("a notice");

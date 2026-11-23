@@ -49,16 +49,15 @@ fn shell_of(serve: &ServeState, approvals: Option<usize>, skills: Option<usize>)
     state.apply(Action::SetApprovalsPending(
         approvals.map_or(Badge::Unknown, Badge::Count),
     ));
-    if let Some(n) = skills {
-        state.apply(Action::SetSkillsNew(n));
-    }
+    state.apply(Action::SetSkillsNew(
+        skills.map_or(Badge::Unknown, Badge::Count),
+    ));
     LiveCapture {
         name: "",
         keys: "",
         state,
         status: Status {
             serve: serve.clone(),
-            skills_unknown: skills.is_none(),
             actionable: true,
         },
     }
@@ -191,7 +190,7 @@ mod tests {
             // A serve that is not ready has no known count.
             if !c.status.serve.is_ready() {
                 assert_eq!(c.state.approvals_pending, Badge::Unknown, "{}", c.name);
-                assert!(c.status.skills_unknown, "{}", c.name);
+                assert_eq!(c.state.skills_new, Badge::Unknown, "{}", c.name);
             }
         }
         assert!(captures
