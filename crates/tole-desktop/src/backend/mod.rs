@@ -51,6 +51,13 @@
 //! - It never flaps: at most one attach per second, and an attach that cannot
 //!   build an `Api` is retried after 1 s, doubling to 30 s (see `engine`).
 //!
+//! # The shell
+//!
+//! [`shell::apply`] is a pure function that applies a [`BackendView`] to the
+//! model's `ShellState`: the sidebar counts and the connection dot. An unknown
+//! count is never written as a zero (see its docs for the skills count, which the
+//! shell cannot yet say is unknown).
+//!
 //! # Thread model
 //!
 //! | thread | does | blocks on |
@@ -115,6 +122,7 @@ mod link;
 mod live;
 mod reap;
 mod shared;
+pub mod shell;
 mod tasks;
 mod view;
 mod worker;
