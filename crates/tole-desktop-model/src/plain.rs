@@ -58,8 +58,10 @@ pub(crate) fn printable_text(s: &str, max: usize) -> (String, bool) {
 /// characters (newlines, tabs, escapes) and the line and paragraph separators
 /// become spaces; bidirectional marks and overrides and zero-width characters
 /// are dropped; the ends are trimmed and it is cut to `max` characters (an
-/// ellipsis marks a cut). Nothing a model wrote is shown raw.
-pub(crate) fn printable(s: &str, max: usize) -> String {
+/// ellipsis marks a cut). Nothing a model wrote is shown raw. Public so that an
+/// adapter that must hand a server's words to a page outside the model's own
+/// text (an error message) cleans them the same way.
+pub fn printable(s: &str, max: usize) -> String {
     let flat: String = s
         .chars()
         .filter(|c| !hidden(*c))
