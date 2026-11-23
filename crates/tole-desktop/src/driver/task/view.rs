@@ -2,7 +2,7 @@
 //! model and of what the driver knows, with no toolkit type in it.
 
 use tole_desktop_model::task::{
-    visible, ApprovalInfo, Item, Link, Phase, SendMode, StatusRow, Visible,
+    title, visible, ApprovalInfo, Item, Link, Phase, SendMode, StatusRow, Visible,
 };
 
 use super::store::Shared;
@@ -41,6 +41,11 @@ pub struct TaskView {
     pub history_complete: bool,
     /// The rows of the window the UI last set with `Handle::set_viewport`.
     pub rows: Vec<Item>,
+    /// For each of `rows`: a "Working" group that is going on (the model's
+    /// `TaskState::group_active`), drawn as "Working", not "Worked".
+    pub active: Vec<bool>,
+    /// The name of the task for its tab: the owner's first words, once there are some.
+    pub title: Option<String>,
     /// Which rows those are, and the padding before and after them.
     pub window: Visible,
     pub total_rows: usize,
@@ -69,6 +74,15 @@ pub struct TaskView {
     /// The composer's text, as the driver left it (a send that failed puts the
     /// owner's words back here).
     pub draft: String,
+    /// How many rows of the transcript are the owner's words (prompts and
+    /// notes). A message the driver took shows as one more: that is how a UI
+    /// knows it need not give the words back.
+    pub owner_rows: usize,
+    /// Which driver this view is of. The backend makes a new driver for a task
+    /// after a restart of the serve, with its own window and no measured
+    /// heights: a UI that sent its viewport and heights to the old one must
+    /// send them again when this changes.
+    pub driver: u64,
 }
 
 impl TaskView {
@@ -110,6 +124,9 @@ impl TaskView {
         let window = visible(&task.layout, vp.scroll_top, vp.height, vp.overscan);
         let rows = (task.transcript.items.get(window.start..window.end))
             .map_or_else(Vec::new, <[Item]>::to_vec);
+        let active = (window.start..window.start + rows.len())
+            .map(|i| task.group_active(i))
+            .collect();
         TaskView {
             status,
             link,
@@ -117,6 +134,8 @@ impl TaskView {
             loading: facts.loading,
             history_complete: task.history_complete,
             rows,
+            active,
+            title: title(&task.transcript),
             window,
             total_rows: task.transcript.items.len(),
             approvals: task.run.approvals.clone(),
@@ -126,6 +145,10 @@ impl TaskView {
             ignored: facts.ignored,
             approvals_stale: task.run.approvals_stale,
             draft: task.composer.text.clone(),
+            owner_rows: (task.transcript.items.iter())
+                .filter(|item| matches!(item, Item::User { .. }))
+                .count(),
+            driver: 0,
         }
     }
 }

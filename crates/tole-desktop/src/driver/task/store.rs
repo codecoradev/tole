@@ -3,7 +3,7 @@
 //! rows the UI is looking at. One mutex, held for the apply (or the copy for a
 //! view) and nothing else: never across a call or a send.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use tole_desktop_model::task::TaskState;
@@ -77,7 +77,11 @@ pub(super) struct Store {
     shared: Mutex<Shared>,
     look_only: bool,
     broken: AtomicBool,
+    /// Which driver this is (see `TaskView::driver`): never the same twice.
+    id: u64,
 }
+
+static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
     pub(super) fn new(look_only: bool) -> Self {
@@ -85,6 +89,7 @@ impl Store {
             shared: Mutex::new(Shared::new(look_only)),
             look_only,
             broken: AtomicBool::new(false),
+            id: NEXT_DRIVER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -108,6 +113,9 @@ impl Store {
     }
 
     pub(super) fn view(&self, alive: bool) -> TaskView {
-        TaskView::of(&self.lock(), alive)
+        TaskView {
+            driver: self.id,
+            ..TaskView::of(&self.lock(), alive)
+        }
     }
 }
