@@ -1,9 +1,9 @@
 //! The backend: the module that keeps the drivers true to the local serve.
 //!
 //! The window needs one thing to read and one thing to call: this. It owns the
-//! approvals and skills drivers ([`approvals`], [`skills`]) and starts and
-//! stops them as the serve comes and goes, so the window never holds a driver's
-//! handle that a restart of the serve would orphan.
+//! approvals, skills and task drivers ([`approvals`], [`skills`], [`task`]) and
+//! starts and stops them as the serve comes and goes, so the window never holds
+//! a driver's handle that a restart of the serve would orphan.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -17,8 +17,11 @@
 //! let backend = Backend::start(link, Arc::new(SystemClock), Config::default())?;
 //! let view = backend.snapshot(); // plain data: the serve, the approvals, the skills
 //! println!("{:?}", view.serve);
+//! backend.open_task("20261123-1")?; // a driver follows it, now or when the serve is ready
+//! let _ = backend.task_view("20261123-1"); // None while the serve is down
+//! let _ = backend.send("20261123-1", "hello"); // Err(Unavailable) then, never lost silently
 //! backend.shutdown(Duration::from_secs(1)); // the serve itself is left alone
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # What it does
@@ -31,6 +34,20 @@
 //!   reads `Unknown` from that moment. When the serve is ready again it builds
 //!   a new `Api` (a new serve may have a new credential) and starts new
 //!   drivers.
+//! - The app opens and closes tasks by session id ([`Backend::open_task`],
+//!   [`Backend::close_task`], at most [`MAX_OPEN_TASKS`](task::MAX_OPEN_TASKS),
+//!   the fourth is refused with a reason). The open set is the app's wish and
+//!   survives the serve: a task opened while the serve is down is started when
+//!   it is ready, and after a restart the drivers are made again for the same
+//!   sessions. The approvals driver follows exactly the open sessions. Task
+//!   commands go through the backend by session id ([`Backend::send`],
+//!   [`Backend::steer`], [`Backend::stop`], [`Backend::decide`]) and the view of
+//!   a task is [`Backend::task_view`], so the UI never holds a handle that a
+//!   restart would orphan. A command is queued on the driver that is there now
+//!   or refused with a reason ([`TaskRefused`]); it is never kept for the next
+//!   driver, and what the old driver had queued when the serve went away is
+//!   lost (the task driver's own rule: a UI keeps the words it typed until the
+//!   transcript shows them).
 //! - It never flaps: at most one attach per second, and an attach that cannot
 //!   build an `Api` is retried after 1 s, doubling to 30 s (see `engine`).
 //!
@@ -41,6 +58,12 @@
 //! | `worker` (1) | reads the link at every message, runs `Engine::step`, starts and stops the drivers, tells the UI | its inbox |
 //! | `ticker` (1) | wakes the worker every 100 ms of the clock | the clock |
 //! | `reap` (1 per driver, only while detaching) | stops a driver, so several stop at once | the driver's join |
+//!
+//! The drivers' own threads are theirs (see their module docs): the approvals
+//! driver's four fixed threads and up to four readers, the skills driver's four,
+//! and a task driver's nine for each open task. The stream budget is in `tasks`: at most
+//! six of the serve's eight event streams are live (three tasks and the
+//! approvals readers of the same sessions), seven by the constants.
 //!
 //! Only the worker starts or stops a driver. The state the UI reads is one
 //! `Arc` of handles behind a mutex that is held for a clone and nothing else,
@@ -92,6 +115,7 @@ mod link;
 mod live;
 mod reap;
 mod shared;
+mod tasks;
 mod view;
 mod worker;
 
@@ -100,19 +124,23 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tole_desktop_model::approvals::Decision;
+
 use self::engine::Engine;
 use self::link::Link;
 pub use self::link::{ServeLink, SupervisorLink};
 use self::live::Settings;
 use self::shared::{Fanin, Msg, Shared};
+pub use self::tasks::{OpenRefused, TaskRefused};
 pub use self::view::BackendView;
 use self::worker::Worker;
 use crate::driver::approvals::{self, ApprovalsView};
 use crate::driver::clock::{Clock, Shutdown};
 use crate::driver::runtime::{JoinReport, Threads};
-use crate::driver::shared::handle::OnChange;
+use crate::driver::shared::handle::{Busy, OnChange};
 use crate::driver::shared::thread::{spawn_ticker, stop_threads};
 use crate::driver::skills::{self, SkillsPageView};
+use crate::driver::task::{self, TaskView};
 
 /// The room in the worker's inbox.
 const INBOX: usize = 64;
@@ -146,6 +174,7 @@ impl Default for Config {
 pub struct Backend {
     shared: Arc<Shared>,
     link: Link,
+    fan: Arc<Fanin>,
     inbox: SyncSender<Msg>,
     stop: Shutdown,
     threads: Threads,
@@ -169,6 +198,7 @@ impl Backend {
         let mut backend = Backend {
             shared: Arc::clone(&shared),
             link: link.clone(),
+            fan: Arc::clone(&fan),
             inbox: inbox.clone(),
             stop: stop.clone(),
             threads: Threads::new(),
@@ -197,7 +227,7 @@ impl Backend {
         match started {
             Ok(()) => Ok(backend),
             Err(e) => {
-                backend.stop(DROP_JOIN);
+                backend.end(DROP_JOIN);
                 Err(e)
             }
         }
@@ -216,6 +246,7 @@ impl Backend {
                 .as_ref()
                 .map_or_else(SkillsPageView::not_loaded, |a| a.skills.snapshot()),
             serve: look.state,
+            open_tasks: self.shared.tasks.list(),
         }
     }
 
@@ -237,6 +268,113 @@ impl Backend {
         Some(f(&attached.skills))
     }
 
+    /// Record `session` as an open task: a driver follows it from now on (when
+    /// the serve is ready, otherwise as soon as it is), and the approvals driver
+    /// follows it too. Opening a task that is open is `Ok` and takes no slot.
+    ///
+    /// Refused ([`OpenRefused`]) for an id the serve cannot have given
+    /// (`[A-Za-z0-9_-]`, 1 to 64 bytes) and when [`MAX_OPEN_TASKS`] tasks are
+    /// open: each holds one of the serve's eight event streams (see the
+    /// "stream budget" in `tasks`), so the UI says so and offers to close one.
+    /// The task opens with its history read from the serve; a plan-mode session
+    /// is not told apart yet (`task::Config::look_only` is not set).
+    ///
+    /// [`MAX_OPEN_TASKS`]: crate::driver::task::MAX_OPEN_TASKS
+    pub fn open_task(&self, session: &str) -> Result<(), OpenRefused> {
+        if !self.is_running() {
+            return Err(OpenRefused::Stopped);
+        }
+        if self.shared.tasks.open(session)? {
+            self.changed();
+        }
+        Ok(())
+    }
+
+    /// Stop following `session` (its driver stops, the approvals driver
+    /// follows one less). `true` when it was open. A task closed while the serve
+    /// is down is not started when the serve is ready.
+    pub fn close_task(&self, session: &str) -> bool {
+        let was_open = self.shared.tasks.close(session);
+        if was_open {
+            self.changed();
+        }
+        was_open
+    }
+
+    /// An open task, as of now: `None` when it is not open, or has no driver
+    /// (the serve is not ready, was replaced, or the driver is being made
+    /// again), never a view of a driver that stopped.
+    pub fn task_view(&self, session: &str) -> Option<TaskView> {
+        self.with_task(session, |h| h.snapshot())
+    }
+
+    /// Call `f` with the handle of an open task's driver (viewport, row
+    /// heights, a group toggle, and the commands the methods below wrap), if
+    /// the task has a driver for the serve that is there now. The handle lives
+    /// for the call only: a restart replaces the driver, and a handle kept
+    /// would read stopped for good.
+    pub fn with_task<R>(&self, session: &str, f: impl FnOnce(&task::Handle) -> R) -> Option<R> {
+        if !self.shared.tasks.contains(session) {
+            return None;
+        }
+        let look = self.link.look();
+        let attached = self.shared.current(&look)?;
+        let (_, handle) = attached.tasks.iter().find(|(id, _)| id == session)?;
+        Some(f(handle))
+    }
+
+    /// [`task::Handle::send`] on an open task.
+    pub fn send(&self, session: &str, text: &str) -> Result<(), TaskRefused> {
+        self.command(session, |h| h.send(text))
+    }
+
+    /// [`task::Handle::steer`] on an open task.
+    pub fn steer(&self, session: &str, text: &str) -> Result<(), TaskRefused> {
+        self.command(session, |h| h.steer(text))
+    }
+
+    /// [`task::Handle::stop`] on an open task: stops the running turn, not the
+    /// task (that is [`close_task`](Self::close_task)).
+    pub fn stop(&self, session: &str) -> Result<(), TaskRefused> {
+        self.command(session, task::Handle::stop)
+    }
+
+    /// [`task::Handle::decide`] on an open task.
+    pub fn decide(
+        &self,
+        session: &str,
+        approval: &str,
+        decision: Decision,
+    ) -> Result<(), TaskRefused> {
+        self.command(session, |h| h.decide(approval, decision))
+    }
+
+    /// A command is queued on the driver that is there now, or refused with
+    /// the reason: it is never held for a later driver (a restart drops what
+    /// the old one had queued, and a UI keeps the words it typed until the
+    /// transcript shows them).
+    fn command(
+        &self,
+        session: &str,
+        f: impl FnOnce(&task::Handle) -> Result<(), Busy>,
+    ) -> Result<(), TaskRefused> {
+        if !self.shared.tasks.contains(session) {
+            return Err(TaskRefused::NotOpen);
+        }
+        match self.with_task(session, f) {
+            None => Err(TaskRefused::Unavailable),
+            Some(Err(Busy)) => Err(TaskRefused::Busy),
+            Some(Ok(())) => Ok(()),
+        }
+    }
+
+    /// The view changed: tell the UI (at the backend's pace) and have the
+    /// worker look.
+    fn changed(&self) {
+        self.fan.mark();
+        let _ = self.inbox.try_send(Msg::Wake);
+    }
+
     /// Whether the worker runs. False after [`shutdown`](Self::shutdown) and
     /// when a panic ended it.
     pub fn is_running(&self) -> bool {
@@ -255,10 +393,10 @@ impl Backend {
     /// stopping them, and counts it detached). The report adds up the backend's own
     /// threads and every driver it ever stopped. The serve is left alone.
     pub fn shutdown(mut self, timeout: Duration) -> JoinReport {
-        self.stop(timeout)
+        self.end(timeout)
     }
 
-    fn stop(&mut self, timeout: Duration) -> JoinReport {
+    fn end(&mut self, timeout: Duration) -> JoinReport {
         let own = stop_threads(&self.stop, &self.inbox, &mut self.threads, timeout);
         reap::sum(own, self.shared.totals())
     }
@@ -266,6 +404,6 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        self.stop(DROP_JOIN);
+        self.end(DROP_JOIN);
     }
 }

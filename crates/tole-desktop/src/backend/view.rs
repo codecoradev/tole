@@ -19,4 +19,8 @@ pub struct BackendView {
     pub serve: ServeState,
     pub approvals: ApprovalsView,
     pub skills: SkillsPageView,
+    /// The tasks the app has open, in the order it opened them: the app's
+    /// wish, which holds while the serve is down. Read each one by
+    /// [`Backend::task_view`](super::Backend::task_view).
+    pub open_tasks: Vec<String>,
 }

@@ -174,6 +174,7 @@ use super::clock::{Clock, Shutdown};
 use super::runtime::{JoinReport, Threads};
 use super::shared::handle::{self, clamp_refresh};
 pub use super::shared::handle::{Busy, OnChange};
+use super::shared::ids::is_session_id;
 use super::shared::thread::{run_guarded, spawn_ticker, stop_threads, DROP_JOIN};
 
 /// Most event streams one driver holds. The serve allows 8 for all its
@@ -196,9 +197,6 @@ pub(super) fn effective_refresh(refresh: Duration, ceiling: Duration) -> Duratio
     clamp_refresh(refresh, MIN_REFRESH, ceiling)
 }
 
-/// The longest session id followed (the core's own rule, as the model's).
-const MAX_SESSION_ID_LEN: usize = 64;
-
 /// The sessions to follow: only ids the serve can have given (`[A-Za-z0-9_-]`,
 /// 1 to 64 bytes, as the model keeps them: an id with a control character or
 /// a megabyte of text is never put in a URL), none twice (two readers of one
@@ -206,14 +204,9 @@ const MAX_SESSION_ID_LEN: usize = 64;
 /// eight), in the given order, at most [`MAX_STREAMS`]. An id it refuses costs
 /// no more than its length check (a huge one is never scanned).
 pub(super) fn followed_sessions(sessions: Vec<String>) -> Vec<String> {
-    let valid = |s: &str| {
-        !s.is_empty()
-            && s.len() <= MAX_SESSION_ID_LEN
-            && (s.chars()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-    };
     let mut followed: Vec<String> = Vec::new();
     for s in sessions {
-        if valid(&s) && !followed.contains(&s) {
+        if is_session_id(&s) && !followed.contains(&s) {
             followed.push(s);
             if followed.len() == MAX_STREAMS {
                 break;
