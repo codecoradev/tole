@@ -30,6 +30,16 @@ pub fn section_label(section: Section) -> &'static str {
 /// Shown by a build without the `gpui` feature (a developer message, not UI).
 pub const NO_WINDOW_TOOLKIT: &str = "this build has no window toolkit; rebuild with `--features gpui` (see docs/design/desktop/README.md)";
 
+/// The thread that starts Tole could not be started.
+pub fn launch_thread_failed(detail: &str) -> String {
+    format!("could not start a thread: {detail}")
+}
+
+/// Starting Tole panicked.
+pub fn launch_panicked(detail: &str) -> String {
+    format!("starting Tole panicked: {detail}")
+}
+
 /// Prefix of the error when the window cannot open (a developer message).
 pub const WINDOW_FAILED: &str = "cannot open the window";
 

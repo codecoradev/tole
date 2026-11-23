@@ -69,6 +69,12 @@ impl SupervisorLink {
     pub fn supervisor(&self) -> &Arc<Supervisor> {
         &self.supervisor
     }
+
+    /// The supervisor, by value of its `Arc`: `Arc::try_unwrap` it for
+    /// `close_window` once nothing else holds it (the backend is shut down).
+    pub fn into_supervisor(self) -> Arc<Supervisor> {
+        self.supervisor
+    }
 }
 
 impl ServeLink for SupervisorLink {

@@ -22,8 +22,14 @@
 //! - [`backend`] (macOS and Linux): keeps the drivers true to the supervisor's
 //!   serve (starts them when it is ready, stops them when it is not) and gives
 //!   the UI one plain-data view to read.
+//! - [`app`] (macOS and Linux): the boot. Starts the serve for the folder the
+//!   app was started in, off the window's thread, keeps the backend following
+//!   it, and gives the window the view, a change signal and the few commands
+//!   it may call (no toolkit).
 
 pub mod adapter;
+#[cfg(unix)]
+pub mod app;
 #[cfg(unix)]
 pub mod backend;
 #[cfg(unix)]
