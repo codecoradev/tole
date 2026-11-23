@@ -69,6 +69,7 @@ mod discussions;
 pub mod missions;
 mod models;
 pub mod past_sessions;
+mod pct;
 mod state_views;
 
 pub struct ServeConfig {
@@ -936,7 +937,10 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // body).
     if req.method == "GET" {
         if let Some((id, query)) = events_target(&req.path) {
-            serve_events(stream, &state, id, query, req.last_event_id.as_deref());
+            match pct::id(id) {
+                Ok(id) => serve_events(stream, &state, &id, query, req.last_event_id.as_deref()),
+                Err((status, payload)) => respond(&mut stream, status, &payload),
+            }
             return;
         }
     }
@@ -944,14 +948,21 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // Images (#558): a binary body in, binary bytes out.
     if req.method == "POST" {
         if let Some(id) = upload_target(&req.path) {
-            let (status, payload) = upload_image(&state, id, &req.body);
+            let (status, payload) = match pct::id(id) {
+                Ok(id) => upload_image(&state, &id, &req.body),
+                Err(refused) => refused,
+            };
             respond(&mut stream, status, &payload);
             return;
         }
     }
     if req.method == "GET" {
         if let Some((id, hash)) = image_target(&req.path) {
-            match read_image(&state, id, hash) {
+            let read = match (pct::id(id), pct::id(hash)) {
+                (Ok(id), Ok(hash)) => read_image(&state, &id, &hash),
+                (Err(refused), _) | (_, Err(refused)) => Err(refused),
+            };
+            match read {
                 Ok((mime, data)) => respond_image(&mut stream, &mime, &data),
                 Err((status, payload)) => respond(&mut stream, status, &payload),
             }
@@ -1713,6 +1724,19 @@ fn id_between<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> 
     path.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
+/// Runs `f` with the percent-decoded id of a route matched by [`id_between`]
+/// (the match is on the raw path, the id is decoded after it: see `pct`), or
+/// answers the `400` of a value that does not decode.
+fn with_id(
+    raw: Option<&str>,
+    f: impl FnOnce(&str) -> (u16, serde_json::Value),
+) -> (u16, serde_json::Value) {
+    match pct::id(raw.unwrap_or_default()) {
+        Ok(id) => f(&id),
+        Err(refused) => refused,
+    }
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (
@@ -1861,28 +1885,35 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         // Missions (#947): a mission is its own session, run on a thread.
         ("POST", "/missions") => missions::start(state, body),
         ("GET", p) if p.starts_with("/missions/") && !p["/missions/".len()..].contains('/') => {
-            missions::status(state, &p["/missions/".len()..])
+            with_id(Some(&p["/missions/".len()..]), |id| {
+                missions::status(state, id)
+            })
         }
-        ("POST", p) if id_between(p, "/missions/", "/cancel").is_some() => missions::cancel(
-            state,
-            id_between(p, "/missions/", "/cancel").unwrap_or_default(),
-        ),
+        ("POST", p) if id_between(p, "/missions/", "/cancel").is_some() => {
+            with_id(id_between(p, "/missions/", "/cancel"), |id| {
+                missions::cancel(state, id)
+            })
+        }
         // Discussions (#1042): the owner's `tole discuss`, read and dry run.
         ("GET", "/discussions") => discussions::list(state),
         ("POST", "/discussions/estimate") => discussions::estimate(state, body),
         ("POST", "/discussions") => discussions::start(state, body),
-        ("POST", p) if id_between(p, "/discussions/", "/resume").is_some() => discussions::resume(
-            state,
-            id_between(p, "/discussions/", "/resume").unwrap_or_default(),
-        ),
-        ("POST", p) if id_between(p, "/discussions/", "/stop").is_some() => discussions::stop(
-            state,
-            id_between(p, "/discussions/", "/stop").unwrap_or_default(),
-        ),
+        ("POST", p) if id_between(p, "/discussions/", "/resume").is_some() => {
+            with_id(id_between(p, "/discussions/", "/resume"), |id| {
+                discussions::resume(state, id)
+            })
+        }
+        ("POST", p) if id_between(p, "/discussions/", "/stop").is_some() => {
+            with_id(id_between(p, "/discussions/", "/stop"), |id| {
+                discussions::stop(state, id)
+            })
+        }
         ("GET", p)
             if p.starts_with("/discussions/") && !p["/discussions/".len()..].contains('/') =>
         {
-            discussions::show(state, &p["/discussions/".len()..])
+            with_id(Some(&p["/discussions/".len()..]), |id| {
+                discussions::show(state, id)
+            })
         }
         // The owner's profiles, skills and connected tools (#1042): read-only.
         ("GET", "/profiles") => state_views::profiles(state),
@@ -1890,31 +1921,30 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("GET", "/tools") => state_views::tools(state),
         // Cron jobs (#1042): read, pause, and resume what the owner reviewed.
         ("GET", "/cron/jobs") => cron::list(),
-        ("POST", p) if id_between(p, "/cron/jobs/", "/pause").is_some() => cron::set_paused(
-            state,
-            id_between(p, "/cron/jobs/", "/pause").unwrap_or_default(),
-            true,
-        ),
-        ("POST", p) if id_between(p, "/cron/jobs/", "/resume").is_some() => cron::set_paused(
-            state,
-            id_between(p, "/cron/jobs/", "/resume").unwrap_or_default(),
-            false,
-        ),
+        ("POST", p) if id_between(p, "/cron/jobs/", "/pause").is_some() => {
+            with_id(id_between(p, "/cron/jobs/", "/pause"), |id| {
+                cron::set_paused(state, id, true)
+            })
+        }
+        ("POST", p) if id_between(p, "/cron/jobs/", "/resume").is_some() => {
+            with_id(id_between(p, "/cron/jobs/", "/resume"), |id| {
+                cron::set_paused(state, id, false)
+            })
+        }
         // Cron run results (#579, design §9): the pull delivery target.
         ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {
-            let query = |key: &str| {
-                p.split_once('?').and_then(|(_, q)| {
-                    q.split('&')
-                        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-                })
-            };
-            let limit = match query("limit").map(str::parse::<usize>) {
+            let query = p.split_once('?').map_or("", |(_, q)| q);
+            let limit = match pct::raw_param(query, "limit").map(str::parse::<usize>) {
                 None => None,
                 Some(Ok(n)) => Some(n),
                 Some(Err(_)) => return (400, json!({"error": "limit must be a number"})),
             };
+            let job = match pct::param(query, "job") {
+                Ok(job) => job,
+                Err(refused) => return refused,
+            };
             let runs = tole_cli::cron::default_dir()
-                .and_then(|dir| tole_cli::cron::runs_json(&dir, query("job"), limit));
+                .and_then(|dir| tole_cli::cron::runs_json(&dir, job.as_deref(), limit));
             match runs {
                 Ok(v) => (200, v),
                 Err(e) if e.to_string().starts_with("no job") => {
@@ -1925,10 +1955,10 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         }
         // Remote approvals (issue #200): list + decide.
         ("GET", p) if p == "/approvals" || p.starts_with("/approvals?") => {
-            let session = p.split_once('?').and_then(|(_, q)| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("session=").map(str::to_string))
-            });
+            let session = match pct::param(p.split_once('?').map_or("", |(_, q)| q), "session") {
+                Ok(session) => session.map(|s| s.into_owned()),
+                Err(refused) => return refused,
+            };
             let mut list = state
                 .approvals
                 .list(session.as_deref())
@@ -1951,10 +1981,13 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         (method, p)
             if method == "POST" && (p.starts_with("/approvals/") && p.ends_with("/decision")) =>
         {
-            let id = p
-                .trim_start_matches("/approvals/")
-                .trim_end_matches("/decision")
-                .to_string();
+            let id = match pct::id(
+                p.trim_start_matches("/approvals/")
+                    .trim_end_matches("/decision"),
+            ) {
+                Ok(id) => id.into_owned(),
+                Err(refused) => return refused,
+            };
             // A delegated child's request (#714): the durable queue, not
             // serve's in-memory one. The child is already waiting: no resume.
             if id.starts_with("dap-") {
@@ -2146,6 +2179,12 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 Some((id, action)) => (id, Some(action)),
                 None => (rest, None),
             };
+            // The id is decoded after the raw path was split (see `pct`).
+            let id = match pct::id(id) {
+                Ok(id) => id,
+                Err(refused) => return refused,
+            };
+            let id: &str = &id;
             match (method, id, action) {
                 ("GET", id, None | Some("status")) => {
                     // Take the storage HANDLE under the map lock, then
