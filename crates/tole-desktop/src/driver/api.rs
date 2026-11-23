@@ -25,9 +25,9 @@ use std::time::Duration;
 
 use tole_client::{
     Approval, ApprovalList, CancelReply, Client, CronJobState, CronJobs, CronRuns, Decision,
-    DecisionReply, EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply,
-    PromptRequest, ReconnectPolicy, ResumingStream, SessionStatus, SkillsState, StreamItem,
-    ToolsState,
+    DecisionReply, EntriesPage, Error, InterruptReply, InterruptRequest, NewSession, PromptReply,
+    PromptRequest, ReconnectPolicy, ResumingStream, SessionOpened, SessionStatus, SkillsState,
+    StreamItem, ToolsState,
 };
 
 /// One session's event stream, as a source of items. It reconnects by itself
@@ -89,6 +89,19 @@ pub trait Api: Send + Sync + 'static {
     /// `POST /approvals/{id}/decision` of a serve row (no fingerprint; a
     /// delegated child's row goes through [`Api::decide_row`]).
     fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error>;
+
+    // ---- the app: starting a task ----
+
+    /// `POST /sessions`: a new session (`NewSession::cwd` is its working
+    /// folder, inside the serve's workspace). Not called by a driver: the app
+    /// makes it once, off the window's thread (`Backend::new_task`). An `Api`
+    /// that cannot says so, so a test double only writes what it uses.
+    fn create_session(&self, req: &NewSession) -> Result<SessionOpened, Error> {
+        let _ = req;
+        Err(Error::InvalidConfig(
+            "this api does not create sessions".to_owned(),
+        ))
+    }
 
     // ---- the skills driver: the Skills and Connected tools pages (read-only) ----
 
@@ -189,6 +202,10 @@ impl Api for ClientApi {
 
     fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionReply, Error> {
         self.short.decide(approval_id, decision)
+    }
+
+    fn create_session(&self, req: &NewSession) -> Result<SessionOpened, Error> {
+        self.short.create_session(req)
     }
 
     fn skills(&self) -> Result<SkillsState, Error> {

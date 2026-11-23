@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use tole_client::{
     Approval, ApprovalList, CancelReply, CronJobState, CronJobs, CronRuns, Decision, DecisionReply,
-    EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result,
-    SessionStatus, SkillsState, StreamItem, ToolsState,
+    EntriesPage, Error, InterruptReply, InterruptRequest, NewSession, PromptReply, PromptRequest,
+    Result, SessionOpened, SessionStatus, SkillsState, StreamItem, ToolsState,
 };
 
 use super::api::{Api, EventSource};
@@ -90,6 +90,8 @@ struct Script {
     cron_runs: Queue<CronRuns>,
     pauses: Queue<CronJobState>,
     resumes: Queue<CronJobState>,
+    creates: Queue<SessionOpened>,
+    create_calls: Vec<Option<String>>,
     always_status: Option<SessionStatus>,
     streams: HashMap<String, VecDeque<Receiver<Frame>>>,
     /// Senders of streams nobody scripted: they stay silent, open.
@@ -140,6 +142,7 @@ macro_rules! scripted {
 }
 
 // Declared after the macro so that the module can use it.
+mod create;
 mod cron;
 
 // The whole scripting surface is here for every driver's tests; one test file
@@ -434,6 +437,11 @@ impl Api for FakeApi {
             |s| s.decide_calls.push((id, decision)),
             |s| s.decides.pop_front(),
         )
+    }
+
+    fn create_session(&self, req: &NewSession) -> Result<SessionOpened> {
+        let cwd = req.cwd.clone();
+        self.call(|s| s.create_calls.push(cwd), |s| s.creates.pop_front())
     }
 
     fn skills(&self) -> Result<SkillsState> {
