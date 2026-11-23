@@ -19,6 +19,8 @@
 //!   clock readings, the tick, guarded-thread and stop sequence, and the UI
 //!   side's `Busy`, `OnChange` and refresh clamp.
 //! - [`approvals`]: the approvals queue (the first driver).
+//! - [`automations`]: the Automations page: the jobs, the history of one, and the
+//!   on/off switch, one pause or resume per press.
 //! - [`skills`]: the Skills and Connected tools pages (read-only).
 //! - [`task`]: one task, that is one session: its history, live stream, prompt,
 //!   Stop, steer and the approvals of that session.
@@ -39,6 +41,7 @@
 
 pub mod api;
 pub mod approvals;
+pub mod automations;
 pub mod clock;
 pub mod guard;
 pub mod runtime;
