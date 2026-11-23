@@ -28,6 +28,12 @@ pub struct SkillsPageView {
 }
 
 impl SkillsPageView {
+    /// What there is before a driver has run, and after it stopped: nothing
+    /// loaded, both badges `Unknown`.
+    pub fn not_loaded() -> Self {
+        Self::of(&Shared::default())
+    }
+
     pub(super) fn of(shared: &Shared) -> Self {
         SkillsPageView {
             page: shared.page.clone(),
