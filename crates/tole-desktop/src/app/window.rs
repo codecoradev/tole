@@ -3,8 +3,10 @@
 use tole_desktop_model::{Action, Badge, ConnectionStatus, OwnerAction, Section, ShellState};
 
 use super::{App, Boot};
-use crate::backend::{shell, BackendView};
-use crate::ui::{Source, Status};
+use crate::backend::{shell, BackendView, TaskRefused};
+use crate::driver::task::TaskView;
+use crate::ui::{Source, Status, TaskCall};
+use tole_desktop_model::strings::StartProblem;
 
 impl Boot {
     /// The shell the window starts from: the folder the app was started in is
@@ -65,6 +67,30 @@ impl Source for App {
 
     fn owner_action(&self, action: OwnerAction) {
         App::owner_action(self, action);
+    }
+
+    fn open_tasks(&self) -> Vec<String> {
+        self.tasks_open()
+    }
+
+    fn close_task(&self, session: &str) {
+        self.tasks_close(session);
+    }
+
+    fn task_view(&self, session: &str) -> Option<TaskView> {
+        self.tasks_view(session)
+    }
+
+    fn task_call(&self, session: &str, call: TaskCall) -> Result<(), TaskRefused> {
+        self.tasks_call(session, call)
+    }
+
+    fn new_task(&self, folder: Option<&str>) {
+        self.tasks_new(folder);
+    }
+
+    fn new_task_problem(&self) -> Option<StartProblem> {
+        self.tasks_new_problem()
     }
 }
 

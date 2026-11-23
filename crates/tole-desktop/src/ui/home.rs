@@ -58,7 +58,7 @@ impl ShellView {
                 .text_color(color(p.background))
                 .focus_visible(|style| style.border_color(color(p.text_primary)))
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| this.dispatch(Action::NewTask, cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.task_start(cx)))
                 .into_any_element()
         } else {
             button
@@ -89,6 +89,17 @@ impl ShellView {
                 .children(chips)
                 .into_any_element()
         };
+        let problem = if home.can_start {
+            self.start_problem()
+        } else {
+            None
+        };
+        let failed = problem.map(|problem| {
+            div()
+                .text_size(len(font::CAPTION))
+                .text_color(color(p.danger))
+                .child(strings::start_problem_text(problem))
+        });
         let blocked = (!home.can_start).then(|| {
             div()
                 .text_size(len(font::CAPTION))
@@ -131,7 +142,8 @@ impl ShellView {
                     .items_center()
                     .gap(len(size::GUTTER))
                     .child(self.start_button(home.can_start, cx))
-                    .children(blocked),
+                    .children(blocked)
+                    .children(failed),
             )
     }
 }

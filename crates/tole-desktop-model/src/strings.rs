@@ -104,6 +104,40 @@ pub const HOME_START: &str = "New task";
 /// Under the button while it cannot be pressed.
 pub const HOME_START_BLOCKED: &str = "Tole is not connected yet, so a task cannot start.";
 
+/// Why the last try did not start a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartProblem {
+    /// This many tasks are open already.
+    TooMany { max: usize },
+    /// Tole is not connected (starting, restarting, failed, stopped).
+    NotReady,
+    /// The last one is still being started.
+    Busy,
+    /// Tole answered that it could not (the folder, or an error of its own).
+    ServeFailed,
+    /// Anything else (the system could not start the work).
+    Other,
+}
+
+/// Under the button when the last try did not start a task: what happened and
+/// what to do about it, in that case's own words.
+pub fn start_problem_text(problem: StartProblem) -> String {
+    match problem {
+        StartProblem::TooMany { max } => {
+            format!("At most {max} tasks can be open at once. Close one and try again.")
+        }
+        StartProblem::NotReady => {
+            "Tole is not connected yet. Wait until it says connected and try again.".to_owned()
+        }
+        StartProblem::Busy => "Tole is still starting the last task.".to_owned(),
+        StartProblem::ServeFailed => {
+            "Tole could not start the task in this folder. Try again, or choose another folder."
+                .to_owned()
+        }
+        StartProblem::Other => "Tole could not start the task. Try again.".to_owned(),
+    }
+}
+
 pub const HOME_TITLE: &str = "What would you like Tole to do?";
 pub const HOME_SUBTITLE: &str =
     "Describe it in your own words. Tole shows its plan and asks before it changes anything.";
@@ -253,6 +287,30 @@ pub use crate::task_strings as task;
 
 #[cfg(test)]
 mod tests {
+    use super::{start_problem_text, StartProblem};
+
+    #[test]
+    fn each_way_a_task_fails_to_start_says_its_own_thing() {
+        let all = [
+            StartProblem::TooMany { max: 3 },
+            StartProblem::NotReady,
+            StartProblem::Busy,
+            StartProblem::ServeFailed,
+            StartProblem::Other,
+        ];
+        let texts: Vec<_> = all.iter().map(|p| start_problem_text(*p)).collect();
+        for (i, a) in texts.iter().enumerate() {
+            assert!(!a.is_empty());
+            assert!(
+                texts[i + 1..].iter().all(|b| a != b),
+                "two share a text: {a}"
+            );
+        }
+        // The cap is said only when it is the reason, and with the number.
+        assert!(texts[0].contains('3'));
+        assert!(texts[1..].iter().all(|t| !t.contains("At most")));
+    }
+
     use super::*;
 
     #[test]

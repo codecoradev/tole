@@ -12,7 +12,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use tole_desktop_model::task::TaskEvent;
-use tole_desktop_model::{Action, ConnectionStatus, OwnerAction, ServeState, ShellState};
+use tole_desktop_model::{Action, ConnectionStatus, OwnerAction, Section, ServeState, ShellState};
 
 use super::adapter::offscreen::Offscreen;
 use super::harness::{Rendered, WindowSize};
@@ -30,11 +30,25 @@ pub const SESSION: &str = "20261123-1";
 
 /// The calls the window made on tasks, in order.
 pub type Calls = Rc<RefCell<Vec<(String, TaskCall)>>>;
+/// The folder asked for by each "New task".
+pub type Starts = Rc<RefCell<Vec<Option<String>>>>;
+/// The ids of the tasks open, in order.
+pub type Ids = Rc<RefCell<Vec<String>>>;
+
+/// The tasks open and their drivers (a [`Preview`] each): a check replaces one
+/// to stand for the serve restarting, which makes the task a new driver.
+pub type Slots = Rc<RefCell<Vec<(String, Option<Rc<Preview>>)>>>;
+
+/// The task a "New task" opens.
+pub const NEW_SESSION: &str = "20261123-9";
 
 /// The tasks the window has open: each a [`Preview`], or none yet.
 struct Tasks {
-    open: RefCell<Vec<(String, Option<Rc<Preview>>)>>,
+    open: Slots,
     calls: Calls,
+    /// The folder of every "New task", and the ids open now (for the checks).
+    starts: Starts,
+    ids: Ids,
     /// Refuse `Send` and `Steer`, as a task that is not connected does.
     refuse: bool,
     /// What a prompt does to the task, as a driver that accepted it would.
@@ -69,6 +83,16 @@ impl Source for Tasks {
 
     fn close_task(&self, session: &str) {
         self.open.borrow_mut().retain(|(id, _)| id != session);
+        self.ids.borrow_mut().retain(|id| id != session);
+    }
+
+    fn new_task(&self, folder: Option<&str>) {
+        self.starts.borrow_mut().push(folder.map(str::to_owned));
+        let task = Preview::new(false);
+        self.open
+            .borrow_mut()
+            .push((NEW_SESSION.to_owned(), Some(Rc::new(task))));
+        self.ids.borrow_mut().push(NEW_SESSION.to_owned());
     }
 
     fn task_view(&self, session: &str) -> Option<TaskView> {
@@ -162,6 +186,14 @@ pub struct Scene {
     pub refuse: bool,
     /// Text typed in the composer.
     pub typed: Option<&'static str>,
+    /// The folder of each "New task" the window asked for.
+    pub starts: Starts,
+    /// The ids of the tasks open (the window closes them).
+    pub ids: Ids,
+    /// The tasks open and their drivers.
+    pub slots: Slots,
+    /// The window starts on the home page, with no task open.
+    pub home: bool,
     /// Rows of "Working" groups to open.
     pub open: Vec<usize>,
     /// Rows whose technical details to show.
@@ -181,6 +213,10 @@ impl Scene {
             calls: Calls::default(),
             refuse: false,
             typed: None,
+            starts: Starts::default(),
+            ids: Ids::default(),
+            slots: Slots::default(),
+            home: false,
             open: vec![],
             technical: vec![],
             scroll: None,
@@ -197,15 +233,27 @@ pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, S
             .iter()
             .map(|(id, p)| ((*id).to_owned(), Some(Rc::clone(p)))),
     );
+    if scene.home {
+        open.clear();
+    }
+    *scene.ids.borrow_mut() = open.iter().map(|(id, _)| id.clone()).collect();
+    *scene.slots.borrow_mut() = open;
     let source = Box::new(Tasks {
-        open: RefCell::new(open),
+        open: Rc::clone(&scene.slots),
         calls: Rc::clone(&scene.calls),
+        starts: Rc::clone(&scene.starts),
+        ids: Rc::clone(&scene.ids),
         refuse: scene.refuse,
         seq: Cell::new(1_000),
     });
+    let home = scene.home;
     let mut offscreen = Offscreen::open(window.width, window.height, move |_cx| {
         let mut view = ShellView::with_source(shell(), status(), source);
-        view.show_task(SESSION);
+        // The tasks open at the start were seen by the first look, not opened since.
+        view.sync_tasks();
+        if !home {
+            view.show_task(SESSION);
+        }
         view
     })?;
     offscreen.settle(8)?;
@@ -224,6 +272,49 @@ pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, S
         offscreen.settle(8)?;
     }
     Ok(offscreen)
+}
+
+/// The serve restarted: the task `SESSION` has a new driver, which starts at
+/// the top with no measured heights and holds what `task` holds.
+pub fn replace_driver(scene: &Scene, task: Rc<Preview>) {
+    for (id, slot) in scene.slots.borrow_mut().iter_mut() {
+        if id == SESSION {
+            *slot = Some(Rc::clone(&task));
+        }
+    }
+}
+
+/// A new driver for the long task of the scene `task-long-at-the-end`.
+pub fn restarted_long_task() -> Rc<Preview> {
+    Rc::new(super::harness_scenes::long_task())
+}
+
+/// A task's tab, chosen.
+pub fn show_tab(window: &mut Offscreen<ShellView>, id: &str) -> Result<(), String> {
+    window.update(|view, window, cx| view.task_show(id, window, cx))?;
+    window.settle(4)
+}
+
+/// Whether the note about a refused send is up.
+pub fn composer_refused(window: &mut Offscreen<ShellView>) -> Result<bool, String> {
+    window.read(|view, _| view.composer_refused())
+}
+
+/// The home page's "New task", pressed.
+pub fn start(window: &mut Offscreen<ShellView>) -> Result<(), String> {
+    window.update(|view, _, cx| view.task_start(cx))?;
+    window.settle(8)
+}
+
+/// A sidebar section, chosen: it takes the main area.
+pub fn choose_section(window: &mut Offscreen<ShellView>, section: Section) -> Result<(), String> {
+    window.update(|view, _, cx| view.dispatch(Action::SelectSection(section), cx))?;
+    window.settle(4)
+}
+
+/// The task in the main area.
+pub fn shown(window: &mut Offscreen<ShellView>) -> Result<Option<String>, String> {
+    window.read(|view, _| view.shown_task())
 }
 
 /// Put `text` in the composer, as typing would.

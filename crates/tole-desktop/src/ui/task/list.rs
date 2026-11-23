@@ -18,6 +18,7 @@ use crate::ui::shell::ShellView;
 use tole_desktop_model::task::mark;
 use tole_desktop_model::task_strings as words;
 use tole_desktop_model::tokens::{size, DARK};
+use tole_desktop_model::Action;
 
 impl ShellView {
     /// Put `session` in the main area.
@@ -32,6 +33,7 @@ impl ShellView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.sync_tasks();
         let id = self.tasks.tabs.shown()?.to_owned();
         // The pane is taken out while it is built: building reads the window's
         // source through `self`.
@@ -54,6 +56,31 @@ impl ShellView {
                 .children(composer)
                 .into_any_element(),
         )
+    }
+
+    /// Look at the open set: a task that appeared is shown, one that closed is
+    /// let go (`Tabs::watch`).
+    pub(in crate::ui) fn sync_tasks(&mut self) {
+        let Some(open) = self.source().map(|s| s.open_tasks()) else {
+            return;
+        };
+        self.tasks.tabs.watch(&open);
+        self.tasks.panes.retain(|id, _| open.contains(id));
+    }
+
+    /// Why the last "New task" did not start a task, if it did not.
+    pub(in crate::ui) fn start_problem(&self) -> Option<tole_desktop_model::strings::StartProblem> {
+        self.source().and_then(|s| s.new_task_problem())
+    }
+
+    /// The home page's "New task": ask for a session in the selected folder.
+    /// The home page stays until the task appears (see `sync_tasks`).
+    pub(in crate::ui) fn task_start(&mut self, cx: &mut Context<Self>) {
+        let folder = self.state.selected().map(|f| f.path.clone());
+        if let Some(source) = self.source() {
+            source.new_task(folder.as_deref());
+        }
+        self.dispatch(Action::NewTask, cx);
     }
 
     /// Learn from the last frame, then draw the window the driver gives now.

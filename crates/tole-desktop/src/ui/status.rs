@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use tole_desktop_model::strings::StartProblem;
 use tole_desktop_model::tokens::Tone;
 use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState};
 
@@ -62,6 +63,25 @@ pub trait Source {
         let _ = session;
     }
 
+    /// "New task": make a session in `folder` (the serve's workspace when
+    /// `None`) and open it as a task. Returns at once: the task shows in
+    /// [`open_tasks`](Self::open_tasks) when the serve made it.
+    fn new_task(&self, folder: Option<&str>) {
+        let _ = folder;
+    }
+
+    /// Why the last [`new_task`](Self::new_task) did not start a task
+    /// (refused, or the serve could not make it); `None` when it did, or none
+    /// was tried.
+    fn new_task_problem(&self) -> Option<StartProblem> {
+        None
+    }
+
+    /// The last [`new_task`](Self::new_task) did not start a task.
+    fn new_task_failed(&self) -> bool {
+        self.new_task_problem().is_some()
+    }
+
     /// What the owner did in an open task. Returns at once; the reason it did
     /// nothing, if it did not, is the answer.
     #[cfg(unix)]
@@ -92,6 +112,18 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
 
     fn close_task(&self, session: &str) {
         (**self).close_task(session);
+    }
+
+    fn new_task(&self, folder: Option<&str>) {
+        (**self).new_task(folder);
+    }
+
+    fn new_task_problem(&self) -> Option<StartProblem> {
+        (**self).new_task_problem()
+    }
+
+    fn new_task_failed(&self) -> bool {
+        (**self).new_task_failed()
     }
 
     #[cfg(unix)]

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tole_client::{
     Approval, ApprovalList, CancelReply, CronJobState, CronJobs, CronRuns, Decision, DecisionReply,
-    EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply, PromptRequest,
-    SessionStatus, SkillsState, ToolsState,
+    EntriesPage, Error, InterruptReply, InterruptRequest, NewSession, PromptReply, PromptRequest,
+    SessionOpened, SessionStatus, SkillsState, ToolsState,
 };
 use tole_desktop_model::ServeState;
 
@@ -135,6 +135,15 @@ impl Api for Scripted {
         Ok(
             serde_json::from_value(json!({"servers": servers, "notes": [], "probed": false}))
                 .expect("a tools answer"),
+        )
+    }
+
+    /// Every session it makes is `s1`, in the folder asked for.
+    fn create_session(&self, req: &NewSession) -> Result<SessionOpened, Error> {
+        let workspace = req.cwd.clone().unwrap_or_else(|| "/w".to_owned());
+        Ok(
+            serde_json::from_value(json!({"sessionId": "s1", "workspace": workspace}))
+                .expect("an opened session"),
         )
     }
 
