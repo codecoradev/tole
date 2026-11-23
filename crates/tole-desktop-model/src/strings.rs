@@ -35,6 +35,19 @@ pub const NO_WINDOW_TOOLKIT: &str = "this build has no window toolkit; rebuild w
 pub const NO_DISPLAY: &str =
     "no display is available (on Linux, DISPLAY or WAYLAND_DISPLAY must name one)";
 
+/// Why the app does not start the serve when it was started in `/` (a file
+/// manager or launcher does that): a serve rooted there could read the whole
+/// disk. Shown after "Tole did not start: ".
+pub const WORKSPACE_IS_ROOT: &str = "the folder the app was started in is the top of the disk, so Tole will not work in it. Start the app from the project folder instead.";
+
+/// The same for the home folder, which is too broad to be a workspace.
+pub const WORKSPACE_IS_HOME: &str = "the folder the app was started in is your home folder, which is too broad for Tole to work in. Start the app from the project folder instead.";
+
+/// The app could not start the threads it needs.
+pub fn start_threads_failed(detail: &str) -> String {
+    format!("the app could not start its background services: {detail}")
+}
+
 /// The thread that starts Tole could not be started.
 pub fn launch_thread_failed(detail: &str) -> String {
     format!("could not start a thread: {detail}")

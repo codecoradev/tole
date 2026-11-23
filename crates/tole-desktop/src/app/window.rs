@@ -10,9 +10,13 @@ impl Boot {
     /// The shell the window starts from: the folder the app was started in is
     /// its first working folder, selected. Nothing else is claimed: the
     /// connection reads as connecting and the counts as unknown until the app
-    /// says otherwise.
+    /// says otherwise. A folder that is not a workspace (see
+    /// [`Boot::refusal`]) is not shown as one: the shell has no folder.
     pub fn shell(&self) -> ShellState {
         let mut shell = ShellState::new();
+        if self.refusal().is_some() {
+            return shell;
+        }
         let name = self.workspace.file_name().map_or_else(
             || self.workspace.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -73,13 +77,19 @@ mod tests {
     use super::*;
     use crate::driver::SystemClock;
 
-    fn boot(workspace: &str) -> Boot {
-        Boot::from_parts(workspace.into(), None, Path::new("/tmp"), 7)
+    fn boot(workspace: &str, home: &str) -> Boot {
+        Boot::from_parts(
+            workspace.into(),
+            None,
+            Some(home.into()),
+            Path::new("/tmp"),
+            7,
+        )
     }
 
     #[test]
     fn the_folder_the_app_started_in_is_the_first_folder_and_is_selected() {
-        let shell = boot("/home/me/Invoices").shell();
+        let shell = boot("/home/me/Invoices", "/home/me").shell();
         let folder = shell.selected().expect("selected");
         assert_eq!(folder.name, "Invoices");
         assert_eq!(folder.path, "/home/me/Invoices");
@@ -89,6 +99,12 @@ mod tests {
         // Nothing is claimed before the app speaks.
         assert_eq!(shell.connection.status, ConnectionStatus::Connecting);
         assert_eq!(shell.approvals_pending, Badge::Unknown);
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_workspace_is_not_shown_as_one() {
+        assert!(boot("/", "/home/me").shell().folders.is_empty());
+        assert!(boot("/home/me", "/home/me").shell().folders.is_empty());
     }
 
     #[test]

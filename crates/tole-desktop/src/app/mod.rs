@@ -53,9 +53,11 @@
 //!
 //! # Not starting
 //!
-//! The backend is started before the launch begins, so a backend that cannot
-//! start (no threads) leaves no serve behind: [`App::start`] returns the error
-//! and nothing is running.
+//! [`App::start`] refuses a folder that cannot be a workspace: `/` and the home
+//! folder, which a file manager or a launcher starts an app in ([`Boot::refusal`]).
+//! It returns a [`StartError`] with the reason, no serve is started, and the
+//! window says so. It also refuses when the backend's threads cannot start, and
+//! then the launch is never begun: the backend is started first.
 //!
 //! # Quitting
 //!
@@ -88,7 +90,7 @@ use std::sync::Arc;
 
 use tole_desktop_model::OwnerAction;
 
-pub use self::boot::Boot;
+pub use self::boot::{Boot, StartError, Workspace};
 pub use self::launch::Serve;
 use self::launch::{supervisor_launcher, LaunchLink, Launcher};
 pub use self::quit::{Limits, Quit, ServeQuit};
@@ -105,11 +107,16 @@ pub struct App {
 
 impl App {
     /// Start the serve for `boot` (off this thread) and the backend, and
-    /// return at once. `Err` only when the system cannot start the backend's
-    /// threads: nothing is running and no serve was started then.
-    pub fn start(boot: &Boot) -> io::Result<App> {
+    /// return at once. `Err` when the folder the app was started in is not a
+    /// workspace (`/` or the home folder) or when the system cannot start the
+    /// backend's threads: in both cases nothing is running and no serve was
+    /// started.
+    pub fn start(boot: &Boot) -> Result<App, StartError> {
+        if let Some(refused) = boot.refusal() {
+            return Err(StartError::Workspace(refused));
+        }
         let launcher = supervisor_launcher(boot.supervisor_config());
-        App::start_with(launcher, Arc::new(SystemClock))
+        App::start_with(launcher, Arc::new(SystemClock)).map_err(StartError::Threads)
     }
 
     pub(crate) fn start_with(launcher: Launcher, clock: Arc<dyn Clock>) -> io::Result<App> {

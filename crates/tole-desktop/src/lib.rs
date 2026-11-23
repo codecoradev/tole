@@ -26,12 +26,17 @@
 //!   app was started in, off the window's thread, keeps the backend following
 //!   it, and gives the window the view, a change signal and the few commands
 //!   it may call (no toolkit).
+//! - [`cli`]: `--help` and `--version` of the binary. `main.rs` boots the
+//!   [`app`], opens the window on it ([`ui::run`]) and ends the app in order
+//!   when the window closes; where there is no [`app`] (not macOS or Linux) it
+//!   opens the sample-data preview.
 
 pub mod adapter;
 #[cfg(unix)]
 pub mod app;
 #[cfg(unix)]
 pub mod backend;
+pub mod cli;
 #[cfg(unix)]
 pub mod driver;
 #[cfg(unix)]
