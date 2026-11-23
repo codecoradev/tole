@@ -106,6 +106,54 @@ fn a_command_is_the_target_when_there_is_no_path_and_an_empty_one_is_none() {
 }
 
 #[test]
+fn an_owners_steer_note_shows_the_owners_words_without_the_wrapper_core_adds() {
+    // The exact text `turn::deliver_interrupts` commits.
+    let wrapped = |tag: &str, words: &str, source: &str| {
+        let text =
+            format!("[{tag} \u{2014} injected mid-turn, not part of the original request] {words}");
+        let mut e = user(1, &text);
+        e.payload["interrupt"] = json!(true);
+        e.payload["source"] = json!(source);
+        EntryMapper::new().entry(&e)
+    };
+    let words = |events: &[TaskEvent]| match events {
+        [TaskEvent::UserMessage { text, kind, .. }] => (text.clone(), *kind),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        words(&wrapped("owner interrupt", "use July first", "owner")),
+        ("use July first".to_string(), UserKind::Steer)
+    );
+    assert_eq!(
+        words(&wrapped(
+            "owner interrupt \u{b7} urgent",
+            "stop that",
+            "owner"
+        )),
+        ("stop that".to_string(), UserKind::Steer)
+    );
+    // Only the wrapper, once: the owner's own brackets stay.
+    let twice = "[owner interrupt \u{2014} injected mid-turn, not part of the original request] x";
+    assert_eq!(
+        words(&wrapped("owner interrupt", twice, "owner")).0,
+        format!("{twice}")
+    );
+    // A note of an older core has no wrapper, and a sibling notice is not the owner's.
+    let mut old = user(1, "focus on the tests");
+    old.payload["interrupt"] = json!(true);
+    assert_eq!(
+        words(&EntryMapper::new().entry(&old)).0,
+        "focus on the tests"
+    );
+    let notice = wrapped("sibling notice", "a file changed", "notice");
+    assert_eq!(words(&notice).1, UserKind::Synthetic);
+    assert!(
+        words(&notice).0.starts_with("[sibling notice"),
+        "left as it is"
+    );
+}
+
+#[test]
 fn the_flags_of_a_user_message_decide_its_kind_like_core_reads_them() {
     let kind = |flags: Value| {
         let mut e = user(1, "x");
