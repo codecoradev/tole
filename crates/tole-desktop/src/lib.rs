@@ -19,8 +19,13 @@
 //! - [`driver`] (macOS and Linux): the threads that call the client, feed the
 //!   adapter and the model, and give the UI a plain-data view; the approvals
 //!   driver is the first.
+//! - [`backend`] (macOS and Linux): keeps the drivers true to the supervisor's
+//!   serve (starts them when it is ready, stops them when it is not) and gives
+//!   the UI one plain-data view to read.
 
 pub mod adapter;
+#[cfg(unix)]
+pub mod backend;
 #[cfg(unix)]
 pub mod driver;
 #[cfg(unix)]

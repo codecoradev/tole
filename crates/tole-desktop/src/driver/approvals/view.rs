@@ -39,6 +39,12 @@ pub struct ApprovalsView {
 }
 
 impl ApprovalsView {
+    /// What there is before a driver has run, and after it stopped: the list
+    /// is not known (badge `Unknown`), nothing is listed and no box is open.
+    pub fn unknown() -> Self {
+        Self::of(&ApprovalsState::new(), 0, 0, Vec::new())
+    }
+
     pub(super) fn of(
         state: &ApprovalsState,
         now: u64,
