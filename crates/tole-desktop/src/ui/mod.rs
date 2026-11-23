@@ -22,6 +22,10 @@ mod adapter;
 pub mod harness;
 #[cfg(feature = "render-harness")]
 pub mod harness_live;
+#[cfg(feature = "render-harness")]
+mod harness_scenes;
+#[cfg(feature = "render-harness")]
+pub mod harness_task;
 #[cfg(feature = "gpui")]
 mod header;
 #[cfg(feature = "gpui")]

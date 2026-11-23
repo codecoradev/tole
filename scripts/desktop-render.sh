@@ -9,7 +9,7 @@
 #   --size WxH    window size in logical pixels (default: the window's own,
 #                 1200x780; the design boards are 1440x900). The images are at
 #                 2x, the fixed scale factor of GPUI's test platform.
-#   --test        runs the harness checks of crates/tole-desktop/tests/render.rs
+#   --test        runs the harness checks of crates/tole-desktop/tests/render.rs and render_task.rs
 #                 (PNG written, size, tokens on screen, Tab and Shift+Tab
 #                 order) instead of writing to a directory you name.
 #
@@ -104,7 +104,7 @@ manifest="$work/Cargo.toml"
 features=(--features render-harness -p tole-desktop)
 
 if [ "$mode" = test ]; then
-  "$cargo_bin" test --manifest-path "$manifest" "${features[@]}" --lib --test render -- --test-threads=1
+  "$cargo_bin" test --manifest-path "$manifest" "${features[@]}" --lib --test render --test render_task -- --test-threads=1
 else
   "$cargo_bin" run --manifest-path "$manifest" "${features[@]}" --example render -- "$out" ${size_args[@]+"${size_args[@]}"}
   echo "wrote the images and index.tsv to $out (2x; compare each with its board in docs/design/desktop, see index.tsv)"

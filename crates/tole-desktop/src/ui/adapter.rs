@@ -314,6 +314,28 @@ pub mod offscreen {
             Ok(())
         }
 
+        /// Changes the view with the window at hand, then paints.
+        pub fn update<R>(
+            &mut self,
+            f: impl FnOnce(&mut V, &mut Window, &mut Context<V>) -> R,
+        ) -> Result<R, String> {
+            let view = self.view.clone();
+            let out = self
+                .cx
+                .update_window(self.window, |_, window, cx| {
+                    view.update(cx, |view, cx| f(view, window, cx))
+                })
+                .map_err(|err| err.to_string())?;
+            self.draw()?;
+            Ok(out)
+        }
+
+        /// Paints `frames` more frames: a list measures its rows in one frame
+        /// and moves in the next.
+        pub fn settle(&mut self, frames: usize) -> Result<(), String> {
+            (0..frames).try_for_each(|_| self.draw())
+        }
+
         /// Presses one key (`"tab"`, `"shift-tab"`) and paints the result.
         pub fn press(&mut self, keystroke: &'static str) -> Result<(), String> {
             let keystroke = gpui::Keystroke::parse(keystroke).map_err(|err| err.to_string())?;

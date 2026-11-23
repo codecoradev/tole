@@ -1,0 +1,133 @@
+//! Checks of the task view in the offscreen render harness (#1031): what each
+//! row shows and how the list follows a running task. They run only through
+//! `scripts/desktop-render.sh --test` (feature `render-harness`, with the local
+//! patch of the manifest); a plain `cargo test` skips this file.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use tole_desktop::ui::harness::{Rendered, WindowSize};
+use tole_desktop::ui::harness_task::{
+    exchanges, jump, open as open_scene, render_tasks, scenes, scroll_state, scroll_to, Scene,
+};
+use tole_desktop_model::tokens::{size, Rgb, DARK};
+
+/// One window at a time: each opens its own GPU device.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn out_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("render-harness")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn rgb(c: Rgb) -> [u8; 4] {
+    [c.r(), c.g(), c.b(), 255]
+}
+
+fn scene(name: &str) -> Scene {
+    scenes().into_iter().find(|s| s.name == name).expect(name)
+}
+
+/// Every pixel of `colour` in the main area (right of the sidebar, below the header).
+fn count_in_main(r: &Rendered, colour: Rgb) -> usize {
+    let (from_x, from_y) = (
+        size::SIDEBAR_WIDTH as u32 * 2 + 4,
+        size::TOPBAR_HEIGHT as u32 * 2 + 4,
+    );
+    let at = rgb(colour);
+    let mut n = 0;
+    for y in from_y..r.height {
+        for x in from_x..r.width {
+            n += usize::from(r.pixel(x, y) == at);
+        }
+    }
+    n
+}
+
+#[test]
+fn every_task_scene_is_drawn_and_shows_what_its_rows_say() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = out_dir("tasks");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let rendered = render_tasks(&dir, WindowSize::default()).expect("render");
+    let by_name = |n: &str| rendered.iter().find(|r| r.name == n).expect(n);
+    for r in &rendered {
+        assert!(r.colours() > 8 && r.bytes > 1000, "{}: blank", r.name);
+    }
+    // The owner's words are a bubble (the raised colour); a task with none has no bubble.
+    for with in ["task-working", "task-thinking", "task-answer-markdown"] {
+        assert!(
+            count_in_main(by_name(with), DARK.raised) > 2_000,
+            "{with}: no bubble"
+        );
+    }
+    for without in ["task-empty", "task-opening"] {
+        assert_eq!(count_in_main(by_name(without), DARK.raised), 0, "{without}");
+    }
+    // A step that did not work is shown in the danger colour, and only then.
+    assert!(count_in_main(by_name("task-failed-step"), DARK.danger) > 50);
+    assert_eq!(count_in_main(by_name("task-working"), DARK.danger), 0);
+    // An opened group shows its link (accent); a folded one does not.
+    assert!(
+        count_in_main(by_name("task-working"), DARK.accent) > 50,
+        "an open group"
+    );
+    assert_eq!(
+        count_in_main(by_name("task-writing"), DARK.accent),
+        0,
+        "a folded group"
+    );
+}
+
+#[test]
+fn a_long_task_builds_a_window_of_rows_and_the_list_does_not_grow_with_it() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let long = scene("task-long-at-the-end");
+    let task = long.task.clone().expect("a task");
+    let mut window = open_scene(&long, WindowSize::default()).expect("open");
+    let (following, top) = scroll_state(&mut window).expect("state");
+    let view = task.view();
+    // 500 exchanges are 1,500 rows; only those near the screen are built.
+    assert_eq!(view.total_rows, 1_500);
+    assert!(view.rows.len() < 60, "built {} rows", view.rows.len());
+    assert!(
+        following && view.window.end == view.total_rows,
+        "at the end"
+    );
+    assert!(top > 20_000.0, "scrolled to the end of a long list: {top}");
+}
+
+#[test]
+fn a_running_task_follows_its_end_until_the_owner_scrolls_up_and_jump_returns() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let long = scene("task-long-at-the-end");
+    let task = long.task.clone().expect("a task");
+    let mut w = open_scene(&long, WindowSize::default()).expect("open");
+    let (_, at_end) = scroll_state(&mut w).expect("state");
+    // More words arrive: the list moves with them.
+    task.feed(exchanges(100_000, 20));
+    w.settle(8).expect("settle");
+    let (following, top) = scroll_state(&mut w).expect("state");
+    assert!(
+        following && top > at_end,
+        "it did not follow: {top} <= {at_end}"
+    );
+    // The owner scrolls up: it stays where they put it however much arrives.
+    scroll_to(&mut w, top - 3_000.0).expect("scroll");
+    let (following, reading) = scroll_state(&mut w).expect("state");
+    assert!(!following);
+    task.feed(exchanges(200_000, 20));
+    w.settle(8).expect("settle");
+    assert_eq!(
+        scroll_state(&mut w),
+        Ok((false, reading)),
+        "it moved under the reader"
+    );
+    // "Jump to latest" follows again.
+    jump(&mut w).expect("jump");
+    let (following, top) = scroll_state(&mut w).expect("state");
+    assert!(following && top > reading);
+}
