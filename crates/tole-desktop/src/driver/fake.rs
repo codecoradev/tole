@@ -15,20 +15,64 @@
 //! the sender ends the stream cleanly; a stream nobody scripted stays silent.
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 use tole_client::{
     Approval, ApprovalList, CancelReply, CronJobState, CronJobs, CronRuns, Decision, DecisionReply,
-    EntriesPage, InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result,
-    SessionStatus, SkillsState, ToolsState,
+    EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result,
+    SessionStatus, SkillsState, StreamItem, ToolsState,
 };
 
-mod script;
-
-pub(crate) use self::script::{refused, Frame};
-use self::script::{FakeSource, Queue, Scripted, PATIENCE};
 use super::api::{Api, EventSource};
+
+const PATIENCE: Duration = Duration::from_secs(10);
+
+enum Scripted<T> {
+    Now(Result<T>),
+    Gate(Receiver<Result<T>>),
+    /// The call panics.
+    Panic,
+}
+
+impl<T> Scripted<T> {
+    fn settle(self) -> Result<T> {
+        match self {
+            Scripted::Now(r) => r,
+            Scripted::Gate(rx) => rx.recv().unwrap_or_else(|_| Err(refused())),
+            Scripted::Panic => panic!("a scripted panic in an Api call"),
+        }
+    }
+}
+
+type Queue<T> = VecDeque<Scripted<T>>;
+
+/// What a scripted stream yields next.
+pub(crate) enum Frame {
+    Item(StreamItem),
+    Fail(Error),
+    /// The source panics.
+    Panic,
+}
+
+struct FakeSource(Receiver<Frame>);
+
+impl EventSource for FakeSource {
+    fn next_item(&mut self) -> Result<Option<StreamItem>> {
+        match self.0.recv() {
+            Ok(Frame::Item(item)) => Ok(Some(item)),
+            Ok(Frame::Fail(e)) => Err(e),
+            Ok(Frame::Panic) => panic!("a scripted panic in a stream"),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+pub(crate) fn refused() -> Error {
+    Error::Connect(io::Error::from(io::ErrorKind::ConnectionRefused))
+}
 
 #[derive(Default)]
 struct Script {
@@ -95,6 +139,9 @@ macro_rules! scripted {
     };
 }
 
+// Declared after the macro so that the module can use it.
+mod cron;
+
 // The whole scripting surface is here for every driver's tests; one test file
 // does not use every knob.
 #[allow(dead_code)]
@@ -159,28 +206,6 @@ impl FakeApi {
     );
     scripted!(skills, SkillsState, reply_skills, gate_skills, panic_skills);
     scripted!(tools, ToolsState, reply_tools, gate_tools, panic_tools);
-    scripted!(
-        cron_jobs,
-        CronJobs,
-        reply_cron_jobs,
-        gate_cron_jobs,
-        panic_cron_jobs
-    );
-    scripted!(
-        cron_runs,
-        CronRuns,
-        reply_cron_runs,
-        gate_cron_runs,
-        panic_cron_runs
-    );
-    scripted!(pauses, CronJobState, reply_pause, gate_pause, panic_pause);
-    scripted!(
-        resumes,
-        CronJobState,
-        reply_resume,
-        gate_resume,
-        panic_resume
-    );
 
     /// A status call with nothing queued answers this (a poll that goes on).
     pub(crate) fn always_status(&self, status: SessionStatus) {
@@ -250,26 +275,6 @@ impl FakeApi {
         self.script().tools_calls
     }
 
-    /// How many `GET /cron/jobs` calls were made.
-    pub(crate) fn cron_jobs_calls(&self) -> usize {
-        self.script().cron_jobs_calls
-    }
-
-    /// `(job, limit)` of every `GET /cron/runs` call.
-    pub(crate) fn cron_runs_calls(&self) -> Vec<(String, usize)> {
-        self.script().cron_runs_calls.clone()
-    }
-
-    /// The id of every pause call.
-    pub(crate) fn pauses(&self) -> Vec<String> {
-        self.script().pause_calls.clone()
-    }
-
-    /// The id of every resume call.
-    pub(crate) fn resumes(&self) -> Vec<String> {
-        self.script().resume_calls.clone()
-    }
-
     pub(crate) fn opens(&self, session: &str) -> usize {
         self.script().opens.get(session).copied().unwrap_or(0)
     }
@@ -331,22 +336,6 @@ impl FakeApi {
 
     pub(crate) fn wait_tools(&self, n: usize) {
         self.wait("GET /tools calls", n, |s| s.tools_calls);
-    }
-
-    pub(crate) fn wait_cron_jobs(&self, n: usize) {
-        self.wait("GET /cron/jobs calls", n, |s| s.cron_jobs_calls);
-    }
-
-    pub(crate) fn wait_cron_runs(&self, n: usize) {
-        self.wait("GET /cron/runs calls", n, |s| s.cron_runs_calls.len());
-    }
-
-    pub(crate) fn wait_pauses(&self, n: usize) {
-        self.wait("pause calls", n, |s| s.pause_calls.len());
-    }
-
-    pub(crate) fn wait_resumes(&self, n: usize) {
-        self.wait("resume calls", n, |s| s.resume_calls.len());
     }
 
     pub(crate) fn wait_opens(&self, session: &str, n: usize) {

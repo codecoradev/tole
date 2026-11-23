@@ -31,6 +31,7 @@
 //! Deadlines are on the monotonic clock; the wall clock is read only to see the
 //! jump.
 
+mod lane;
 mod loading;
 
 use std::sync::Arc;
@@ -38,10 +39,10 @@ use std::time::Duration;
 
 use tole_desktop_model::Tab;
 
+use self::lane::Lane;
 pub(super) use self::loading::Reply;
 use super::store::Store;
 use crate::adapter::skills::{LoadId, LoadIds};
-use crate::driver::shared::lane::Lane;
 use crate::driver::shared::thread::DriverInput;
 
 /// The worker wakes at least this often (a refresh, a backoff or the age of the
@@ -122,7 +123,7 @@ pub(super) struct Engine {
     ids: LoadIds,
     refresh: Duration,
     /// One schedule per route, by `Route::index`.
-    lanes: [Lane<LoadId>; 2],
+    lanes: [Lane; 2],
     /// The time of the last step, to see the clock jump.
     last_seen: Option<Now>,
 }
