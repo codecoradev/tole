@@ -140,8 +140,8 @@ fn the_skills_count_is_the_skills_and_the_tools_that_wait() {
     assert_eq!(skills_badge(&known(9, 0, 0)), Badge::Count(0));
     let mut shell = ShellState::new();
     let applied = apply(&mut shell, &known(0, 2, 3));
-    assert_eq!(shell.skills_new, 5);
-    assert!(applied.changed && !applied.skills_unknown);
+    assert_eq!(shell.skills_new, Badge::Count(5));
+    assert!(applied.changed);
     assert_eq!(shell.badge(Section::SkillsAndTools), Some(5));
 }
 
@@ -157,27 +157,29 @@ fn an_unknown_skills_count_is_never_written_as_a_zero() {
         v.skills.tools_needing_attention = tools;
         assert_eq!(skills_badge(&v), Badge::Unknown, "a part is a lower bound");
         assert!(
-            !actions(&v)
-                .iter()
-                .any(|a| matches!(a, Action::SetSkillsNew(_))),
-            "no count is written"
+            actions(&v).contains(&Action::SetSkillsNew(Badge::Unknown)),
+            "what is not known is written as unknown"
         );
         let mut shell = ShellState::new();
-        shell.apply(Action::SetSkillsNew(4));
-        let applied = apply(&mut shell, &v);
-        assert_eq!(shell.skills_new, 4, "left as it was, not zero");
-        assert!(applied.skills_unknown, "and said");
+        shell.apply(Action::SetSkillsNew(Badge::Count(4)));
+        apply(&mut shell, &v);
+        assert_eq!(
+            shell.skills_new,
+            Badge::Unknown,
+            "not the old count, not zero"
+        );
+        assert_eq!(
+            shell.badge_text(Section::SkillsAndTools).as_deref(),
+            Some("?")
+        );
     }
 }
 
 #[test]
 fn a_new_shell_with_nothing_known_reports_the_skills_count_unknown() {
-    // The shell's own count starts at 0 and cannot say "not known": this is the
-    // gap `Applied::skills_unknown` reports.
     let mut shell = ShellState::new();
-    let applied = apply(&mut shell, &view(ServeState::Starting));
-    assert_eq!(shell.skills_new, 0);
-    assert!(applied.skills_unknown);
+    apply(&mut shell, &view(ServeState::Starting));
+    assert_eq!(shell.skills_new, Badge::Unknown);
     assert_eq!(shell.approvals_pending, Badge::Unknown);
 }
 
@@ -188,7 +190,6 @@ fn applying_the_same_view_twice_changes_nothing_the_second_time() {
     assert!(apply(&mut shell, &v).changed);
     let again = apply(&mut shell, &v);
     assert!(!again.changed);
-    assert!(!again.skills_unknown);
 }
 
 #[test]

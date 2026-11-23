@@ -59,8 +59,8 @@ pub struct Status {
     /// What the local serve is doing.
     pub serve: ServeState,
     /// The count of new skills and tools is not known now: the shell's
-    /// [`ShellState::skills_new`] is then the last known number (0 before the
-    /// first) and must not be shown as the truth.
+    /// [`ShellState::skills_new`] says `Unknown` too, and the sidebar shows
+    /// the mark.
     pub skills_unknown: bool,
     /// There is an app behind the window to press a button on. False for a
     /// window whose app could not start: its notice then has no button, which
@@ -230,8 +230,8 @@ mod tests {
             badge_text(Some(&unknown), &shell, Section::SkillsAndTools),
             mark
         );
-        // The shell's own number is 0 here, and must not be what is shown.
-        assert_eq!(shell.badge_text(Section::SkillsAndTools), None);
+        // The shell's own count is Unknown too, and says the same.
+        assert_eq!(shell.badge_text(Section::SkillsAndTools), mark);
         // Approvals say their own unknown; no other row gains a mark.
         assert_eq!(badge_text(Some(&unknown), &shell, Section::Approvals), mark);
         assert_eq!(
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn a_known_count_and_a_preview_read_as_the_shell_says() {
         let mut shell = ShellState::new();
-        shell.apply(Action::SetSkillsNew(3));
+        shell.apply(Action::SetSkillsNew(Badge::Count(3)));
         let known = status(running());
         let three = shell.badge_text(Section::SkillsAndTools);
         assert!(three.is_some());

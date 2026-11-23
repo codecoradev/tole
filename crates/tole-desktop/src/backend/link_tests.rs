@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tole_desktop_model::{Action, ConnectionStatus, ServeFailure, ServeState, ShellState};
+use tole_desktop_model::{Action, Badge, ConnectionStatus, ServeFailure, ServeState, ShellState};
 
 use super::shell::apply;
 use super::{Backend, Config, ServeLink, SupervisorLink};
@@ -64,9 +64,9 @@ fn a_backend_over_it_shows_the_failure_and_attaches_nothing() {
     assert!(backend.with_approvals(|_| ()).is_none());
     let mut shell = ShellState::new();
     shell.apply(Action::SetConnectionStatus(ConnectionStatus::Preview));
-    let applied = apply(&mut shell, &view);
+    apply(&mut shell, &view);
     assert_eq!(shell.connection.status, ConnectionStatus::Unreachable);
-    assert!(applied.skills_unknown);
+    assert_eq!(shell.skills_new, Badge::Unknown);
     assert_eq!(
         backend.thread_report(),
         Default::default(),
