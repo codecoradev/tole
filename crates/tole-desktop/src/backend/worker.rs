@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::engine::{Effect, Engine, Input, Observation};
 use super::link::Link;
-use super::live::{Live, Settings};
+use super::live::{stop_all, Live, Settings};
 use super::shared::{Fanin, Msg, Shared};
 use crate::driver::clock::{Clock, Shutdown};
 use crate::driver::shared::handle::{self, OnChange};
@@ -71,6 +71,8 @@ impl Worker {
             state: look.state,
             epoch: look.epoch,
             drivers_alive: self.live.as_ref().is_none_or(Live::alive),
+            dead_tasks: self.live.as_ref().map_or_else(Vec::new, Live::dead_tasks),
+            wanted: self.shared.tasks.list(),
         };
         let mut queue = VecDeque::from([Input::Observe(observation)]);
         while let Some(input) = queue.pop_front() {
@@ -80,10 +82,20 @@ impl Worker {
             }
             for effect in out.effects {
                 match effect {
-                    Effect::Attach { epoch } => {
-                        queue.push_back(Input::Attached(self.attach(epoch)));
+                    Effect::Attach { epoch, sessions } => {
+                        queue.push_back(Input::Attached(self.attach(epoch, sessions)));
                     }
                     Effect::Detach => self.detach(),
+                    Effect::StartTask(id) => {
+                        let started = self.start_task(&id);
+                        queue.push_back(Input::TaskStarted(id, started));
+                    }
+                    Effect::StopTasks(ids) => self.stop_tasks(&ids),
+                    Effect::SetSessions(sessions) => {
+                        if let Some(live) = &self.live {
+                            live.set_sessions(sessions);
+                        }
+                    }
                 }
             }
         }
@@ -92,17 +104,42 @@ impl Worker {
 
     /// Start the drivers over a new `Api`. `false` when there is none yet or
     /// a driver cannot start.
-    fn attach(&mut self, epoch: u64) -> bool {
+    fn attach(&mut self, epoch: u64, sessions: Vec<String>) -> bool {
         let Some(api) = self.link.api() else {
             return false;
         };
-        let started = Live::start(api, &self.clock, epoch, self.settings, &self.fan);
+        let (clock, settings, fan) = (&self.clock, self.settings, &self.fan);
+        let started = Live::start(api, clock, epoch, settings, fan, sessions);
         let Ok(live) = started else {
             return false;
         };
         self.shared.publish(Some(live.attached()));
         self.live = Some(live);
         true
+    }
+
+    /// Start the driver of one task over the api of the drivers that run.
+    /// `false` when the system has no thread for it.
+    fn start_task(&mut self, id: &str) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        if live.start_task(id).is_err() {
+            return false;
+        }
+        self.shared.publish(Some(live.attached()));
+        true
+    }
+
+    /// Stop task drivers: the view stops showing them first, no lock is held
+    /// while they stop.
+    fn stop_tasks(&mut self, ids: &[String]) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let drivers = live.take_tasks(ids);
+        self.shared.publish(Some(live.attached()));
+        self.shared.add_report(stop_all(drivers, DETACH_JOIN));
     }
 
     /// Stop the drivers, if any. The view reads unknown from before the first
