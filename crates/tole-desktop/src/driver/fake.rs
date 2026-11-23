@@ -21,9 +21,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tole_client::{
-    Approval, ApprovalList, CancelReply, Decision, DecisionReply, EntriesPage, Error,
-    InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result, SessionStatus,
-    SkillsState, StreamItem, ToolsState,
+    Approval, ApprovalList, CancelReply, CronJobState, CronJobs, CronRuns, Decision, DecisionReply,
+    EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply, PromptRequest, Result,
+    SessionStatus, SkillsState, StreamItem, ToolsState,
 };
 
 use super::api::{Api, EventSource};
@@ -86,6 +86,10 @@ struct Script {
     decides: Queue<DecisionReply>,
     skills: Queue<SkillsState>,
     tools: Queue<ToolsState>,
+    cron_jobs: Queue<CronJobs>,
+    cron_runs: Queue<CronRuns>,
+    pauses: Queue<CronJobState>,
+    resumes: Queue<CronJobState>,
     always_status: Option<SessionStatus>,
     streams: HashMap<String, VecDeque<Receiver<Frame>>>,
     /// Senders of streams nobody scripted: they stay silent, open.
@@ -100,6 +104,10 @@ struct Script {
     decide_calls: Vec<(String, Decision)>,
     skills_calls: usize,
     tools_calls: usize,
+    cron_jobs_calls: usize,
+    cron_runs_calls: Vec<(String, usize)>,
+    pause_calls: Vec<String>,
+    resume_calls: Vec<String>,
     opens: HashMap<String, usize>,
     afters: Vec<u64>,
 }
@@ -130,6 +138,9 @@ macro_rules! scripted {
         }
     };
 }
+
+// Declared after the macro so that the module can use it.
+mod cron;
 
 // The whole scripting surface is here for every driver's tests; one test file
 // does not use every knob.
@@ -431,5 +442,27 @@ impl Api for FakeApi {
 
     fn tools(&self) -> Result<ToolsState> {
         self.call(|s| s.tools_calls += 1, |s| s.tools.pop_front())
+    }
+
+    fn cron_jobs(&self) -> Result<CronJobs> {
+        self.call(|s| s.cron_jobs_calls += 1, |s| s.cron_jobs.pop_front())
+    }
+
+    fn cron_runs(&self, job: &str, limit: usize) -> Result<CronRuns> {
+        let job = job.to_owned();
+        self.call(
+            |s| s.cron_runs_calls.push((job, limit)),
+            |s| s.cron_runs.pop_front(),
+        )
+    }
+
+    fn pause_cron_job(&self, id: &str) -> Result<CronJobState> {
+        let id = id.to_owned();
+        self.call(|s| s.pause_calls.push(id), |s| s.pauses.pop_front())
+    }
+
+    fn resume_cron_job(&self, id: &str) -> Result<CronJobState> {
+        let id = id.to_owned();
+        self.call(|s| s.resume_calls.push(id), |s| s.resumes.pop_front())
     }
 }

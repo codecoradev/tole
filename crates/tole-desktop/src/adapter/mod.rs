@@ -20,10 +20,12 @@
 //! - Server data never panics: no `unwrap`, no indexing, no slicing of a server
 //!   string, and counters saturate.
 //!
-//! One module per capability: [`approvals`], [`skills`] (with the tools page)
-//! and [`task`]; `wire` holds what the first two read the same way.
+//! One module per capability: [`approvals`], [`automations`], [`skills`] (with
+//! the tools page) and [`task`]; `wire` holds what the first two read the same
+//! way.
 
 pub mod approvals;
+pub mod automations;
 pub mod skills;
 pub mod task;
 mod wire;

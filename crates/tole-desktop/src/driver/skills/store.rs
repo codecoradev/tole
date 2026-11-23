@@ -6,16 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use tole_desktop_model::SkillsPageState;
 
 use super::view::SkillsPageView;
-
-/// What the driver knows about one tab's loads, beside the page state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Feed {
-    /// Loads that failed in a row, 0 when the last one worked (or none was
-    /// tried). The retry waits 1 s, then doubles up to 30 s.
-    pub failures: u32,
-    /// A call is out now. The rows shown (if any) are from the one before.
-    pub loading: bool,
-}
+pub use crate::driver::shared::handle::Feed;
 
 /// The page and the feeds change together under one lock, so a view never
 /// shows a count of failures that belongs to another state of the page.

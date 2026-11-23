@@ -24,9 +24,10 @@
 use std::time::Duration;
 
 use tole_client::{
-    Approval, ApprovalList, CancelReply, Client, Decision, DecisionReply, EntriesPage, Error,
-    InterruptReply, InterruptRequest, PromptReply, PromptRequest, ReconnectPolicy, ResumingStream,
-    SessionStatus, SkillsState, StreamItem, ToolsState,
+    Approval, ApprovalList, CancelReply, Client, CronJobState, CronJobs, CronRuns, Decision,
+    DecisionReply, EntriesPage, Error, InterruptReply, InterruptRequest, PromptReply,
+    PromptRequest, ReconnectPolicy, ResumingStream, SessionStatus, SkillsState, StreamItem,
+    ToolsState,
 };
 
 /// One session's event stream, as a source of items. It reconnects by itself
@@ -98,6 +99,22 @@ pub trait Api: Send + Sync + 'static {
     /// `GET /tools`: the connected tools with their trust state. No server is
     /// started to answer it.
     fn tools(&self) -> Result<ToolsState, Error>;
+
+    // ---- the automations driver: the Automations page ----
+
+    /// `GET /cron/jobs`: the jobs with their schedule, next run and last
+    /// result, and whether a scheduler is alive.
+    fn cron_jobs(&self) -> Result<CronJobs, Error>;
+
+    /// `GET /cron/runs` of one job, newest first, at most `limit`.
+    fn cron_runs(&self, job: &str, limit: usize) -> Result<CronRuns, Error>;
+
+    /// `POST /cron/jobs/{id}/pause`. Always allowed.
+    fn pause_cron_job(&self, id: &str) -> Result<CronJobState, Error>;
+
+    /// `POST /cron/jobs/{id}/resume`. A `403` is an agent's job the owner has
+    /// not reviewed (done at a terminal), a `409` a server in plan mode.
+    fn resume_cron_job(&self, id: &str) -> Result<CronJobState, Error>;
 }
 
 /// The longest one blocking read of a call, and one answer's body, may take.
@@ -180,5 +197,21 @@ impl Api for ClientApi {
 
     fn tools(&self) -> Result<ToolsState, Error> {
         self.short.tools()
+    }
+
+    fn cron_jobs(&self) -> Result<CronJobs, Error> {
+        self.short.cron_jobs()
+    }
+
+    fn cron_runs(&self, job: &str, limit: usize) -> Result<CronRuns, Error> {
+        self.short.cron_runs(Some(job), Some(limit))
+    }
+
+    fn pause_cron_job(&self, id: &str) -> Result<CronJobState, Error> {
+        self.short.pause_cron_job(id)
+    }
+
+    fn resume_cron_job(&self, id: &str) -> Result<CronJobState, Error> {
+        self.short.resume_cron_job(id)
     }
 }
