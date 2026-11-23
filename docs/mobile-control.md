@@ -65,6 +65,19 @@ The round trip the app must support (the cross-repo acceptance):
 4. `202` (allow) means the resume is running; `GET /sessions/{id}/status`
    until `busy` clears.
 
+## Percent-encoding of ids
+
+A client sends every path segment and query value percent-encoded (`tole-client` leaves `A-Za-z0-9-_.~` and writes
+every other byte as `%XX`), and the server decodes the ones it reads as an id or a name: the session id of
+`/sessions/{id}/...`, the approval id, the mission, discussion and cron job ids, the image hash, and the `job` of
+`GET /cron/runs?job=<id or name>` and the `session` of `GET /approvals?session=<id>`. The path is split on the raw `/`
+and `?` first and the query on `&`, so an encoded `/`, `?` or `&` is part of one value and never a new segment,
+parameter or route. A `%` without two hex digits, or bytes that are not UTF-8, is a `400`. A value that decodes to a
+`/`, a NUL or a control character is not decoded (it names nothing: the usual `404`). Decoding happens once
+(`%252F` is the text `%2F`) and `+` is a plus, not a space: encode a space as `%20`. The decoded value meets the
+same rules as before (a session id is `[A-Za-z0-9_-]`, 1 to 64), so an escaped form of a valid id is that id and
+nothing else becomes valid. `/hooks/<route>` is not part of this: it is for webhook senders, matched as written.
+
 ## Approval summary (#1041)
 
 Every approval row (`GET /approvals`, the `approval` of an `approval_required` stop, the `approval_requested` /
@@ -288,7 +301,7 @@ the same cron ledger `tole cron` does, through `tole_cli::cron::view`.
 | Action | Route | Answer |
 |---|---|---|
 | List jobs | `GET /cron/jobs` | `{"jobs": [{"id", "name", "schedule", "timezone", "mode", "state", "next_run", "next", "last", "missed", "blocked", "created_by", "awaiting_review"}], "scheduler": {"alive", "host", "age_seconds"}}`. `state` is `active` or `paused`; `next_run` is Unix seconds (`null` while paused); `last` is the last run's status; `created_by` is `cli` (saved by its owner) or `agent` (the `cron_create` tool); `awaiting_review` is true for an agent's job nobody has enabled. `scheduler` says whether a ticker has passed lately and where it runs (`serve` for `tole serve --cron`, `tick` for `tole cron tick`) |
-| Run history | `GET /cron/runs?job=<id>&limit=<n>` | unchanged (#579): newest first, at most 500, each with its redacted output capped at 16 KiB. `404` for an unknown `job` |
+| Run history | `GET /cron/runs?job=<id or name>&limit=<n>` | unchanged (#579): newest first, at most 500, each with its redacted output capped at 16 KiB. `job` is an id, else a name (case-insensitive ASCII), percent-encoded when it has a space or a non-ASCII letter. `404` for an unknown `job` |
 | Pause | `POST /cron/jobs/{id}/pause` | `200 {"id", "state": "paused"}`. Any job, on any server: a paused job has less authority |
 | Resume | `POST /cron/jobs/{id}/resume` | `200 {"id", "state": "active"}` for a job its owner stands behind (saved with `tole cron create`, or an agent's job the owner already enabled). `403` for an agent's job nobody enabled: reviewing and enabling it is trust approval and stays `tole cron resume <id>` at a terminal. `409` on a `--plan-mode` server. The owner's review record (`enabled_by`) is never written over serve |
 
