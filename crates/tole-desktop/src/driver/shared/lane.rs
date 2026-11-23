@@ -1,19 +1,19 @@
-//! The schedule of one tab's loads: when the next call may start and what each
-//! outcome does to it. Pure bookkeeping on the monotonic clock; the page and
-//! the replies are the engine's (`loading`).
+//! The schedule of one route's loads: when the next call may start and what
+//! each outcome does to it. Pure bookkeeping on the monotonic clock; the page
+//! and the replies are the engine's. Shared by the drivers that load a list on
+//! a timer (skills, automations); `I` is the driver's id of a call.
 
 use std::time::Duration;
 
-use super::millis;
+use super::now::millis;
 use crate::adapter::approvals::{Backoff, RETRY_MIN};
-use crate::adapter::skills::LoadId;
 
-pub(super) struct Lane {
+pub(crate) struct Lane<I: Copy + PartialEq> {
     /// The call the page trusts: the one started last, not lost since.
-    pub current: Option<LoadId>,
+    pub current: Option<I>,
     /// The call whose answer is awaited (also after it was lost: its thread is
     /// still in it). The one slot of the route: only its answer frees it.
-    pub out: Option<LoadId>,
+    pub out: Option<I>,
     /// A load must start, when the pace allows.
     pub want: bool,
     /// The owner asked for a load now: it ignores the backoff wait (not the
@@ -30,9 +30,9 @@ pub(super) struct Lane {
     next_refresh: Option<u64>,
 }
 
-impl Lane {
+impl<I: Copy + PartialEq> Lane<I> {
     /// Nothing is loaded: the first call is wanted at once.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Lane {
             current: None,
             out: None,
@@ -46,14 +46,14 @@ impl Lane {
         }
     }
 
-    pub(super) fn may_start(&self, mono: u64) -> bool {
+    pub(crate) fn may_start(&self, mono: u64) -> bool {
         self.want
             && self.out.is_none()
             && mono >= self.floor
             && (mono >= self.not_before || self.asap)
     }
 
-    pub(super) fn started(&mut self, id: LoadId, mono: u64) {
+    pub(crate) fn started(&mut self, id: I, mono: u64) {
         self.want = false;
         self.asap = false;
         self.out = Some(id);
@@ -63,7 +63,7 @@ impl Lane {
 
     /// A refresh is due, or the owner asked for one, and nothing trusted is
     /// out: a load is wanted.
-    pub(super) fn schedule(&mut self, mono: u64) {
+    pub(crate) fn schedule(&mut self, mono: u64) {
         let due = self.next_refresh.is_some_and(|t| mono >= t);
         if self.current.is_none() && (self.asap || due) {
             self.want = true;
@@ -72,7 +72,7 @@ impl Lane {
     }
 
     /// The call of `current` answered with data that is on the page now.
-    pub(super) fn succeeded(&mut self, mono: u64, refresh: Duration) {
+    pub(crate) fn succeeded(&mut self, mono: u64, refresh: Duration) {
         self.current = None;
         self.want = false;
         self.backoff.succeeded();
@@ -83,7 +83,7 @@ impl Lane {
 
     /// The call of `current` failed (or its answer could not be used): retry
     /// after the next backoff step, for ever.
-    pub(super) fn failed(&mut self, mono: u64) {
+    pub(crate) fn failed(&mut self, mono: u64) {
         self.current = None;
         self.want = true;
         self.not_before = mono.saturating_add(millis(self.backoff.failed()));
@@ -95,7 +95,7 @@ impl Lane {
     /// that is out is forgotten too (its answer is ignored when it comes), and
     /// a new one is wanted; without it (the data is old only because that call
     /// is slow) its answer is awaited.
-    pub(super) fn lost(&mut self, drop_call: bool) {
+    pub(crate) fn lost(&mut self, drop_call: bool) {
         if drop_call {
             self.current = None;
         }
@@ -107,7 +107,7 @@ impl Lane {
     }
 
     /// The data was read longer ago than `limit`.
-    pub(super) fn aged(&self, mono: u64, limit: u64) -> bool {
+    pub(crate) fn aged(&self, mono: u64, limit: u64) -> bool {
         self.last_ok.is_some_and(|t| mono.saturating_sub(t) > limit)
     }
 }
