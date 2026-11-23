@@ -49,7 +49,7 @@ pub mod task;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 #[cfg(test)]
 mod foundation_tests;
 #[cfg(test)]
