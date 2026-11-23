@@ -58,6 +58,7 @@ fn shell_of(serve: &ServeState, approvals: Option<usize>, skills: Option<usize>)
         state,
         status: Status {
             serve: serve.clone(),
+            skills_unknown: skills.is_none(),
             actionable: true,
         },
     }
@@ -190,6 +191,7 @@ mod tests {
             // A serve that is not ready has no known count.
             if !c.status.serve.is_ready() {
                 assert_eq!(c.state.approvals_pending, Badge::Unknown, "{}", c.name);
+                assert!(c.status.skills_unknown, "{}", c.name);
                 assert_eq!(c.state.skills_new, Badge::Unknown, "{}", c.name);
             }
         }
