@@ -106,6 +106,16 @@ impl<I: Copy + PartialEq> Lane<I> {
         }
     }
 
+    /// Something changed on the serve that the call which is out may have read
+    /// before (a switch was answered): its answer is no longer trusted, and a
+    /// new call is wanted at once (not after a backoff). What is on the page
+    /// stays, and keeps aging: it is not known to be wrong, only to be due.
+    pub(crate) fn redo(&mut self) {
+        self.current = None;
+        self.want = true;
+        self.asap = true;
+    }
+
     /// The data was read longer ago than `limit`.
     pub(crate) fn aged(&self, mono: u64, limit: u64) -> bool {
         self.last_ok.is_some_and(|t| mono.saturating_sub(t) > limit)
