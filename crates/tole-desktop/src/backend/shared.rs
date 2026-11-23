@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::link::Look;
 use super::reap;
+use super::tasks::TaskSet;
 use crate::driver::approvals;
 use crate::driver::runtime::JoinReport;
 use crate::driver::shared::handle::OnChange;
 use crate::driver::shared::thread::DriverInput;
 use crate::driver::skills;
+use crate::driver::task;
 
 /// What reaches the worker's inbox. None of it carries state: the worker reads
 /// the link, the open tasks and the drivers afresh at every message, so a
@@ -47,6 +49,8 @@ pub(super) struct Attached {
     pub epoch: u64,
     pub approvals: approvals::Handle,
     pub skills: skills::Handle,
+    /// One per task driver that runs, in the order they were started.
+    pub tasks: Vec<(String, task::Handle)>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -58,6 +62,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// clone or an assignment, never across a call.
 pub(super) struct Shared {
     attached: Mutex<Option<Arc<Attached>>>,
+    /// The tasks the app has open: its wish, whatever runs.
+    pub tasks: TaskSet,
     /// What the drivers shut down so far reported.
     totals: Mutex<JoinReport>,
     alive: AtomicBool,
@@ -67,6 +73,7 @@ impl Shared {
     pub(super) fn new() -> Self {
         Shared {
             attached: Mutex::new(None),
+            tasks: TaskSet::default(),
             totals: Mutex::new(JoinReport::default()),
             alive: AtomicBool::new(true),
         }

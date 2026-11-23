@@ -2,6 +2,7 @@
 //! one place: a driver keeps only what differs (its `Input`, its tick, its
 //! bounds).
 //!
+//! - [`ids`]: which session ids the drivers and the backend accept.
 //! - [`now`]: the two readings of time the worker takes at every input.
 //! - [`thread`]: the thread bodies and the stop sequence every driver runs,
 //!   generic over the driver's `Input` through [`thread::DriverInput`].
@@ -10,5 +11,6 @@
 //!   change callback and the refresh bounds.
 
 pub(crate) mod handle;
+pub(crate) mod ids;
 pub(crate) mod now;
 pub(crate) mod thread;
