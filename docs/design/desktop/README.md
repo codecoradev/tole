@@ -68,7 +68,7 @@ Checked: the window opens and renders the shell under X11 (Xvfb, software GL) on
 Every desktop page PR (#1030 to #1037) renders the real window offscreen, compares each image with the matching board and checks the keyboard and focus order; the images and findings go in the PR. No `screencapture` (it needs Screen Recording permission). The harness is how:
 
 ```bash
-scripts/desktop-render.sh /tmp/shots                  # every screen and state, the window's own size
+scripts/desktop-render.sh /tmp/shots                  # every screen and state, the window's own size (`live-*.png` are the states the app gives the window: the serve starting, restarting or failed, with its notice and button, and the counts known or not)
 scripts/desktop-render.sh /tmp/shots --size 1440x900  # at the size of the boards
 scripts/desktop-render.sh --test                      # the harness checks (below)
 ```

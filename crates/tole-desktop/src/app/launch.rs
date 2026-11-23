@@ -10,7 +10,7 @@
 //! |---|---|
 //! | launching | `Starting` |
 //! | up | the supervisor's own state, epoch and `Api` |
-//! | failed (the launch panicked, or no thread could be started) | `Failed(StartFailed { detail })` |
+//! | failed (the launch panicked, or no thread could be started) | `Failed(StartFailed { detail })`, which the window shows with a "Try again" that launches again |
 //! | closed (the window is closing) | `Stopped` |
 //!
 //! The epoch is the number of phase changes in its high half and the
@@ -19,9 +19,14 @@
 //!
 //! A launch that ends after the window closed is not kept: its serve gets
 //! `close_window` on the launch thread, which nobody waits for.
+//!
+//! What the window does to the serve (`retry`, `restart_serve`) can block (the
+//! supervisor takes its engine lock, and a restart waits for the old serve to
+//! stop), so each runs on a short-lived thread of its own, one at a time: a
+//! second press while one runs is ignored.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
@@ -36,6 +41,11 @@ use crate::supervisor::Config;
 /// window does to it. [`SupervisorLink`] is the real one; tests script their
 /// own.
 pub trait Serve: ServeLink {
+    /// Try again after a failure. May block.
+    fn retry(&self);
+    /// Replace the serve that is there with the one the desktop would start.
+    /// May block.
+    fn restart_serve(&self);
     /// The window is closing: what the settings say happens to the serve (by
     /// default it keeps running). Consumes the handle and says what it did.
     fn close_window(self: Arc<Self>) -> CloseOutcome;
@@ -55,6 +65,14 @@ pub enum CloseOutcome {
 }
 
 impl Serve for SupervisorLink {
+    fn retry(&self) {
+        self.supervisor().retry();
+    }
+
+    fn restart_serve(&self) {
+        self.supervisor().restart_serve();
+    }
+
     fn close_window(self: Arc<Self>) -> CloseOutcome {
         let Ok(link) = Arc::try_unwrap(self) else {
             return CloseOutcome::Held;
@@ -118,6 +136,8 @@ pub struct LaunchLink {
     changes: AtomicU64,
     launcher: Launcher,
     signal: Signal,
+    /// A command of the window is running.
+    busy: AtomicBool,
 }
 
 impl LaunchLink {
@@ -130,6 +150,7 @@ impl LaunchLink {
             changes: AtomicU64::new(0),
             launcher,
             signal,
+            busy: AtomicBool::new(false),
         })
     }
 
@@ -186,6 +207,56 @@ impl LaunchLink {
         if let Some(serve) = late {
             // Nobody is left to show how it went.
             let _ = serve.close_window();
+        }
+    }
+
+    /// "Try again". Over a serve: the supervisor's retry. After a failed
+    /// launch: a new launch. Otherwise nothing.
+    pub fn retry(self: &Arc<Self>) {
+        match self.current() {
+            Phase::Up(serve) => self.command(move || serve.retry()),
+            Phase::Failed(_) => self.relaunch(),
+            Phase::Launching | Phase::Closed => {}
+        }
+    }
+
+    /// "Restart Tole": only over a serve that is there.
+    pub fn restart_serve(self: &Arc<Self>) {
+        if let Phase::Up(serve) = self.current() {
+            self.command(move || serve.restart_serve());
+        }
+    }
+
+    fn relaunch(self: &Arc<Self>) {
+        {
+            let mut phase = lock(&self.phase);
+            if !matches!(*phase, Phase::Failed(_)) {
+                return;
+            }
+            *phase = Phase::Launching;
+            self.count_change();
+        }
+        self.signal.raise();
+        self.spawn_launch();
+    }
+
+    /// Run `f` on a thread of its own unless a command already runs. A press
+    /// while one runs is ignored, so the button looks dead until the running
+    /// command ends (a restart waits for the old serve to stop).
+    fn command(self: &Arc<Self>, f: impl FnOnce() + Send + 'static) {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("tole-desktop-command".into())
+            .spawn(move || {
+                let _ = catch_unwind(AssertUnwindSafe(f));
+                me.busy.store(false, Ordering::SeqCst);
+                me.signal.raise();
+            });
+        if spawned.is_err() {
+            self.busy.store(false, Ordering::SeqCst);
         }
     }
 

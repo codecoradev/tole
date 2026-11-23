@@ -13,18 +13,25 @@ use std::fmt;
 
 use tole_desktop_model::{strings, ShellState};
 
+pub use self::status::{badge_text, Notice, Offer, Source, Status, LOOK_EVERY};
+
 #[cfg(feature = "gpui")]
 mod adapter;
 #[cfg(feature = "render-harness")]
 pub mod harness;
+#[cfg(feature = "render-harness")]
+pub mod harness_live;
 #[cfg(feature = "gpui")]
 mod header;
 #[cfg(feature = "gpui")]
 mod home;
 #[cfg(feature = "gpui")]
+mod notice;
+#[cfg(feature = "gpui")]
 mod shell;
 #[cfg(feature = "gpui")]
 mod sidebar;
+mod status;
 
 /// Why [`run`] could not open a window.
 #[derive(Debug)]
@@ -46,9 +53,37 @@ impl fmt::Display for UiError {
 
 impl std::error::Error for UiError {}
 
-/// Opens the window for `state` and blocks until it closes.
+/// Opens the window for `state`, showing the app `start` builds, and blocks
+/// until it closes.
+///
+/// `start` runs once, after the display is up and just as the window is built
+/// (so a machine with no display never starts an app), on the window's thread.
+/// An `Err` is the app that could not start: the window opens anyway and says
+/// so, with the connection shown as unreachable. On a build without the
+/// `gpui` feature `start` is not called.
 #[cfg(feature = "gpui")]
-pub fn run(state: ShellState) -> Result<(), UiError> {
+pub fn run(
+    state: ShellState,
+    start: impl FnOnce() -> Result<Box<dyn Source>, String> + 'static,
+) -> Result<(), UiError> {
+    use tole_desktop_model::tokens::size;
+
+    adapter::launch(
+        strings::WINDOW_TITLE,
+        size::WINDOW_WIDTH,
+        size::WINDOW_HEIGHT,
+        move |cx| match start() {
+            Ok(source) => shell::ShellView::live(state, source, cx),
+            Err(detail) => shell::ShellView::failed(state, Status::failed_to_start(detail)),
+        },
+    )
+    .map_err(UiError::Window)
+}
+
+/// Opens the window for `state` and blocks until it closes. Nothing is behind
+/// it: `state` is shown as it is (the sample data of a preview).
+#[cfg(feature = "gpui")]
+pub fn preview(state: ShellState) -> Result<(), UiError> {
     use tole_desktop_model::tokens::size;
 
     adapter::launch(
@@ -60,9 +95,19 @@ pub fn run(state: ShellState) -> Result<(), UiError> {
     .map_err(UiError::Window)
 }
 
+/// Without the toolkit there is no window, and `start` is not called.
+#[cfg(not(feature = "gpui"))]
+pub fn run(
+    state: ShellState,
+    start: impl FnOnce() -> Result<Box<dyn Source>, String> + 'static,
+) -> Result<(), UiError> {
+    let _ = (state, start);
+    Err(UiError::NoWindowToolkit)
+}
+
 /// Opens the window for `state` and blocks until it closes.
 #[cfg(not(feature = "gpui"))]
-pub fn run(state: ShellState) -> Result<(), UiError> {
+pub fn preview(state: ShellState) -> Result<(), UiError> {
     let _ = state;
     Err(UiError::NoWindowToolkit)
 }
@@ -72,8 +117,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_without_the_toolkit_says_so() {
-        let err = run(ShellState::placeholder()).unwrap_err();
+    fn a_preview_without_the_toolkit_says_so() {
+        let err = preview(ShellState::placeholder()).unwrap_err();
         assert!(err.to_string().contains("--features gpui"));
+    }
+
+    #[test]
+    fn a_run_without_the_toolkit_says_so_and_never_starts_the_app() {
+        let err = run(ShellState::new(), || panic!("the app must not start")).unwrap_err();
+        assert!(matches!(err, UiError::NoWindowToolkit));
     }
 }

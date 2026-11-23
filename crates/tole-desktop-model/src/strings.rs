@@ -30,6 +30,11 @@ pub fn section_label(section: Section) -> &'static str {
 /// Shown by a build without the `gpui` feature (a developer message, not UI).
 pub const NO_WINDOW_TOOLKIT: &str = "this build has no window toolkit; rebuild with `--features gpui` (see docs/design/desktop/README.md)";
 
+/// The reason the window cannot open when there is no display to open it on
+/// (a developer message).
+pub const NO_DISPLAY: &str =
+    "no display is available (on Linux, DISPLAY or WAYLAND_DISPLAY must name one)";
+
 /// The thread that starts Tole could not be started.
 pub fn launch_thread_failed(detail: &str) -> String {
     format!("could not start a thread: {detail}")
@@ -39,6 +44,10 @@ pub fn launch_thread_failed(detail: &str) -> String {
 pub fn launch_panicked(detail: &str) -> String {
     format!("starting Tole panicked: {detail}")
 }
+
+/// The app's background link ended by itself (a worker panicked): what the
+/// window shows from then on. Shown after "Tole did not start: ".
+pub const BACKEND_ENDED: &str = "the app's link to Tole in the background ended unexpectedly (an internal error). Close the window and open it again.";
 
 /// Prefix of the error when the window cannot open (a developer message).
 pub const WINDOW_FAILED: &str = "cannot open the window";
