@@ -104,6 +104,10 @@ mod view;
 mod worker;
 
 #[cfg(test)]
+mod e2e_end_tests;
+#[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
 mod engine_runs_tests;
 #[cfg(test)]
 mod engine_tests;
@@ -111,6 +115,10 @@ mod engine_tests;
 mod engine_toggle_tests;
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod hostile_tests;
+#[cfg(test)]
+mod rig;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
