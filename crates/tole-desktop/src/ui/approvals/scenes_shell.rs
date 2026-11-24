@@ -1,6 +1,8 @@
 //! The Approvals page in the whole window, one PNG per state
-//! (`shell-approvals-page-*.png`), and the source that stands in for the app
-//! (render harness only).
+//! (`shell-approvals-page-*.png`), the source that stands in for the app, and
+//! the checks that drive it through the real window (`tests`): a press must
+//! reach the app as a call with the id of what was pressed (render harness
+//! only).
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -165,3 +167,6 @@ pub fn render_scenes(dir: &Path, window: WindowSize) -> Result<Vec<Rendered>, St
     }
     Ok(done)
 }
+
+#[cfg(test)]
+mod tests;
