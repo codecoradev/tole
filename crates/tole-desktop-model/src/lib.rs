@@ -45,6 +45,7 @@ pub mod task_strings;
 pub mod tokens;
 
 pub use approvals::{ApprovalCard, ApprovalRequest, ApprovalsAction, ApprovalsState};
+pub use automations::Standing as AutomationsStanding;
 pub use automations::{
     AutomationId, AutomationRow, AutomationsState, NextRun, Notice, Origin, RawJob, RawRun,
     RowNote, RunEntry, RunOutcome, Schedule, Scheduler, SchedulerHost, Switch, ToggleIntent,

@@ -16,6 +16,13 @@ pub const NEVER_RAN: &str = "Never ran";
 pub const HISTORY_EMPTY: &str = "Nothing has run yet";
 pub const OPEN_IN_APPROVALS: &str = "Open in Approvals";
 pub const LOAD_FAILED: &str = "Tole could not read the automations";
+pub const CHECKING: &str = "Checking the automations...";
+pub const OUT_OF_DATE: &str = "This list may be out of date. Tole could not read it again.";
+
+/// "3 more not shown" (jobs the table has no room for).
+pub fn more_not_shown(count: usize) -> String {
+    format!("{count} more not shown")
+}
 
 /// "2 on, 1 paused" (the top bar).
 pub fn summary(on: usize, paused: usize) -> String {
