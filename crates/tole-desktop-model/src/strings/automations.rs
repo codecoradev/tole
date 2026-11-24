@@ -19,10 +19,24 @@ pub const LOAD_FAILED: &str = "Tole could not read the automations";
 pub const DISMISS: &str = "Dismiss";
 pub const CHECKING: &str = "Checking the automations...";
 pub const OUT_OF_DATE: &str = "This list may be out of date. Tole could not read it again.";
+pub const HISTORY_LOADING: &str = "Reading what happened...";
+pub const HISTORY_FAILED: &str = "Tole could not read what happened";
+pub const LINKS_UNKNOWN: &str =
+    "Tole could not tell which runs are waiting in Approvals. Open Approvals to see them.";
 
 /// "3 more not shown" (jobs the table has no room for).
 pub fn more_not_shown(count: usize) -> String {
     format!("{count} more not shown")
+}
+
+/// The title of the history of one automation.
+pub fn history_title(name: &str) -> String {
+    format!("{name}: what happened")
+}
+
+/// "At least 5 older runs are not shown".
+pub fn history_more(count: usize) -> String {
+    format!("At least {count} older runs are not shown")
 }
 
 /// "2 on, 1 paused" (the top bar).
