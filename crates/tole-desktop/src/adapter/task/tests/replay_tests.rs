@@ -136,7 +136,7 @@ fn an_owners_steer_note_shows_the_owners_words_without_the_wrapper_core_adds() {
     let twice = "[owner interrupt \u{2014} injected mid-turn, not part of the original request] x";
     assert_eq!(
         words(&wrapped("owner interrupt", twice, "owner")).0,
-        format!("{twice}")
+        twice.to_string()
     );
     // A note of an older core has no wrapper, and a sibling notice is not the owner's.
     let mut old = user(1, "focus on the tests");
