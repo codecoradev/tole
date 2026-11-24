@@ -1,8 +1,8 @@
 //! What the window keeps of each open task besides what the driver says: where
 //! its list is scrolled and whether it follows the end, which heights the driver
-//! has.
+//! has, which rows show their technical details.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::measure::{Drawn, Reported};
 use crate::ui::adapter::ScrollHandle;
@@ -13,6 +13,8 @@ pub(in crate::ui) struct Pane {
     pub scroll: ScrollHandle,
     pub follow: Follow,
     pub anchor: Anchor,
+    /// Rows whose "Show technical details" is open.
+    pub technical: HashSet<usize>,
     pub reported: Reported,
     /// Which driver of the task the viewport and the heights above were given
     /// to (`TaskView::driver`): a new driver has neither.
@@ -29,6 +31,7 @@ impl Default for Pane {
             scroll: ScrollHandle::new(),
             follow: Follow::default(),
             anchor: Anchor::default(),
+            technical: HashSet::new(),
             reported: Reported::default(),
             driver: None,
             drawn: Drawn::default(),
