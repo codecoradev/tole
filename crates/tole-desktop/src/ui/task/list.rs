@@ -27,13 +27,20 @@ impl ShellView {
     }
 
     /// The main area of the shown task, if one is shown.
-    pub(in crate::ui) fn task_pane(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(in crate::ui) fn task_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let id = self.tasks.tabs.shown()?.to_owned();
         // The pane is taken out while it is built: building reads the window's
         // source through `self`.
         let mut pane = self.tasks.panes.remove(&id).unwrap_or_default();
         let (body, view) = self.task_list(&id, &mut pane, cx);
         let strip = view.as_ref().map(|v| self.task_strip(&id, v, cx));
+        let composer = view
+            .as_ref()
+            .map(|v| self.task_composer(&mut pane, v, window, cx));
         self.tasks.panes.insert(id, pane);
         Some(
             div()
@@ -44,6 +51,7 @@ impl ShellView {
                 .flex_col()
                 .children(strip)
                 .child(body)
+                .children(composer)
                 .into_any_element(),
         )
     }

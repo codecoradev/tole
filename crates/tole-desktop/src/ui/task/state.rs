@@ -5,8 +5,21 @@
 use std::collections::{HashMap, HashSet};
 
 use super::measure::{Drawn, Reported};
-use crate::ui::adapter::ScrollHandle;
-use tole_desktop_model::task::{Anchor, Follow, Tabs};
+use super::outbox::Outbox;
+use crate::ui::adapter::{ScrollHandle, TextBox};
+use tole_desktop_model::task::{Anchor, Follow, SendMode, Tabs};
+
+/// The composer of one task: its text box and what the window keeps about a send.
+pub(in crate::ui) struct Compose {
+    pub text: TextBox,
+    pub outbox: Outbox,
+    /// The hint the box shows now.
+    pub hint: &'static str,
+    /// The last send was refused (the task is not connected): the words are
+    /// kept, and the note stays while the same driver is in the same state
+    /// (`TaskView::driver`, what Enter does).
+    pub refused: Option<(u64, SendMode)>,
+}
 
 /// One open task as the window shows it.
 pub(in crate::ui) struct Pane {
@@ -23,6 +36,8 @@ pub(in crate::ui) struct Pane {
     pub drawn: Drawn,
     /// The viewport last given to the driver: how far scrolled and how tall.
     pub viewport: Option<(f32, f32)>,
+    /// Made when the composer is first drawn (it needs the window).
+    pub compose: Option<Compose>,
 }
 
 impl Default for Pane {
@@ -36,6 +51,7 @@ impl Default for Pane {
             driver: None,
             drawn: Drawn::default(),
             viewport: None,
+            compose: None,
         }
     }
 }

@@ -199,10 +199,10 @@ impl ShellView {
 }
 
 impl Render for ShellView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = DARK;
         self.sync_focus(cx);
-        let task = self.task_pane(cx);
+        let task = self.task_pane(window, cx);
         let sidebar = self
             .state
             .sidebar_visible()

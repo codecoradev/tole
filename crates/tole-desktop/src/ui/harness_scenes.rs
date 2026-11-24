@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use tole_desktop_model::task::{ApprovalInfo, TaskEvent, UserKind};
 
-use super::harness_task::Scene;
+use super::harness_task::{Calls, Scene};
 use crate::driver::task::Preview;
 
 // ---- the events of the scenes ----
@@ -177,6 +177,8 @@ pub fn scenes() -> Vec<Scene> {
         ),
         ("20261123-3", Rc::new(of_events(vec![]))),
     ];
+    let mut typed = Scene::of("task-composer-text", reply());
+    typed.typed = Some("Also keep the scans\nin a folder of their own.");
     vec![
         working,
         technical,
@@ -192,5 +194,6 @@ pub fn scenes() -> Vec<Scene> {
         offline,
         look_only,
         tabs,
+        typed,
     ]
 }

@@ -81,6 +81,15 @@ pub struct Composer {
 }
 
 impl Composer {
+    /// A composer holding `text`: what the window asks Enter's rules about
+    /// the text of its own box.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Composer {
+            text: text.into(),
+            ..Composer::default()
+        }
+    }
+
     /// Images only go with a new prompt.
     pub fn can_attach(mode: SendMode) -> bool {
         mode == SendMode::Send

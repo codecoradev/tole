@@ -8,14 +8,18 @@
 //! - `measure`: the numbers the list learns from its last frame (no toolkit).
 //! - `call`: what the window asks of a task (no toolkit).
 //! - `list`: the scrolling column of rows, following the end of a running task.
-//! - `strip`: the tabs of the open tasks and the status row.
+//! - `strip`: the tabs of the open tasks and the status row; `compose`: the
+//!   composer; `outbox`: when a message that went out must come back (no toolkit).
 //! - `rows`, `work`, `prose`: one row of each kind, a "Working" group, an
 //!   answer's Markdown.
 
 mod call;
 #[cfg(all(feature = "gpui", unix))]
+mod compose;
+#[cfg(all(feature = "gpui", unix))]
 mod list;
 pub mod measure;
+pub mod outbox;
 #[cfg(all(feature = "gpui", unix))]
 mod prose;
 #[cfg(all(feature = "gpui", unix))]
