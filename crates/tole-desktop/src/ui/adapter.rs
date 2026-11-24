@@ -453,12 +453,34 @@ pub mod offscreen {
             self.draw()
         }
 
+        /// Presses and releases a key (`"enter"`) and paints: the release activates a button.
+        pub fn tap(&mut self, keystroke: &'static str) -> Result<(), String> {
+            let keystroke = gpui::Keystroke::parse(keystroke).map_err(|err| err.to_string())?;
+            self.cx
+                .update_window(self.window, |_, window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                    let up = gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke });
+                    window.dispatch_event(up, cx);
+                })
+                .map_err(|err| err.to_string())?;
+            self.draw()
+        }
+
         /// Reads the view, with the window to ask which element has focus.
         pub fn read<R>(&mut self, f: impl FnOnce(&V, &Window) -> R) -> Result<R, String> {
             let view = self.view.clone();
             self.cx
                 .update_window(self.window, |_, window, cx| f(view.read(cx), window))
                 .map_err(|err| err.to_string())
+        }
+
+        /// Changes the view with its own context (so it can notify), then paints.
+        pub fn act(&mut self, f: impl FnOnce(&mut V, &mut Context<V>)) -> Result<(), String> {
+            let view = self.view.clone();
+            self.cx
+                .update_window(self.window, |_, _window, cx| view.update(cx, f))
+                .map_err(|err| err.to_string())?;
+            self.draw()
         }
 
         /// Paints a frame and writes it as a PNG; returns its size in pixels
