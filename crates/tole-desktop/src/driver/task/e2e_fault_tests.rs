@@ -37,8 +37,11 @@ fn a_stream_that_fails_shows_offline_and_is_opened_again_from_the_last_entry() {
     stream
         .send(Frame::Fail(Error::Io(io::Error::other("reset"))))
         .unwrap();
-    rig.until("offline", |v| v.link == LinkState::Lost);
-    assert_eq!(rig.handle.snapshot().status.phase, Phase::Offline);
+    // The stream flag and the model's link are set in two steps: the view can
+    // say the link is lost a moment before the phase says offline.
+    rig.until("offline", |v| {
+        v.link == LinkState::Lost && v.status.phase == Phase::Offline
+    });
     // The reader waits one second (on the manual clock), then reopens.
     let end = std::time::Instant::now() + PATIENCE;
     while api.opens(S) < 2 {
