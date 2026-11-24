@@ -33,7 +33,7 @@ impl ShellView {
         // source through `self`.
         let mut pane = self.tasks.panes.remove(&id).unwrap_or_default();
         let (body, view) = self.task_list(&id, &mut pane, cx);
-        let strip = view.as_ref().map(|v| self.task_strip(v, cx));
+        let strip = view.as_ref().map(|v| self.task_strip(&id, v, cx));
         self.tasks.panes.insert(id, pane);
         Some(
             div()

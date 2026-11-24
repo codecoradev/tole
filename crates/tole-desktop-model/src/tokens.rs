@@ -141,6 +141,8 @@ pub mod size {
     pub const BUBBLE_PAD_Y: f32 = 10.0;
     /// A line between two blocks (a horizontal rule).
     pub const HAIRLINE: f32 = 1.0;
+    /// Widest a task's tab grows before its name is cut.
+    pub const TAB_MAX_WIDTH: f32 = 200.0;
     /// Dot before a step of a "Working" group.
     pub const STEP_DOT: f32 = 6.0;
     /// Indent of a list or of the steps under their header.

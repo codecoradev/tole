@@ -8,7 +8,8 @@ use std::sync::Mutex;
 
 use tole_desktop::ui::harness::{Rendered, WindowSize};
 use tole_desktop::ui::harness_task::{
-    exchanges, jump, open as open_scene, render_tasks, scenes, scroll_state, scroll_to, Scene,
+    close_shown, exchanges, jump, open as open_scene, render_tasks, scenes, scroll_state,
+    scroll_to, Scene,
 };
 use tole_desktop_model::tokens::{size, Rgb, DARK};
 
@@ -180,4 +181,21 @@ fn the_status_row_has_its_dot_and_stop_only_while_a_turn_can_be_stopped() {
     assert!(tone("task-waiting-approval", DARK.amber) > 20);
     assert!(tone("task-offline", DARK.danger) > 20 && tone("task-offline", DARK.ok) == 0);
     assert_eq!(tone("task-look-only", DARK.amber), 0);
+}
+
+#[test]
+fn closing_the_shown_tab_shows_its_neighbour_and_the_last_one_leaves_the_task_view() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let tabs = scene("task-tabs");
+    let mut w = open_scene(&tabs, WindowSize::default()).expect("open");
+    // Three tasks are open; the shown one is the first.
+    assert_eq!(
+        close_shown(&mut w).expect("close").as_deref(),
+        Some("20261123-2")
+    );
+    assert_eq!(
+        close_shown(&mut w).expect("close").as_deref(),
+        Some("20261123-3")
+    );
+    assert_eq!(close_shown(&mut w).expect("close"), None);
 }
