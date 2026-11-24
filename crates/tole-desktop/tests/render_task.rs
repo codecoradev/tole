@@ -11,7 +11,7 @@ use tole_desktop::ui::harness::{Rendered, WindowSize};
 use tole_desktop::ui::harness_task::{
     choose_section, close_shown, compose, composer_focused, composer_refused, exchanges, jump,
     open as open_scene, render_tasks, replace_driver, restarted_long_task, scenes, scroll_state,
-    scroll_to, show_tab, shown, start, write, written, Scene, NEW_SESSION,
+    scroll_times, scroll_to, show_tab, shown, start, write, written, Scene, NEW_SESSION,
 };
 use tole_desktop::ui::TaskCall;
 use tole_desktop_model::tokens::{size, Rgb, DARK};
@@ -400,4 +400,31 @@ fn choosing_a_tab_gives_its_composer_the_keyboard() {
         composer_focused(&mut w).expect("focus"),
         "the tab gives it back"
     );
+}
+
+#[test]
+fn scrolling_a_2000_row_task_builds_a_bounded_window_each_frame_and_records_the_cost() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let long = scene("task-long-at-the-end");
+    let task = long.task.clone().expect("a task");
+    task.feed(exchanges(100_000, 250)); // 1,500 + 500 rows
+    let mut w = open_scene(&long, WindowSize::default()).expect("open");
+    assert!(task.view().total_rows >= 2_000);
+    let (_, end) = scroll_state(&mut w).expect("state");
+    // A hundred scrolls of 400 px, up from the end, and each frame builds a window.
+    let mut times = scroll_times(&mut w, end - 40_000.0, 400.0, 100).expect("scroll");
+    let built = task.view().rows.len();
+    assert!(built < 60, "built {built} rows");
+    times.sort_by(f64::total_cmp);
+    let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+    let report = format!(
+        "{} rows, 100 scrolls of 400 px, software rendering: median {:.1} ms, p95 {:.1} ms, max {:.1} ms per frame\n",
+        task.view().total_rows,
+        at(0.5),
+        at(0.95),
+        at(1.0)
+    );
+    let dir = out_dir("scroll-cost");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("scroll-cost.txt"), report).expect("write");
 }

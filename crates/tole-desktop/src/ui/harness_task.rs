@@ -300,6 +300,25 @@ pub fn composer_refused(window: &mut Offscreen<ShellView>) -> Result<bool, Strin
     window.read(|view, _| view.composer_refused())
 }
 
+/// How long each of `steps` scrolls of the list took to draw, in milliseconds:
+/// the list moves by `by` pixels each time, from `from`, and draws one frame
+/// (the window builds the rows near the screen, lays them out and paints).
+pub fn scroll_times(
+    window: &mut Offscreen<ShellView>,
+    from: f32,
+    by: f32,
+    steps: usize,
+) -> Result<Vec<f64>, String> {
+    let mut times = Vec::with_capacity(steps);
+    for i in 0..steps {
+        let top = from + by * i as f32;
+        let started = std::time::Instant::now();
+        window.update(|view, _, _| view.scroll_task_to(top))?;
+        times.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    Ok(times)
+}
+
 /// The home page's "New task", pressed.
 pub fn start(window: &mut Offscreen<ShellView>) -> Result<(), String> {
     window.update(|view, _, cx| view.task_start(cx))?;
