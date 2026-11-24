@@ -34,6 +34,12 @@ pub struct AutomationsView {
 }
 
 impl AutomationsView {
+    /// What there is before a driver has run, and after it stopped: no rows,
+    /// not loaded, no count.
+    pub fn not_loaded() -> Self {
+        Self::of(&Shared::default())
+    }
+
     pub(super) fn of(shared: &Shared) -> Self {
         AutomationsView {
             page: shared.page.clone(),

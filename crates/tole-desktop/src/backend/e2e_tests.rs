@@ -38,6 +38,7 @@ fn before_the_serve_is_ready_the_view_reads_unknown_and_nothing_is_asked_of_it()
     assert_eq!(link.api_calls(), 0, "no api is asked for");
     assert!(rig.backend().with_approvals(|_| ()).is_none());
     assert!(rig.backend().with_skills(|_| ()).is_none());
+    assert!(rig.backend().with_automations(|_| ()).is_none());
 }
 
 #[test]
@@ -62,6 +63,21 @@ fn leaving_the_ready_state_reads_unknown_before_the_worker_has_looked() {
     assert!(is_unknown(&v), "never the old serve's numbers: {v:?}");
     assert!(rig.backend().with_approvals(|_| ()).is_none());
     assert!(rig.backend().with_skills(|_| ()).is_none());
+    assert!(rig.backend().with_automations(|_| ()).is_none());
+}
+
+#[test]
+fn the_automations_page_is_read_over_the_same_api_and_its_handle_reaches_the_driver() {
+    let link = FakeLink::ready();
+    let api = known_api(0, 0);
+    link.queue_api(api.clone());
+    let rig = Rig::start(link.clone());
+    let v = rig.until("the automations are known", |v| is_known(v, 0, 0));
+    assert_eq!(v.automations.page.rows.len(), 2);
+    assert_eq!(v.automations.counts(), Some((1, 1)));
+    assert_eq!(api.cron_jobs_calls(), 1, "one read, not one per driver");
+    let running = rig.backend().with_automations(|h| h.is_running());
+    assert_eq!(running, Some(true));
 }
 
 #[test]
@@ -81,9 +97,10 @@ fn the_drivers_are_stopped_when_the_serve_stops_being_ready() {
         let rig = Rig::start(link.clone());
         rig.until("known", |v| is_known(v, 1, 0));
         link.set(gone.clone());
-        // Four approvals threads and four skills threads, joined.
+        // Four approvals threads, four skills threads and five automations
+        // threads, joined.
         rig.wait_ticking("the drivers were stopped", |b| {
-            b.thread_report().joined >= 8
+            b.thread_report().joined >= 13
         });
         let v = rig.until("unknown", is_unknown);
         assert_eq!(v.serve, gone);
@@ -172,10 +189,10 @@ fn shutdown_stops_every_thread_and_leaves_the_serve_alone() {
     rig.until("known", |v| is_known(v, 0, 0));
     let backend = rig.backend.take().expect("running");
     let report = backend.shutdown(secs(5));
-    // The worker and the ticker, the approvals driver's four threads and the
-    // skills driver's four.
+    // The worker and the ticker, the approvals driver's four threads, the
+    // skills driver's four and the automations driver's five.
     assert_eq!((report.panicked, report.detached), (0, 0), "{report:?}");
-    assert_eq!(report.joined, 10, "{report:?}");
+    assert_eq!(report.joined, 15, "{report:?}");
     assert_eq!(link.state(), running("1"), "the serve is not touched");
 }
 
@@ -225,7 +242,7 @@ fn a_link_that_panics_reads_as_not_ready_and_the_backend_recovers() {
     assert_eq!(v.serve, ServeState::Starting);
     assert!(is_unknown(&v));
     rig.wait_ticking("the drivers were stopped", |b| {
-        b.thread_report().joined >= 8
+        b.thread_report().joined >= 13
     });
     assert!(rig.backend().is_running(), "the worker survived");
     link.panic_on_state(false);

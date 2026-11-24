@@ -405,7 +405,7 @@ fn a_link_that_forgets_to_bump_its_epoch_is_still_not_ready_in_the_view() {
     assert!(is_unknown(&rig.view()), "the state alone says not ready");
     assert!(rig.backend().with_approvals(|_| ()).is_none());
     rig.wait_ticking("the drivers were stopped", |b| {
-        b.thread_report().joined >= 8
+        b.thread_report().joined >= 13
     });
     link.set_without_epoch(running("2"));
     rig.until_ticking("new drivers", |v| is_known(v, 2, 0));
