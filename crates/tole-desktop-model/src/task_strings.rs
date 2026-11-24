@@ -105,6 +105,13 @@ pub fn attach_error_text(error: AttachError) -> String {
     }
 }
 
+/// The mark before a list item of an answer.
+pub const BULLET: &str = "\u{2022}";
+/// The mark before an item of a numbered list: `3.`.
+pub fn list_number(number: u32) -> String {
+    format!("{number}.")
+}
+
 /// The link under an opened "Working" group (board S3).
 pub const TECH_SHOW: &str = "Show technical details";
 pub const TECH_HIDE: &str = "Hide technical details";
@@ -303,6 +310,7 @@ mod tests {
         let words: Vec<_> = steps.iter().map(|s| step_state(*s)).collect();
         assert_eq!(words, ["working", "done", "did not work", "stopped"]);
         assert_ne!(mark_label(Mark::Thinking), mark_label(Mark::Writing));
+        assert_eq!(list_number(12), "12.");
         assert_eq!(images_label(1), "1 image attached");
         assert_eq!(images_label(3), "3 images attached");
         assert!(too_many_tasks(3).starts_with("3 tasks"));

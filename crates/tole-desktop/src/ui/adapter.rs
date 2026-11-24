@@ -33,6 +33,82 @@ pub fn len(v: f32) -> Pixels {
     gpui::px(v)
 }
 
+pub use gpui::{AnyElement, Div, FontWeight, ScrollHandle};
+
+/// A length relative to the font size: `1.5` is a line and a half.
+pub fn rel(v: f32) -> gpui::DefiniteLength {
+    gpui::relative(v)
+}
+
+/// One run of a line of text and how it is drawn.
+#[derive(Clone, Copy)]
+pub struct Run<'a> {
+    pub text: &'a str,
+    pub bold: bool,
+    pub italic: bool,
+    /// Text colour; `None` is the colour of the element.
+    pub fill: Option<Rgb>,
+    /// Background colour.
+    pub back: Option<Rgb>,
+}
+
+/// The runs as one wrapping piece of text.
+pub fn rich_text(runs: &[Run<'_>]) -> gpui::StyledText {
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    for run in runs {
+        let start = text.len();
+        text.push_str(run.text);
+        let style = gpui::HighlightStyle {
+            color: run.fill.map(|c| color(c).into()),
+            font_weight: run.bold.then_some(gpui::FontWeight::BOLD),
+            font_style: run.italic.then_some(gpui::FontStyle::Italic),
+            background_color: run.back.map(|c| color(c).into()),
+            ..Default::default()
+        };
+        if !run.text.is_empty() {
+            styles.push((start..text.len(), style));
+        }
+    }
+    gpui::StyledText::new(text).with_highlights(styles)
+}
+
+/// What a scrolling list laid out in its last frame (all zero before the first).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListFrame {
+    /// How far the list is scrolled.
+    pub top: f32,
+    pub viewport: f32,
+    /// The height of everything in the list.
+    pub content: f32,
+    /// Each direct child: where it starts in the content, and its height.
+    pub children: Vec<(f32, f32)>,
+}
+
+/// The last frame of the list `handle` tracks.
+pub fn laid_out(handle: &ScrollHandle) -> ListFrame {
+    let (offset, max) = (handle.offset(), handle.max_offset());
+    let bounds = handle.bounds();
+    let origin = f32::from(bounds.origin.y);
+    let viewport = f32::from(bounds.size.height);
+    let children = (0..)
+        .map_while(|i| handle.bounds_for_item(i))
+        .map(|b| (f32::from(b.origin.y) - origin, f32::from(b.size.height)))
+        .collect();
+    ListFrame {
+        top: -f32::from(offset.y),
+        viewport,
+        content: viewport + f32::from(max.y),
+        children,
+    }
+}
+
+/// Scroll the list `handle` tracks to `top`.
+pub fn scroll_to(handle: &ScrollHandle, top: f32) {
+    let x = handle.offset().x;
+    handle.set_offset(gpui::point(x, gpui::px(-top.max(0.0))));
+}
+
 /// A repeating call on the window's thread; it stops when this is dropped.
 pub struct Every {
     _task: gpui::Task<()>,

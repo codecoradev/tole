@@ -14,6 +14,7 @@ use std::fmt;
 use tole_desktop_model::{strings, ShellState};
 
 pub use self::status::{badge_text, Notice, Offer, Source, Status, LOOK_EVERY};
+pub use self::task::TaskCall;
 
 #[cfg(feature = "gpui")]
 mod adapter;
@@ -32,6 +33,7 @@ mod shell;
 #[cfg(feature = "gpui")]
 mod sidebar;
 mod status;
+pub mod task;
 
 /// Why [`run`] could not open a window.
 #[derive(Debug)]
