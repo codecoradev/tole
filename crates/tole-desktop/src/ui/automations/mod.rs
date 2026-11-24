@@ -7,6 +7,10 @@
 //!
 //! - `types`: what the page asks of its host, and its own small state.
 //! - `cells`: the cell, the small text and the tone ink the rows and the page share.
+//! - `switch`: the on/off switch of a row.
+//! - `notices`: what stands where the table would be, and the warnings under it.
 
 pub mod cells;
+pub mod notices;
+pub mod switch;
 pub mod types;
