@@ -156,6 +156,11 @@ impl ShellView {
     }
 
     pub(super) fn dispatch(&mut self, action: Action, cx: &mut Context<Self>) {
+        // A section or the home page takes the main area; the tasks stay open.
+        #[cfg(unix)]
+        if matches!(action, Action::SelectSection(_) | Action::NewTask) {
+            self.tasks.tabs.leave();
+        }
         if self.state.apply(action) {
             cx.notify();
         }

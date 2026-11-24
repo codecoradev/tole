@@ -57,6 +57,7 @@ impl Source for Tasks {
                 task.set_heights(&heights);
             }
             TaskCall::Toggle(row) => task.toggle_group(row),
+            TaskCall::Stop => {}
         }
         Ok(())
     }
