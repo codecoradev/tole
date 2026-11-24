@@ -193,6 +193,8 @@ pub fn cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     all.extend(super::harness_task::render_tasks(&dir, window)?);
     all.extend(super::harness_skills::render_skills(&dir, window)?);
     all.extend(super::approvals::scenes::render_scenes(&dir)?);
+    #[cfg(unix)]
+    all.extend(super::approvals::scenes_page::render_scenes(&dir)?);
     for r in all {
         println!(
             "{}  {}x{}  {} bytes  board: {}",

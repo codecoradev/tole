@@ -36,3 +36,5 @@ pub use self::focus::StopFocus;
 pub use self::page::{approvals_page, standing, PageHost, PageUi};
 #[cfg(feature = "render-harness")]
 pub mod scenes;
+#[cfg(all(feature = "render-harness", unix))]
+pub mod scenes_page;
