@@ -10,9 +10,13 @@
 //! - `switch`: the on/off switch of a row.
 //! - `notices`: what stands where the table would be, and the warnings under it.
 //! - `row`: one row of the table.
+//! - `table`: the column titles and the rows.
+//! - `page`: the page: title, top bar, table or stand-in, notices, scheduler note.
 
 pub mod cells;
 pub mod notices;
+pub mod page;
 pub mod row;
 pub mod switch;
+pub mod table;
 pub mod types;
