@@ -10,6 +10,7 @@ use super::reap;
 use super::tasks::TaskSet;
 use crate::driver::api::Api;
 use crate::driver::approvals;
+use crate::driver::automations;
 use crate::driver::runtime::JoinReport;
 use crate::driver::shared::handle::OnChange;
 use crate::driver::shared::thread::DriverInput;
@@ -53,6 +54,7 @@ pub(super) struct Attached {
     pub api: Arc<dyn Api>,
     pub approvals: approvals::Handle,
     pub skills: skills::Handle,
+    pub automations: automations::Handle,
     /// One per task driver that runs, in the order they were started.
     pub tasks: Vec<(String, task::Handle)>,
 }

@@ -8,6 +8,7 @@ use super::reap::{self, Job};
 use super::shared::{Attached, Fanin};
 use crate::driver::api::Api;
 use crate::driver::approvals::{self, ApprovalsDriver};
+use crate::driver::automations::{self, AutomationsDriver};
 use crate::driver::clock::Clock;
 use crate::driver::runtime::JoinReport;
 use crate::driver::skills::{self, SkillsDriver};
@@ -18,6 +19,7 @@ use crate::driver::task::{self, TaskDriver};
 pub(super) struct Settings {
     pub approvals_refresh: Duration,
     pub skills_refresh: Duration,
+    pub automations_refresh: Duration,
 }
 
 /// The drivers that run over one `Api`, and the handles the UI reads them by.
@@ -28,13 +30,14 @@ pub(super) struct Live {
     epoch: u64,
     approvals: ApprovalsDriver,
     skills: SkillsDriver,
+    automations: AutomationsDriver,
     tasks: Vec<(String, TaskDriver)>,
     attached: Arc<Attached>,
 }
 
 impl Live {
-    /// Start the approvals driver, following `sessions`, and the skills driver
-    /// over `api`. `Err` when the system cannot start a thread; nothing is left
+    /// Start the approvals driver, following `sessions`, and the skills and
+    /// automations drivers over `api`. `Err` when the system cannot start a thread; nothing is left
     /// running then.
     pub(super) fn start(
         api: Arc<dyn Api>,
@@ -61,11 +64,20 @@ impl Live {
                 on_change: Some(fan.callback()),
             },
         )?;
+        let automations = AutomationsDriver::start(
+            Arc::clone(&api),
+            Arc::clone(clock),
+            automations::Config {
+                refresh: settings.automations_refresh,
+                on_change: Some(fan.callback()),
+            },
+        )?;
         let attached = Arc::new(Attached {
             epoch,
             api: Arc::clone(&api),
             approvals: approvals.handle(),
             skills: skills.handle(),
+            automations: automations.handle(),
             tasks: Vec::new(),
         });
         Ok(Live {
@@ -76,6 +88,7 @@ impl Live {
             attached,
             approvals,
             skills,
+            automations,
             tasks: Vec::new(),
         })
     }
@@ -91,16 +104,19 @@ impl Live {
             api: Arc::clone(&self.api),
             approvals: self.approvals.handle(),
             skills: self.skills.handle(),
+            automations: self.automations.handle(),
             tasks: (self.tasks.iter())
                 .map(|(id, driver)| (id.clone(), driver.handle()))
                 .collect(),
         });
     }
 
-    /// The approvals and the skills drivers still run: neither ended by itself
-    /// (a thread died).
+    /// The approvals, skills and automations drivers still run: none ended by
+    /// itself (a thread died).
     pub(super) fn alive(&self) -> bool {
-        self.attached.approvals.is_running() && self.attached.skills.is_running()
+        self.attached.approvals.is_running()
+            && self.attached.skills.is_running()
+            && self.attached.automations.is_running()
     }
 
     /// The tasks whose driver ended by itself.
@@ -148,12 +164,14 @@ impl Live {
         let Live {
             approvals,
             skills,
+            automations,
             tasks,
             ..
         } = self;
         let mut jobs: Vec<Job> = vec![
             Box::new(move || approvals.shutdown(timeout)),
             Box::new(move || skills.shutdown(timeout)),
+            Box::new(move || automations.shutdown(timeout)),
         ];
         for (_, driver) in tasks {
             jobs.push(Box::new(move || driver.shutdown(timeout)));

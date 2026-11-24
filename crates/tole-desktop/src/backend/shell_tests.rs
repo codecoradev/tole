@@ -9,6 +9,7 @@ use tole_desktop_model::{
 use super::shell::{actions, apply, skills_badge};
 use super::BackendView;
 use crate::driver::approvals::ApprovalsView;
+use crate::driver::automations::AutomationsView;
 use crate::driver::skills::SkillsPageView;
 
 fn running() -> ServeState {
@@ -23,6 +24,7 @@ fn view(serve: ServeState) -> BackendView {
         serve,
         approvals: ApprovalsView::unknown(),
         skills: SkillsPageView::not_loaded(),
+        automations: AutomationsView::not_loaded(),
         open_tasks: Vec::new(),
     }
 }
