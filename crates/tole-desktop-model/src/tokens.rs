@@ -149,6 +149,12 @@ pub mod size {
     pub const INDENT: f32 = 16.0;
     /// Width of the marker (bullet or number) before a list item.
     pub const MARKER_WIDTH: f32 = 22.0;
+    /// Widest the list of a page (Skills and tools) grows.
+    pub const PAGE_MAX_WIDTH: f32 = 760.0;
+    /// Space inside a card of a page list.
+    pub const CARD_PADDING: f32 = 12.0;
+    /// Height of a tag (a small label on a card).
+    pub const TAG_HEIGHT: f32 = 20.0;
     /// First window size.
     pub const WINDOW_WIDTH: f32 = 1200.0;
     pub const WINDOW_HEIGHT: f32 = 780.0;

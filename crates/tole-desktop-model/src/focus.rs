@@ -5,7 +5,7 @@
 //! sidebar sections in sidebar order, the folders in list order, and then the
 //! controls of the home page. A control that is not on screen is not a stop.
 
-use crate::{FolderId, Section, ShellState};
+use crate::{FolderId, Section, ShellState, Tab};
 
 /// A control of the shell that can take keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +18,10 @@ pub enum FocusTarget {
     HomeFolder(FolderId),
     /// The "New task" button of the home page.
     HomeStart,
+    /// A tab of the Skills and tools page.
+    SkillsTab(Tab),
+    /// The refresh button of the Skills and tools page.
+    SkillsRefresh,
 }
 
 impl ShellState {
@@ -33,6 +37,11 @@ impl ShellState {
             if self.home().can_start {
                 order.push(FocusTarget::HomeStart);
             }
+        }
+        if self.section == Section::SkillsAndTools {
+            order.push(FocusTarget::SkillsTab(Tab::Skills));
+            order.push(FocusTarget::SkillsTab(Tab::ConnectedTools));
+            order.push(FocusTarget::SkillsRefresh);
         }
         order
     }
@@ -81,6 +90,30 @@ mod tests {
         assert_eq!(order[0], FocusTarget::SidebarToggle);
         state.apply(Action::SelectSection(Section::Approvals));
         assert_eq!(state.tab_order(), [FocusTarget::SidebarToggle]);
+    }
+
+    #[test]
+    fn the_skills_page_adds_its_tabs_and_refresh_after_the_sidebar_and_only_there() {
+        let mut state = ShellState::placeholder();
+        let home = state.tab_order();
+        assert!(!home
+            .iter()
+            .any(|t| matches!(t, FocusTarget::SkillsTab(_) | FocusTarget::SkillsRefresh)));
+        state.apply(Action::SelectSection(Section::SkillsAndTools));
+        let order = state.tab_order();
+        let n = order.len();
+        assert_eq!(
+            order[n - 3..],
+            [
+                FocusTarget::SkillsTab(Tab::Skills),
+                FocusTarget::SkillsTab(Tab::ConnectedTools),
+                FocusTarget::SkillsRefresh
+            ]
+        );
+        assert_eq!(order[0], FocusTarget::SidebarToggle);
+        // A hidden sidebar leaves the page's own controls.
+        state.apply(Action::ToggleSidebar);
+        assert_eq!(state.tab_order().len(), 4);
     }
 
     #[test]
