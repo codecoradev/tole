@@ -69,6 +69,9 @@ pub const CHECKING: &str = "Checking what is waiting for you...";
 pub const UNREACHABLE: &str = "Tole cannot reach its server to check. It keeps trying.";
 pub const NO_CARD: &str = "Pick a request to read it.";
 pub const NO_CARD_DECIDED: &str = "Pick a request to see how it ended.";
+/// The app could not pass the owner's press on: nothing was sent.
+pub const CALL_REFUSED: &str =
+    "Tole could not send that. Nothing was changed. Try again in a moment.";
 pub const INCOMPLETE_NOTICE: &str =
     "This list may not show everything yet. Tole is checking again.";
 pub const PARKED_NOTICE: &str =

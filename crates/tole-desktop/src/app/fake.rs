@@ -76,7 +76,12 @@ pub(super) struct Counts {
     pub untrusted_tools: usize,
 }
 
-struct Scripted(Counts, Arc<AtomicUsize>);
+/// The answers the serve was given: (approval id, verdict).
+pub(super) type Decided = Arc<Mutex<Vec<(String, Decision)>>>;
+
+/// The counts it answers with, how many times the skills were read, and the
+/// answers it was given.
+struct Scripted(Counts, Arc<AtomicUsize>, Decided);
 
 fn refused() -> Error {
     Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused))
@@ -148,8 +153,17 @@ impl Api for Scripted {
         )
     }
 
-    fn decide_row(&self, _: &Approval, _: Decision) -> Result<DecisionReply, Error> {
-        Err(refused())
+    fn decide_row(&self, row: &Approval, decision: Decision) -> Result<DecisionReply, Error> {
+        lock(&self.2).push((row.id.clone(), decision));
+        let status = match decision {
+            Decision::Allow => "approved",
+            Decision::Deny => "denied",
+        };
+        Ok(DecisionReply {
+            id: row.id.clone(),
+            status: status.to_owned(),
+            resuming: None,
+        })
     }
     fn cron_jobs(&self) -> Result<CronJobs, Error> {
         Err(refused())
@@ -201,6 +215,8 @@ pub(super) struct FakeServe {
     /// `close_window` waits here, when set.
     pub close_gate: Mutex<Option<Arc<Gate>>>,
     pub dropped: Arc<AtomicBool>,
+    /// The answers the serve was given.
+    pub decided: Decided,
     /// What `close_window` reports.
     pub close_outcome: Mutex<CloseOutcome>,
 }
@@ -224,6 +240,7 @@ impl FakeServe {
             command_gate: Mutex::new(None),
             close_gate: Mutex::new(None),
             dropped: Arc::new(AtomicBool::new(false)),
+            decided: Decided::default(),
             close_outcome: Mutex::new(CloseOutcome::Closed),
         })
     }
@@ -260,7 +277,11 @@ impl ServeLink for FakeServe {
 
     fn api(&self) -> Option<Arc<dyn Api>> {
         let counts = (*lock(&self.counts))?;
-        Some(Arc::new(Scripted(counts, Arc::clone(&self.skills_calls))))
+        Some(Arc::new(Scripted(
+            counts,
+            Arc::clone(&self.skills_calls),
+            Arc::clone(&self.decided),
+        )))
     }
 }
 

@@ -6,7 +6,9 @@ use tole_desktop_model::{
 
 use super::{App, Boot};
 use crate::backend::{shell, BackendView, TaskRefused};
+use crate::driver::approvals::ApprovalsView;
 use crate::driver::task::TaskView;
+use crate::ui::approvals::{ApprovalsCall, ApprovalsRefused};
 use crate::ui::{Source, Status, TaskCall};
 use tole_desktop_model::strings::StartProblem;
 
@@ -111,6 +113,23 @@ impl Source for App {
     /// not read, and the next attach reads it.
     fn refresh_skills(&self) {
         let _ = self.backend.with_skills(|skills| skills.refresh());
+    }
+
+    fn approvals(&self) -> ApprovalsView {
+        self.view().approvals
+    }
+
+    fn approvals_call(&self, call: ApprovalsCall) -> Result<(), ApprovalsRefused> {
+        let sent = self.backend_approvals(|handle| match call {
+            ApprovalsCall::Decide { id, decision } => handle.decide(&id, decision),
+            ApprovalsCall::Select(id) => handle.select(id),
+            ApprovalsCall::SelectTab(tab) => handle.select_tab(tab),
+        });
+        match sent {
+            None => Err(ApprovalsRefused::NoServe),
+            Some(Err(_)) => Err(ApprovalsRefused::Busy),
+            Some(Ok(())) => Ok(()),
+        }
     }
 }
 

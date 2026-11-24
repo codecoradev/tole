@@ -15,6 +15,10 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
+use super::approvals::{ApprovalsCall, ApprovalsRefused};
+#[cfg(unix)]
+use crate::driver::approvals::ApprovalsView;
 use tole_desktop_model::strings::StartProblem;
 use tole_desktop_model::tokens::Tone;
 use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState, SkillsPane};
@@ -101,6 +105,22 @@ pub trait Source {
     /// again. The work is the app's, off this thread; the result arrives as the
     /// next [`skills_page`](Self::skills_page).
     fn refresh_skills(&self) {}
+
+    /// The Approvals page as of now. Cheap and never blocks. A source with no
+    /// approvals reads as the driver does when nothing is known: the list is
+    /// not known, never empty.
+    #[cfg(unix)]
+    fn approvals(&self) -> ApprovalsView {
+        ApprovalsView::unknown()
+    }
+
+    /// What the owner did on the Approvals page. Returns at once; the outcome
+    /// is the next [`approvals`](Self::approvals). `Err` says nothing was sent.
+    #[cfg(unix)]
+    fn approvals_call(&self, call: ApprovalsCall) -> Result<(), ApprovalsRefused> {
+        let _ = call;
+        Err(ApprovalsRefused::NoServe)
+    }
 }
 
 /// A source shared with its owner: the window holds one clone and the host
@@ -154,6 +174,16 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
 
     fn refresh_skills(&self) {
         (**self).refresh_skills();
+    }
+
+    #[cfg(unix)]
+    fn approvals(&self) -> ApprovalsView {
+        (**self).approvals()
+    }
+
+    #[cfg(unix)]
+    fn approvals_call(&self, call: ApprovalsCall) -> Result<(), ApprovalsRefused> {
+        (**self).approvals_call(call)
     }
 }
 
