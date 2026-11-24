@@ -469,7 +469,8 @@ fn detect_uncached() -> (Availability, bool) {
 /// - `$HOME`, the account's passwd home or any ancestor of either (`/home`),
 ///   since that would mount it.
 ///   Paths under `$HOME` (a project dir) are fine. When `$HOME` is not
-///   known, an ancestor of `/home` or `/root` is refused instead;
+///   known, an ancestor of `/home` or `/root` (resolved too) is refused
+///   instead;
 /// - the tole data dir, anything inside it, or any ancestor of it.
 ///
 /// Returns the RESOLVED path: the caller must bind that one, never the
@@ -490,9 +491,12 @@ pub fn check_grant(
     }
     let holds_home = match home {
         Some(h) => crate::paths::canon_lenient(h).starts_with(&p),
+        // Resolved like the grant: `/home` is a symlink on macOS
+        // (`/System/Volumes/Data/home`), and a resolved grant never starts
+        // with the unresolved name.
         None => ["/home", "/root"]
             .iter()
-            .any(|h| Path::new(h).starts_with(&p)),
+            .any(|h| crate::paths::canon_lenient(Path::new(h)).starts_with(&p)),
     };
     if holds_home {
         return Err(format!(

@@ -342,7 +342,8 @@ fn a_program_with_a_slash_or_not_found_is_refused_in_every_mode() {
 fn a_relative_path_entry_is_never_searched() {
     let ws = tmp("relpath");
     let mut env = env_in(&ws);
-    env.path = Some(".:bin:/usr/bin".into());
+    // `sh` is in `/usr/bin` on a merged-usr Linux and only in `/bin` on macOS.
+    env.path = Some(".:bin:/bin:/usr/bin".into());
     std::fs::create_dir_all(ws.join("bin")).unwrap();
     let c = on(Mode::Required, Mode::Required);
     let a = match plan_command(
@@ -373,10 +374,17 @@ fn a_relative_path_entry_is_never_searched() {
 
 #[test]
 fn find_program_skips_every_relative_path_entry() {
-    // A relative entry that WOULD reach /usr/bin from this process's cwd.
+    // The system directory that holds `sh` (`/usr/bin` on a merged-usr Linux,
+    // `/bin` on macOS), and a relative entry that WOULD reach it from this
+    // process's cwd.
+    let sys = if Path::new("/usr/bin/sh").exists() {
+        "usr/bin"
+    } else {
+        assert!(Path::new("/bin/sh").exists());
+        "bin"
+    };
     let up = std::env::current_dir().unwrap().components().count();
-    let rel = format!("{}usr/bin", "../".repeat(up));
-    assert!(Path::new("/usr/bin/sh").exists() || Path::new("/bin/sh").exists());
+    let rel = format!("{}{sys}", "../".repeat(up));
     assert!(
         std::fs::metadata(Path::new(&rel).join("sh")).is_ok(),
         "sanity: the relative entry reaches sh"
