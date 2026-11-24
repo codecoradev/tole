@@ -12,6 +12,7 @@
 //! - `notices`: what stands where the table would be, and the warnings under it.
 //! - `row`: one row of the table.
 //! - `table`: the column titles and the rows.
+//! - `window`: the page inside the window: the section's area and what its presses do.
 //! - `page`: the page: title, top bar, table or stand-in, notices, scheduler note.
 
 pub mod call;
@@ -29,5 +30,9 @@ pub mod switch;
 pub mod table;
 #[cfg(all(feature = "gpui", unix))]
 pub mod types;
+#[cfg(all(feature = "gpui", unix))]
+pub mod window;
 
 pub use self::call::{AutomationsCall, AutomationsRefused};
+#[cfg(all(feature = "gpui", unix))]
+pub use self::window::AutomationsWindow;
