@@ -11,6 +11,8 @@
 //!   client; `kind`, `effect`, `status` and the risk tier stay the server's
 //!   codes, and an unknown code reads as the most careful value.
 //! - [`ApprovalCard`]: what one request shows, in the words of [`strings`].
+//! - [`Standing`], [`PageStop`]: what the page says about its list, and the
+//!   order Tab visits its controls in.
 //! - `ApprovalsState`, `ApprovalsAction`: the Waiting and Decided lists,
 //!   the countdown and expiry, the sidebar count and the composer rule.
 //!
@@ -19,6 +21,7 @@
 
 mod card;
 mod kind;
+mod page;
 mod queue;
 mod request;
 mod summary;
@@ -28,6 +31,7 @@ pub mod strings;
 
 pub use card::{ApprovalCard, Button, CardState, DetailRow, BUTTONS};
 pub use kind::{effect_care, risk_care, Care, Wording};
+pub use page::{page_stops, PageStop, Standing};
 pub use queue::{
     AnswerError, ApprovalsAction, ApprovalsState, ComposerState, FetchId, Row, Scope, Tab,
     FETCH_TIMEOUT_SECS, MAX_DECIDED, MAX_TOMBSTONES, MAX_WAITING,
