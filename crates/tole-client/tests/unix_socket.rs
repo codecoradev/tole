@@ -168,3 +168,43 @@ fn a_server_that_is_not_listening_is_a_transient_connect_error() {
     assert!(matches!(err, Error::Connect(_)), "{err:?}");
     assert!(err.is_transient());
 }
+
+/// A peer that closed the connection before the client set a timeout on it:
+/// macOS refuses that `setsockopt` with EINVAL (#1174). It is a dropped
+/// connection (transient), never a bad setting (`InvalidConfig`, not retried).
+#[test]
+fn a_peer_that_closed_first_is_a_dropped_connection_not_a_bad_setting() {
+    use tole_client::{Connection, Transport, UnixTransport};
+    let (sock, _) = server(0, |_, _| {});
+    // `server(0, ..)` binds and then drops its listener; bind our own here.
+    let _ = std::fs::remove_file(&sock.path);
+    let listener = UnixListener::bind(&sock.path).unwrap();
+    let transport = UnixTransport::new(&sock.path).unwrap();
+    let mut conn: Box<dyn Connection> = transport.connect().unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    drop(peer);
+    std::thread::sleep(Duration::from_millis(100));
+    for result in [
+        conn.set_write_timeout(Some(Duration::from_secs(5))),
+        conn.set_read_timeout(Some(Duration::from_secs(5))),
+    ] {
+        // Accepted where the OS allows it, else a dropped connection.
+        if let Err(e) = result {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e:?}");
+            assert!(Error::from(e).is_transient());
+        }
+    }
+}
+
+/// The standard library's refusal of a zero timeout is still a bad setting.
+#[test]
+fn a_zero_timeout_is_still_a_bad_setting() {
+    use tole_client::{Transport, UnixTransport};
+    let (sock, _) = server(0, |_, _| {});
+    let _ = std::fs::remove_file(&sock.path);
+    let _listener = UnixListener::bind(&sock.path).unwrap();
+    let mut conn = UnixTransport::new(&sock.path).unwrap().connect().unwrap();
+    let err = conn.set_read_timeout(Some(Duration::ZERO)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(matches!(Error::from(err), Error::InvalidConfig(_)));
+}

@@ -24,13 +24,32 @@ const SOCKET_PATH_MAX: usize = 103;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const SOCKET_PATH_MAX: usize = 107;
 
+/// macOS refuses `setsockopt` with `EINVAL` on a Unix socket whose peer has
+/// already closed it (checked on macOS 26.5.1: the same call is accepted while
+/// the peer is open or only shut down, and on a TCP socket). Left as it is,
+/// `From<io::Error>` would turn that `InvalidInput` into
+/// [`Error::InvalidConfig`], a bad setting that is never retried, when it is a
+/// dropped connection, which says nothing about the request (#1174). The
+/// refusal of a zero timeout comes from the standard library and has no OS
+/// error, so it stays `InvalidInput`.
+fn peer_gone(e: io::Error) -> io::Error {
+    if e.raw_os_error() == Some(libc::EINVAL) {
+        io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "the server closed the connection",
+        )
+    } else {
+        e
+    }
+}
+
 impl Connection for UnixStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_read_timeout(self, timeout)
+        UnixStream::set_read_timeout(self, timeout).map_err(peer_gone)
     }
 
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_write_timeout(self, timeout)
+        UnixStream::set_write_timeout(self, timeout).map_err(peer_gone)
     }
 }
 
