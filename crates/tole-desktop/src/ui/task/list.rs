@@ -12,6 +12,7 @@ use super::measure::{self, Drawn};
 use super::rows::shell;
 use super::state::Pane;
 use super::TaskCall;
+use crate::driver::task::TaskView;
 use crate::ui::adapter::*;
 use crate::ui::shell::ShellView;
 use tole_desktop_model::task::mark;
@@ -28,10 +29,11 @@ impl ShellView {
     /// The main area of the shown task, if one is shown.
     pub(in crate::ui) fn task_pane(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.tasks.tabs.shown()?.to_owned();
-        // The pane is taken out while the list is built: building reads the
-        // window's source through `self`.
+        // The pane is taken out while it is built: building reads the window's
+        // source through `self`.
         let mut pane = self.tasks.panes.remove(&id).unwrap_or_default();
-        let body = self.task_list(&id, &mut pane, cx);
+        let (body, view) = self.task_list(&id, &mut pane, cx);
+        let strip = view.as_ref().map(|v| self.task_strip(v, cx));
         self.tasks.panes.insert(id, pane);
         Some(
             div()
@@ -40,13 +42,19 @@ impl ShellView {
                 .min_h(len(0.0))
                 .flex()
                 .flex_col()
+                .children(strip)
                 .child(body)
                 .into_any_element(),
         )
     }
 
     /// Learn from the last frame, then draw the window the driver gives now.
-    fn task_list(&self, id: &str, pane: &mut Pane, cx: &mut Context<Self>) -> AnyElement {
+    fn task_list(
+        &self,
+        id: &str,
+        pane: &mut Pane,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, Option<TaskView>) {
         let p = DARK;
         let source = self.source();
         let frame = laid_out(&pane.scroll);
@@ -101,7 +109,7 @@ impl ShellView {
             view = source.and_then(|s| s.task_view(id));
         }
         let Some(view) = view else {
-            return note_line(words::LOADING);
+            return (note_line(words::LOADING), None);
         };
         let window = view.window;
         pane.drawn = Drawn {
@@ -126,11 +134,13 @@ impl ShellView {
             )
         });
         let empty = view.total_rows == 0 && working.is_none();
-        if empty && view.loading {
-            return note_line(words::LOADING);
-        }
         if empty {
-            return note_line(words::EMPTY_TASK);
+            let line = if view.loading {
+                words::LOADING
+            } else {
+                words::EMPTY_TASK
+            };
+            return (note_line(line), Some(view));
         }
         let away = pane.follow.away(top, frame.viewport, frame.content);
         let list = div()
@@ -172,7 +182,7 @@ impl ShellView {
                         .child(words::JUMP_TO_LATEST),
                 )
         });
-        div()
+        let body = div()
             .relative()
             .flex_1()
             .min_h(len(0.0))
@@ -180,7 +190,8 @@ impl ShellView {
             .flex_col()
             .child(list)
             .children(jump)
-            .into_any_element()
+            .into_any_element();
+        (body, Some(view))
     }
 
     /// A "Working" group was clicked.

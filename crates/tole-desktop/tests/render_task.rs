@@ -1,6 +1,6 @@
 //! Checks of the task view in the offscreen render harness (#1031): what each
-//! row shows and how the list follows a running task. They run only through
-//! `scripts/desktop-render.sh --test` (feature `render-harness`, with the local
+//! row and the status row show and how the list follows a running task. They
+//! run only through `scripts/desktop-render.sh --test` (feature `render-harness`, with the local
 //! patch of the manifest); a plain `cargo test` skips this file.
 
 use std::path::PathBuf;
@@ -31,12 +31,11 @@ fn scene(name: &str) -> Scene {
     scenes().into_iter().find(|s| s.name == name).expect(name)
 }
 
-/// Every pixel of `colour` in the main area (right of the sidebar, below the header).
+/// Every pixel of `colour` in the transcript: right of the sidebar, below the
+/// strip.
 fn count_in_main(r: &Rendered, colour: Rgb) -> usize {
-    let (from_x, from_y) = (
-        size::SIDEBAR_WIDTH as u32 * 2 + 4,
-        size::TOPBAR_HEIGHT as u32 * 2 + 4,
-    );
+    let from_x = size::SIDEBAR_WIDTH as u32 * 2 + 4;
+    let from_y = (size::TOPBAR_HEIGHT as u32 + 60) * 2;
     let at = rgb(colour);
     let mut n = 0;
     for y in from_y..r.height {
@@ -130,4 +129,55 @@ fn a_running_task_follows_its_end_until_the_owner_scrolls_up_and_jump_returns() 
     jump(&mut w).expect("jump");
     let (following, top) = scroll_state(&mut w).expect("state");
     assert!(following && top > reading);
+}
+
+/// How many pixels of `colour` the strip (tabs, status, chip, Stop) of a task
+/// holds in the box (logical pixels) of the 1200 x 780 window.
+fn strip_count(r: &Rendered, x: (u32, u32), colour: Rgb) -> usize {
+    let (y0, y1) = (
+        size::TOPBAR_HEIGHT as u32 * 2,
+        (size::TOPBAR_HEIGHT as u32 + 48) * 2,
+    );
+    let at = rgb(colour);
+    let mut n = 0;
+    for y in y0..y1 {
+        for px in x.0 * 2..x.1 * 2 {
+            n += usize::from(r.pixel(px, y) == at);
+        }
+    }
+    n
+}
+
+#[test]
+fn the_status_row_has_its_dot_and_stop_only_while_a_turn_can_be_stopped() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = out_dir("status");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let rendered = render_tasks(&dir, WindowSize::default()).expect("render");
+    let by_name = |n: &str| rendered.iter().find(|r| r.name == n).expect(n);
+    let (strip, stop) = ((size::SIDEBAR_WIDTH as u32, 1200), (1200 - 90, 1200 - 16));
+    // The Stop button is white text on the strip at its right end: only a running turn has it.
+    let text = DARK.text_primary;
+    assert!(
+        strip_count(by_name("task-working"), stop, text) > 20,
+        "no Stop while working"
+    );
+    for idle in [
+        "task-answer-markdown",
+        "task-waiting-approval",
+        "task-offline",
+        "task-look-only",
+    ] {
+        assert_eq!(
+            strip_count(by_name(idle), stop, text),
+            0,
+            "{idle}: Stop offered"
+        );
+    }
+    // The dot says how it is going: going on and done are good, waiting asks, a lost link is bad.
+    let tone = |scene: &str, c: Rgb| strip_count(by_name(scene), strip, c);
+    assert!(tone("task-working", DARK.ok) > 20 && tone("task-working", DARK.amber) == 0);
+    assert!(tone("task-waiting-approval", DARK.amber) > 20);
+    assert!(tone("task-offline", DARK.danger) > 20 && tone("task-offline", DARK.ok) == 0);
+    assert_eq!(tone("task-look-only", DARK.amber), 0);
 }

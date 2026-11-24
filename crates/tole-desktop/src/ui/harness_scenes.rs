@@ -3,8 +3,7 @@
 
 use std::rc::Rc;
 
-use tole_desktop_model::task::TaskEvent;
-use tole_desktop_model::task::UserKind;
+use tole_desktop_model::task::{ApprovalInfo, TaskEvent, UserKind};
 
 use super::harness_task::Scene;
 use crate::driver::task::Preview;
@@ -77,6 +76,12 @@ fn long(n: u64) -> Vec<TaskEvent> {
     events
 }
 
+fn look_only_task() -> Preview {
+    let task = Preview::new(true);
+    task.feed([said(1, PROMPT), answer(2, "Here is what I found.")]);
+    task
+}
+
 /// `n` more exchanges (a question and its answer), their entries numbered from `first`.
 pub fn exchanges(first: u64, n: u64) -> Vec<TaskEvent> {
     (0..n)
@@ -141,13 +146,22 @@ pub fn scenes() -> Vec<Scene> {
     let long_end = Scene::of("task-long-at-the-end", long(500));
     let mut long_up = Scene::of("task-long-scrolled-up", long(500));
     long_up.scroll = Some(60_000.0);
-    let opening = Scene {
-        name: "task-opening",
-        task: None,
-        open: vec![],
-        technical: vec![],
-        scroll: None,
-    };
+    let mut opening = Scene::of("task-opening", vec![]);
+    opening.task = None;
+    let ask = TaskEvent::ApprovalRequested(ApprovalInfo {
+        id: "a1".into(),
+        tool: "run_command".into(),
+        summary: Some("Run a program to copy files".into()),
+    });
+    let mut waiting = calls(None);
+    waiting.push(ask);
+    let waiting = Scene::of("task-waiting-approval", waiting);
+    let offline = Scene::of(
+        "task-offline",
+        vec![said(1, PROMPT), TaskEvent::ConnectionLost],
+    );
+    let mut look_only = Scene::of("task-look-only", vec![]);
+    look_only.task = Some(Rc::new(look_only_task()));
     vec![
         working,
         technical,
@@ -159,5 +173,8 @@ pub fn scenes() -> Vec<Scene> {
         long_end,
         long_up,
         opening,
+        waiting,
+        offline,
+        look_only,
     ]
 }

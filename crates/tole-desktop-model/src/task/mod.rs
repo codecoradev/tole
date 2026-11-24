@@ -18,6 +18,7 @@ mod status;
 mod tabs;
 #[cfg(test)]
 mod text_tests;
+mod tone;
 mod transcript;
 #[cfg(test)]
 mod transcript_tests;
@@ -33,6 +34,7 @@ pub use mark::{mark, Mark};
 pub use run::{Link, Run};
 pub use status::{status_row, Phase, SendMode, StatusRow};
 pub use tabs::{title, Tabs, MAX_TITLE_CHARS};
+pub use tone::phase_tone;
 pub use transcript::{Counts, Item, Step, StepState, Transcript, WorkGroup};
 pub use viewport::{visible, ListLayout, Visible, MAX_ROW_HEIGHT};
 
