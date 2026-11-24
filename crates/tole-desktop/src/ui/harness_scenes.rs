@@ -76,6 +76,12 @@ fn long(n: u64) -> Vec<TaskEvent> {
     events
 }
 
+fn of_events(events: Vec<TaskEvent>) -> Preview {
+    let task = Preview::new(false);
+    task.feed(events);
+    task
+}
+
 fn look_only_task() -> Preview {
     let task = Preview::new(true);
     task.feed([said(1, PROMPT), answer(2, "Here is what I found.")]);
@@ -162,6 +168,15 @@ pub fn scenes() -> Vec<Scene> {
     );
     let mut look_only = Scene::of("task-look-only", vec![]);
     look_only.task = Some(Rc::new(look_only_task()));
+    let reply = || vec![said(1, PROMPT), answer(2, "Here is what I found.")];
+    let mut tabs = Scene::of("task-tabs", reply());
+    tabs.others = vec![
+        (
+            "20261123-2",
+            Rc::new(of_events(vec![said(1, "Weekly report")])),
+        ),
+        ("20261123-3", Rc::new(of_events(vec![]))),
+    ];
     vec![
         working,
         technical,
@@ -176,5 +191,6 @@ pub fn scenes() -> Vec<Scene> {
         waiting,
         offline,
         look_only,
+        tabs,
     ]
 }

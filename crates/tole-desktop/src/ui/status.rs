@@ -51,6 +51,17 @@ pub trait Source {
         None
     }
 
+    /// The tasks the window has open, in the order they were opened.
+    fn open_tasks(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Stop following `session`: its tab closes. The task itself goes on
+    /// where it runs; only this window lets go of it.
+    fn close_task(&self, session: &str) {
+        let _ = session;
+    }
+
     /// What the owner did in an open task. Returns at once; the reason it did
     /// nothing, if it did not, is the answer.
     #[cfg(unix)]
@@ -73,6 +84,14 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
 
     fn owner_action(&self, action: OwnerAction) {
         (**self).owner_action(action);
+    }
+
+    fn open_tasks(&self) -> Vec<String> {
+        (**self).open_tasks()
+    }
+
+    fn close_task(&self, session: &str) {
+        (**self).close_task(session);
     }
 
     #[cfg(unix)]

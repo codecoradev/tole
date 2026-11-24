@@ -8,7 +8,7 @@
 //! - `measure`: the numbers the list learns from its last frame (no toolkit).
 //! - `call`: what the window asks of a task (no toolkit).
 //! - `list`: the scrolling column of rows, following the end of a running task.
-//! - `strip`: the status row.
+//! - `strip`: the tabs of the open tasks and the status row.
 //! - `rows`, `work`, `prose`: one row of each kind, a "Working" group, an
 //!   answer's Markdown.
 

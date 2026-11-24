@@ -185,6 +185,9 @@ pub const NEW_TASK_TAB: &str = "New task";
 pub const CLOSE_TAB: &str = "Close this task";
 /// The tab button that starts another.
 pub const ADD_TAB: &str = "New task";
+/// What those two buttons show.
+pub const CLOSE_MARK: &str = "\u{00D7}";
+pub const ADD_MARK: &str = "+";
 /// A fourth task was asked for while three are open.
 pub fn too_many_tasks(max: usize) -> String {
     format!("{max} tasks are open. Close one to open another.")

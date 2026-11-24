@@ -5,6 +5,7 @@
 //! are in later captures): the owner's bubble at the right, Tole's words as
 //! plain text, a "Working" group that folds, a plan as a list.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
@@ -26,8 +27,17 @@ const BOARD: &str = "S3 (transcript)";
 /// The session the scenes show.
 pub const SESSION: &str = "20261123-1";
 
-/// A source with one task, read from a [`Preview`].
-struct Tasks(Option<Rc<Preview>>);
+/// The tasks the window has open: each a [`Preview`], or none yet.
+struct Tasks {
+    open: RefCell<Vec<(String, Option<Rc<Preview>>)>>,
+}
+
+impl Tasks {
+    fn find(&self, session: &str) -> Option<Rc<Preview>> {
+        let open = self.open.borrow();
+        open.iter().find(|(id, _)| id == session)?.1.clone()
+    }
+}
 
 impl Source for Tasks {
     fn changed(&self) -> bool {
@@ -40,23 +50,34 @@ impl Source for Tasks {
 
     fn owner_action(&self, _action: OwnerAction) {}
 
+    fn open_tasks(&self) -> Vec<String> {
+        self.open
+            .borrow()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn close_task(&self, session: &str) {
+        self.open.borrow_mut().retain(|(id, _)| id != session);
+    }
+
     fn task_view(&self, session: &str) -> Option<TaskView> {
-        let task = self.0.as_ref().filter(|_| session == SESSION)?;
-        Some(task.view())
+        Some(self.find(session)?.view())
     }
 
     fn task_call(&self, session: &str, call: TaskCall) -> Result<(), TaskRefused> {
-        let task = (self.0.as_ref().filter(|_| session == SESSION)).ok_or(TaskRefused::NotOpen)?;
-        match call {
+        let task = self.find(session).ok_or(TaskRefused::NotOpen)?;
+        match &call {
             TaskCall::Viewport {
                 top,
                 height,
                 overscan,
-            } => task.set_viewport(top, height, overscan),
+            } => task.set_viewport(*top, *height, *overscan),
             TaskCall::Heights(heights) => {
-                task.set_heights(&heights);
+                task.set_heights(heights);
             }
-            TaskCall::Toggle(row) => task.toggle_group(row),
+            TaskCall::Toggle(row) => task.toggle_group(*row),
             TaskCall::Stop => {}
         }
         Ok(())
@@ -108,6 +129,8 @@ pub struct Scene {
     pub name: &'static str,
     /// The task, or none yet (the window says it is opening).
     pub task: Option<Rc<Preview>>,
+    /// Other tasks open beside it (their tabs).
+    pub others: Vec<(&'static str, Rc<Preview>)>,
     /// Rows of "Working" groups to open.
     pub open: Vec<usize>,
     /// Rows whose technical details to show.
@@ -123,6 +146,7 @@ impl Scene {
         Scene {
             name,
             task: Some(Rc::new(task)),
+            others: vec![],
             open: vec![],
             technical: vec![],
             scroll: None,
@@ -132,7 +156,16 @@ impl Scene {
 
 /// The window showing `scene`, settled, with its groups opened and its list scrolled.
 pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, String> {
-    let source = Box::new(Tasks(scene.task.clone()));
+    let mut open = vec![(SESSION.to_owned(), scene.task.clone())];
+    open.extend(
+        scene
+            .others
+            .iter()
+            .map(|(id, p)| ((*id).to_owned(), Some(Rc::clone(p)))),
+    );
+    let source = Box::new(Tasks {
+        open: RefCell::new(open),
+    });
     let mut offscreen = Offscreen::open(window.width, window.height, move |_cx| {
         let mut view = ShellView::with_source(shell(), status(), source);
         view.show_task(SESSION);
@@ -151,6 +184,16 @@ pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, S
         offscreen.settle(8)?;
     }
     Ok(offscreen)
+}
+
+/// The tab's × of the shown task, pressed; the task now shown.
+pub fn close_shown(window: &mut Offscreen<ShellView>) -> Result<Option<String>, String> {
+    window.update(|view, _, cx| {
+        if let Some(id) = view.shown_task() {
+            view.task_close(&id, cx);
+        }
+        view.shown_task()
+    })
 }
 
 /// Renders every scene into `dir` (which must exist) and adds a line for each
