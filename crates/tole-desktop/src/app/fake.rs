@@ -76,7 +76,7 @@ pub(super) struct Counts {
     pub untrusted_tools: usize,
 }
 
-struct Scripted(Counts);
+struct Scripted(Counts, Arc<AtomicUsize>);
 
 fn refused() -> Error {
     Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused))
@@ -107,6 +107,7 @@ impl Api for Scripted {
     }
 
     fn skills(&self) -> Result<SkillsState, Error> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         let drafts: Vec<Value> = (0..self.0.drafts)
             .map(|i| {
                 json!({
@@ -191,6 +192,8 @@ pub(super) struct FakeServe {
     epoch: AtomicU64,
     counts: Mutex<Option<Counts>>,
     pub retries: AtomicUsize,
+    /// How many times `GET /skills` was asked.
+    pub skills_calls: Arc<AtomicUsize>,
     pub restarts: AtomicUsize,
     pub closes: AtomicUsize,
     /// `retry` and `restart_serve` wait here, when set.
@@ -215,6 +218,7 @@ impl FakeServe {
             epoch: AtomicU64::new(1),
             counts: Mutex::new(counts),
             retries: AtomicUsize::new(0),
+            skills_calls: Arc::new(AtomicUsize::new(0)),
             restarts: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
             command_gate: Mutex::new(None),
@@ -256,7 +260,7 @@ impl ServeLink for FakeServe {
 
     fn api(&self) -> Option<Arc<dyn Api>> {
         let counts = (*lock(&self.counts))?;
-        Some(Arc::new(Scripted(counts)))
+        Some(Arc::new(Scripted(counts, Arc::clone(&self.skills_calls))))
     }
 }
 

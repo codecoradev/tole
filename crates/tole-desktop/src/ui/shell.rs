@@ -9,7 +9,9 @@ use super::status::{badge_text, Source, Status, LOOK_EVERY};
 #[cfg(unix)]
 use super::task::TaskPanes;
 use tole_desktop_model::tokens::{font, size, DARK};
-use tole_desktop_model::{strings, Action, FocusTarget, OwnerAction, Section, ShellState};
+use tole_desktop_model::{
+    strings, Action, FocusTarget, OwnerAction, Section, ShellState, SkillsPane,
+};
 
 /// The app behind the window and the repeating look at it.
 struct Live {
@@ -25,6 +27,9 @@ pub struct ShellView {
     pub(super) status: Option<Status>,
     /// The button of the notice, a tab stop while there is one.
     pub(super) notice_focus: Option<FocusHandle>,
+    /// The Skills and tools page as the app last said it, with the tab the
+    /// owner chose (see `ui::skills`).
+    pub(super) skills: SkillsPane,
     live: Option<Live>,
     /// The open tasks and which one is shown.
     #[cfg(unix)]
@@ -42,6 +47,7 @@ impl ShellView {
             focus: HashMap::new(),
             status: None,
             notice_focus: None,
+            skills: SkillsPane::default(),
             live: None,
             #[cfg(unix)]
             tasks: TaskPanes::default(),
@@ -58,6 +64,9 @@ impl ShellView {
         // A change from before the window existed is shown by this read.
         let _ = source.changed();
         view.status = Some(source.refresh(&mut view.state));
+        if let Some(fresh) = source.skills_page() {
+            view.adopt_skills(fresh);
+        }
         let look = every(cx, LOOK_EVERY, |this: &mut ShellView, cx| this.look(cx));
         on_release(cx, |this: &mut ShellView| this.live = None);
         view.live = Some(Live {
@@ -93,7 +102,17 @@ impl ShellView {
         };
         if live.source.changed() {
             self.status = Some(live.source.refresh(&mut self.state));
+            if let Some(fresh) = live.source.skills_page() {
+                self.adopt_skills(fresh);
+            }
             cx.notify();
+        }
+    }
+
+    /// The Refresh button of the Skills and tools page was pressed.
+    pub(super) fn refresh_skills(&self) {
+        if let Some(live) = &self.live {
+            live.source.refresh_skills();
         }
     }
 
@@ -179,6 +198,7 @@ impl ShellView {
             .p(len(size::PADDING));
         match self.state.section {
             Section::NewTask => frame.child(self.home(cx)).into_any_element(),
+            Section::SkillsAndTools => self.skills_page(cx).into_any_element(),
             other => frame
                 .child(
                     div()

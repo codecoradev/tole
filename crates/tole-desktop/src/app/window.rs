@@ -1,6 +1,8 @@
 //! The app as the window's source: what the window reads, in the window's terms.
 
-use tole_desktop_model::{Action, Badge, ConnectionStatus, OwnerAction, Section, ShellState};
+use tole_desktop_model::{
+    Action, Badge, ConnectionStatus, OwnerAction, Section, ShellState, SkillsPane,
+};
 
 use super::{App, Boot};
 use crate::backend::{shell, BackendView, TaskRefused};
@@ -92,6 +94,24 @@ impl Source for App {
     fn new_task_problem(&self) -> Option<StartProblem> {
         self.tasks_new_problem()
     }
+
+    /// The skills driver's page: the same read as the view's, so the page and
+    /// the sidebar count come from one place.
+    fn skills_page(&self) -> Option<SkillsPane> {
+        let skills = self.view().skills;
+        Some(SkillsPane {
+            page: skills.page,
+            skills_loading: skills.skills_feed.loading,
+            tools_loading: skills.tools_feed.loading,
+        })
+    }
+
+    /// Both lists again, as soon as the driver's pace allows. Nothing when
+    /// there is no driver (the serve is not ready): the page then says it was
+    /// not read, and the next attach reads it.
+    fn refresh_skills(&self) {
+        let _ = self.backend.with_skills(|skills| skills.refresh());
+    }
 }
 
 #[cfg(test)]
@@ -99,7 +119,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use tole_desktop_model::{strings, ServeState};
+    use std::sync::atomic::Ordering;
+
+    use tole_desktop_model::{strings, Load, ServeState, SkillsPane, Tab, ToolTrust};
 
     use super::super::fake::{launcher_of, running, wait_until, Counts, FakeServe};
     use super::*;
@@ -173,6 +195,59 @@ mod tests {
             "{}",
             notice.text
         );
+        let _ = app.quit(Default::default());
+    }
+
+    /// The page the window draws is the driver's, read as it is: nothing before
+    /// the serve is ready (not a zero), the rows once the routes answered.
+    #[test]
+    fn the_window_reads_the_skills_page_as_the_driver_keeps_it() {
+        let counts = Counts {
+            approvals: 0,
+            drafts: 2,
+            untrusted_tools: 1,
+        };
+        let serve = FakeServe::new(ServeState::Starting, Some(counts));
+        let app = App::start_with(launcher_of(serve.clone(), None), Arc::new(SystemClock)).unwrap();
+        // The serve is not ready: no driver, nothing read.
+        assert_eq!(app.skills_page(), Some(SkillsPane::default()));
+        serve.set(running());
+        wait_until("both lists", || {
+            app.skills_page().is_some_and(|v| {
+                v.page.skills_load == Load::Ready && v.page.tools_load == Load::Ready
+            })
+        });
+        let page = app.skills_page().expect("a page").page;
+        assert_eq!(page.tab, Tab::Skills);
+        assert_eq!(page.skills.review.len(), 2);
+        assert_eq!(page.tools.len(), 1);
+        assert_eq!(page.tools[0].trust, ToolTrust::NotTrusted);
+        let _ = app.quit(Default::default());
+    }
+
+    /// Refresh reads the lists again; with no driver it does nothing and says
+    /// nothing, and the page stays as it was.
+    #[test]
+    fn refresh_asks_the_serve_for_the_skills_again_and_is_harmless_without_a_driver() {
+        let counts = Counts {
+            approvals: 0,
+            drafts: 1,
+            untrusted_tools: 0,
+        };
+        let serve = FakeServe::new(ServeState::Starting, Some(counts));
+        let app = App::start_with(launcher_of(serve.clone(), None), Arc::new(SystemClock)).unwrap();
+        app.refresh_skills();
+        assert_eq!(app.skills_page(), Some(SkillsPane::default()));
+        assert_eq!(serve.skills_calls.load(Ordering::SeqCst), 0);
+        serve.set(running());
+        wait_until("the first read", || {
+            serve.skills_calls.load(Ordering::SeqCst) >= 1
+        });
+        let first = serve.skills_calls.load(Ordering::SeqCst);
+        app.refresh_skills();
+        wait_until("a second read", || {
+            serve.skills_calls.load(Ordering::SeqCst) > first
+        });
         let _ = app.quit(Default::default());
     }
 }

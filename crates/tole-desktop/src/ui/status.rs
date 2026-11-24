@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tole_desktop_model::strings::StartProblem;
 use tole_desktop_model::tokens::Tone;
-use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState};
+use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState, SkillsPane};
 
 #[cfg(unix)]
 use super::task::TaskCall;
@@ -89,6 +89,18 @@ pub trait Source {
         let _ = (session, call);
         Err(TaskRefused::NotOpen)
     }
+
+    /// The Skills and tools page as the app knows it now: the tabs, their
+    /// loads and rows, and whether a call is out. `None` for a source with no
+    /// such page (the window then shows it as not read yet).
+    fn skills_page(&self) -> Option<SkillsPane> {
+        None
+    }
+
+    /// The owner pressed Refresh on the Skills and tools page: read both lists
+    /// again. The work is the app's, off this thread; the result arrives as the
+    /// next [`skills_page`](Self::skills_page).
+    fn refresh_skills(&self) {}
 }
 
 /// A source shared with its owner: the window holds one clone and the host
@@ -134,6 +146,14 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
     #[cfg(unix)]
     fn task_call(&self, session: &str, call: TaskCall) -> Result<(), TaskRefused> {
         (**self).task_call(session, call)
+    }
+
+    fn skills_page(&self) -> Option<SkillsPane> {
+        (**self).skills_page()
+    }
+
+    fn refresh_skills(&self) {
+        (**self).refresh_skills();
     }
 }
 
