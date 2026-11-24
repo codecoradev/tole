@@ -28,3 +28,5 @@ mod preview;
 pub use self::card::{approval_card, CardHost};
 #[cfg(feature = "gpui")]
 pub use self::focus::StopFocus;
+#[cfg(feature = "render-harness")]
+pub mod scenes;
