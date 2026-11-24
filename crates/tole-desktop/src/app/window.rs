@@ -7,8 +7,10 @@ use tole_desktop_model::{
 use super::{App, Boot};
 use crate::backend::{shell, BackendView, TaskRefused};
 use crate::driver::approvals::ApprovalsView;
+use crate::driver::automations::AutomationsView;
 use crate::driver::task::TaskView;
 use crate::ui::approvals::{ApprovalsCall, ApprovalsRefused};
+use crate::ui::automations::{AutomationsCall, AutomationsRefused};
 use crate::ui::{Source, Status, TaskCall};
 use tole_desktop_model::strings::StartProblem;
 
@@ -129,6 +131,23 @@ impl Source for App {
         match sent {
             None => Err(ApprovalsRefused::NoServe),
             Some(Err(_)) => Err(ApprovalsRefused::Busy),
+            Some(Ok(())) => Ok(()),
+        }
+    }
+
+    fn automations(&self) -> AutomationsView {
+        self.view().automations
+    }
+
+    fn automations_call(&self, call: AutomationsCall) -> Result<(), AutomationsRefused> {
+        let sent = self.backend_automations(|handle| match &call {
+            AutomationsCall::SetEnabled { id, enabled } => handle.set_enabled(id, *enabled),
+            AutomationsCall::Select(id) => handle.select(id),
+            AutomationsCall::DismissNotice => handle.dismiss_notice(),
+        });
+        match sent {
+            None => Err(AutomationsRefused::NoServe),
+            Some(Err(_)) => Err(AutomationsRefused::Busy),
             Some(Ok(())) => Ok(()),
         }
     }

@@ -88,6 +88,8 @@ mod tests;
 #[cfg(test)]
 mod tests_approvals;
 #[cfg(test)]
+mod tests_automations;
+#[cfg(test)]
 mod tests_quit;
 
 use std::io;
@@ -199,6 +201,15 @@ impl App {
         f: impl FnOnce(&crate::driver::approvals::Handle) -> R,
     ) -> Option<R> {
         self.backend.with_approvals(f)
+    }
+
+    /// Call `f` with the automations driver's handle, if there is a driver for
+    /// the serve that is there now (see [`Backend::with_automations`]).
+    pub(crate) fn backend_automations<R>(
+        &self,
+        f: impl FnOnce(&crate::driver::automations::Handle) -> R,
+    ) -> Option<R> {
+        self.backend.with_automations(f)
     }
 
     /// Whether the backend still runs (false after a panic ended it).
