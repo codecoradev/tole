@@ -12,11 +12,14 @@
 //!   `CardHost`).
 //! - `page`: the page itself, a pure function of the driver's view
 //!   (`crate::driver::approvals::ApprovalsView`) and a small state of its own.
+//! - `window`: the page inside the window (the section's main area and what a
+//!   press does).
 //! - `focus`: the Tab stops of the page and of a card, in the order the model
 //!   gives ([`tole_desktop_model::approvals::page_stops`]).
 //!
 //! [`Decision`]: tole_desktop_model::approvals::Decision
 
+mod call;
 #[cfg(feature = "gpui")]
 mod card;
 #[cfg(feature = "gpui")]
@@ -27,13 +30,18 @@ mod page;
 mod parts;
 #[cfg(feature = "gpui")]
 mod preview;
+#[cfg(all(feature = "gpui", unix))]
+mod window;
 
+pub use self::call::{ApprovalsCall, ApprovalsRefused};
 #[cfg(feature = "gpui")]
 pub use self::card::{approval_card, CardHost};
 #[cfg(feature = "gpui")]
 pub use self::focus::StopFocus;
 #[cfg(all(feature = "gpui", unix))]
 pub use self::page::{approvals_page, standing, PageHost, PageUi};
+#[cfg(all(feature = "gpui", unix))]
+pub use self::window::ApprovalsUi;
 #[cfg(feature = "render-harness")]
 pub mod scenes;
 #[cfg(all(feature = "render-harness", unix))]

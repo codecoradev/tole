@@ -39,6 +39,8 @@ pub struct PageUi {
     details_for: Option<String>,
     /// The card the handles of the card's controls were made for.
     shown: Option<String>,
+    /// The last press was refused: nothing was sent.
+    refused: bool,
 }
 
 impl PageUi {
@@ -67,6 +69,12 @@ impl PageUi {
     pub fn details_open(&self, view: &ApprovalsView) -> bool {
         let shown = view.selected.as_ref().map(|c| c.id.as_str());
         shown.is_some() && shown == self.details_for.as_deref()
+    }
+
+    /// Says whether the owner's last press reached nobody (the page then tells
+    /// them to try again).
+    pub fn set_refused(&mut self, refused: bool) {
+        self.refused = refused;
     }
 
     pub fn toggle_details(&mut self, id: &str) {
@@ -108,12 +116,14 @@ pub fn approvals_page<V: 'static>(
         .text_size(len(font::CAPTION))
         .text_color(color(p.text_muted))
         .child(div().min_w(len(0.0)).truncate().child(st.top_line()));
+    let refused = ui.refused.then(|| notice(strings::CALL_REFUSED.to_owned()));
     let detail = match &view.selected {
         Some(card) => div()
             .p(len(size::PADDING))
             .flex()
             .flex_col()
             .gap(len(size::PADDING))
+            .children(refused)
             .child(approval_card(
                 card,
                 ui.details_open(view),
@@ -127,6 +137,7 @@ pub fn approvals_page<V: 'static>(
             .flex()
             .flex_col()
             .gap(len(size::PADDING))
+            .children(refused)
             .text_color(color(p.text_faint))
             .child(match view.tab {
                 Tab::Waiting => strings::NO_CARD,

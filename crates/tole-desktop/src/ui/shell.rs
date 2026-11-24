@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 
 use super::adapter::*;
+#[cfg(unix)]
+use super::approvals::ApprovalsUi;
 use super::status::{badge_text, Source, Status, LOOK_EVERY};
 #[cfg(unix)]
 use super::task::TaskPanes;
@@ -34,6 +36,9 @@ pub struct ShellView {
     /// The open tasks and which one is shown.
     #[cfg(unix)]
     pub(super) tasks: TaskPanes,
+    /// The Approvals page's own state.
+    #[cfg(unix)]
+    pub(super) approvals: ApprovalsUi,
     /// A source the render harness gives a window that is not live.
     #[cfg(feature = "render-harness")]
     preview: Option<Box<dyn Source>>,
@@ -51,6 +56,8 @@ impl ShellView {
             live: None,
             #[cfg(unix)]
             tasks: TaskPanes::default(),
+            #[cfg(unix)]
+            approvals: ApprovalsUi::default(),
             #[cfg(feature = "render-harness")]
             preview: None,
         }
@@ -128,8 +135,8 @@ impl ShellView {
         badge_text(self.status.as_ref(), &self.state, section)
     }
 
-    /// A window showing `status` and reading tasks from `source`, with no timer
-    /// behind it (for the render harness).
+    /// A window showing `status` and reading the app from `source`, with no
+    /// timer behind it (for the render harness).
     #[cfg(feature = "render-harness")]
     pub fn with_source(state: ShellState, status: Status, source: Box<dyn Source>) -> Self {
         let mut view = ShellView::with_status(state, status);
@@ -137,7 +144,7 @@ impl ShellView {
         view
     }
 
-    /// What the window reads tasks from and sends the owner's actions to.
+    /// What the window reads the app from and sends the owner's presses to.
     #[cfg(unix)]
     pub(super) fn source(&self) -> Option<&dyn Source> {
         #[cfg(feature = "render-harness")]
@@ -199,6 +206,8 @@ impl ShellView {
         match self.state.section {
             Section::NewTask => frame.child(self.home(cx)).into_any_element(),
             Section::SkillsAndTools => self.skills_page(cx).into_any_element(),
+            #[cfg(unix)]
+            Section::Approvals => self.approvals_main(cx).into_any_element(),
             other => frame
                 .child(
                     div()
