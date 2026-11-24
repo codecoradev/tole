@@ -194,6 +194,22 @@ fn launch_starts_a_serve_with_a_private_credential_and_quit_completely_stops_it(
     assert_eq!(mode(&token::token_path(&w.cfg.runtime_dir)), 0o600);
 
     let pid = w.pid();
+    {
+        // The credential is not in the arguments, on macOS and Linux alike
+        // (`ps` shows them on both; `-ww` keeps a long line whole).
+        let secret = w.token();
+        let ps = std::process::Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        assert!(ps.status.success(), "ps did not find the serve");
+        let shown = String::from_utf8_lossy(&ps.stdout);
+        assert!(
+            !shown.contains(&secret),
+            "the credential leaked into the arguments"
+        );
+        assert!(shown.contains("--token-fd"), "{shown}");
+    }
     #[cfg(target_os = "linux")]
     {
         // The credential is in neither the arguments nor the environment.
