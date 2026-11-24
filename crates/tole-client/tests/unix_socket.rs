@@ -169,31 +169,54 @@ fn a_server_that_is_not_listening_is_a_transient_connect_error() {
     assert!(err.is_transient());
 }
 
-/// A peer that closed the connection before the client set a timeout on it:
-/// macOS refuses that `setsockopt` with EINVAL (#1174). It is a dropped
-/// connection (transient), never a bad setting (`InvalidConfig`, not retried).
-#[test]
-fn a_peer_that_closed_first_is_a_dropped_connection_not_a_bad_setting() {
-    use tole_client::{Connection, Transport, UnixTransport};
+/// A connected pair of a client `Connection` and the server's end.
+fn pair() -> (Sock, Box<dyn tole_client::Connection>, UnixStream) {
+    use tole_client::{Transport, UnixTransport};
     let (sock, _) = server(0, |_, _| {});
     // `server(0, ..)` binds and then drops its listener; bind our own here.
     let _ = std::fs::remove_file(&sock.path);
     let listener = UnixListener::bind(&sock.path).unwrap();
-    let transport = UnixTransport::new(&sock.path).unwrap();
-    let mut conn: Box<dyn Connection> = transport.connect().unwrap();
+    let conn = UnixTransport::new(&sock.path).unwrap().connect().unwrap();
     let (peer, _) = listener.accept().unwrap();
+    (sock, conn, peer)
+}
+
+/// The server answers and closes (`Connection: close`) while the client is
+/// busy; the client then re-arms its read timeout before the next read. macOS
+/// refuses that with EINVAL because the peer is gone, but the answer is still
+/// in the socket and must be read whole (#1174): losing it would turn an
+/// answered request into an error, and a POST must never be replayed.
+#[test]
+fn an_answer_sent_before_the_server_closed_is_still_read() {
+    let (_sock, mut conn, mut peer) = pair();
+    peer.write_all(b"the whole answer").unwrap();
     drop(peer);
     std::thread::sleep(Duration::from_millis(100));
-    for result in [
-        conn.set_write_timeout(Some(Duration::from_secs(5))),
-        conn.set_read_timeout(Some(Duration::from_secs(5))),
-    ] {
-        // Accepted where the OS allows it, else a dropped connection.
-        if let Err(e) = result {
-            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e:?}");
-            assert!(Error::from(e).is_transient());
-        }
-    }
+    conn.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout on a closed peer is moot, not an error");
+    let mut got = Vec::new();
+    conn.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"the whole answer");
+}
+
+/// A peer that is gone before the request is written: the write fails as a
+/// dropped connection (transient), never as a bad setting.
+#[test]
+fn a_write_to_a_peer_that_closed_is_a_dropped_connection() {
+    let (_sock, mut conn, peer) = pair();
+    drop(peer);
+    std::thread::sleep(Duration::from_millis(100));
+    conn.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("a write timeout on a closed peer is moot, not an error");
+    let err = conn.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ),
+        "{err:?}"
+    );
+    assert!(Error::from(err).is_transient());
 }
 
 /// The standard library's refusal of a zero timeout is still a bad setting.
