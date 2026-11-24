@@ -49,6 +49,60 @@ pub const DETAIL_KIND_CODE: &str = "Kind code";
 pub const DETAIL_EFFECT_CODE: &str = "Effect code";
 pub const DETAIL_REQUEST_ID: &str = "Request id";
 
+/// The top bar of the Approvals page, after the count.
+pub const EVERY_ANSWER_FINAL: &str = "every answer is final and is recorded with the task";
+/// Between the count and the rule in the top bar.
+pub const TOP_SEPARATOR: &str = " \u{b7} ";
+pub const NOTHING_WAITING: &str = "Nothing is waiting";
+pub const CHECKING_WAITING: &str = "Checking what is waiting";
+pub const ALL_FOLDERS: &str = "all folders";
+/// The mark of a list row whose file is outside the working folder: a chip of
+/// its own, so a long title cannot cut it off.
+pub const LIST_OUTSIDE_CHIP: &str = "Outside the folder";
+
+pub const EMPTY_WAITING: &str =
+    "Nothing is waiting for you. When Tole needs an OK, it shows up here.";
+pub const EMPTY_DECIDED: &str =
+    "Nothing decided yet. Answers given while this app is open show up here.";
+pub const CHECKING: &str = "Checking what is waiting for you...";
+pub const UNREACHABLE: &str = "Tole cannot reach its server to check. It keeps trying.";
+pub const NO_CARD: &str = "Pick a request to read it.";
+pub const NO_CARD_DECIDED: &str = "Pick a request to see how it ended.";
+pub const INCOMPLETE_NOTICE: &str =
+    "This list may not show everything yet. Tole is checking again.";
+pub const PARKED_NOTICE: &str =
+    "A request in a task that is not open here can show up a little late. Tole checks every few seconds.";
+
+/// The top bar: the count, then the rule that answers are final.
+pub fn top_line(summary: &str) -> String {
+    format!("{summary}{TOP_SEPARATOR}{EVERY_ANSWER_FINAL}")
+}
+
+/// "3 waiting".
+pub fn waiting_count(count: usize) -> String {
+    format!("{count} waiting")
+}
+
+/// What is certain while the list is not known.
+pub fn at_least_waiting(count: usize) -> String {
+    format!("At least {count} waiting")
+}
+
+/// A tab name with its count: "Waiting 2" (the count may be the unknown mark).
+pub fn tab_with_count(name: &str, count: &str) -> String {
+    format!("{name} {count}")
+}
+
+/// A request the server sent that this app could not read: it may be waiting.
+pub fn refused_notice(count: usize) -> String {
+    match count {
+        1 => "Tole could not read 1 request from its server. It may be waiting for you.".to_owned(),
+        n => format!(
+            "Tole could not read {n} requests from its server. They may be waiting for you."
+        ),
+    }
+}
+
 pub fn button_label(button: Button) -> &'static str {
     match button {
         Button::DontAllow => "Don't allow",
@@ -205,6 +259,17 @@ mod tests {
         assert_eq!(
             (left_short(840).as_str(), left_short(59).as_str()),
             ("14 min left", "59 s left")
+        );
+    }
+
+    #[test]
+    fn the_counts_of_the_page_are_worded_here() {
+        assert_eq!(waiting_count(3), "3 waiting");
+        assert_eq!(at_least_waiting(2), "At least 2 waiting");
+        assert_eq!(tab_with_count(TAB_WAITING, "2"), "Waiting 2");
+        assert!(
+            !EVERY_ANSWER_FINAL.contains("History"),
+            "that page does not exist yet"
         );
     }
 
