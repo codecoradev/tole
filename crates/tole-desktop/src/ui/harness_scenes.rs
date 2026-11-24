@@ -54,6 +54,11 @@ const LEAD_IN: &str =
 const PLAN: &str = "I found 36 invoices with a clear date and 2 without one. My plan:\n\n- Make 6 folders, one for each month from June to November.\n- Copy each invoice into the folder for its month. The originals stay where they are.\n- Leave the 2 invoices without a date in place and tell you which ones.\n\nCopying files is done by running a program, so Tole will ask you before it starts.";
 const REPORT: &str = "## What I did\n\nI read **38 files** in `Invoices` and found a date in 36 of them.\n\n1. `2026-06-invoice-01.pdf` and 17 more are from June.\n2. The rest are from July to November.\n\n> Nothing was copied yet.\n\n```\nls Invoices | wc -l\n38\n```\n\nSee [the notes](https://example.com/notes) for how dates are read.";
 
+/// The task of the scenes `task-long-*`, as a new driver would read it.
+pub(super) fn long_task() -> Preview {
+    of_events(long(500))
+}
+
 /// The history of a task with `n` exchanges: a question, two reads, an answer.
 fn long(n: u64) -> Vec<TaskEvent> {
     let mut events = Vec::new();
@@ -177,6 +182,9 @@ pub fn scenes() -> Vec<Scene> {
         ),
         ("20261123-3", Rc::new(of_events(vec![]))),
     ];
+    let mut home = Scene::of("home-new-task", vec![]);
+    home.task = None;
+    home.home = true;
     let mut typed = Scene::of("task-composer-text", reply());
     typed.typed = Some("Also keep the scans\nin a folder of their own.");
     vec![
@@ -195,5 +203,6 @@ pub fn scenes() -> Vec<Scene> {
         look_only,
         tabs,
         typed,
+        home,
     ]
 }

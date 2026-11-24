@@ -76,17 +76,20 @@ mod boot;
 mod launch;
 mod quit;
 mod signal;
+mod tasks;
 mod window;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod tasks_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_quit;
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tole_desktop_model::OwnerAction;
 
@@ -95,7 +98,7 @@ pub use self::launch::Serve;
 use self::launch::{supervisor_launcher, LaunchLink, Launcher};
 pub use self::quit::{Limits, Quit, ServeQuit};
 pub use self::signal::Signal;
-use crate::backend::{Backend, BackendView, Config as BackendConfig};
+use crate::backend::{Backend, BackendView, Config as BackendConfig, NewTaskRefused};
 use crate::driver::{Clock, SystemClock};
 
 /// The running app: the backend, and the link to the serve it follows.
@@ -103,6 +106,8 @@ pub struct App {
     backend: Backend,
     link: Arc<LaunchLink>,
     signal: Signal,
+    /// The last "New task" was refused at once (see `tasks`).
+    new_task_refused: Mutex<Option<NewTaskRefused>>,
 }
 
 impl App {
@@ -151,6 +156,7 @@ impl App {
             backend,
             link,
             signal,
+            new_task_refused: Mutex::new(None),
         })
     }
 

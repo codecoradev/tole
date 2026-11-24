@@ -15,6 +15,8 @@ pub const MAX_TITLE_CHARS: usize = 40;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tabs {
     shown: Option<String>,
+    /// The open tasks as of the last look ([`Tabs::watch`]).
+    known: Vec<String>,
 }
 
 impl Tabs {
@@ -41,6 +43,20 @@ impl Tabs {
             return true;
         }
         false
+    }
+
+    /// The window looks at the open set (`open`, in the order the tasks were
+    /// opened): a task that appeared since the last look is shown, the newest
+    /// one if several did (the owner asked for it, by "New task"), and one that
+    /// is gone is not. Whether the shown task changed.
+    pub fn watch(&mut self, open: &[String]) -> bool {
+        let before = self.shown.clone();
+        if let Some(new) = open.iter().rev().find(|id| !self.known.contains(id)) {
+            self.shown = Some(new.clone());
+        }
+        self.known = open.to_vec();
+        self.sync(open);
+        self.shown != before
     }
 
     /// The task that takes the area when the shown one is closed: the one
@@ -84,6 +100,25 @@ mod tests {
         t.leave();
         assert_eq!(t.shown(), None);
         assert!(!t.sync(&[]), "nothing shown, nothing to drop");
+    }
+
+    #[test]
+    fn a_task_that_appears_is_shown_and_one_that_is_gone_is_not() {
+        let mut t = Tabs::default();
+        assert!(!t.watch(&[]), "nothing open, nothing shown");
+        assert!(t.watch(&ids(&["a"])));
+        assert_eq!(t.shown(), Some("a"));
+        // The owner went home; a second task appears: it is shown, the first stays open.
+        t.leave();
+        assert!(t.watch(&ids(&["a", "b"])));
+        assert_eq!(t.shown(), Some("b"));
+        // A look that finds nothing new leaves the choice alone, also another tab.
+        t.show("a");
+        assert!(!t.watch(&ids(&["a", "b"])));
+        assert_eq!(t.shown(), Some("a"));
+        // The shown one is closed elsewhere: the area is free.
+        assert!(t.watch(&ids(&["b"])));
+        assert_eq!(t.shown(), None);
     }
 
     #[test]
