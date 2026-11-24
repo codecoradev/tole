@@ -9,8 +9,10 @@
 //! - `cells`: the cell, the small text and the tone ink the rows and the page share.
 //! - `switch`: the on/off switch of a row.
 //! - `notices`: what stands where the table would be, and the warnings under it.
+//! - `row`: one row of the table.
 
 pub mod cells;
 pub mod notices;
+pub mod row;
 pub mod switch;
 pub mod types;
