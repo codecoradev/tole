@@ -117,6 +117,91 @@ pub fn scroll_to(handle: &ScrollHandle, top: f32) {
     handle.set_offset(gpui::point(x, gpui::px(-top.max(0.0))));
 }
 
+/// The Enter key as the text box's own action (`shift` for Shift+Enter). Handle
+/// it with `capture_action` on an element around the box and call
+/// `Context::stop_propagation` when the window takes it: the box then never
+/// sees the key, so it makes no line break, whatever the platform does with a
+/// key nobody handled.
+#[cfg(unix)]
+pub use gpui_component::input::Enter as EnterKey;
+
+/// A text box of several lines that grows with its text. Enter and Shift+Enter
+/// break the line, unless the window takes Enter first (see [`EnterKey`]). The input method is the toolkit's.
+#[cfg(unix)]
+pub struct TextBox {
+    state: gpui::Entity<gpui_component::input::TextareaState>,
+}
+
+#[cfg(unix)]
+impl TextBox {
+    /// A box showing `hint` while it is empty, from `min_rows` to `max_rows` tall.
+    pub fn new<V: 'static>(
+        window: &mut Window,
+        cx: &mut Context<V>,
+        hint: &str,
+        rows: (usize, usize),
+    ) -> Self {
+        let hint = hint.to_owned();
+        let state = cx.new(|cx| {
+            gpui_component::input::TextareaState::new(window, cx)
+                .auto_grow(rows.0, rows.1)
+                .placeholder(hint)
+        });
+        TextBox { state }
+    }
+
+    pub fn element(&self) -> impl IntoElement {
+        gpui_component::input::Textarea::new(&self.state)
+            .appearance(false)
+            .bordered(false)
+    }
+
+    pub fn text(&self, cx: &App) -> String {
+        self.state.read(cx).value().to_string()
+    }
+
+    pub fn set_text(&self, text: &str, window: &mut Window, cx: &mut App) {
+        let text = text.to_owned();
+        self.state
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+    }
+
+    pub fn set_hint(&self, hint: &str, window: &mut Window, cx: &mut App) {
+        let hint = hint.to_owned();
+        self.state
+            .update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+    }
+
+    /// An input method is composing text in the box (Enter then belongs to it).
+    pub fn composing(&self, window: &mut Window, cx: &mut App) -> bool {
+        use gpui::EntityInputHandler as _;
+        self.state.update(cx, |state, cx| {
+            state.marked_text_range(window, cx).is_some()
+        })
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.state.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Whether the box has keyboard focus.
+    #[cfg(feature = "render-harness")]
+    pub fn focused(&self, window: &Window, cx: &App) -> bool {
+        use gpui::Focusable as _;
+        self.state.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// The input method starts composing `text` in the box (for the render harness).
+    #[cfg(feature = "render-harness")]
+    pub fn compose(&self, text: &str, window: &mut Window, cx: &mut App) {
+        use gpui::EntityInputHandler as _;
+        let text = text.to_owned();
+        self.state.update(cx, |state, cx| {
+            state.replace_and_mark_text_in_range(None, &text, None, window, cx)
+        });
+    }
+}
+
 /// A repeating call on the window's thread; it stops when this is dropped.
 pub struct Every {
     _task: gpui::Task<()>,
@@ -152,12 +237,33 @@ pub fn is_focused(handle: &FocusHandle, window: &Window) -> bool {
     handle.is_focused(window)
 }
 
+/// The component library's colours are the design tokens, so a text box is
+/// drawn in the window's own palette and not the library's light default.
+fn set_theme(cx: &mut App) {
+    use gpui_component::{Theme, ThemeMode};
+    use tole_desktop_model::tokens::DARK as P;
+    Theme::change(ThemeMode::Dark, None, cx);
+    let hsla = |c: Rgb| -> Hsla { color(c).into() };
+    Theme::update(cx, |theme| {
+        theme.colors.background = hsla(P.background);
+        theme.colors.foreground = hsla(P.text_primary);
+        theme.colors.muted = hsla(P.raised);
+        theme.colors.muted_foreground = hsla(P.text_faint);
+        theme.colors.caret = hsla(P.accent);
+        theme.colors.selection = hsla(P.accent).opacity(0.3);
+        theme.colors.border = hsla(P.line);
+        theme.colors.input = hsla(P.line);
+        theme.colors.ring = hsla(P.accent);
+    });
+}
+
 /// Sets the application up: the component library and the keyboard focus keys.
 /// Runs once before the first window opens, for the real window and for the
 /// offscreen harness alike, so both behave the same.
 pub fn init(cx: &mut App) {
     // Must run before any gpui-component feature is used.
     gpui_component::init(cx);
+    set_theme(cx);
     cx.bind_keys([
         gpui::KeyBinding::new("tab", FocusNextRow, None),
         gpui::KeyBinding::new("shift-tab", FocusPrevRow, None),

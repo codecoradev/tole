@@ -5,7 +5,7 @@
 //! are in later captures): the owner's bubble at the right, Tole's words as
 //! plain text, a "Working" group that folds, a plan as a list.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
@@ -16,6 +16,7 @@ use tole_desktop_model::{Action, ConnectionStatus, OwnerAction, ServeState, Shel
 
 use super::adapter::offscreen::Offscreen;
 use super::harness::{Rendered, WindowSize};
+use super::harness_scenes::said;
 pub use super::harness_scenes::{exchanges, scenes};
 use super::shell::ShellView;
 use super::status::{Source, Status};
@@ -27,9 +28,17 @@ const BOARD: &str = "S3 (transcript)";
 /// The session the scenes show.
 pub const SESSION: &str = "20261123-1";
 
+/// The calls the window made on tasks, in order.
+pub type Calls = Rc<RefCell<Vec<(String, TaskCall)>>>;
+
 /// The tasks the window has open: each a [`Preview`], or none yet.
 struct Tasks {
     open: RefCell<Vec<(String, Option<Rc<Preview>>)>>,
+    calls: Calls,
+    /// Refuse `Send` and `Steer`, as a task that is not connected does.
+    refuse: bool,
+    /// What a prompt does to the task, as a driver that accepted it would.
+    seq: Cell<u64>,
 }
 
 impl Tasks {
@@ -78,7 +87,23 @@ impl Source for Tasks {
                 task.set_heights(heights);
             }
             TaskCall::Toggle(row) => task.toggle_group(*row),
+            TaskCall::Send(text) | TaskCall::Steer(text) => {
+                if self.refuse {
+                    return Err(TaskRefused::Unavailable);
+                }
+                if matches!(call, TaskCall::Send(_)) {
+                    let seq = self.seq.get() + 1;
+                    self.seq.set(seq);
+                    task.feed([said(seq, text), TaskEvent::Ready { busy: true }]);
+                }
+            }
             TaskCall::Stop => {}
+        }
+        if !matches!(
+            call,
+            TaskCall::Viewport { .. } | TaskCall::Heights(_) | TaskCall::Toggle(_)
+        ) {
+            self.calls.borrow_mut().push((session.to_owned(), call));
         }
         Ok(())
     }
@@ -131,6 +156,12 @@ pub struct Scene {
     pub task: Option<Rc<Preview>>,
     /// Other tasks open beside it (their tabs).
     pub others: Vec<(&'static str, Rc<Preview>)>,
+    /// What the window called on the tasks.
+    pub calls: Calls,
+    /// The tasks refuse messages, as one that is not connected does.
+    pub refuse: bool,
+    /// Text typed in the composer.
+    pub typed: Option<&'static str>,
     /// Rows of "Working" groups to open.
     pub open: Vec<usize>,
     /// Rows whose technical details to show.
@@ -147,6 +178,9 @@ impl Scene {
             name,
             task: Some(Rc::new(task)),
             others: vec![],
+            calls: Calls::default(),
+            refuse: false,
+            typed: None,
             open: vec![],
             technical: vec![],
             scroll: None,
@@ -165,6 +199,9 @@ pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, S
     );
     let source = Box::new(Tasks {
         open: RefCell::new(open),
+        calls: Rc::clone(&scene.calls),
+        refuse: scene.refuse,
+        seq: Cell::new(1_000),
     });
     let mut offscreen = Offscreen::open(window.width, window.height, move |_cx| {
         let mut view = ShellView::with_source(shell(), status(), source);
@@ -178,12 +215,37 @@ pub fn open(scene: &Scene, window: WindowSize) -> Result<Offscreen<ShellView>, S
     for row in &scene.technical {
         offscreen.update(|view, _, _| view.toggle_technical(*row))?;
     }
+    if let Some(text) = scene.typed {
+        write(&mut offscreen, text)?;
+    }
     offscreen.settle(8)?;
     if let Some(top) = scene.scroll {
         offscreen.update(|view, _, _| view.scroll_task_to(top))?;
         offscreen.settle(8)?;
     }
     Ok(offscreen)
+}
+
+/// Put `text` in the composer, as typing would.
+pub fn write(window: &mut Offscreen<ShellView>, text: &str) -> Result<(), String> {
+    window.update(|view, window, cx| view.write_composer(text, window, cx))
+}
+
+/// What the composer holds.
+pub fn written(window: &mut Offscreen<ShellView>) -> Result<String, String> {
+    window
+        .update(|view, _, cx| view.composer_text(cx))?
+        .ok_or_else(|| "no composer".to_owned())
+}
+
+/// An input method starts composing `text` in the composer.
+pub fn compose(window: &mut Offscreen<ShellView>, text: &str) -> Result<(), String> {
+    window.update(|view, window, cx| view.compose_composer(text, window, cx))
+}
+
+/// Whether the composer has keyboard focus.
+pub fn composer_focused(window: &mut Offscreen<ShellView>) -> Result<bool, String> {
+    window.update(|view, window, cx| view.composer_focused(window, cx))
 }
 
 /// The tab's × of the shown task, pressed; the task now shown.

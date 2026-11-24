@@ -1,6 +1,7 @@
 //! Checks of the task view in the offscreen render harness (#1031): what each
-//! row and the status row show and how the list follows a running task. They
-//! run only through `scripts/desktop-render.sh --test` (feature `render-harness`, with the local
+//! row and the status row show, how the list follows a running task, and what
+//! Enter does in the composer. They run only through
+//! `scripts/desktop-render.sh --test` (feature `render-harness`, with the local
 //! patch of the manifest); a plain `cargo test` skips this file.
 
 use std::path::PathBuf;
@@ -8,9 +9,10 @@ use std::sync::Mutex;
 
 use tole_desktop::ui::harness::{Rendered, WindowSize};
 use tole_desktop::ui::harness_task::{
-    close_shown, exchanges, jump, open as open_scene, render_tasks, scenes, scroll_state,
-    scroll_to, Scene,
+    close_shown, compose, composer_focused, exchanges, jump, open as open_scene, render_tasks,
+    scenes, scroll_state, scroll_to, write, written, Scene,
 };
+use tole_desktop::ui::TaskCall;
 use tole_desktop_model::tokens::{size, Rgb, DARK};
 
 /// One window at a time: each opens its own GPU device.
@@ -33,13 +35,13 @@ fn scene(name: &str) -> Scene {
 }
 
 /// Every pixel of `colour` in the transcript: right of the sidebar, below the
-/// strip.
+/// strip and above the composer.
 fn count_in_main(r: &Rendered, colour: Rgb) -> usize {
     let from_x = size::SIDEBAR_WIDTH as u32 * 2 + 4;
-    let from_y = (size::TOPBAR_HEIGHT as u32 + 60) * 2;
+    let (from_y, to_y) = ((size::TOPBAR_HEIGHT as u32 + 60) * 2, r.height - 170 * 2);
     let at = rgb(colour);
     let mut n = 0;
-    for y in from_y..r.height {
+    for y in from_y..to_y {
         for x in from_x..r.width {
             n += usize::from(r.pixel(x, y) == at);
         }
@@ -181,6 +183,91 @@ fn the_status_row_has_its_dot_and_stop_only_while_a_turn_can_be_stopped() {
     assert!(tone("task-waiting-approval", DARK.amber) > 20);
     assert!(tone("task-offline", DARK.danger) > 20 && tone("task-offline", DARK.ok) == 0);
     assert_eq!(tone("task-look-only", DARK.amber), 0);
+}
+
+fn calls_of(scene: &Scene) -> Vec<TaskCall> {
+    scene
+        .calls
+        .borrow()
+        .iter()
+        .map(|(_, c)| c.clone())
+        .collect()
+}
+
+#[test]
+fn enter_sends_shift_enter_breaks_the_line_and_an_input_method_keeps_its_enter() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let scene = scene("task-answer-markdown");
+    let mut w = open_scene(&scene, WindowSize::default()).expect("open");
+    assert!(
+        composer_focused(&mut w).expect("focus"),
+        "the box takes focus"
+    );
+
+    // Blank text sends nothing and makes no line break.
+    w.press("enter").expect("press");
+    assert!(calls_of(&scene).is_empty());
+    assert_eq!(written(&mut w).expect("text"), "");
+
+    // Shift+Enter breaks the line and sends nothing.
+    write(&mut w, "first line").expect("write");
+    w.press("shift-enter").expect("press");
+    assert!(calls_of(&scene).is_empty(), "Shift+Enter sent");
+    assert!(
+        written(&mut w).expect("text").contains('\n'),
+        "no line break"
+    );
+
+    // Enter while an input method composes is the input method's.
+    write(&mut w, "tidy").expect("write");
+    compose(&mut w, "\u{304B}").expect("compose");
+    w.press("enter").expect("press");
+    assert!(calls_of(&scene).is_empty(), "Enter sent while composing");
+    assert!(!written(&mut w).expect("text").is_empty(), "the words went");
+
+    // Enter sends the words, and the box is empty for the next.
+    write(&mut w, "tidy the folder").expect("write");
+    w.press("enter").expect("press");
+    assert_eq!(calls_of(&scene), [TaskCall::Send("tidy the folder".into())]);
+    assert_eq!(written(&mut w).expect("text"), "");
+}
+
+#[test]
+fn a_running_turn_takes_a_note_and_a_waiting_or_lost_task_takes_nothing() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let working = scene("task-working");
+    let mut w = open_scene(&working, WindowSize::default()).expect("open");
+    write(&mut w, "use July as the first month").expect("write");
+    w.press("enter").expect("press");
+    assert_eq!(
+        calls_of(&working),
+        [TaskCall::Steer("use July as the first month".into())]
+    );
+
+    for blocked in ["task-waiting-approval", "task-offline"] {
+        let scene = scene(blocked);
+        let mut w = open_scene(&scene, WindowSize::default()).expect("open");
+        write(&mut w, "hello").expect("write");
+        w.press("enter").expect("press");
+        assert!(calls_of(&scene).is_empty(), "{blocked}: Enter sent");
+        assert_eq!(
+            written(&mut w).expect("text"),
+            "hello",
+            "{blocked}: the words are kept"
+        );
+    }
+}
+
+#[test]
+fn a_message_the_task_refuses_stays_in_the_box() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut refusing = scene("task-answer-markdown");
+    refusing.refuse = true;
+    let mut w = open_scene(&refusing, WindowSize::default()).expect("open");
+    write(&mut w, "tidy the folder").expect("write");
+    w.press("enter").expect("press");
+    assert!(calls_of(&refusing).is_empty());
+    assert_eq!(written(&mut w).expect("text"), "tidy the folder");
 }
 
 #[test]

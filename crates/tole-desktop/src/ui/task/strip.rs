@@ -38,8 +38,8 @@ impl ShellView {
                     .truncate()
                     .px(len(size::GUTTER))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.task_show(&open, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.task_show(&open, window, cx);
                     }))
                     .child(label),
             )
@@ -51,7 +51,13 @@ impl ShellView {
                     .px(len(size::GUTTER))
                     .text_color(color(p.text_faint))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.task_close(&gone, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.task_close(&gone, cx);
+                        // The tab that took its place is written in next.
+                        if let Some(next) = this.tasks.tabs.shown().map(str::to_owned) {
+                            this.focus_composer(&next, window, cx);
+                        }
+                    }))
                     .child(words::CLOSE_MARK),
             );
         if selected {
@@ -181,14 +187,22 @@ impl ShellView {
             .into_any_element()
     }
 
-    /// A tab was chosen: its task takes the area.
-    pub(in crate::ui) fn task_show(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// A tab was chosen: its task takes the area, and its composer the keyboard.
+    pub(in crate::ui) fn task_show(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.tasks.tabs.show(id);
+        self.focus_composer(id, window, cx);
         cx.notify();
     }
 
     /// The tab's × was pressed: this window lets go of the task, and the
-    /// neighbouring tab (or the home page) takes its place.
+    /// neighbouring tab (or the home page) takes its place. Words typed in its
+    /// composer and not sent go with it: closing a task lets go of everything
+    /// the window keeps of it.
     pub(in crate::ui) fn task_close(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(source) = self.source() else {
             return;
@@ -214,14 +228,5 @@ impl ShellView {
             let _ = source.task_call(&id, TaskCall::Stop);
         }
         cx.notify();
-    }
-}
-
-/// What the render harness reads of the tabs.
-#[cfg(feature = "render-harness")]
-impl ShellView {
-    /// The task in the main area.
-    pub fn shown_task(&self) -> Option<String> {
-        self.tasks.tabs.shown().map(str::to_owned)
     }
 }
