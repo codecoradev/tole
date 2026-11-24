@@ -396,6 +396,7 @@ fn a_verify_writing_to_the_status_descriptor_cannot_change_its_classification() 
 /// succeed, so the sandbox looks usable; then `body` runs for every real
 /// launch. With `chmod_after_selftest` the script removes its own execute bit
 /// once it has passed the self-test, so a later launch cannot be spawned.
+#[cfg(target_os = "linux")]
 fn path_with_fake_bwrap(dir: &Path, body: &str, chmod_after_selftest: bool) -> String {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("fakebin");
@@ -423,6 +424,9 @@ fn path_with_fake_bwrap(dir: &Path, body: &str, chmod_after_selftest: bool) -> S
 /// `verify_refused`, the model is not told to fix it, no strike is counted,
 /// and it is never a pass. A real child exit 3 stays an ordinary failure
 /// (`a_failing_sandboxed_verify_is_a_verify_failure_not_a_refusal`).
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_failure_is_a_refusal_not_a_verify_failure() {
     let (dir, ws, home) = project("launcher");
@@ -521,6 +525,9 @@ fn a_workspace_layout_the_profile_refuses_refuses_the_verify() {
 
 /// The launcher cannot even be started (it passed the self-test and was
 /// gone after): the spawn error is a refusal too.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_that_cannot_be_spawned_is_a_refusal() {
     let (dir, ws, home) = project("spawn");
@@ -661,6 +668,9 @@ fn a_sandboxed_stop_gate_cannot_write_hooks_and_still_passes_the_turn() {
 /// turn is still denied (never a pass, exit 6 after the 3-denial cap), but the
 /// reason says the sandbox failed before or while starting the gate, and the
 /// gate never ran.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 #[cfg(feature = "shell-tools")]
 fn a_stop_gate_whose_launcher_fails_is_a_deny_that_says_so() {
@@ -696,6 +706,9 @@ fn a_stop_gate_whose_launcher_fails_is_a_deny_that_says_so() {
 }
 
 /// A launcher that cannot be spawned after the self-test is a deny too.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 #[cfg(feature = "shell-tools")]
 fn a_stop_gate_whose_launcher_cannot_be_spawned_is_a_deny() {
@@ -906,7 +919,14 @@ fn the_default_verify_without_any_sandbox_runs_loudly_and_is_ledgered() {
     assert_eq!(lines.len(), 1, "one ledger line: {lines:?}");
     assert_eq!(lines[0]["kind"], "sandbox");
     assert_eq!(lines[0]["default"], true);
-    assert!(lines[0]["reason"].as_str().unwrap().contains("bwrap"));
+    // The reason names what is missing: bubblewrap on Linux, the platform elsewhere.
+    let reason = lines[0]["reason"].as_str().unwrap();
+    let missing = if cfg!(target_os = "linux") {
+        "bwrap"
+    } else {
+        "this platform"
+    };
+    assert!(reason.contains(missing), "{reason}");
     // An explicit `off` is silent and records nothing.
     let (dir2, ws2, home2) = project("dflt-nosandbox-off");
     let r = mission(
@@ -925,6 +945,9 @@ fn the_default_verify_without_any_sandbox_runs_loudly_and_is_ledgered() {
 /// The default degrades only for "no backend at all". A backend that exists
 /// and then fails (the self-test passes, the launch does not) is a refusal,
 /// as with `required`: fail closed when we could sandbox and something is wrong.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn the_default_verify_whose_launcher_fails_is_still_refused() {
     for (tag, body, chmod) in [
@@ -992,6 +1015,9 @@ fn the_default_stop_gate_without_any_sandbox_runs_loudly_and_is_ledgered() {
 }
 
 /// ...and a deny when the backend exists and its launcher fails.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 #[cfg(feature = "shell-tools")]
 fn the_default_stop_gate_whose_launcher_fails_is_still_a_deny() {
@@ -1098,6 +1124,9 @@ fn the_fallback_warning_is_one_sanitized_line() {
 /// The backend is probed at start-up when a consumer is only optional by
 /// default, before any command runs (serve, acp, mcp and the gates have no
 /// start-up check of their own); not at all when both are written off.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn the_backend_is_probed_at_start_up_when_a_consumer_is_implicit() {
     let probes = |cfg: &str, tag: &str| -> usize {
