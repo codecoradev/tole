@@ -82,6 +82,40 @@ pub fn trust_tone(trust: ToolTrust) -> Tone {
     }
 }
 
+/// The page as the window holds it: the model's page state and whether a call
+/// of each route is out now (what Refresh shows). Plain data with no driver in
+/// it, so every platform's window can hold one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillsPane {
+    pub page: SkillsPageState,
+    /// A call of `GET /skills` is out; the rows shown are from the one before.
+    pub skills_loading: bool,
+    /// The same for `GET /tools`.
+    pub tools_loading: bool,
+}
+
+impl SkillsPane {
+    /// A call of the route `tab` shows is out.
+    pub fn call_out(&self, tab: Tab) -> bool {
+        match tab {
+            Tab::Skills => self.skills_loading,
+            Tab::ConnectedTools => self.tools_loading,
+        }
+    }
+
+    /// A call of either route is out.
+    pub fn refreshing(&self) -> bool {
+        self.skills_loading || self.tools_loading
+    }
+
+    /// Takes the app's latest read and keeps the tab the owner chose.
+    pub fn adopt(&mut self, fresh: SkillsPane) {
+        let mut page = std::mem::take(&mut self.page);
+        page.adopt(fresh.page);
+        *self = SkillsPane { page, ..fresh };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +202,22 @@ mod tests {
             secrets: vec![],
             sandbox: "none".into(),
         }
+    }
+
+    #[test]
+    fn the_pane_says_which_route_has_a_call_out_and_keeps_the_tab_when_it_adopts() {
+        let mut shown = SkillsPane::default();
+        shown.page.select_tab(Tab::ConnectedTools);
+        assert!(!shown.refreshing());
+        let mut fresh = SkillsPane {
+            skills_loading: true,
+            ..SkillsPane::default()
+        };
+        fresh.page.skills_loaded(vec![], vec![], vec![], vec![]);
+        shown.adopt(fresh);
+        assert_eq!(shown.page.tab, Tab::ConnectedTools);
+        assert_eq!(shown.page.skills_load, Load::Ready);
+        assert!(shown.refreshing());
+        assert!(shown.call_out(Tab::Skills) && !shown.call_out(Tab::ConnectedTools));
     }
 }

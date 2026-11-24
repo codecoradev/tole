@@ -36,6 +36,8 @@ mod notice;
 mod shell;
 #[cfg(feature = "gpui")]
 mod sidebar;
+#[cfg(feature = "gpui")]
+mod skills;
 mod status;
 pub mod task;
 
