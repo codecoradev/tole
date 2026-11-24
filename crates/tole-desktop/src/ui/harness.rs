@@ -191,6 +191,7 @@ pub fn cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut all = render_all(&dir, window)?;
     all.extend(super::harness_live::render_live(&dir, window)?);
     all.extend(super::harness_task::render_tasks(&dir, window)?);
+    all.extend(super::harness_skills::render_skills(&dir, window)?);
     for r in all {
         println!(
             "{}  {}x{}  {} bytes  board: {}",

@@ -16,11 +16,13 @@
 //! Not in these routes today, so not in the model: the full text of a skill or
 //! draft, its author and last use, and the names of tools that changed.
 
+mod scenes;
 mod screen;
 mod skill;
 mod state;
 mod tool;
 
+pub use scenes::{skills_scenes, SkillsScene};
 pub use screen::{trust_tone, Body, SkillsPane};
 pub use skill::{
     ApprovedSkill, ArchivedSkill, BlockedReason, BlockedSkill, RawArchived, RawDraft, RawSkill,
