@@ -61,17 +61,19 @@ impl Live {
                 on_change: Some(fan.callback()),
             },
         )?;
+        let attached = Arc::new(Attached {
+            epoch,
+            api: Arc::clone(&api),
+            approvals: approvals.handle(),
+            skills: skills.handle(),
+            tasks: Vec::new(),
+        });
         Ok(Live {
             api,
             clock: Arc::clone(clock),
             fan: Arc::clone(fan),
             epoch,
-            attached: Arc::new(Attached {
-                epoch,
-                approvals: approvals.handle(),
-                skills: skills.handle(),
-                tasks: Vec::new(),
-            }),
+            attached,
             approvals,
             skills,
             tasks: Vec::new(),
@@ -86,6 +88,7 @@ impl Live {
     fn rebuild(&mut self) {
         self.attached = Arc::new(Attached {
             epoch: self.epoch,
+            api: Arc::clone(&self.api),
             approvals: self.approvals.handle(),
             skills: self.skills.handle(),
             tasks: (self.tasks.iter())

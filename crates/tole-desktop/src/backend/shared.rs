@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::link::Look;
 use super::reap;
 use super::tasks::TaskSet;
+use crate::driver::api::Api;
 use crate::driver::approvals;
 use crate::driver::runtime::JoinReport;
 use crate::driver::shared::handle::OnChange;
@@ -47,6 +48,9 @@ impl DriverInput for Msg {
 pub(super) struct Attached {
     /// The link's epoch when the drivers were started.
     pub epoch: u64,
+    /// The calls on the serve the drivers make, for the few the app makes
+    /// itself (starting a task).
+    pub api: Arc<dyn Api>,
     pub approvals: approvals::Handle,
     pub skills: skills::Handle,
     /// One per task driver that runs, in the order they were started.
@@ -67,6 +71,11 @@ pub(super) struct Shared {
     /// What the drivers shut down so far reported.
     totals: Mutex<JoinReport>,
     alive: AtomicBool,
+    /// The last attempt to start a task failed (`Backend::new_task`).
+    pub new_task_failed: AtomicBool,
+    /// A `Backend::new_task` call is out on the serve: only one at a time, so
+    /// the cap check and the opening of its session cannot be passed twice.
+    pub new_task_busy: AtomicBool,
 }
 
 impl Shared {
@@ -76,6 +85,8 @@ impl Shared {
             tasks: TaskSet::default(),
             totals: Mutex::new(JoinReport::default()),
             alive: AtomicBool::new(true),
+            new_task_failed: AtomicBool::new(false),
+            new_task_busy: AtomicBool::new(false),
         }
     }
 

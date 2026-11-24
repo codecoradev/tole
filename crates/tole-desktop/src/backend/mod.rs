@@ -134,6 +134,9 @@ mod link;
 #[cfg(test)]
 mod link_tests;
 mod live;
+mod new_task;
+#[cfg(test)]
+mod new_task_tests;
 mod reap;
 #[cfg(test)]
 mod rig;
@@ -160,6 +163,7 @@ use self::engine::Engine;
 use self::link::Link;
 pub use self::link::{ServeLink, SupervisorLink};
 use self::live::Settings;
+pub use self::new_task::NewTaskRefused;
 use self::shared::{Fanin, Msg, Shared};
 pub use self::tasks::{OpenRefused, TaskRefused};
 pub use self::view::BackendView;
