@@ -86,6 +86,8 @@ mod tasks_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_approvals;
+#[cfg(test)]
 mod tests_quit;
 
 use std::io;
@@ -188,6 +190,15 @@ impl App {
             OwnerAction::Retry => self.link.retry(),
             OwnerAction::RestartServe => self.link.restart_serve(),
         }
+    }
+
+    /// Call `f` with the approvals driver's handle, if there is a driver for the
+    /// serve that is there now (see [`Backend::with_approvals`]).
+    pub(crate) fn backend_approvals<R>(
+        &self,
+        f: impl FnOnce(&crate::driver::approvals::Handle) -> R,
+    ) -> Option<R> {
+        self.backend.with_approvals(f)
     }
 
     /// Whether the backend still runs (false after a panic ended it).
