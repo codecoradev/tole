@@ -11,16 +11,24 @@
 //! - `rows`, `prose`: one row of each kind, an answer's Markdown.
 
 mod call;
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", unix))]
 mod list;
 pub mod measure;
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", unix))]
 mod prose;
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", unix))]
 mod rows;
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", unix))]
 mod state;
 
 pub use self::call::TaskCall;
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", unix))]
 pub(super) use self::state::TaskPanes;
+
+// The task view reads the driver's `TaskView`, and there is no driver where
+// there is no serve supervisor (not macOS or Linux): the window has no task
+// pane there.
+#[cfg(all(feature = "gpui", not(unix)))]
+mod none;
+#[cfg(all(feature = "gpui", not(unix)))]
+pub(super) use self::none::TaskPanes;
