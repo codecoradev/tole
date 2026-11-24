@@ -63,7 +63,7 @@ fn status(status: ConnectionStatus) -> ShellState {
 fn counts() -> ShellState {
     preview_with([
         Action::SetApprovalsPending(Badge::Count(1)),
-        Action::SetAutomationsOn(2),
+        Action::SetAutomationsOn(Badge::Count(2)),
         Action::SetDiscussionsNeedYou(1),
         Action::SetSkillsNew(Badge::Count(2)),
     ])

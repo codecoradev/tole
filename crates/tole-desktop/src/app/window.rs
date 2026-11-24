@@ -46,6 +46,7 @@ pub(super) fn refresh(state: &mut ShellState, view: BackendView, running: bool) 
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Unreachable));
         state.apply(Action::SetApprovalsPending(Badge::Unknown));
         state.apply(Action::SetSkillsNew(Badge::Unknown));
+        state.apply(Action::SetAutomationsOn(Badge::Unknown));
         return Status::backend_ended();
     }
     Status {

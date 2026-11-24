@@ -366,10 +366,15 @@ mod tests {
         );
         // The shell's own count is Unknown too, and says the same.
         assert_eq!(shell.badge_text(Section::SkillsAndTools), mark);
-        // Approvals say their own unknown; no other row gains a mark.
+        // Approvals and automations say their own unknown; no other row gains a
+        // mark.
         assert_eq!(badge_text(Some(&unknown), &shell, Section::Approvals), mark);
         assert_eq!(
             badge_text(Some(&unknown), &shell, Section::Automations),
+            mark
+        );
+        assert_eq!(
+            badge_text(Some(&unknown), &shell, Section::Discussions),
             None
         );
     }
