@@ -100,6 +100,21 @@ pub const DARK: Palette = Palette {
     danger: Rgb(0xF2A39B),
 };
 
+/// Fills and lines the palette has no name for: the tinted surfaces of the
+/// approval card (a diff line, a warning, a status pill), read off board S5.
+pub mod tint {
+    use super::Rgb;
+
+    /// A line the card adds, and the pill of a harmless effect.
+    pub const ADDED: Rgb = Rgb(0x1A2B22);
+    /// A line the card removes, and the pill of a dangerous effect.
+    pub const REMOVED: Rgb = Rgb(0x2E1B1D);
+    /// The warning bar, the selected waiting row and the pill of a careful effect.
+    pub const WARNING: Rgb = Rgb(0x2A2314);
+    /// The line around a selected waiting row and a warning.
+    pub const WARNING_LINE: Rgb = Rgb(0x5A4721);
+}
+
 /// Lengths in logical pixels.
 pub mod size {
     /// Sidebar width (board S2).
@@ -158,6 +173,12 @@ pub mod size {
     pub const BUTTON_MIN_WIDTH: f32 = 112.0;
     /// Height of a tag (a small label on a card).
     pub const TAG_HEIGHT: f32 = 20.0;
+    /// Width of the label column of a card's rows ("Where", "Waits").
+    pub const LABEL_WIDTH: f32 = 120.0;
+    /// Width of the line number column of a preview.
+    pub const LINE_NUMBER_WIDTH: f32 = 28.0;
+    /// Tallest the preview of a card grows before it scrolls.
+    pub const PREVIEW_MAX_HEIGHT: f32 = 240.0;
     /// First window size.
     pub const WINDOW_WIDTH: f32 = 1200.0;
     pub const WINDOW_HEIGHT: f32 = 780.0;
@@ -166,6 +187,8 @@ pub mod size {
 /// Type sizes in logical pixels.
 pub mod font {
     pub const TITLE: f32 = 26.0;
+    /// The title of an approval card.
+    pub const CARD_TITLE: f32 = 20.0;
     pub const BODY: f32 = 14.0;
     pub const CAPTION: f32 = 11.0;
     /// Secondary lines: the steps' states, the group header.
@@ -210,6 +233,23 @@ mod tests {
                 .iter()
                 .all(|b| DARK.tone(*a) != DARK.tone(*b)));
             assert_ne!(DARK.tone(*a), DARK.panel);
+        }
+    }
+
+    #[test]
+    fn the_tints_are_the_ones_of_the_board_and_differ_from_each_other() {
+        assert_eq!(tint::ADDED.hex(), 0x1A2B22);
+        assert_eq!(tint::WARNING.hex(), 0x2A2314);
+        assert_eq!(tint::WARNING_LINE.hex(), 0x5A4721);
+        let all = [
+            tint::ADDED,
+            tint::REMOVED,
+            tint::WARNING,
+            tint::WARNING_LINE,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert_ne!(*a, DARK.background);
+            assert!(all[i + 1..].iter().all(|b| a != b));
         }
     }
 
