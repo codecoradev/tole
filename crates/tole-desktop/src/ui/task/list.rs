@@ -110,7 +110,13 @@ impl ShellView {
             before: window.before,
             after: window.after,
         };
-        let rows: Vec<_> = view.rows.iter().map(|item| self.task_row(item)).collect();
+        let rows: Vec<_> = (view.rows.iter().enumerate())
+            .map(|(i, item)| {
+                let index = window.start + i;
+                let active = view.active.get(i).copied().unwrap_or(false);
+                self.task_row(index, item, active, pane.technical.contains(&index), cx)
+            })
+            .collect();
         let last = view.rows.last().filter(|_| window.end == view.total_rows);
         let working = mark(&view.status, last).map(|m| {
             shell(
@@ -126,6 +132,7 @@ impl ShellView {
         if empty {
             return note_line(words::EMPTY_TASK);
         }
+        let away = pane.follow.away(top, frame.viewport, frame.content);
         let list = div()
             .id("transcript")
             .flex_1()
@@ -139,6 +146,32 @@ impl ShellView {
             .children(rows)
             .child(div().h(len(window.after)).flex_none())
             .children(working);
+        let jump = away.then(|| {
+            div()
+                .absolute()
+                .bottom(len(size::PADDING))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("jump-to-latest")
+                        .role(Role::Button)
+                        .h(len(size::ROW_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .px(len(size::PADDING))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(color(p.line))
+                        .bg(color(p.raised))
+                        .text_color(color(p.text_primary))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.task_jump(cx)))
+                        .child(words::JUMP_TO_LATEST),
+                )
+        });
         div()
             .relative()
             .flex_1()
@@ -146,7 +179,48 @@ impl ShellView {
             .flex()
             .flex_col()
             .child(list)
+            .children(jump)
             .into_any_element()
+    }
+
+    /// A "Working" group was clicked.
+    pub(super) fn task_toggle(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.tasks.tabs.shown().map(str::to_owned) else {
+            return;
+        };
+        if let Some(source) = self.source() {
+            let _ = source.task_call(&id, TaskCall::Toggle(row));
+        }
+        cx.notify();
+    }
+
+    /// "Show technical details" of a group was clicked: the window's own switch.
+    pub(super) fn task_technical(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self
+            .tasks
+            .tabs
+            .shown()
+            .and_then(|id| self.tasks.panes.get_mut(id))
+        else {
+            return;
+        };
+        if !pane.technical.remove(&row) {
+            pane.technical.insert(row);
+        }
+        cx.notify();
+    }
+
+    /// "Jump to latest" was clicked.
+    pub(in crate::ui) fn task_jump(&mut self, cx: &mut Context<Self>) {
+        if let Some(pane) = self
+            .tasks
+            .tabs
+            .shown()
+            .and_then(|id| self.tasks.panes.get_mut(id))
+        {
+            pane.follow.jump();
+        }
+        cx.notify();
     }
 }
 
@@ -182,5 +256,19 @@ impl ShellView {
     pub fn task_scroll(&self) -> Option<(bool, f32)> {
         let pane = self.tasks.panes.get(self.tasks.tabs.shown()?)?;
         Some((pane.follow.following(), laid_out(&pane.scroll).top))
+    }
+
+    /// Open or close "Show technical details" of the group at `row`.
+    pub fn toggle_technical(&mut self, row: usize) {
+        if let Some(pane) = self
+            .tasks
+            .tabs
+            .shown()
+            .and_then(|id| self.tasks.panes.get_mut(id))
+        {
+            if !pane.technical.remove(&row) {
+                pane.technical.insert(row);
+            }
+        }
     }
 }

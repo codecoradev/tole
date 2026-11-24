@@ -8,7 +8,8 @@
 //! - `measure`: the numbers the list learns from its last frame (no toolkit).
 //! - `call`: what the window asks of a task (no toolkit).
 //! - `list`: the scrolling column of rows, following the end of a running task.
-//! - `rows`, `prose`: one row of each kind, an answer's Markdown.
+//! - `rows`, `work`, `prose`: one row of each kind, a "Working" group, an
+//!   answer's Markdown.
 
 mod call;
 #[cfg(all(feature = "gpui", unix))]
@@ -20,6 +21,8 @@ mod prose;
 mod rows;
 #[cfg(all(feature = "gpui", unix))]
 mod state;
+#[cfg(all(feature = "gpui", unix))]
+mod work;
 
 pub use self::call::TaskCall;
 #[cfg(all(feature = "gpui", unix))]

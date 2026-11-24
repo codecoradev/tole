@@ -112,6 +112,19 @@ pub fn list_number(number: u32) -> String {
     format!("{number}.")
 }
 
+/// The marks of a "Working" group that is folded and one that is open.
+pub const GROUP_FOLDED: &str = "\u{25B8}";
+pub const GROUP_OPEN: &str = "\u{25BE}";
+
+/// A step's tool and target, as the technical details show them.
+pub fn technical_line(step: &Step) -> String {
+    format!(
+        "{} {}",
+        step.tool,
+        step.target.as_deref().unwrap_or_default()
+    )
+}
+
 /// The link under an opened "Working" group (board S3).
 pub const TECH_SHOW: &str = "Show technical details";
 pub const TECH_HIDE: &str = "Hide technical details";
@@ -310,7 +323,16 @@ mod tests {
         let words: Vec<_> = steps.iter().map(|s| step_state(*s)).collect();
         assert_eq!(words, ["working", "done", "did not work", "stopped"]);
         assert_ne!(mark_label(Mark::Thinking), mark_label(Mark::Writing));
+        let step = Step {
+            id: "e".into(),
+            tool: "run_command".into(),
+            target: Some("mkdir a".into()),
+            effect: ToolEffect::Change,
+            state: StepState::Done,
+        };
+        assert_eq!(technical_line(&step), "run_command mkdir a");
         assert_eq!(list_number(12), "12.");
+        assert_ne!(GROUP_FOLDED, GROUP_OPEN);
         assert_eq!(images_label(1), "1 image attached");
         assert_eq!(images_label(3), "3 images attached");
         assert!(too_many_tasks(3).starts_with("3 tasks"));
