@@ -260,8 +260,15 @@ mod tests {
         assert_eq!(app.skills_page(), Some(SkillsPane::default()));
         assert_eq!(serve.skills_calls.load(Ordering::SeqCst), 0);
         serve.set(running());
+        // The call counter goes up when the driver asks the serve, a moment
+        // before the backend publishes the driver's handle. A refresh in that
+        // moment finds no driver and does nothing, so wait for the page: it is
+        // read through the published handle.
         wait_until("the first read", || {
             serve.skills_calls.load(Ordering::SeqCst) >= 1
+                && app.skills_page().is_some_and(|v| {
+                    v.page.skills_load == Load::Ready && v.page.tools_load == Load::Ready
+                })
         });
         let first = serve.skills_calls.load(Ordering::SeqCst);
         app.refresh_skills();
