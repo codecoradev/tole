@@ -173,6 +173,10 @@ pub mod size {
     pub const BUTTON_MIN_WIDTH: f32 = 112.0;
     /// Height of a tag (a small label on a card).
     pub const TAG_HEIGHT: f32 = 20.0;
+    /// The list pane of the Approvals page (board S5).
+    pub const LIST_WIDTH: f32 = 400.0;
+    /// Height of a row of that list: a title line and a subject line.
+    pub const LIST_ROW_HEIGHT: f32 = 56.0;
     /// Width of the label column of a card's rows ("Where", "Waits").
     pub const LABEL_WIDTH: f32 = 120.0;
     /// Width of the line number column of a preview.

@@ -10,6 +10,8 @@
 //!   page draws it in its detail pane and the task view can draw it in the
 //!   conversation. It is generic over the view that hosts it (see
 //!   `CardHost`).
+//! - `page`: the page itself, a pure function of the driver's view
+//!   (`crate::driver::approvals::ApprovalsView`) and a small state of its own.
 //! - `focus`: the Tab stops of the page and of a card, in the order the model
 //!   gives ([`tole_desktop_model::approvals::page_stops`]).
 //!
@@ -19,6 +21,8 @@
 mod card;
 #[cfg(feature = "gpui")]
 mod focus;
+#[cfg(all(feature = "gpui", unix))]
+mod page;
 #[cfg(feature = "gpui")]
 mod parts;
 #[cfg(feature = "gpui")]
@@ -28,5 +32,7 @@ mod preview;
 pub use self::card::{approval_card, CardHost};
 #[cfg(feature = "gpui")]
 pub use self::focus::StopFocus;
+#[cfg(all(feature = "gpui", unix))]
+pub use self::page::{approvals_page, standing, PageHost, PageUi};
 #[cfg(feature = "render-harness")]
 pub mod scenes;

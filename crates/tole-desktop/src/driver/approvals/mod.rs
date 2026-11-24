@@ -134,6 +134,7 @@ mod readers;
 mod store;
 mod threads;
 mod view;
+mod view_preview;
 mod worker;
 
 #[cfg(test)]
