@@ -115,8 +115,6 @@ pub fn change_text(change: &ToolChange) -> String {
 /// Said while nothing was asked yet (the serve is not ready): not a zero.
 pub const NOT_LOADED: &str = "Tole has not read this page yet. It reads it once it is connected.";
 pub const LOADING: &str = "Reading this page\u{2026}";
-/// Stands in the Connected tools tab, once read, until its cards are drawn (the next version of the page).
-pub const ROWS_LATER: &str = "The list of this tab is shown in the next version of this page.";
 pub const REFRESH: &str = "Refresh";
 pub const REFRESHING: &str = "Refreshing\u{2026}";
 /// Above the notes of an answer the server could read only in part.

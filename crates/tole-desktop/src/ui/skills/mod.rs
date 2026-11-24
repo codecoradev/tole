@@ -7,14 +7,11 @@
 //! `skills_inbox_is_empty`, `no_connected_tools`): a tab that was not read, is
 //! being read or failed shows that, never rows and never an empty list, and a
 //! partial answer is never read as "nothing is waiting". This module only draws.
-//!
-//! Until the cards of the Connected tools tab are drawn (the next change), that
-//! tab, once read, says so in one line (`ROWS_LATER`) and shows no rows, so the
-//! page never draws an empty list that reads as "nothing here".
 
 mod cards;
 mod parts;
 mod skill_list;
+mod tools;
 
 use super::adapter::*;
 use super::shell::ShellView;
@@ -128,7 +125,7 @@ impl ShellView {
             .gap(len(size::GUTTER))
             .children(parts::partial(words::PARTIAL, notes))
             .children((page.tab == Tab::Skills).then(|| self.skill_groups()))
-            .children((page.tab == Tab::ConnectedTools).then(|| parts::plain(words::ROWS_LATER)))
+            .children((page.tab == Tab::ConnectedTools).then(|| self.tool_cards()))
             .into_any_element()
     }
 
