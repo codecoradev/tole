@@ -2,8 +2,8 @@
 //! rest of [`crate::strings`].
 
 use crate::automations::{
-    AutomationRow, NextRun, Notice, RowNote, RunOutcome, Schedule, Scheduler, SchedulerHost,
-    OWNER_RESUME_COMMAND,
+    AutomationRow, NextRun, Notice, RowNote, RunEntry, RunOutcome, Schedule, Scheduler,
+    SchedulerHost, OWNER_RESUME_COMMAND,
 };
 
 pub const TITLE: &str = "Automations";
@@ -77,6 +77,50 @@ pub fn outcome_label(outcome: Option<&RunOutcome>) -> String {
     }
 }
 
+/// What stands under the output of a run that was cut short.
+pub const OUTPUT_CUT: &str = "Output cut short";
+
+/// A day count since 1970-01-01 as (year, month, day) in the proleptic
+/// Gregorian calendar.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+/// When a run was due, "2026-11-24 18:30 UTC". The zone is said, because the
+/// window has no way to know the owner's.
+pub fn run_time(unix_secs: i64) -> String {
+    let (year, month, day) = civil_from_days(unix_secs.div_euclid(86_400));
+    let in_day = unix_secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        in_day / 3_600,
+        in_day % 3_600 / 60
+    )
+}
+
+/// One line of the history: when the run was due and how it ended.
+pub fn run_line(entry: &RunEntry) -> String {
+    format!(
+        "{}, {}",
+        run_time(entry.scheduled_for),
+        outcome_label(Some(&entry.outcome))
+    )
+}
+
 /// The small line under a name.
 pub fn row_note(note: RowNote) -> &'static str {
     match note {
@@ -140,6 +184,41 @@ pub fn notice_text(notice: &Notice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_time_is_in_utc_and_right_across_the_calendar() {
+        assert_eq!(run_time(0), "1970-01-01 00:00 UTC");
+        assert_eq!(run_time(1_700_000_000), "2023-11-14 22:13 UTC");
+        assert_eq!(run_time(-1), "1969-12-31 23:59 UTC", "before 1970");
+        assert_eq!(run_time(951_782_400), "2000-02-29 00:00 UTC", "a leap day");
+        assert_eq!(run_time(951_868_800), "2000-03-01 00:00 UTC");
+        assert_eq!(
+            run_time(4_107_542_400),
+            "2100-03-01 00:00 UTC",
+            "2100 is not a leap year"
+        );
+    }
+
+    #[test]
+    fn a_line_of_the_history_says_when_and_how_it_ended() {
+        use crate::automations::RawRun;
+        let entry = |status: Option<&str>| {
+            RunEntry::new(RawRun {
+                fire_id: "f1".into(),
+                scheduled_for: 1_700_000_000,
+                status: status.map(str::to_owned),
+                session_id: None,
+                approval_id: None,
+                output: String::new(),
+                output_truncated: false,
+            })
+        };
+        assert_eq!(run_line(&entry(Some("ok"))), "2023-11-14 22:13 UTC, Passed");
+        assert_eq!(
+            run_line(&entry(Some("awaiting_approval"))),
+            "2023-11-14 22:13 UTC, Stopped to ask you"
+        );
+    }
 
     #[test]
     fn a_schedule_without_a_sentence_shows_its_expression() {
