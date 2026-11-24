@@ -19,6 +19,11 @@
 //!   job exited), is `Synthetic`: its text names files and commands, so the model
 //!   must clean it, and it is not the owner's words. Prompt and Steer text is the
 //!   one class the model does not clean, so only owner-authored text may use it.
+//! - Core writes an owner's steer note with a wrapper the model reads
+//!   (`[owner interrupt — injected mid-turn, not part of the original request] `,
+//!   and `owner interrupt · urgent` for an urgent one); the transcript shows
+//!   the owner's own words, so that exact prefix is taken off a `Steer` (once,
+//!   and only that prefix: anything else the owner wrote stays).
 //! - A `tool_result` or `error` without a `parentId` maps to nothing: it cannot
 //!   be tied to a call.
 //! - Core writes two shapes of `error`. A tool failure (`settle_err`) is a child
@@ -80,6 +85,20 @@ fn user_kind(payload: &Value) -> UserKind {
     } else {
         UserKind::Prompt
     }
+}
+
+/// What core puts before an owner's steer note (`turn::deliver_interrupts`).
+const STEER_WRAPPERS: [&str; 2] = [
+    "[owner interrupt \u{2014} injected mid-turn, not part of the original request] ",
+    "[owner interrupt \u{b7} urgent \u{2014} injected mid-turn, not part of the original request] ",
+];
+
+/// The owner's words of a steer note: the text without core's wrapper.
+fn steer_words(text: &str) -> &str {
+    STEER_WRAPPERS
+        .iter()
+        .find_map(|wrapper| text.strip_prefix(wrapper))
+        .unwrap_or(text)
 }
 
 fn target(input: Option<&Value>) -> Option<String> {
@@ -156,11 +175,18 @@ impl EntryMapper {
         match str_of(&e.payload, "role")? {
             "user" => {
                 let images = e.payload.get("images").and_then(Value::as_array);
+                let kind = user_kind(&e.payload);
+                let text = text.unwrap_or_default();
+                let text = if kind == UserKind::Steer {
+                    steer_words(text)
+                } else {
+                    text
+                };
                 Some(TaskEvent::UserMessage {
                     seq: e.seq,
-                    text: text.unwrap_or_default().to_string(),
+                    text: text.to_string(),
                     images: images.map_or(0, |a| u32::try_from(a.len()).unwrap_or(u32::MAX)),
-                    kind: user_kind(&e.payload),
+                    kind,
                 })
             }
             "assistant" => Some(TaskEvent::AnswerEntry {
