@@ -42,6 +42,8 @@ mod sidebar;
 #[cfg(feature = "gpui")]
 mod skills;
 mod status;
+#[cfg(all(feature = "gpui", unix))]
+pub mod stops;
 pub mod task;
 
 /// Why [`run`] could not open a window.
