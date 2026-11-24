@@ -11,6 +11,7 @@
 mod cards;
 mod parts;
 mod skill_list;
+mod tools;
 
 use super::adapter::*;
 use super::shell::ShellView;
@@ -124,6 +125,7 @@ impl ShellView {
             .gap(len(size::GUTTER))
             .children(parts::partial(words::PARTIAL, notes))
             .children((page.tab == Tab::Skills).then(|| self.skill_groups()))
+            .children((page.tab == Tab::ConnectedTools).then(|| self.tool_cards()))
             .into_any_element()
     }
 
