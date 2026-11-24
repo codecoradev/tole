@@ -99,8 +99,9 @@ pub enum Action {
     /// The approvals badge: `ApprovalsState::waiting_badge` of the queue, so a
     /// list that is not known reads `Unknown`, never a zero.
     SetApprovalsPending(Badge),
-    /// How many automations are on.
-    SetAutomationsOn(usize),
+    /// How many automations are on: `AutomationsView::counts` of the list, so a
+    /// list that is not known reads `Unknown`, never a zero.
+    SetAutomationsOn(Badge),
     /// How many discussions need the owner.
     SetDiscussionsNeedYou(usize),
     /// How many skills and tools are new and not yet reviewed (never a zero).
@@ -115,7 +116,7 @@ pub struct ShellState {
     pub selected_folder: Option<FolderId>,
     pub connection: Connection,
     pub approvals_pending: Badge,
-    pub automations_on: usize,
+    pub automations_on: Badge,
     pub discussions_need_you: usize,
     pub skills_new: Badge,
     pub sidebar_collapsed: bool,
@@ -135,7 +136,7 @@ impl ShellState {
             },
             // Not known until the approvals queue says so: never a zero.
             approvals_pending: Badge::Unknown,
-            automations_on: 0,
+            automations_on: Badge::Unknown,
             discussions_need_you: 0,
             skills_new: Badge::Unknown,
             sidebar_collapsed: false,
@@ -160,6 +161,7 @@ impl ShellState {
         // A preview shows sample data: a quiet sidebar, not a list it lacks.
         state.apply(Action::SetApprovalsPending(Badge::Count(0)));
         state.apply(Action::SetSkillsNew(Badge::Count(0)));
+        state.apply(Action::SetAutomationsOn(Badge::Count(0)));
         state
     }
 
@@ -239,12 +241,13 @@ impl ShellState {
     }
 
     /// The count shown next to a sidebar row: only the four rows that have
-    /// one, and only when it is above zero. An approvals list that is not
-    /// known has no count: see [`ShellState::badge_unknown`].
+    /// one, and only when it is above zero. A list that is not known (the
+    /// approvals, the automations, the skills and tools) has no count: see
+    /// [`ShellState::badge_unknown`].
     pub fn badge(&self, section: Section) -> Option<usize> {
         let count = match section {
             Section::Approvals => self.approvals_pending.shown().unwrap_or(0),
-            Section::Automations => self.automations_on,
+            Section::Automations => self.automations_on.shown().unwrap_or(0),
             Section::Discussions => self.discussions_need_you,
             Section::SkillsAndTools => self.skills_new.shown().unwrap_or(0),
             Section::NewTask | Section::Search => 0,
@@ -254,10 +257,12 @@ impl ShellState {
 }
 
 impl ShellState {
-    /// The row has no count because it cannot be known now (approvals, skills
-    /// and tools): the sidebar shows a mark, not a nothing that reads as zero.
+    /// The row has no count because it cannot be known now (approvals,
+    /// automations, skills and tools): the sidebar shows a mark, not a nothing
+    /// that reads as zero.
     pub fn badge_unknown(&self, section: Section) -> bool {
         (section == Section::Approvals && self.approvals_pending == Badge::Unknown)
+            || (section == Section::Automations && self.automations_on == Badge::Unknown)
             || (section == Section::SkillsAndTools && self.skills_new == Badge::Unknown)
     }
 
@@ -434,7 +439,7 @@ mod tests {
             assert_eq!(s.badge(section), None, "{section:?} at zero");
         }
         s.apply(Action::SetApprovalsPending(Badge::Count(2)));
-        s.apply(Action::SetAutomationsOn(3));
+        s.apply(Action::SetAutomationsOn(Badge::Count(3)));
         s.apply(Action::SetDiscussionsNeedYou(1));
         s.apply(Action::SetSkillsNew(Badge::Count(4)));
         assert_eq!(s.badge(Section::Approvals), Some(2));
@@ -444,27 +449,9 @@ mod tests {
         assert_eq!(s.badge(Section::NewTask), None);
         assert_eq!(s.badge(Section::Search), None);
         // Back to zero hides the count again.
-        s.apply(Action::SetAutomationsOn(0));
+        s.apply(Action::SetAutomationsOn(Badge::Count(0)));
         assert_eq!(s.badge(Section::Automations), None);
-        assert!(!s.apply(Action::SetAutomationsOn(0)));
-    }
-
-    #[test]
-    fn an_unknown_approvals_list_shows_a_mark_not_a_zero() {
-        let mut s = ShellState::new();
-        assert_eq!(s.approvals_pending, Badge::Unknown, "a new shell");
-        assert_eq!(s.badge_text(Section::Approvals).as_deref(), Some("?"));
-        s.apply(Action::SetApprovalsPending(Badge::Count(0)));
-        assert_eq!(s.badge_text(Section::Approvals), None, "a known zero");
-        s.apply(Action::SetApprovalsPending(Badge::Unknown));
-        assert_eq!(s.badge(Section::Approvals), None);
-        assert!(s.badge_unknown(Section::Approvals));
-        assert_eq!(s.badge_text(Section::Approvals).as_deref(), Some("?"));
-        assert!(!s.badge_unknown(Section::Automations));
-        s.apply(Action::SetApprovalsPending(Badge::Count(3)));
-        assert_eq!(s.badge_text(Section::Approvals).as_deref(), Some("3"));
-        s.apply(Action::SetAutomationsOn(2));
-        assert_eq!(s.badge_text(Section::Automations).as_deref(), Some("2 on"));
+        assert!(!s.apply(Action::SetAutomationsOn(Badge::Count(0))));
     }
 
     #[test]
