@@ -70,3 +70,8 @@ required-features = ["render-harness"]
 name = "render"
 path = "tests/render.rs"
 required-features = ["render-harness"]
+
+[[test]]
+name = "render_task"
+path = "tests/render_task.rs"
+required-features = ["render-harness"]
