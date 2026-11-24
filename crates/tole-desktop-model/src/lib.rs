@@ -30,6 +30,8 @@ mod endpoint;
 mod focus;
 mod header;
 mod home;
+pub mod markdown;
+pub mod markdown_cache;
 mod plain;
 mod section;
 mod serve_state;
