@@ -35,6 +35,10 @@ pub const APPROVE_TOOL_COMMAND: &str = "tole plugin approve";
 /// The column titles of the tools table.
 pub const TOOL_COLUMNS: [&str; 2] = ["Tool", "Trust"];
 
+pub const TAG_APPROVED: &str = "Approved";
+pub const TAG_BLOCKED: &str = "Not used";
+pub const TAG_ARCHIVED: &str = "Archived";
+
 /// The tag on a review row.
 pub fn review_tag(reason: ReviewReason) -> &'static str {
     match reason {
@@ -203,6 +207,11 @@ pub fn archived_line(skill: &ArchivedSkill) -> String {
 /// The line that names the skill a draft resembles.
 pub fn nearest_line(name: &str) -> String {
     format!("It looks like the skill \"{name}\".")
+}
+
+/// When a draft was written.
+pub fn suggested_line(at: &str) -> String {
+    format!("Suggested {at}")
 }
 
 /// The hash the owner checks at the terminal.

@@ -8,7 +8,9 @@
 //! being read or failed shows that, never rows and never an empty list, and a
 //! partial answer is never read as "nothing is waiting". This module only draws.
 
+mod cards;
 mod parts;
+mod skill_list;
 
 use super::adapter::*;
 use super::shell::ShellView;
@@ -77,8 +79,10 @@ impl ShellView {
             .track_focus(&self.focus[&FocusTarget::SkillsRefresh])
             .role(Role::Button)
             .h(len(size::ROW_HEIGHT))
+            .min_w(len(size::BUTTON_MIN_WIDTH))
             .flex()
             .items_center()
+            .justify_center()
             .px(len(size::PADDING))
             .rounded(len(size::RADIUS))
             .border_1()
@@ -119,6 +123,7 @@ impl ShellView {
             .flex_col()
             .gap(len(size::GUTTER))
             .children(parts::partial(words::PARTIAL, notes))
+            .children((page.tab == Tab::Skills).then(|| self.skill_groups()))
             .into_any_element()
     }
 
