@@ -12,6 +12,7 @@ use super::request::Outcome;
 pub const TAB_WAITING: &str = "Waiting";
 pub const TAB_DECIDED: &str = "Decided";
 pub const SHOW_DETAILS: &str = "Show technical details";
+pub const HIDE_DETAILS: &str = "Hide technical details";
 
 pub const LABEL_WHERE: &str = "Where";
 pub const LABEL_WAITS: &str = "Waits";
@@ -91,6 +92,16 @@ pub fn at_least_waiting(count: usize) -> String {
 /// A tab name with its count: "Waiting 2" (the count may be the unknown mark).
 pub fn tab_with_count(name: &str, count: &str) -> String {
     format!("{name} {count}")
+}
+
+/// A cut marker of a preview, in the card's own words (the server's marker is
+/// never drawn as if it were content). The count is the server's claim.
+pub fn more_lines(omitted: Option<usize>) -> String {
+    match omitted {
+        Some(1) => "1 more line".to_owned(),
+        Some(n) => format!("{n} more lines"),
+        None => "More lines".to_owned(),
+    }
 }
 
 /// A request the server sent that this app could not read: it may be waiting.
@@ -271,6 +282,13 @@ mod tests {
             !EVERY_ANSWER_FINAL.contains("History"),
             "that page does not exist yet"
         );
+    }
+
+    #[test]
+    fn a_cut_marker_is_worded_by_its_count() {
+        assert_eq!(more_lines(Some(9)), "9 more lines");
+        assert_eq!(more_lines(Some(1)), "1 more line");
+        assert_eq!(more_lines(None), "More lines");
     }
 
     #[test]
