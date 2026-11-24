@@ -91,12 +91,19 @@ fn a_root_with_regex_metacharacters_is_still_found_and_killed() {
     let dir = tmp("re(g[e]x+.)");
     let pattern = ere_literal(&dir);
     let mut child = std::process::Command::new("sh")
-        .args(["-c", "sleep 60", "sh"])
+        // `; true` keeps the shell from exec-replacing itself with `sleep`
+        // (bash 3.2, `/bin/sh` on macOS, does for a single command), which
+        // would drop the marker argument from the command line.
+        .args(["-c", "sleep 60; true", "sh"])
         .arg(&*dir)
         .spawn()
         .unwrap();
     // `spawn` returns after the exec, so the command line is in place.
     assert_eq!(holders(&pattern), Ok(true), "the process is not found");
+    // The shell no longer execs, so `sleep` is its child: end it with the shell.
+    let _ = std::process::Command::new("pkill")
+        .args(["-P", &child.id().to_string()])
+        .status();
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(holders(&pattern), Ok(false), "the process is still found");

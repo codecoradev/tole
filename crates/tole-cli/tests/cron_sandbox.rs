@@ -163,6 +163,7 @@ fn path_without_bwrap(dir: &Path) -> String {
 /// succeed, so the sandbox looks usable; then `body` runs for every real
 /// launch. With `chmod_after_selftest` it removes its own execute bit once it
 /// has passed the self-test, so a later launch cannot be spawned.
+#[cfg(target_os = "linux")]
 fn path_with_fake_bwrap(dir: &Path, body: &str, chmod_after_selftest: bool) -> String {
     let bin = dir.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -475,6 +476,9 @@ fn a_workspace_layout_the_profile_refuses_refuses_the_job() {
 
 /// A launcher that fails (its own error, exit 1, no exit code of a command) is
 /// the sandbox's failure: a refusal, never a script failure and never a pass.
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_failure_is_a_refusal_not_a_script_failure() {
     let e = Env::new("launcher");
@@ -497,6 +501,9 @@ fn a_launcher_failure_is_a_refusal_not_a_script_failure() {
     assert!(!e.ws.join("ran-marker").exists());
 }
 
+// Linux only: a fake `bwrap` is used only where the backend is detected, so
+// elsewhere there is no launcher to fail (#1171).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_that_cannot_be_spawned_is_a_refusal() {
     let e = Env::new("spawn");
