@@ -16,6 +16,7 @@ pub const NEVER_RAN: &str = "Never ran";
 pub const HISTORY_EMPTY: &str = "Nothing has run yet";
 pub const OPEN_IN_APPROVALS: &str = "Open in Approvals";
 pub const LOAD_FAILED: &str = "Tole could not read the automations";
+pub const DISMISS: &str = "Dismiss";
 pub const CHECKING: &str = "Checking the automations...";
 pub const OUT_OF_DATE: &str = "This list may be out of date. Tole could not read it again.";
 

@@ -1,6 +1,7 @@
 //! How a run of an automation ended, and one line of its history.
 
 use crate::plain::printable;
+use crate::tokens::Tone;
 
 /// Longest run output kept for display.
 const OUTPUT_CHARS: usize = 600;
@@ -43,6 +44,22 @@ impl RunOutcome {
     /// included, is something to look at.
     pub fn is_pass(&self) -> bool {
         matches!(self, RunOutcome::Passed)
+    }
+
+    /// The colour of the result: green only for a pass, red for a failure,
+    /// amber for what the owner should look at (a run that stopped to ask, hit
+    /// its limit, was interrupted, or ended in a way nobody taught the model),
+    /// neutral for a run that was cancelled or has no result yet.
+    pub fn tone(&self) -> Tone {
+        match self {
+            RunOutcome::Passed => Tone::Good,
+            RunOutcome::Failed => Tone::Bad,
+            RunOutcome::StoppedToAsk
+            | RunOutcome::StoppedByLimit
+            | RunOutcome::Interrupted
+            | RunOutcome::Unknown(_) => Tone::Attention,
+            RunOutcome::Cancelled | RunOutcome::NoResultYet => Tone::Neutral,
+        }
     }
 }
 
@@ -146,5 +163,22 @@ mod tests {
         assert_eq!(no_id.approval_link(), None);
         let passed = RunEntry::new(raw(Some("ok"), Some("apr-1")));
         assert_eq!(passed.approval_link(), None);
+    }
+
+    #[test]
+    fn only_a_pass_is_green_and_what_nobody_taught_the_model_is_amber() {
+        use crate::tokens::Tone;
+        assert_eq!(RunOutcome::Passed.tone(), Tone::Good);
+        assert_eq!(RunOutcome::Failed.tone(), Tone::Bad);
+        for look in [
+            RunOutcome::StoppedToAsk,
+            RunOutcome::StoppedByLimit,
+            RunOutcome::Interrupted,
+            RunOutcome::Unknown("odd".into()),
+        ] {
+            assert_eq!(look.tone(), Tone::Attention, "{look:?}");
+        }
+        assert_eq!(RunOutcome::Cancelled.tone(), Tone::Neutral);
+        assert_eq!(RunOutcome::NoResultYet.tone(), Tone::Neutral);
     }
 }
