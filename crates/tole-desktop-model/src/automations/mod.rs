@@ -14,12 +14,14 @@
 //!   with an HTTP status becomes `Refused { status, message }`.
 
 mod job;
+mod page;
 mod run;
 mod schedule;
 mod state;
 mod toggle;
 
 pub use job::{AutomationId, AutomationRow, NextRun, Origin, RawJob, RowNote, Switch};
+pub use page::{page_stops, PageStop, Standing};
 pub use run::{RawRun, RunEntry, RunOutcome};
 pub use schedule::Schedule;
 pub use state::{AutomationsState, Scheduler, SchedulerHost};
