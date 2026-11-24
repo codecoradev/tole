@@ -24,13 +24,60 @@ const SOCKET_PATH_MAX: usize = 103;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const SOCKET_PATH_MAX: usize = 107;
 
+/// macOS refuses `setsockopt` with `EINVAL` on a Unix socket whose peer has
+/// already closed it (checked on macOS 26.5.1: the same call is accepted while
+/// the peer is open or only shut down, and on a TCP socket).
+///
+/// The client sets a timeout before EVERY read and write, and a serve answers
+/// and closes (`Connection: close`). Under load a serve can finish and close
+/// between two reads of one answer: the rest of the answer is waiting in the
+/// socket and only the timeout is refused. Failing there lost an answer the
+/// server had already sent, as [`crate::Error::InvalidConfig`] (#1174).
+///
+/// Once the peer is gone a timeout means nothing: a read returns what is
+/// buffered and then end of input, and never blocks. So a refusal with
+/// `EINVAL` is dropped when a read would not block, and the next read or write
+/// reports what really happened (the rest of the answer, end of input, or a
+/// broken pipe). Any other refusal, and an `EINVAL` on a socket that is open
+/// and quiet (not explained), is returned as before. The standard library's
+/// own refusal of a zero timeout has no OS error and stays `InvalidInput`.
+fn refused(sock: &UnixStream, e: io::Error) -> io::Result<()> {
+    if e.raw_os_error() == Some(libc::EINVAL) && read_would_not_block(sock) {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+/// Does a read now return at once (data waiting, end of input or an error)?
+/// A one-byte `MSG_PEEK | MSG_DONTWAIT` receive leaves the data queued.
+fn read_would_not_block(sock: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: one writable byte, valid for the call; MSG_PEEK removes nothing
+    // from the socket and MSG_DONTWAIT never blocks.
+    let n = unsafe {
+        libc::recv(
+            sock.as_raw_fd(),
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n >= 0
+        || !matches!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN) | Some(libc::EINTR)
+        )
+}
+
 impl Connection for UnixStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_read_timeout(self, timeout)
+        UnixStream::set_read_timeout(self, timeout).or_else(|e| refused(self, e))
     }
 
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_write_timeout(self, timeout)
+        UnixStream::set_write_timeout(self, timeout).or_else(|e| refused(self, e))
     }
 }
 
