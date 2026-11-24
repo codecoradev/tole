@@ -18,7 +18,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use super::approvals::{ApprovalsCall, ApprovalsRefused};
 #[cfg(unix)]
+use super::automations::{AutomationsCall, AutomationsRefused};
+#[cfg(unix)]
 use crate::driver::approvals::ApprovalsView;
+#[cfg(unix)]
+use crate::driver::automations::AutomationsView;
 use tole_desktop_model::strings::StartProblem;
 use tole_desktop_model::tokens::Tone;
 use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState, SkillsPane};
@@ -121,6 +125,22 @@ pub trait Source {
         let _ = call;
         Err(ApprovalsRefused::NoServe)
     }
+
+    /// The Automations page as of now. Cheap and never blocks. A source with no
+    /// automations reads as the driver does before it has read anything: the
+    /// list is not read, never empty.
+    #[cfg(unix)]
+    fn automations(&self) -> AutomationsView {
+        AutomationsView::not_loaded()
+    }
+
+    /// What the owner did on the Automations page. Returns at once; the outcome
+    /// is the next [`automations`](Self::automations). `Err` says nothing was sent.
+    #[cfg(unix)]
+    fn automations_call(&self, call: AutomationsCall) -> Result<(), AutomationsRefused> {
+        let _ = call;
+        Err(AutomationsRefused::NoServe)
+    }
 }
 
 /// A source shared with its owner: the window holds one clone and the host
@@ -184,6 +204,16 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
     #[cfg(unix)]
     fn approvals_call(&self, call: ApprovalsCall) -> Result<(), ApprovalsRefused> {
         (**self).approvals_call(call)
+    }
+
+    #[cfg(unix)]
+    fn automations(&self) -> AutomationsView {
+        (**self).automations()
+    }
+
+    #[cfg(unix)]
+    fn automations_call(&self, call: AutomationsCall) -> Result<(), AutomationsRefused> {
+        (**self).automations_call(call)
     }
 }
 

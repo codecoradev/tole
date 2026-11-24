@@ -19,7 +19,6 @@ pub use self::task::TaskCall;
 #[cfg(feature = "gpui")]
 mod adapter;
 pub mod approvals;
-#[cfg(all(feature = "gpui", unix))]
 pub mod automations;
 #[cfg(feature = "render-harness")]
 pub mod harness;

@@ -5,6 +5,7 @@
 //! controls in. These files only draw it, and report a press to the host as the
 //! id of the row or switch that was pressed.
 //!
+//! - `call`: what the page asks of the app, as plain data.
 //! - `types`: what the page asks of its host, and its own small state.
 //! - `cells`: the cell, the small text and the tone ink the rows and the page share.
 //! - `switch`: the on/off switch of a row.
@@ -13,10 +14,20 @@
 //! - `table`: the column titles and the rows.
 //! - `page`: the page: title, top bar, table or stand-in, notices, scheduler note.
 
+pub mod call;
+#[cfg(all(feature = "gpui", unix))]
 pub mod cells;
+#[cfg(all(feature = "gpui", unix))]
 pub mod notices;
+#[cfg(all(feature = "gpui", unix))]
 pub mod page;
+#[cfg(all(feature = "gpui", unix))]
 pub mod row;
+#[cfg(all(feature = "gpui", unix))]
 pub mod switch;
+#[cfg(all(feature = "gpui", unix))]
 pub mod table;
+#[cfg(all(feature = "gpui", unix))]
 pub mod types;
+
+pub use self::call::{AutomationsCall, AutomationsRefused};
