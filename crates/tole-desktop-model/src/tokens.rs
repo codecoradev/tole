@@ -128,6 +128,25 @@ pub mod size {
     pub const HEADER_LABEL_MAX_WIDTH: f32 = 220.0;
     /// Widest a folder name grows in a chip before it is cut.
     pub const CHIP_MAX_WIDTH: f32 = 180.0;
+    /// Widest the transcript and the composer of a task grow (board S3).
+    pub const TRANSCRIPT_WIDTH: f32 = 720.0;
+    /// Space under each row of a transcript.
+    pub const TRANSCRIPT_GAP: f32 = 18.0;
+    /// Rows built beyond the edges of the viewport, so a fast scroll shows no gap.
+    pub const OVERSCAN: f32 = 400.0;
+    /// Corner radius of a message bubble.
+    pub const BUBBLE_RADIUS: f32 = 10.0;
+    /// Space inside a message bubble.
+    pub const BUBBLE_PAD_X: f32 = 14.0;
+    pub const BUBBLE_PAD_Y: f32 = 10.0;
+    /// A line between two blocks (a horizontal rule).
+    pub const HAIRLINE: f32 = 1.0;
+    /// Dot before a step of a "Working" group.
+    pub const STEP_DOT: f32 = 6.0;
+    /// Indent of a list or of the steps under their header.
+    pub const INDENT: f32 = 16.0;
+    /// Width of the marker (bullet or number) before a list item.
+    pub const MARKER_WIDTH: f32 = 22.0;
     /// First window size.
     pub const WINDOW_WIDTH: f32 = 1200.0;
     pub const WINDOW_HEIGHT: f32 = 780.0;
@@ -138,6 +157,12 @@ pub mod font {
     pub const TITLE: f32 = 26.0;
     pub const BODY: f32 = 14.0;
     pub const CAPTION: f32 = 11.0;
+    /// Secondary lines: the steps' states, the group header.
+    pub const SMALL: f32 = 12.0;
+    /// A heading inside an answer.
+    pub const HEADING: f32 = 16.0;
+    /// Line height of body text, as a multiple of its size.
+    pub const LINE: f32 = 1.55;
 
     /// Interface font.
     pub const FAMILY_UI: &str = "Inter";

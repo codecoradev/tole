@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use super::adapter::*;
 use super::status::{badge_text, Source, Status, LOOK_EVERY};
+#[cfg(unix)]
+use super::task::TaskPanes;
 use tole_desktop_model::tokens::{font, size, DARK};
 use tole_desktop_model::{strings, Action, FocusTarget, OwnerAction, Section, ShellState};
 
@@ -24,6 +26,12 @@ pub struct ShellView {
     /// The button of the notice, a tab stop while there is one.
     pub(super) notice_focus: Option<FocusHandle>,
     live: Option<Live>,
+    /// The open tasks and which one is shown.
+    #[cfg(unix)]
+    pub(super) tasks: TaskPanes,
+    /// A source the render harness gives a window that is not live.
+    #[cfg(feature = "render-harness")]
+    preview: Option<Box<dyn Source>>,
 }
 
 impl ShellView {
@@ -35,6 +43,10 @@ impl ShellView {
             status: None,
             notice_focus: None,
             live: None,
+            #[cfg(unix)]
+            tasks: TaskPanes::default(),
+            #[cfg(feature = "render-harness")]
+            preview: None,
         }
     }
 
@@ -95,6 +107,25 @@ impl ShellView {
     /// What the sidebar draws beside a row.
     pub(super) fn badge_text(&self, section: Section) -> Option<String> {
         badge_text(self.status.as_ref(), &self.state, section)
+    }
+
+    /// A window showing `status` and reading tasks from `source`, with no timer
+    /// behind it (for the render harness).
+    #[cfg(feature = "render-harness")]
+    pub fn with_source(state: ShellState, status: Status, source: Box<dyn Source>) -> Self {
+        let mut view = ShellView::with_status(state, status);
+        view.preview = Some(source);
+        view
+    }
+
+    /// What the window reads tasks from and sends the owner's actions to.
+    #[cfg(unix)]
+    pub(super) fn source(&self) -> Option<&dyn Source> {
+        #[cfg(feature = "render-harness")]
+        if let Some(preview) = &self.preview {
+            return Some(preview.as_ref());
+        }
+        self.live.as_ref().map(|live| live.source.as_ref())
     }
 
     /// The control that has keyboard focus in `window`, if any (for the render harness).
@@ -166,6 +197,7 @@ impl Render for ShellView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = DARK;
         self.sync_focus(cx);
+        let task = self.task_pane(cx);
         let sidebar = self
             .state
             .sidebar_visible()
@@ -192,7 +224,10 @@ impl Render for ShellView {
                             .flex()
                             .flex_col()
                             .children(self.notice(cx))
-                            .child(self.main_area(cx)),
+                            .child(match task {
+                                Some(task) => task,
+                                None => self.main_area(cx).into_any_element(),
+                            }),
                     ),
             )
     }

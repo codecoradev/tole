@@ -18,6 +18,13 @@ use std::time::Duration;
 use tole_desktop_model::tokens::Tone;
 use tole_desktop_model::{strings, OwnerAction, Section, ServeState, ShellState};
 
+#[cfg(unix)]
+use super::task::TaskCall;
+#[cfg(unix)]
+use crate::backend::TaskRefused;
+#[cfg(unix)]
+use crate::driver::task::TaskView;
+
 /// How often the window asks [`Source::changed`]. The backend tells at most
 /// every 100 ms, so a change shows within about 150 ms.
 pub const LOOK_EVERY: Duration = Duration::from_millis(50);
@@ -35,6 +42,22 @@ pub trait Source {
     /// The owner pressed the button of a failure. The work is the app's, off
     /// this thread; the result arrives as the next [`refresh`](Self::refresh).
     fn owner_action(&self, action: OwnerAction);
+
+    /// An open task as of now (`None`: not open, or no driver for it yet).
+    /// Cheap and never blocks. A source with no tasks has none.
+    #[cfg(unix)]
+    fn task_view(&self, session: &str) -> Option<TaskView> {
+        let _ = session;
+        None
+    }
+
+    /// What the owner did in an open task. Returns at once; the reason it did
+    /// nothing, if it did not, is the answer.
+    #[cfg(unix)]
+    fn task_call(&self, session: &str, call: TaskCall) -> Result<(), TaskRefused> {
+        let _ = (session, call);
+        Err(TaskRefused::NotOpen)
+    }
 }
 
 /// A source shared with its owner: the window holds one clone and the host
@@ -50,6 +73,16 @@ impl<T: Source + ?Sized> Source for std::rc::Rc<T> {
 
     fn owner_action(&self, action: OwnerAction) {
         (**self).owner_action(action);
+    }
+
+    #[cfg(unix)]
+    fn task_view(&self, session: &str) -> Option<TaskView> {
+        (**self).task_view(session)
+    }
+
+    #[cfg(unix)]
+    fn task_call(&self, session: &str, call: TaskCall) -> Result<(), TaskRefused> {
+        (**self).task_call(session, call)
     }
 }
 
