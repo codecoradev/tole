@@ -35,6 +35,10 @@ pub const APPROVE_TOOL_COMMAND: &str = "tole plugin approve";
 /// The column titles of the tools table.
 pub const TOOL_COLUMNS: [&str; 2] = ["Tool", "Trust"];
 
+pub const TAG_APPROVED: &str = "Approved";
+pub const TAG_BLOCKED: &str = "Not used";
+pub const TAG_ARCHIVED: &str = "Archived";
+
 /// The tag on a review row.
 pub fn review_tag(reason: ReviewReason) -> &'static str {
     match reason {
@@ -111,7 +115,7 @@ pub fn change_text(change: &ToolChange) -> String {
 /// Said while nothing was asked yet (the serve is not ready): not a zero.
 pub const NOT_LOADED: &str = "Tole has not read this page yet. It reads it once it is connected.";
 pub const LOADING: &str = "Reading this page\u{2026}";
-/// Stands in a tab that was read until the cards of that tab are drawn (the next versions of the page).
+/// Stands in the Connected tools tab, once read, until its cards are drawn (the next version of the page).
 pub const ROWS_LATER: &str = "The list of this tab is shown in the next version of this page.";
 pub const REFRESH: &str = "Refresh";
 pub const REFRESHING: &str = "Refreshing\u{2026}";
@@ -205,6 +209,11 @@ pub fn archived_line(skill: &ArchivedSkill) -> String {
 /// The line that names the skill a draft resembles.
 pub fn nearest_line(name: &str) -> String {
     format!("It looks like the skill \"{name}\".")
+}
+
+/// When a draft was written.
+pub fn suggested_line(at: &str) -> String {
+    format!("Suggested {at}")
 }
 
 /// The hash the owner checks at the terminal.

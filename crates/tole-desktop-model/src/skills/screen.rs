@@ -5,6 +5,7 @@
 
 use std::hash::{Hash, Hasher};
 
+use super::skill::{ReviewItem, ReviewReason};
 use super::state::{Badge, SkillsPageState, Tab};
 use super::tool::ToolTrust;
 use crate::plain::Load;
@@ -69,6 +70,17 @@ impl SkillsPageState {
         let tab = self.tab;
         *self = fresh;
         self.select_tab(tab);
+    }
+}
+
+impl ReviewItem {
+    /// The card asks for the owner's care, not just a decision: the session
+    /// that wrote it read untrusted text, the checks warned about it, or it was
+    /// approved once and its files differ now.
+    pub fn needs_care(&self) -> bool {
+        self.tainted
+            || !self.warnings.is_empty()
+            || self.reason == ReviewReason::ChangedSinceApproval
     }
 }
 
@@ -188,6 +200,35 @@ mod tests {
         assert_eq!(trust_tone(ToolTrust::NotTrusted), Tone::Attention);
         let tabs: HashSet<_> = [Tab::Skills, Tab::ConnectedTools].into_iter().collect();
         assert_eq!(tabs.len(), 2);
+    }
+
+    fn item(reason: ReviewReason) -> ReviewItem {
+        ReviewItem {
+            name: "weekly".into(),
+            reason,
+            draft_id: None,
+            description: None,
+            created_at: None,
+            hash: None,
+            tainted: false,
+            warnings: vec![],
+            nearest: None,
+        }
+    }
+
+    /// A quiet suggestion is only a decision; each of the three signs makes it
+    /// a card that asks for care.
+    #[test]
+    fn a_tainted_warned_or_changed_skill_asks_for_care() {
+        assert!(!item(ReviewReason::SuggestedByTole).needs_care());
+        assert!(!item(ReviewReason::NotApprovedYet).needs_care());
+        assert!(item(ReviewReason::ChangedSinceApproval).needs_care());
+        let mut tainted = item(ReviewReason::SuggestedByTole);
+        tainted.tainted = true;
+        assert!(tainted.needs_care());
+        let mut warned = item(ReviewReason::SuggestedByTole);
+        warned.warnings.push("mentions a command".into());
+        assert!(warned.needs_care());
     }
 
     fn tool(name: &str, trust: &str, state: &str) -> RawTool {

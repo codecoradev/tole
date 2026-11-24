@@ -153,6 +153,9 @@ pub mod size {
     pub const PAGE_MAX_WIDTH: f32 = 760.0;
     /// Space inside a card of a page list.
     pub const CARD_PADDING: f32 = 12.0;
+    /// Narrowest a text button of a page grows, so its label can change
+    /// ("Refresh", "Refreshing...") without the row shifting.
+    pub const BUTTON_MIN_WIDTH: f32 = 112.0;
     /// Height of a tag (a small label on a card).
     pub const TAG_HEIGHT: f32 = 20.0;
     /// First window size.
