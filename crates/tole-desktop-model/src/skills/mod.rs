@@ -21,7 +21,7 @@ mod skill;
 mod state;
 mod tool;
 
-pub use screen::{trust_tone, Body};
+pub use screen::{trust_tone, Body, SkillsPane};
 pub use skill::{
     ApprovedSkill, ArchivedSkill, BlockedReason, BlockedSkill, RawArchived, RawDraft, RawSkill,
     ReviewItem, ReviewReason, SkillsView,

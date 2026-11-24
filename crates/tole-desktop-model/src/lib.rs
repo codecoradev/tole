@@ -64,7 +64,7 @@ pub use plain::{printable, Load};
 pub use section::Section;
 pub use serve_state::{OwnerAction, ServeFailure, ServeState};
 pub use shell::{Action, Connection, ConnectionStatus, Folder, FolderId, ShellState, Target};
-pub use skills::{trust_tone, Body as SkillsBody};
+pub use skills::{trust_tone, Body as SkillsBody, SkillsPane};
 pub use skills::{
     ApprovedSkill, ArchivedSkill, Badge, BlockedReason, BlockedSkill, RawArchived, RawDraft,
     RawSkill, RawTool, ReviewItem, ReviewReason, SkillsPageState, SkillsView, Tab, ToolChange,
