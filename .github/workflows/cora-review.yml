@@ -165,5 +165,5 @@ jobs:
           cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
           cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL || vars.CORA_MODEL }}
 
-          review-timeout-seconds: ${{ vars.CORA_REVIEW_TIMEOUT_SECONDS || secrets.CORA_REVIEW_TIMEOUT_SECONDS }}
-          max-attempts: ${{ vars.CORA_MAX_ATTEMPTS || secrets.CORA_MAX_ATTEMPTS }}
+          review-timeout-seconds: ${{ vars.CORA_REVIEW_TIMEOUT_SECONDS || secrets.CORA_REVIEW_TIMEOUT_SECONDS || '900' }}
+          max-attempts: ${{ vars.CORA_MAX_ATTEMPTS || secrets.CORA_MAX_ATTEMPTS || '2' }}
