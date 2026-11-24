@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     # PRs of 850+ lines need ~16 min of review; 10 min cancelled them
     # mid-review with no verdict.
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       # Anthropic workload identity federation (organization secrets or variables).
       # When all four are set, the job exchanges its GitHub OIDC token for a
@@ -164,3 +164,6 @@ jobs:
           cora-api-key: ${{ env.ACCESS_TOKEN || secrets.CORA_API_KEY }}
           cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
           cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL || vars.CORA_MODEL }}
+
+          review-timeout-seconds: ${{ secrets.CORA_REVIEW_TIMEOUT_SECONDS }}
+          max-attempts: ${{ secrets.CORA_MAX_ATTEMPTS }}
