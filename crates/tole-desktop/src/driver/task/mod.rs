@@ -128,6 +128,7 @@ mod engine_watch_tests;
 mod fixtures;
 #[cfg(test)]
 mod hostile_tests;
+mod preview;
 #[cfg(test)]
 mod rig;
 #[cfg(test)]
@@ -149,6 +150,7 @@ use tole_desktop_model::approvals::Decision;
 
 use self::calls::{Call, LANES};
 use self::engine::{Engine, Input, TICK_EVERY};
+pub use self::preview::Preview;
 use self::store::Store;
 use self::threads::{reader, spawn_lane};
 pub use self::view::{LinkState, TaskView};
