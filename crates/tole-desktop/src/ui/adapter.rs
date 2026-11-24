@@ -33,14 +33,18 @@ pub fn len(v: f32) -> Pixels {
     gpui::px(v)
 }
 
-pub use gpui::{AnyElement, Div, FontWeight, ScrollHandle};
+pub use gpui::AnyElement;
+#[cfg(unix)]
+pub use gpui::{Div, FontWeight, ScrollHandle};
 
 /// A length relative to the font size: `1.5` is a line and a half.
+#[cfg(unix)]
 pub fn rel(v: f32) -> gpui::DefiniteLength {
     gpui::relative(v)
 }
 
 /// One run of a line of text and how it is drawn.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 pub struct Run<'a> {
     pub text: &'a str,
@@ -53,6 +57,7 @@ pub struct Run<'a> {
 }
 
 /// The runs as one wrapping piece of text.
+#[cfg(unix)]
 pub fn rich_text(runs: &[Run<'_>]) -> gpui::StyledText {
     let mut text = String::new();
     let mut styles = Vec::new();
@@ -74,6 +79,7 @@ pub fn rich_text(runs: &[Run<'_>]) -> gpui::StyledText {
 }
 
 /// What a scrolling list laid out in its last frame (all zero before the first).
+#[cfg(unix)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListFrame {
     /// How far the list is scrolled.
@@ -86,6 +92,7 @@ pub struct ListFrame {
 }
 
 /// The last frame of the list `handle` tracks.
+#[cfg(unix)]
 pub fn laid_out(handle: &ScrollHandle) -> ListFrame {
     let (offset, max) = (handle.offset(), handle.max_offset());
     let bounds = handle.bounds();
@@ -104,6 +111,7 @@ pub fn laid_out(handle: &ScrollHandle) -> ListFrame {
 }
 
 /// Scroll the list `handle` tracks to `top`.
+#[cfg(unix)]
 pub fn scroll_to(handle: &ScrollHandle, top: f32) {
     let x = handle.offset().x;
     handle.set_offset(gpui::point(x, gpui::px(-top.max(0.0))));

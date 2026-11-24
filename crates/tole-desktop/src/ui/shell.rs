@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use super::adapter::*;
 use super::status::{badge_text, Source, Status, LOOK_EVERY};
+#[cfg(unix)]
 use super::task::TaskPanes;
 use tole_desktop_model::tokens::{font, size, DARK};
 use tole_desktop_model::{strings, Action, FocusTarget, OwnerAction, Section, ShellState};
@@ -26,6 +27,7 @@ pub struct ShellView {
     pub(super) notice_focus: Option<FocusHandle>,
     live: Option<Live>,
     /// The open tasks and which one is shown.
+    #[cfg(unix)]
     pub(super) tasks: TaskPanes,
     /// A source the render harness gives a window that is not live.
     #[cfg(feature = "render-harness")]
@@ -41,6 +43,7 @@ impl ShellView {
             status: None,
             notice_focus: None,
             live: None,
+            #[cfg(unix)]
             tasks: TaskPanes::default(),
             #[cfg(feature = "render-harness")]
             preview: None,
@@ -116,6 +119,7 @@ impl ShellView {
     }
 
     /// What the window reads tasks from and sends the owner's actions to.
+    #[cfg(unix)]
     pub(super) fn source(&self) -> Option<&dyn Source> {
         #[cfg(feature = "render-harness")]
         if let Some(preview) = &self.preview {

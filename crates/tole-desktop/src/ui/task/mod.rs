@@ -30,5 +30,3 @@ pub(super) use self::state::TaskPanes;
 // pane there.
 #[cfg(all(feature = "gpui", not(unix)))]
 mod none;
-#[cfg(all(feature = "gpui", not(unix)))]
-pub(super) use self::none::TaskPanes;
