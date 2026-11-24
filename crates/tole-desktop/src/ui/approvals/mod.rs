@@ -46,3 +46,5 @@ pub use self::window::ApprovalsUi;
 pub mod scenes;
 #[cfg(all(feature = "render-harness", unix))]
 pub mod scenes_page;
+#[cfg(all(feature = "render-harness", unix))]
+pub mod scenes_shell;
