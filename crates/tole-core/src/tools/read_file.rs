@@ -21,7 +21,8 @@ pub const MAX_READ_BYTES: u64 = 1_048_576; // 1 MiB
 
 /// Head cap (characters) on the content returned per call — the same
 /// 20,000-char bound git/web apply. Larger files are read in chunks via
-/// `offset`/`limit` and the `next_offset` continuation (#211).
+/// `offset`/`limit` (both in characters, never lines) and the `next_offset`
+/// continuation (#211); `start_line`/`end_line` select a line window instead.
 pub(crate) const MAX_READ_CHARS: usize = 20_000;
 
 /// Optional non-negative integer parameter (absent/null = `None`).
@@ -118,8 +119,9 @@ impl Tool for ReadFileTool {
                 .into();
         }
         "Read a text file inside the workspace. Returns at most 20000 chars; if `truncated`, \
-         continue with offset=`next_offset` (offset/limit are in chars). Sensitive files \
-         (.env*, keys) come back as KEY=«redacted»."
+         continue with offset=`next_offset` (a character offset, not a line number; offset/limit \
+         are in characters). To read by lines use start_line/end_line (1-based, inclusive). \
+         Sensitive files (.env*, keys) come back as KEY=«redacted»."
             .into()
     }
 
@@ -139,8 +141,10 @@ impl Tool for ReadFileTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Start char (default 0)" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max chars (default/max 20000)" }
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset (NOT a line number). offset: 1086 starts at the 1086th character. To read by lines use start_line/end_line. Default 0" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max characters, not lines (default/max 20000)" },
+                "start_line": { "type": "integer", "minimum": 1, "description": "First line to return (1-based line number). Exclusive with offset/limit" },
+                "end_line": { "type": "integer", "minimum": 1, "description": "Last line to return (1-based, inclusive; default end of file). Exclusive with offset/limit" }
             },
             "required": ["path"]
         }))
@@ -154,6 +158,24 @@ impl Tool for ReadFileTool {
         let limit = opt_uint(&input, "limit")?;
         if limit == Some(0) {
             return Err("read_file: 'limit' must be at least 1".into());
+        }
+        let start_line = opt_uint(&input, "start_line")?;
+        let end_line = opt_uint(&input, "end_line")?;
+        let line_mode = start_line.is_some() || end_line.is_some();
+        if line_mode && (offset.is_some() || limit.is_some()) {
+            return Err("read_file: start_line/end_line (lines) and offset/limit \
+                        (characters) are mutually exclusive; use one pair"
+                .into());
+        }
+        let first_line = start_line.unwrap_or(1);
+        if first_line == 0 {
+            return Err("read_file: 'start_line' is 1-based (must be at least 1)".into());
+        }
+        if end_line.is_some_and(|e| e < first_line) {
+            return Err(format!(
+                "read_file: 'end_line' ({}) must not be before 'start_line' ({first_line})",
+                end_line.unwrap_or(0)
+            ));
         }
         let target = self.jailed(path)?;
         let bytes = read_regular(&target, path, !self.raw)?;
@@ -175,10 +197,38 @@ impl Tool for ReadFileTool {
         // positions come from `char_indices`, never from arithmetic).
         // `hash`/`bytes` always describe the WHOLE file.
         let total_chars = content.chars().count();
-        let offset = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
-        let limit = usize::try_from(limit.unwrap_or(MAX_READ_CHARS as u64))
+        let mut offset = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
+        let mut limit = usize::try_from(limit.unwrap_or(MAX_READ_CHARS as u64))
             .unwrap_or(MAX_READ_CHARS)
             .min(MAX_READ_CHARS);
+        // Chars after which the requested window ends (line mode: the end
+        // of `end_line`; char mode: the end of the file).
+        let mut window_end = total_chars;
+        if line_mode {
+            let (mut pos, mut sb, mut eb) = (0, None, content.len());
+            for (i, l) in content.split_inclusive('\n').enumerate() {
+                let n = i as u64 + 1;
+                if n == first_line {
+                    sb = Some(pos);
+                }
+                pos += l.len();
+                if end_line == Some(n) {
+                    eb = pos;
+                    break;
+                }
+            }
+            let Some(sb) = sb else {
+                let lines = content.split_inclusive('\n').count();
+                return Ok(json!({
+                    "path": path, "content": "", "bytes": bytes.len(), "hash": hash,
+                    "truncated": false, "total_chars": total_chars,
+                    "note": format!("start_line {first_line} is beyond the end ({lines} lines)")
+                }));
+            };
+            offset = content[..sb].chars().count();
+            window_end = offset + content[sb..eb].chars().count();
+            limit = (window_end - offset).min(MAX_READ_CHARS);
+        }
         if offset > 0 && offset >= total_chars {
             return Ok(json!({
                 "path": path, "content": "", "bytes": bytes.len(), "hash": hash,
@@ -194,10 +244,12 @@ impl Tool for ReadFileTool {
         };
         let (start, end) = (byte_at(offset), byte_at(offset + limit));
         let end_chars = (offset + limit).min(total_chars);
-        let truncated = end_chars < total_chars;
+        let truncated = end_chars < window_end;
         let mut out = json!({
             "path": path, "content": &content[start..end], "bytes": bytes.len(), "hash": hash,
-            "truncated": truncated, "total_chars": total_chars
+            "truncated": truncated, "total_chars": total_chars,
+            "start_char": offset,
+            "first_line": 1 + content[..start].matches('\n').count()
         });
         if truncated {
             out["next_offset"] = json!(end_chars);
@@ -484,6 +536,100 @@ mod tests {
         assert!(spec["properties"]["limit"].is_object());
         assert_eq!(spec["required"], json!(["path"]));
         assert!(t.summary().contains("next_offset"));
+    }
+
+    #[test]
+    fn line_window_is_inclusive_and_echoes_position() {
+        let (t, _dir) = file_tool("lines", "one\ntwo\nthree\nfour\n");
+        // (a)+(b): plain range, end_line inclusive.
+        let r = read(
+            &t,
+            json!({ "path": "f.txt", "start_line": 2, "end_line": 3 }),
+        );
+        assert_eq!(r["content"], json!("two\nthree\n"));
+        assert_eq!(r["start_char"], json!(4));
+        assert_eq!(r["first_line"], json!(2));
+        assert_eq!(r["truncated"], json!(false));
+        // (c): end_line absent reads to EOF.
+        let r = read(&t, json!({ "path": "f.txt", "start_line": 3 }));
+        assert_eq!(r["content"], json!("three\nfour\n"));
+        assert_eq!(r["start_char"], json!(8));
+        assert_eq!(r["first_line"], json!(3));
+        // end_line alone starts at line 1.
+        let r = read(&t, json!({ "path": "f.txt", "end_line": 1 }));
+        assert_eq!(r["content"], json!("one\n"));
+        assert_eq!(r["start_char"], json!(0));
+        assert_eq!(r["first_line"], json!(1));
+    }
+
+    #[test]
+    fn char_mode_echoes_start_char_and_first_line() {
+        let (t, _dir) = file_tool("echo", "one\ntwo\nthree\n");
+        let r = read(&t, json!({ "path": "f.txt" }));
+        assert_eq!((&r["start_char"], &r["first_line"]), (&json!(0), &json!(1)));
+        let r = read(&t, json!({ "path": "f.txt", "offset": 9, "limit": 3 }));
+        assert_eq!(r["content"], json!("hre"));
+        assert_eq!((&r["start_char"], &r["first_line"]), (&json!(9), &json!(3)));
+    }
+
+    #[test]
+    fn line_window_conflicts_and_bad_ranges_are_errors() {
+        let (t, _dir) = file_tool("linebad", "a\nb\nc\n");
+        // (d): mutually exclusive with offset/limit.
+        for extra in [json!({"offset": 1}), json!({"limit": 5})] {
+            let mut input = json!({ "path": "f.txt", "start_line": 1 });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let err = t.execute(input).unwrap_err();
+            assert!(err.contains("mutually exclusive"), "{err}");
+        }
+        let err = t
+            .execute(json!({ "path": "f.txt", "end_line": 2, "offset": 0 }))
+            .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        // (g): end before start; and 1-based.
+        let err = t
+            .execute(json!({ "path": "f.txt", "start_line": 3, "end_line": 2 }))
+            .unwrap_err();
+        assert!(err.contains("end_line"), "{err}");
+        let err = t
+            .execute(json!({ "path": "f.txt", "start_line": 0 }))
+            .unwrap_err();
+        assert!(err.contains("start_line"), "{err}");
+    }
+
+    #[test]
+    fn start_line_beyond_eof_is_empty_with_note() {
+        // (e)
+        let (t, _dir) = file_tool("linebeyond", "a\nb\n");
+        let r = read(&t, json!({ "path": "f.txt", "start_line": 3 }));
+        assert_eq!(r["content"], json!(""));
+        assert_eq!(r["truncated"], json!(false));
+        assert!(r["note"].as_str().unwrap().contains("beyond"));
+    }
+
+    #[test]
+    fn line_window_over_cap_continues_by_char_offset() {
+        // (f): 3 lines of 9,000 chars + newline; window = lines 2..3.
+        let line = "x".repeat(8_999);
+        let text = format!("head\n{line}\n{line}\n{line}\n");
+        let (t, _dir) = file_tool("linecap", &text);
+        let r = read(&t, json!({ "path": "f.txt", "start_line": 2 }));
+        assert_eq!(r["start_char"], json!(5));
+        assert_eq!(r["first_line"], json!(2));
+        assert_eq!(r["truncated"], json!(true));
+        let first = r["content"].as_str().unwrap();
+        assert_eq!(first.chars().count(), MAX_READ_CHARS);
+        let next = r["next_offset"].as_u64().unwrap();
+        assert_eq!(next, 5 + MAX_READ_CHARS as u64);
+        let rest = read(&t, json!({ "path": "f.txt", "offset": next }));
+        assert_eq!(
+            format!("{first}{}", rest["content"].as_str().unwrap()),
+            text[5..]
+        );
+        assert_eq!(rest["first_line"], json!(4));
     }
 
     #[test]
