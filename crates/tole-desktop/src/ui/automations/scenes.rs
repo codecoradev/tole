@@ -15,7 +15,7 @@ use super::page::automations_page;
 use super::types::{AutomationsHost, AutomationsUi};
 use crate::driver::automations::AutomationsView;
 use tole_desktop_model::tokens::{font, DARK};
-use tole_desktop_model::{AutomationId, RawJob, Scheduler};
+use tole_desktop_model::{AutomationId, Load, RawJob, RawRun, Scheduler};
 
 /// The board the page is compared with.
 const BOARD: &str = "s6-automations.png";
@@ -90,7 +90,115 @@ pub fn read(jobs: Vec<RawJob>) -> AutomationsView {
     view
 }
 
+fn run(fire: &str, at: i64, status: &str, approval: Option<&str>, output: &str) -> RawRun {
+    RawRun {
+        fire_id: fire.into(),
+        scheduled_for: at,
+        status: Some(status.into()),
+        session_id: Some("sess-1".into()),
+        approval_id: approval.map(str::to_owned),
+        output: output.into(),
+        output_truncated: false,
+    }
+}
+
+/// A list that was read, with the history of `id` read too.
+fn with_history(id: &str, runs: Vec<RawRun>) -> AutomationsView {
+    let mut view = read(jobs());
+    let id = AutomationId::new(id);
+    view.page.select(&id);
+    view.page.history_loaded(&id, runs);
+    view.history.load = Load::Ready;
+    view.history.links_known = true;
+    view
+}
+
+fn history_scenes() -> Vec<Scene> {
+    let mut passed = run(
+        "f1",
+        1_795_000_000,
+        "ok",
+        None,
+        "Moved 12 files into folders.",
+    );
+    passed.output_truncated = true;
+    let asked = run(
+        "f2",
+        1_794_900_000,
+        "awaiting_approval",
+        Some("apr-1"),
+        "Stopped to ask: delete 3 old files.",
+    );
+    let failed = run(
+        "f3",
+        1_794_800_000,
+        "error",
+        None,
+        "The folder was not found.",
+    );
+    let mut partial = with_history(
+        "backups",
+        vec![run("f4", 1_795_000_000, "awaiting_approval", None, "")],
+    );
+    partial.history.links_known = false;
+    partial.history.more_at_least = 5;
+    vec![
+        Scene {
+            name: "automations-page-history",
+            view: with_history("nightly", vec![passed, asked, failed]),
+        },
+        Scene {
+            name: "automations-page-history-partial",
+            view: partial,
+        },
+    ]
+}
+
 pub fn scenes() -> Vec<Scene> {
+    let mut failed = AutomationsView::not_loaded();
+    failed.page.load_failed("connection refused");
+    let mut stale = read(jobs());
+    stale.page.load_failed("connection refused");
+    let mut left_out = read(jobs());
+    left_out.left_out = 3;
+    let mut notice = read(jobs());
+    let _ = notice.page.request_toggle(&AutomationId::new("sorter"));
+    let mut busy = read(jobs());
+    busy.toggling = Some(AutomationId::new("nightly"));
+    let mut stopped = AutomationsView::not_loaded();
+    stopped.page.loaded(jobs(), Scheduler::NotRunning);
+    let mut all = base_scenes();
+    all.extend(history_scenes());
+    all.extend([
+        Scene {
+            name: "automations-page-failed",
+            view: failed,
+        },
+        Scene {
+            name: "automations-page-stale",
+            view: stale,
+        },
+        Scene {
+            name: "automations-page-left-out",
+            view: left_out,
+        },
+        Scene {
+            name: "automations-page-notice",
+            view: notice,
+        },
+        Scene {
+            name: "automations-page-busy",
+            view: busy,
+        },
+        Scene {
+            name: "automations-page-no-scheduler",
+            view: stopped,
+        },
+    ]);
+    all
+}
+
+fn base_scenes() -> Vec<Scene> {
     vec![
         Scene {
             name: "automations-page-table",
