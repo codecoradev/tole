@@ -21,6 +21,7 @@ fn focus_after(window: &mut Offscreen<Gallery>, key: &'static str) -> Option<Pag
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn every_scene_is_drawn_and_none_is_blank() {
     let _one = lock();
     let dir = std::env::temp_dir().join(format!(
@@ -37,6 +38,7 @@ fn every_scene_is_drawn_and_none_is_blank() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn tab_walks_the_tabs_the_rows_and_the_cards_buttons_in_the_models_order() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-three-waiting")).expect("open");
@@ -57,6 +59,7 @@ fn tab_walks_the_tabs_the_rows_and_the_cards_buttons_in_the_models_order() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_key_that_starts_from_nothing_never_lands_on_an_answer() {
     let _one = lock();
     for (key, harmless) in [
@@ -72,6 +75,7 @@ fn a_key_that_starts_from_nothing_never_lands_on_an_answer() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn the_keyboard_never_follows_a_focused_answer_to_a_card_the_owner_did_not_read() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-one-waiting")).expect("open");
@@ -122,6 +126,7 @@ fn the_keyboard_never_follows_a_focused_answer_to_a_card_the_owner_did_not_read(
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn enter_on_a_row_picks_it_and_on_a_tab_shows_that_tab() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-three-waiting")).expect("open");
@@ -155,6 +160,7 @@ fn enter_on_a_row_picks_it_and_on_a_tab_shows_that_tab() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn an_answer_is_sent_once_for_the_card_that_was_pressed() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-one-waiting")).expect("open");
@@ -217,6 +223,7 @@ fn the_technical_details_belong_to_one_card_and_toggle() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_request_whose_time_is_up_cannot_be_allowed_from_the_page() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-expired")).expect("open");
@@ -233,6 +240,7 @@ fn a_request_whose_time_is_up_cannot_be_allowed_from_the_page() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_listed_card_whose_time_is_up_is_drawn_without_buttons() {
     let _one = lock();
     let drawn = |name: &str| {
@@ -260,6 +268,7 @@ fn a_listed_card_whose_time_is_up_is_drawn_without_buttons() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_target_of_1100_characters_is_cut_in_the_list_and_its_card_keeps_its_buttons() {
     let _one = lock();
     let mut window = open(scene_named("approvals-page-long-target")).expect("open");

@@ -174,6 +174,9 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // No `cora` or `uteke` of the developer's machine (#993); a test that
+        // wants its own PATH sets it in `env`, applied below.
+        .env("PATH", common::path_without_sibling_binaries())
         .env_remove("TOLE_MEMORY")
         .env_remove("TOLE_MEMORY_NAMESPACE")
         .env_remove("TOLE_SYSTEM_PROMPT")
@@ -309,6 +312,7 @@ fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Comm
     cmd.args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
+        .env("PATH", common::path_without_sibling_binaries())
         .env_remove("TOLE_MEMORY")
         .env_remove("TOLE_MEMORY_NAMESPACE")
         .env_remove("TOLE_SYSTEM_PROMPT")
@@ -704,10 +708,12 @@ fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
     let base = spawn_mock("NONE".into());
     let dir = temp_dir("review");
     let bin = fake_cora_dir(&dir);
+    // The fake `cora` first, then a PATH without the developer's own `cora`
+    // and `uteke` (#993): the review tools come from the fake and nothing else.
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+        common::path_without_sibling_binaries().to_string_lossy()
     );
     let home = dir.join("home");
     let env = [

@@ -12,7 +12,9 @@
 #   --test        runs the harness checks of crates/tole-desktop/tests/render.rs and render_task.rs
 #                 (PNG written, size, tokens on screen, Tab and Shift+Tab
 #                 order) instead of writing to a directory you name. Linux
-#                 only: on macOS only the library tests run (see #1172).
+#                 only: on macOS the integration tests are skipped and the
+#                 library tests that draw with GPUI are ignored, the others
+#                 run (see #1172).
 #
 # WHY A SCRIPT. GPUI's `Window::render_to_image` and its test platform need the
 # `test-support` feature of `gpui-pre` and `gpui-pre-platform`. That feature
@@ -107,10 +109,12 @@ features=(--features render-harness -p tole-desktop)
 if [ "$mode" = test ] && [ "$(uname -s)" = Darwin ]; then
   # GPUI's macOS test platform must be created on the main thread, and `cargo
   # test` runs each test on a worker thread (#1172): the integration tests
-  # panic with "Mac platform not created on main thread". Run what can run and
+  # panic with "Mac platform not created on main thread". The library tests
+  # that draw with GPUI are `ignore`d on macOS (`cfg_attr`, reason "GPUI needs
+  # main thread (#1172)"; `-- --ignored` still runs them). Run what can run and
   # say what was skipped. `scripts/desktop-render.sh <dir>` (the `render`
   # example, on the main thread) works on macOS and writes the images.
-  echo "note: macOS: the render integration tests (tests/render.rs, tests/render_task.rs) need Linux and are SKIPPED; only the library tests run. To look at the window, run: scripts/desktop-render.sh <output-dir>" >&2
+  echo "note: macOS: the render integration tests (tests/render.rs, tests/render_task.rs) need Linux and are SKIPPED, and the library tests that draw with GPUI are ignored (their reason names #1172); the other library tests run. To look at the window, run: scripts/desktop-render.sh <output-dir>" >&2
   "$cargo_bin" test --manifest-path "$manifest" "${features[@]}" --lib -- --test-threads=1
 elif [ "$mode" = test ]; then
   "$cargo_bin" test --manifest-path "$manifest" "${features[@]}" --lib --test render --test render_task -- --test-threads=1

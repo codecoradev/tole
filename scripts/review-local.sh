@@ -59,7 +59,8 @@ fi
 git rev-parse --verify --quiet "$base^{commit}" >/dev/null || { echo "review-local: unknown base ref: $base" >&2; exit 1; }
 
 range="$base...HEAD"
-mapfile -t files < <(git diff --name-only "$range")
+files=()
+while IFS= read -r f; do files+=("$f"); done < <(git diff --name-only "$range")
 if [ "${#files[@]}" -eq 0 ]; then
   echo "review-local: no changes in $range"
   exit 0
@@ -77,23 +78,25 @@ group_of() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-declare -A group_files=()
+# No associative array (bash 3.2, the macOS default, has none): one
+# "group<TAB>path" line per file, then the paths of a group are read back.
+group_lines="$tmp/groups.tsv"
 for f in "${files[@]}"; do
-  g="$(group_of "$f")"
-  group_files["$g"]+="$f"$'\n'
-done
+  printf '%s\t%s\n' "$(group_of "$f")" "$f"
+done >"$group_lines"
+group_paths() { awk -F'\t' -v g="$1" '$1 == g { sub(/^[^\t]*\t/, ""); print }' "$group_lines"; }
 
 # A chunk is a list of paths, written one per line to $tmp/chunk-N.paths.
 n=0
 add_chunk() { n=$((n + 1)); printf '%s' "$1" >"$tmp/chunk-$n.paths"; }
 
 changed_lines() { # paths on stdin
-  xargs -d '\n' git diff --numstat "$range" -- 2>/dev/null |
+  tr '\n' '\0' | xargs -0 -r git diff --numstat "$range" -- 2>/dev/null |
     awk '{ if ($1 != "-") s += $1 + $2 } END { print s + 0 }'
 }
 
 while IFS= read -r g; do
-  list="${group_files[$g]}"
+  list="$(group_paths "$g")"$'\n'
   total="$(printf '%s' "$list" | changed_lines)"
   if [ "$total" -le "$max_lines" ]; then
     add_chunk "$list"
@@ -109,9 +112,9 @@ while IFS= read -r g; do
       add_chunk "$cur"; cur=""; cur_lines=0
     fi
     cur+="$path"$'\n'; cur_lines=$((cur_lines + size))
-  done < <(printf '%s' "$list" | xargs -d '\n' git diff --numstat "$range" --)
+  done < <(printf '%s' "$list" | tr '\n' '\0' | xargs -0 -r git diff --numstat "$range" --)
   [ -z "$cur" ] || add_chunk "$cur"
-done < <(printf '%s\n' "${!group_files[@]}" | sort)
+done < <(cut -f1 "$group_lines" | sort -u)
 
 echo "review-local: $range, ${#files[@]} files, $n chunk(s), max $max_lines lines per chunk"
 
@@ -123,7 +126,7 @@ for i in $(seq 1 "$n"); do
   echo "--- chunk $i/$n: $count file(s), $lines changed lines"
   if [ "$dry_run" -eq 1 ]; then sed 's/^/    /' "$tmp/chunk-$i.paths"; continue; fi
 
-  xargs -d '\n' git diff "$range" -- <"$tmp/chunk-$i.paths" >"$tmp/chunk-$i.diff"
+  tr '\n' '\0' <"$tmp/chunk-$i.paths" | xargs -0 -r git diff "$range" -- >"$tmp/chunk-$i.diff"
   set +e
   cora review --diff-file "$tmp/chunk-$i.diff" --format compact --no-color \
     --severity "$severity" >"$tmp/chunk-$i.out" 2>"$tmp/chunk-$i.err"
