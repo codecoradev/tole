@@ -14,6 +14,7 @@
 //! - `table`: the column titles and the rows.
 //! - `history`: the runs of the selected automation under the table.
 //! - `window`: the page inside the window: the section's area and what its presses do.
+//! - `scenes`: the page's render-harness images (harness only).
 //! - `page`: the page: title, top bar, table or stand-in, notices, scheduler note.
 
 pub mod call;
@@ -39,3 +40,5 @@ pub mod window;
 pub use self::call::{AutomationsCall, AutomationsRefused};
 #[cfg(all(feature = "gpui", unix))]
 pub use self::window::AutomationsWindow;
+#[cfg(all(feature = "render-harness", unix))]
+pub mod scenes;
