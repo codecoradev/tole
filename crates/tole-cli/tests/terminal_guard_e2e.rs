@@ -51,6 +51,56 @@ fn tole(root: &Path, config: Option<&str>, env: &[(&str, &str)], args: &[&str]) 
     c.spawn().unwrap().wait_with_output().unwrap()
 }
 
+/// Runs `argv` on a pty and prints what it wrote; exits with its status.
+///
+/// Not `pty.spawn`: on macOS the master of a pty never gives end of input or
+/// an error once the child is gone, so `pty.spawn` waits for ever (#1217), with
+/// `tole` already exited. This waits for the child with `waitpid`, then drains
+/// what is left on the master. A child that is still there after the deadline
+/// is killed, so a hung `tole` fails the test instead of leaving the helper
+/// (and its pty) behind.
+const PTY_HELPER: &str = r#"
+import os, pty, select, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+out = bytearray()
+status = None
+deadline = time.time() + float(os.environ.get("PTY_HELPER_DEADLINE", "60"))
+
+def drain(wait):
+    """Read what is on the master. True: nothing more for now. False: the
+    master is closed (end of input, or EIO on Linux once the child is gone)."""
+    while True:
+        ready, _, _ = select.select([fd], [], [], wait)
+        if not ready:
+            return True
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            return False
+        if not data:
+            return False
+        out.extend(data)
+
+while status is None:
+    if not drain(0.1):
+        time.sleep(0.05)  # closed master: only the child's status is left
+    done, st = os.waitpid(pid, os.WNOHANG)
+    if done:
+        status = st
+    elif time.time() > deadline:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        sys.stdout.buffer.write(bytes(out))
+        sys.stderr.write("pty helper: the child did not exit before the deadline\n")
+        sys.exit(124)
+# The child is gone, and everything it wrote is already on the master.
+drain(0.05)
+sys.stdout.buffer.write(bytes(out))
+sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+"#;
+
 /// `tole <args>` on a real pty (stdin and stderr are terminals), or `None`
 /// when python3 is not there.
 fn tole_on_a_pty(
@@ -66,12 +116,8 @@ fn tole_on_a_pty(
         return None;
     }
     let mut d = Command::new("python3");
-    d.args([
-        "-c",
-        "import os,pty,sys\nst=pty.spawn(sys.argv[1:])\nsys.exit(os.WEXITSTATUS(st))",
-        env!("CARGO_BIN_EXE_tole"),
-    ])
-    .args(args);
+    d.args(["-c", PTY_HELPER, env!("CARGO_BIN_EXE_tole")])
+        .args(args);
     // Same scrubbed environment and cwd as `scrubbed`.
     d.current_dir(c.get_current_dir().unwrap())
         .env_clear()
@@ -89,6 +135,69 @@ fn tole_on_a_pty(
         o.status.code().unwrap_or(-1),
         format!("{}{}", text(&o.stdout), text(&o.stderr)),
     ))
+}
+
+/// The helper on its own: `Some((code, stdout, stderr))`, or `None` when
+/// python3 is not there.
+fn run_pty_helper(deadline: &str, argv: &[&str]) -> Option<(i32, String, String)> {
+    let py = Command::new("python3").arg("--version").output().ok()?;
+    if !py.status.success() {
+        return None;
+    }
+    let o = Command::new("python3")
+        .args(["-c", PTY_HELPER])
+        .args(argv)
+        .env("PTY_HELPER_DEADLINE", deadline)
+        .output()
+        .ok()?;
+    Some((
+        o.status.code().unwrap_or(-1),
+        text(&o.stdout),
+        text(&o.stderr),
+    ))
+}
+
+#[test]
+fn the_pty_helper_returns_what_the_child_wrote_and_its_status() {
+    let Some((code, out, _)) = run_pty_helper("30", &["/bin/sh", "-c", "echo on-a-pty; exit 3"])
+    else {
+        eprintln!("SKIPPED: no python3 for a pty here");
+        return;
+    };
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("on-a-pty"), "{out}");
+}
+
+/// What a child writes in its last moment is not lost: the helper drains the
+/// master after the child is gone, not only while it runs.
+#[test]
+fn the_pty_helper_keeps_what_the_child_wrote_just_before_it_exited() {
+    for _ in 0..5 {
+        let Some((code, out, _)) =
+            run_pty_helper("30", &["/bin/sh", "-c", "sleep 0.25; echo last-words"])
+        else {
+            eprintln!("SKIPPED: no python3 for a pty here");
+            return;
+        };
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("last-words"), "{out:?}");
+    }
+}
+
+#[test]
+fn the_pty_helper_kills_a_child_that_does_not_exit() {
+    let started = std::time::Instant::now();
+    let Some((code, _, err)) = run_pty_helper("1", &["/bin/sh", "-c", "exec sleep 30"]) else {
+        eprintln!("SKIPPED: no python3 for a pty here");
+        return;
+    };
+    assert_eq!(code, 124, "{err}");
+    assert!(err.contains("did not exit"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the helper waited {:?}",
+        started.elapsed()
+    );
 }
 
 #[track_caller]
