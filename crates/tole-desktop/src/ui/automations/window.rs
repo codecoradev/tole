@@ -9,12 +9,14 @@
 use std::cell::RefCell;
 
 use super::super::adapter::*;
+use super::super::approvals::ApprovalsCall;
 use super::super::shell::ShellView;
 use super::page::automations_page;
 use super::types::{AutomationsHost, AutomationsUi};
 use super::AutomationsCall;
 use crate::driver::automations::AutomationsView;
-use tole_desktop_model::{AutomationId, Switch, Target};
+use tole_desktop_model::approvals::Tab;
+use tole_desktop_model::{Action, AutomationId, Section, Switch, Target};
 
 /// The window's state of the page: a focus handle for each control Tab visits.
 #[derive(Default)]
@@ -34,6 +36,7 @@ impl ShellView {
             select: ShellView::automations_select,
             toggle: ShellView::automations_toggle,
             dismiss_notice: ShellView::automations_dismiss,
+            open_in_approvals: ShellView::automations_open_approvals,
         };
         let mut ui = self.automations.page.borrow_mut();
         ui.sync(&view, cx);
@@ -71,5 +74,17 @@ impl ShellView {
 
     fn automations_dismiss(&mut self, cx: &mut Context<Self>) {
         self.automations_send(AutomationsCall::DismissNotice, cx);
+    }
+
+    /// "Open in Approvals": the section changes, and the request the run
+    /// stopped on is shown in the Waiting list. A request that is no longer
+    /// waiting is the model's to say on that page, not this one's.
+    fn automations_open_approvals(&mut self, approval: &str, cx: &mut Context<Self>) {
+        self.dispatch(Action::SelectSection(Section::Approvals), cx);
+        if let Some(source) = self.source() {
+            let _ = source.approvals_call(ApprovalsCall::SelectTab(Tab::Waiting));
+            let _ = source.approvals_call(ApprovalsCall::Select(Some(approval.to_owned())));
+        }
+        cx.notify();
     }
 }

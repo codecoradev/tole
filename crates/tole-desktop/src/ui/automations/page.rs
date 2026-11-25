@@ -4,6 +4,7 @@
 //! the colours are the model's.
 
 use super::super::adapter::*;
+use super::history::history;
 use super::notices::{dismiss_button, notice, stand_in};
 use super::table::table;
 use super::types::{standing, AutomationsHost, AutomationsUi};
@@ -79,6 +80,7 @@ pub fn automations_page<V: 'static>(
                     .child(heading)
                     .child(body)
                     .children(notices)
+                    .children(history(view, ui, host, cx))
                     .child(scheduler),
             ),
     )
