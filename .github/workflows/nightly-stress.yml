@@ -49,6 +49,9 @@ jobs:
         env:
           TMPDIR: ${{ env.TOLE_TEST_TMP }}
           RUST_TEST_THREADS: "8"
+          # #1018: rounds of the SIGKILL crash-resume loop (2 when unset;
+          # the seed is printed by the test, so a red night replays).
+          TOLE_CRASH_LOOP_N: "25"
       - name: No test directory left behind
         run: |
           left=$(find "$TOLE_TEST_TMP" target/tmp -mindepth 1 -maxdepth 1 \( -name 'tole-*' -o -name 'cora-*' \) 2>/dev/null | sort)
