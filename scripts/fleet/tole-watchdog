@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Restart the `tole serve` daemon if it died. Safe to call repeatedly from any
+# scheduler (Hermes cron, cron(8), a systemd timer): one log line per call.
+# Uses the same environment as tole-serve-launcher (TOLE_FLEET_DIR, ..._PORT, ...).
+#
+# Usage: tole-watchdog [-- extra `tole serve` args for a restart]
+# Exit codes: 0 alive or restarted, 1 restart failed.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+launcher="$here/tole-serve-launcher"
+DIR="${TOLE_FLEET_DIR:-$HOME/.local/state/tole-fleet}"
+mkdir -p "$DIR"
+WATCHDOG_LOG="$DIR/watchdog.log"
+
+say() { printf '%s tole-watchdog: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$WATCHDOG_LOG"; }
+
+[[ "${1:-}" == "--" ]] && shift
+
+if "$launcher" status >/dev/null 2>&1; then
+  say "alive"
+elif "$launcher" start -- "$@" >/dev/null; then
+  say "was dead, restarted pid $(cat "$DIR/serve.pid")"
+else
+  say "was dead, restart FAILED (see $DIR/serve.log)"
+  exit 1
+fi
