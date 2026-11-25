@@ -88,6 +88,7 @@ fn run<V: 'static>(
             .border_1()
             .border_color(transparent())
             .cursor_pointer()
+            .text_color(color(p.accent))
             .when_some(
                 ui.focus
                     .get(&AutomationsStop::OpenInApprovals(entry.fire_id.clone())),
