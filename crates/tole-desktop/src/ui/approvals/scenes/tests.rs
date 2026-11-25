@@ -23,6 +23,7 @@ fn dir(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn every_scene_is_drawn_and_only_a_waiting_card_has_the_amber_button() {
     let _one = lock();
     let rendered = render_scenes(&dir("approvals-cards")).expect("render");
@@ -38,6 +39,7 @@ fn every_scene_is_drawn_and_only_a_waiting_card_has_the_amber_button() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn tab_reaches_the_buttons_in_order_and_enter_answers_the_card_that_was_pressed() {
     let _one = lock();
     let card = card_of(&create_report(), CardState::Waiting, NOW);
@@ -71,6 +73,7 @@ fn tab_reaches_the_buttons_in_order_and_enter_answers_the_card_that_was_pressed(
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_card_that_cannot_be_answered_has_nothing_to_press() {
     let _one = lock();
     let late = card_of(&create_report(), CardState::Waiting, NOW + 901_000);
@@ -86,6 +89,7 @@ fn a_card_that_cannot_be_answered_has_nothing_to_press() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn the_technical_details_open_from_the_keyboard() {
     let _one = lock();
     let card = card_of(&delete_invoice(), CardState::Waiting, NOW);
@@ -99,6 +103,7 @@ fn the_technical_details_open_from_the_keyboard() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn shift_tab_from_nothing_lands_on_the_details_and_never_on_an_answer() {
     let _one = lock();
     let card = card_of(&create_report(), CardState::Waiting, NOW);
@@ -112,6 +117,7 @@ fn shift_tab_from_nothing_lands_on_the_details_and_never_on_an_answer() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_hostile_target_is_escaped_where_it_is_drawn_and_the_buttons_stay_reachable() {
     let card = card_of(&hostile_target(), CardState::Waiting, NOW);
     let everything = std::iter::once(card.subject.clone())
@@ -132,6 +138,7 @@ fn a_hostile_target_is_escaped_where_it_is_drawn_and_the_buttons_stay_reachable(
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_target_of_1100_characters_and_open_details_leave_the_buttons_on_screen() {
     let _one = lock();
     for (name, details) in [("long", false), ("long-details", true)] {
