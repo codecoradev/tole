@@ -60,10 +60,12 @@ pub fn automations_page<V: 'static>(
         let button = dismiss_button(ui, host, cx).into_any_element();
         notices.push(notice(words::notice_text(page_notice), Some(button)).into_any_element());
     }
-    let scheduler = div()
-        .text_size(len(font::CAPTION))
-        .text_color(color(p.text_faint))
-        .child(words::scheduler_note(&view.page.scheduler, remote));
+    let scheduler = st.scheduler_known().then(|| {
+        div()
+            .text_size(len(font::CAPTION))
+            .text_color(color(p.text_faint))
+            .child(words::scheduler_note(&view.page.scheduler, remote))
+    });
     div().size_full().flex().flex_col().child(bar).child(
         div()
             .id("automations-body")
@@ -81,7 +83,7 @@ pub fn automations_page<V: 'static>(
                     .child(body)
                     .children(notices)
                     .children(history(view, ui, host, cx))
-                    .child(scheduler),
+                    .children(scheduler),
             ),
     )
 }

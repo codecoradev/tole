@@ -39,6 +39,14 @@ impl Standing {
         self.load == Load::Ready && self.left_out == 0
     }
 
+    /// Whether the page may say where the scheduler runs. Not while the list
+    /// has not been read: "no scheduler is running" would then be something
+    /// nobody checked. A list that failed to read says it (the model already
+    /// takes the scheduler for not running then).
+    pub fn scheduler_known(&self) -> bool {
+        !matches!(self.load, Load::Idle | Load::Loading)
+    }
+
     /// "2 on, 1 paused" for the right of the top bar; nothing for a list that
     /// is not known, never a zero.
     pub fn top_line(&self) -> Option<String> {
@@ -181,6 +189,14 @@ mod tests {
         let failed = standing(Load::Failed("down".into()));
         assert_eq!(failed.table_text(0), Some(s::LOAD_FAILED));
         assert_eq!(failed.top_line(), None, "never a count of a failed read");
+    }
+
+    #[test]
+    fn the_scheduler_is_not_talked_about_before_the_list_was_read() {
+        assert!(!standing(Load::Idle).scheduler_known());
+        assert!(!standing(Load::Loading).scheduler_known());
+        assert!(standing(Load::Ready).scheduler_known());
+        assert!(standing(Load::Failed("down".into())).scheduler_known());
     }
 
     #[test]
