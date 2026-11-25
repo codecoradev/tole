@@ -197,6 +197,8 @@ pub fn cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     all.extend(super::approvals::scenes_page::render_scenes(&dir)?);
     #[cfg(unix)]
     all.extend(super::approvals::scenes_shell::render_scenes(&dir, window)?);
+    #[cfg(unix)]
+    all.extend(super::automations::scenes::render_scenes(&dir)?);
     for r in all {
         println!(
             "{}  {}x{}  {} bytes  board: {}",
