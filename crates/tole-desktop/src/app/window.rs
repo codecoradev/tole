@@ -7,8 +7,10 @@ use tole_desktop_model::{
 use super::{App, Boot};
 use crate::backend::{shell, BackendView, TaskRefused};
 use crate::driver::approvals::ApprovalsView;
+use crate::driver::automations::AutomationsView;
 use crate::driver::task::TaskView;
 use crate::ui::approvals::{ApprovalsCall, ApprovalsRefused};
+use crate::ui::automations::{AutomationsCall, AutomationsRefused};
 use crate::ui::{Source, Status, TaskCall};
 use tole_desktop_model::strings::StartProblem;
 
@@ -46,6 +48,7 @@ pub(super) fn refresh(state: &mut ShellState, view: BackendView, running: bool) 
         state.apply(Action::SetConnectionStatus(ConnectionStatus::Unreachable));
         state.apply(Action::SetApprovalsPending(Badge::Unknown));
         state.apply(Action::SetSkillsNew(Badge::Unknown));
+        state.apply(Action::SetAutomationsOn(Badge::Unknown));
         return Status::backend_ended();
     }
     Status {
@@ -128,6 +131,23 @@ impl Source for App {
         match sent {
             None => Err(ApprovalsRefused::NoServe),
             Some(Err(_)) => Err(ApprovalsRefused::Busy),
+            Some(Ok(())) => Ok(()),
+        }
+    }
+
+    fn automations(&self) -> AutomationsView {
+        self.view().automations
+    }
+
+    fn automations_call(&self, call: AutomationsCall) -> Result<(), AutomationsRefused> {
+        let sent = self.backend_automations(|handle| match &call {
+            AutomationsCall::SetEnabled { id, enabled } => handle.set_enabled(id, *enabled),
+            AutomationsCall::Select(id) => handle.select(id),
+            AutomationsCall::DismissNotice => handle.dismiss_notice(),
+        });
+        match sent {
+            None => Err(AutomationsRefused::NoServe),
+            Some(Err(_)) => Err(AutomationsRefused::Busy),
             Some(Ok(())) => Ok(()),
         }
     }
@@ -259,8 +279,15 @@ mod tests {
         assert_eq!(app.skills_page(), Some(SkillsPane::default()));
         assert_eq!(serve.skills_calls.load(Ordering::SeqCst), 0);
         serve.set(running());
+        // The call counter goes up when the driver asks the serve, a moment
+        // before the backend publishes the driver's handle. A refresh in that
+        // moment finds no driver and does nothing, so wait for the page: it is
+        // read through the published handle.
         wait_until("the first read", || {
             serve.skills_calls.load(Ordering::SeqCst) >= 1
+                && app.skills_page().is_some_and(|v| {
+                    v.page.skills_load == Load::Ready && v.page.tools_load == Load::Ready
+                })
         });
         let first = serve.skills_calls.load(Ordering::SeqCst);
         app.refresh_skills();
