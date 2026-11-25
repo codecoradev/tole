@@ -4,8 +4,10 @@
 //! below it (depth 1) can never overload or crash the server.
 //!
 //! - [`Probe`] reads memory, load, disk and pids. [`LinuxProbe`] reads them
-//!   from cgroup v2 and `/proc` (pure parse functions below, tested on
-//!   fixtures); tests use fixed probes, so every decision is deterministic.
+//!   from cgroup v2 and `/proc`, [`MacProbe`] (macOS) through `libc`
+//!   (`getloadavg`, `sysctl`, `proc_listpids`); [`host_probe`] picks the one
+//!   of the machine tole runs on. The pure parts are tested on fixtures;
+//!   tests use fixed probes, so every decision is deterministic.
 //! - [`Thresholds`] are the limits (user config `[delegation]` keys).
 //! - [`Thresholds::admit`] answers [`Admit::Go`] or [`Admit::Wait`] with a
 //!   reason. A `Wait` is a queue decision, never an error: the spawn waits
@@ -498,6 +500,152 @@ impl Probe for LinuxProbe {
             .1
             .map(|n| vec![n.to_string()])
             .unwrap_or_default()
+    }
+}
+
+// ------------------------------------------------------------------ macOS
+
+/// Memory available, in MiB, from the machine's total memory and the
+/// percentage of it the system itself reports as available
+/// (`kern.memorystatus_level`, what `memory_pressure` prints as "free
+/// percentage"). A level above 100 is not a percentage: `None`.
+///
+/// macOS has no `MemAvailable`. Counting free, inactive and file-backed pages
+/// leaves out what the system compresses or purges when it needs room (about
+/// 1.1 to 1.4 GiB on an 8 GiB Mac where the system reports 2.9 GiB), and would
+/// queue every spawn under the default limits.
+pub fn memory_from_level(total_bytes: u64, level_percent: u64) -> Option<u64> {
+    if level_percent > 100 {
+        return None;
+    }
+    Some((total_bytes / MIB).saturating_mul(level_percent) / 100)
+}
+
+/// The process-id limit that is closer to being reached: a fork fails at the
+/// system-wide limit and at the limit of one user, whichever comes first.
+pub fn tighter_pid_limit(a: Pids, b: Pids) -> Pids {
+    // `a` is tighter when its free share, (max - current) / max, is smaller:
+    // compare free_a * max_b with free_b * max_a, with no division.
+    let free = |p: Pids| u128::from(p.max.saturating_sub(p.current));
+    if free(a) * u128::from(b.max.max(1)) <= free(b) * u128::from(a.max.max(1)) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Probes the running macOS machine through `libc`: load from `getloadavg`,
+/// memory from `kern.memorystatus_level` and `hw.memsize` (see
+/// [`memory_from_level`]), process ids from `proc_listpids` against
+/// `kern.maxproc` and `kern.maxprocperuid`. Disk is the same `statvfs` as on
+/// Linux.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Default)]
+pub struct MacProbe;
+
+/// `proc_listpids` types of `<libproc.h>` (`libc` does not name them).
+#[cfg(target_os = "macos")]
+const PROC_ALL_PIDS: u32 = 1;
+#[cfg(target_os = "macos")]
+const PROC_UID_ONLY: u32 = 4;
+
+#[cfg(target_os = "macos")]
+impl MacProbe {
+    /// One integer `sysctl` by name, `None` when it is missing or not that size.
+    fn sysctl_int<T: Copy + Default>(name: &str) -> Option<T> {
+        let name = std::ffi::CString::new(name).ok()?;
+        let mut value = T::default();
+        let mut size = std::mem::size_of::<T>();
+        // SAFETY: `name` is a valid NUL-terminated string; `value` is a valid
+        // out-buffer of `size` bytes, which `sysctlbyname` never exceeds.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!(value).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && size == std::mem::size_of::<T>()).then_some(value)
+    }
+
+    /// How many process ids `proc_listpids(kind, arg)` lists. The list is read
+    /// into a buffer with some room, since processes start between the two
+    /// calls, and what the second call wrote is what is counted.
+    fn count_pids(kind: u32, arg: u32) -> Option<u64> {
+        const ID: usize = std::mem::size_of::<libc::pid_t>();
+        // SAFETY: a null buffer of size 0 only asks how many bytes are needed.
+        let need = unsafe { libc::proc_listpids(kind, arg, std::ptr::null_mut(), 0) };
+        if need <= 0 {
+            return None;
+        }
+        let mut ids: Vec<libc::pid_t> = vec![0; need as usize / ID + 64];
+        let bytes = libc::c_int::try_from(ids.len() * ID).ok()?;
+        // SAFETY: `ids` is a live buffer of `bytes` bytes; the call writes at
+        // most that many and returns how many.
+        let got = unsafe { libc::proc_listpids(kind, arg, ids.as_mut_ptr().cast(), bytes) };
+        (got > 0).then(|| got as u64 / ID as u64)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Probe for MacProbe {
+    fn memory(&self) -> Option<Mem> {
+        let total: u64 = Self::sysctl_int("hw.memsize")?;
+        let level: i32 = Self::sysctl_int("kern.memorystatus_level")?;
+        let available_mb = memory_from_level(total, u64::try_from(level).ok()?)?;
+        Some(Mem { available_mb })
+    }
+
+    fn load(&self) -> Option<Load> {
+        let mut avg = [0f64; 3];
+        // SAFETY: `avg` has room for the 3 samples asked for.
+        let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+        (n >= 1).then(|| Load {
+            one_min: avg[0],
+            cpus: cpus(),
+        })
+    }
+
+    fn disk(&self, path: &Path) -> Option<Disk> {
+        statvfs_free(path).map(|bytes| Disk {
+            free_mb: bytes / MIB,
+        })
+    }
+
+    fn pids(&self) -> Option<Pids> {
+        let machine = Pids {
+            current: Self::count_pids(PROC_ALL_PIDS, 0)?,
+            max: u64::try_from(Self::sysctl_int::<i32>("kern.maxproc")?).ok()?,
+        };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let user = match (
+            Self::count_pids(PROC_UID_ONLY, uid),
+            Self::sysctl_int::<i32>("kern.maxprocperuid").and_then(|m| u64::try_from(m).ok()),
+        ) {
+            (Some(current), Some(max)) => Some(Pids { current, max }),
+            _ => None,
+        };
+        Some(match user {
+            Some(user) => tighter_pid_limit(machine, user),
+            None => machine,
+        })
+    }
+}
+
+/// The probe of the machine tole runs on: [`MacProbe`] on macOS,
+/// [`LinuxProbe`] everywhere else (where an unreadable value is skipped and
+/// said once by [`startup_notes`]).
+pub fn host_probe() -> std::sync::Arc<dyn Probe + Send + Sync> {
+    #[cfg(target_os = "macos")]
+    {
+        std::sync::Arc::new(MacProbe)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::sync::Arc::new(LinuxProbe)
     }
 }
 
