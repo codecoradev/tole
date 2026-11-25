@@ -201,9 +201,10 @@ fn wrapper(root: &std::path::Path, base: &str) -> std::path::PathBuf {
     common::write_executable(
         &w,
         format!(
-            "#!/bin/sh\nexport HOME=\"{home}\" CODECORA_HOME=\"{home}\" PATH=\"{}:$PATH\" TOLE_BASE_URL=\"{base}\" TOLE_API_KEY=test TOLE_MODEL=mock\nunset TOLE_TRUST TOLE_SYSTEM_PROMPT\nexec \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport HOME=\"{home}\" CODECORA_HOME=\"{home}\" PATH=\"{}:{path}\" TOLE_BASE_URL=\"{base}\" TOLE_API_KEY=test TOLE_MODEL=mock\nunset TOLE_TRUST TOLE_SYSTEM_PROMPT\nexec \"{}\" \"$@\"\n",
             bin_dir.display(),
             env!("CARGO_BIN_EXE_tole"),
+            path = common::path_without_sibling_binaries().to_string_lossy(),
             home = root.join("home").display()
         ),
     );
