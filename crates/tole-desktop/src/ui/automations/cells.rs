@@ -4,7 +4,9 @@
 use super::super::adapter::*;
 use tole_desktop_model::tokens::{font, size, Tone, DARK};
 
-/// A cell of fixed width (the name's takes what is left).
+/// A cell of fixed width (the name's takes what is left, and never less than
+/// [`size::COL_NAME_MIN`]: a name column squeezed to nothing wraps its text one
+/// letter to a line).
 pub fn cell(width: Option<f32>) -> Div {
     let base = div()
         .min_w(len(0.0))
@@ -13,7 +15,7 @@ pub fn cell(width: Option<f32>) -> Div {
         .gap(len(size::ROW_GAP));
     match width {
         Some(w) => base.w(len(w)).flex_none(),
-        None => base.flex_1(),
+        None => base.flex_1().min_w(len(size::COL_NAME_MIN)),
     }
 }
 
