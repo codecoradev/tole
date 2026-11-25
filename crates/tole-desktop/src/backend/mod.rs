@@ -1,7 +1,8 @@
 //! The backend: the module that keeps the drivers true to the local serve.
 //!
 //! The window needs one thing to read and one thing to call: this. It owns the
-//! approvals, skills and task drivers ([`approvals`], [`skills`], [`task`]) and
+//! approvals, skills, automations and task drivers ([`approvals`], [`skills`],
+//! [`automations`], [`task`]) and
 //! starts and stops them as the serve comes and goes, so the window never holds
 //! a driver's handle that a restart of the serve would orphan.
 //!
@@ -27,7 +28,7 @@
 //! # What it does
 //!
 //! - While the serve is ready ([`ServeState::is_ready`](tole_desktop_model::ServeState::is_ready))
-//!   it keeps the approvals driver and the skills driver running over one
+//!   it keeps the approvals, skills and automations drivers running over one
 //!   [`Api`](crate::driver::Api).
 //! - When the serve stops being ready (restarting, failed, stopping, stopped,
 //!   another protocol version), or is replaced, it stops them, and the view
@@ -68,7 +69,7 @@
 //!
 //! The drivers' own threads are theirs (see their module docs): the approvals
 //! driver's four fixed threads and up to four readers, the skills driver's four,
-//! and a task driver's nine for each open task. The stream budget is in `tasks`: at most
+//! the automations driver's five, and a task driver's nine for each open task. The stream budget is in `tasks`: at most
 //! six of the serve's eight event streams are live (three tasks and the
 //! approvals readers of the same sessions), seven by the constants.
 //!
@@ -169,6 +170,7 @@ pub use self::tasks::{OpenRefused, TaskRefused};
 pub use self::view::BackendView;
 use self::worker::Worker;
 use crate::driver::approvals::{self, ApprovalsView};
+use crate::driver::automations::{self, AutomationsView};
 use crate::driver::clock::{Clock, Shutdown};
 use crate::driver::runtime::{JoinReport, Threads};
 use crate::driver::shared::handle::{Busy, OnChange};
@@ -192,6 +194,8 @@ pub struct Config {
     pub approvals_refresh: Duration,
     /// The skills driver's refresh (held between its own bounds).
     pub skills_refresh: Duration,
+    /// The automations driver's refresh (held between its own bounds).
+    pub automations_refresh: Duration,
 }
 
 impl Default for Config {
@@ -200,6 +204,7 @@ impl Default for Config {
             on_change: None,
             approvals_refresh: approvals::DEFAULT_REFRESH,
             skills_refresh: skills::DEFAULT_REFRESH,
+            automations_refresh: automations::DEFAULT_REFRESH,
         }
     }
 }
@@ -249,6 +254,7 @@ impl Backend {
                 settings: Settings {
                     approvals_refresh: cfg.approvals_refresh,
                     skills_refresh: cfg.skills_refresh,
+                    automations_refresh: cfg.automations_refresh,
                 },
                 on_change: cfg.on_change,
                 live: None,
@@ -279,6 +285,9 @@ impl Backend {
             skills: attached
                 .as_ref()
                 .map_or_else(SkillsPageView::not_loaded, |a| a.skills.snapshot()),
+            automations: attached
+                .as_ref()
+                .map_or_else(AutomationsView::not_loaded, |a| a.automations.snapshot()),
             serve: look.state,
             open_tasks: self.shared.tasks.list(),
         }
@@ -300,6 +309,14 @@ impl Backend {
         let look = self.link.look();
         let attached = self.shared.current(&look)?;
         Some(f(&attached.skills))
+    }
+
+    /// [`with_approvals`](Self::with_approvals) for the automations driver
+    /// (switch, select, refresh, dismiss).
+    pub fn with_automations<R>(&self, f: impl FnOnce(&automations::Handle) -> R) -> Option<R> {
+        let look = self.link.look();
+        let attached = self.shared.current(&look)?;
+        Some(f(&attached.automations))
     }
 
     /// Record `session` as an open task: a driver follows it from now on (when

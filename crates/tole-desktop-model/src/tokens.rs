@@ -183,6 +183,16 @@ pub mod size {
     pub const LINE_NUMBER_WIDTH: f32 = 28.0;
     /// Tallest the preview of a card grows before it scrolls.
     pub const PREVIEW_MAX_HEIGHT: f32 = 240.0;
+    /// Widths of the columns of the Automations table (the name takes the rest).
+    pub const COL_WHEN: f32 = 190.0;
+    pub const COL_FOLDER: f32 = 110.0;
+    pub const COL_NEXT: f32 = 140.0;
+    pub const COL_LAST: f32 = 170.0;
+    pub const COL_ON: f32 = 56.0;
+    /// The on/off switch drawn from two boxes: its track and its knob.
+    pub const SWITCH_WIDTH: f32 = 36.0;
+    pub const SWITCH_HEIGHT: f32 = 20.0;
+    pub const SWITCH_KNOB: f32 = 14.0;
     /// First window size.
     pub const WINDOW_WIDTH: f32 = 1200.0;
     pub const WINDOW_HEIGHT: f32 = 780.0;

@@ -12,11 +12,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tole_client::{ApprovalList, SkillsState, ToolsState};
+use tole_client::{ApprovalList, CronJobs, SkillsState, ToolsState};
 use tole_desktop_model::Badge;
 
 use super::fake::FakeLink;
 use super::{Backend, BackendView, Config, TICK_EVERY};
+use crate::adapter::automations::fixtures::{job_json, jobs_answer};
+use crate::driver::automations::AutomationsView;
 use crate::driver::clock::{Clock, ManualClock};
 use crate::driver::fake::FakeApi;
 use crate::driver::shared::handle::OnChange;
@@ -59,6 +61,7 @@ impl Rig {
             // a minute must not make them refresh by accident.
             approvals_refresh: Duration::from_secs(3_600),
             skills_refresh: Duration::from_secs(3_600),
+            automations_refresh: Duration::from_secs(3_600),
         };
         let backend = Backend::start(link.clone(), read, cfg).expect("start");
         // The ticker is asleep before the test moves the time.
@@ -185,13 +188,22 @@ pub(super) fn tools(n: usize) -> ToolsState {
         .expect("a tools answer")
 }
 
+/// An answer with two automations: one the owner has on and one paused.
+pub(super) fn cron_jobs() -> CronJobs {
+    jobs_answer(vec![
+        job_json("on", "cli", "active", false),
+        job_json("off", "cli", "paused", false),
+    ])
+}
+
 /// An api that answers the first loads: no approvals, `drafts` skills drafts
-/// waiting, `untrusted` tools not trusted.
+/// waiting, `untrusted` tools not trusted, and two automations (one on).
 pub(super) fn known_api(drafts: usize, untrusted: usize) -> Arc<FakeApi> {
     let api = FakeApi::new();
     api.reply_list(Ok(no_approvals()));
     api.reply_skills(Ok(skills(drafts)));
     api.reply_tools(Ok(tools(untrusted)));
+    api.reply_cron_jobs(Ok(cron_jobs()));
     api
 }
 
@@ -200,6 +212,7 @@ pub(super) fn is_known(v: &BackendView, drafts: usize, untrusted: usize) -> bool
     v.approvals.badge == Badge::Count(0)
         && v.skills.skills_waiting == Badge::Count(drafts)
         && v.skills.tools_needing_attention == Badge::Count(untrusted)
+        && v.automations.counts() == Some((1, 1))
 }
 
 /// Whether the view knows nothing the drivers could have told.
@@ -207,4 +220,5 @@ pub(super) fn is_unknown(v: &BackendView) -> bool {
     v.approvals.badge == Badge::Unknown
         && v.skills.skills_waiting == Badge::Unknown
         && v.skills.tools_needing_attention == Badge::Unknown
+        && v.automations == AutomationsView::not_loaded()
 }

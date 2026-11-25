@@ -3,12 +3,14 @@
 use std::time::Duration;
 
 use tole_desktop_model::{
-    Action, Badge, ConnectionStatus, Section, ServeFailure, ServeState, ShellState, Target,
+    Action, Badge, ConnectionStatus, RawJob, Scheduler, SchedulerHost, Section, ServeFailure,
+    ServeState, ShellState, Target,
 };
 
-use super::shell::{actions, apply, skills_badge};
+use super::shell::{actions, apply, automations_badge, skills_badge};
 use super::BackendView;
 use crate::driver::approvals::ApprovalsView;
+use crate::driver::automations::AutomationsView;
 use crate::driver::skills::SkillsPageView;
 
 fn running() -> ServeState {
@@ -23,6 +25,7 @@ fn view(serve: ServeState) -> BackendView {
         serve,
         approvals: ApprovalsView::unknown(),
         skills: SkillsPageView::not_loaded(),
+        automations: AutomationsView::not_loaded(),
         open_tasks: Vec::new(),
     }
 }
@@ -195,14 +198,80 @@ fn applying_the_same_view_twice_changes_nothing_the_second_time() {
 #[test]
 fn only_what_the_backend_knows_is_touched() {
     let mut shell = ShellState::placeholder();
-    shell.apply(Action::SetAutomationsOn(3));
     shell.apply(Action::SetDiscussionsNeedYou(2));
     let before = shell.clone();
     apply(&mut shell, &known(1, 1, 1));
     assert_eq!(shell.folders, before.folders);
     assert_eq!(shell.section, before.section);
-    assert_eq!(shell.automations_on, 3);
     assert_eq!(shell.discussions_need_you, 2);
+}
+
+/// A job of the list as the serve gives it: `state` is `active` or `paused`.
+fn job(id: &str, state: &str) -> RawJob {
+    RawJob {
+        id: id.into(),
+        name: id.into(),
+        schedule: "every 1h".into(),
+        timezone: "UTC".into(),
+        state: state.into(),
+        next_run: Some(1_700_000_000),
+        next: "soon".into(),
+        last: None,
+        missed: 0,
+        blocked: 0,
+        created_by: "cli".into(),
+        awaiting_review: false,
+        folder: None,
+    }
+}
+
+/// A view whose automations list was read: these jobs.
+fn with_jobs(jobs: Vec<RawJob>) -> BackendView {
+    let mut v = view(running());
+    let scheduler = Scheduler::Running(SchedulerHost::Serve);
+    v.automations.page.loaded(jobs, scheduler);
+    v
+}
+
+#[test]
+fn an_unread_automations_list_stays_unknown_and_never_a_zero() {
+    let mut shell = ShellState::new();
+    shell.apply(Action::SetAutomationsOn(Badge::Count(5)));
+    apply(&mut shell, &view(running()));
+    assert_eq!(shell.automations_on, Badge::Unknown);
+    assert!(shell.badge_unknown(Section::Automations));
+}
+
+#[test]
+fn a_read_list_gives_the_number_of_automations_that_are_on() {
+    let mut shell = ShellState::new();
+    let v = with_jobs(vec![
+        job("a", "active"),
+        job("b", "active"),
+        job("c", "paused"),
+    ]);
+    assert_eq!(automations_badge(&v), Badge::Count(2));
+    apply(&mut shell, &v);
+    assert_eq!(
+        shell.badge_text(Section::Automations).as_deref(),
+        Some("2 on")
+    );
+    // A known zero is a zero: no count and no mark.
+    apply(&mut shell, &with_jobs(vec![job("c", "paused")]));
+    assert_eq!(shell.automations_on, Badge::Count(0));
+    assert_eq!(shell.badge_text(Section::Automations), None);
+}
+
+#[test]
+fn a_list_that_is_not_all_of_the_jobs_or_not_current_is_unknown() {
+    // Jobs past the cap: the rows are only some of them.
+    let mut v = with_jobs(vec![job("a", "active")]);
+    v.automations.left_out = 3;
+    assert_eq!(automations_badge(&v), Badge::Unknown);
+    // A read that failed keeps its rows but they may be out of date.
+    let mut v = with_jobs(vec![job("a", "active")]);
+    v.automations.page.load_failed("down");
+    assert_eq!(automations_badge(&v), Badge::Unknown);
 }
 
 #[test]
