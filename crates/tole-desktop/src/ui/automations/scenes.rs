@@ -15,7 +15,7 @@ use super::page::automations_page;
 use super::types::{AutomationsHost, AutomationsUi};
 use crate::driver::automations::AutomationsView;
 use tole_desktop_model::tokens::{font, DARK};
-use tole_desktop_model::{AutomationId, Load, RawJob, RawRun, Scheduler};
+use tole_desktop_model::{AutomationId, AutomationsStop, Load, RawJob, RawRun, Scheduler};
 
 /// The board the page is compared with.
 const BOARD: &str = "s6-automations.png";
@@ -219,6 +219,10 @@ fn base_scenes() -> Vec<Scene> {
 pub struct Gallery {
     pub view: AutomationsView,
     ui: AutomationsUi,
+    /// The switches that were pressed, in order (for the checks).
+    pub toggled: Vec<AutomationId>,
+    /// The requests "Open in Approvals" was pressed for, in order (for the checks).
+    pub opened: Vec<String>,
 }
 
 impl Gallery {
@@ -226,7 +230,16 @@ impl Gallery {
         Gallery {
             view: scene.view,
             ui: AutomationsUi::default(),
+            toggled: Vec::new(),
+            opened: Vec::new(),
         }
+    }
+
+    /// The control that has focus (for the checks).
+    pub fn focused(&self, window: &Window) -> Option<AutomationsStop> {
+        self.ui
+            .focus
+            .focused(&AutomationsUi::stops(&self.view), window)
     }
 
     fn select(&mut self, id: &AutomationId, cx: &mut Context<Self>) {
@@ -234,7 +247,8 @@ impl Gallery {
         cx.notify();
     }
 
-    fn toggle(&mut self, _: &AutomationId, cx: &mut Context<Self>) {
+    fn toggle(&mut self, id: &AutomationId, cx: &mut Context<Self>) {
+        self.toggled.push(id.clone());
         cx.notify();
     }
 
@@ -243,7 +257,8 @@ impl Gallery {
         cx.notify();
     }
 
-    fn open_approvals(&mut self, _: &str, cx: &mut Context<Self>) {
+    fn open_approvals(&mut self, approval: &str, cx: &mut Context<Self>) {
+        self.opened.push(approval.to_owned());
         cx.notify();
     }
 }
@@ -312,3 +327,6 @@ pub fn render_scenes(dir: &Path) -> Result<Vec<Rendered>, String> {
     }
     Ok(done)
 }
+
+#[cfg(test)]
+mod tests;
