@@ -37,6 +37,21 @@ graph TD
 - **tole-client** — typed blocking client of the `tole serve` protocol (#1040): request/response types, a `Transport` trait (HTTP over TCP, and on macOS and Linux HTTP over the Unix socket of `tole serve --socket`, #1067), and an incremental SSE reader that reconnects with `after=<seq>`. A JSON Schema of its wire and event types is committed (`crates/tole-client/schema/`, regenerated and checked by `scripts/client-schema.sh`, #1068). Depends on tole-core for `Entry` only (never tole-cli or tole-tui), holds no agent logic; the graphical clients are its consumers.
 - **tole-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
+### Crate kinds (#1250)
+
+Every crate declares a kind in `[package.metadata.tole]` and `scripts/arch-check.sh` checks the crate graph against the dependency matrix of the CodeCora modular + thin-UI standard (rules L1 to L3). It runs in CI as a step of the `Check` job. The module layering inside `tole-core` and `tole-cli` is a separate test (#752, above); this is the crate level over it, and it adds no crate (the published crates stay three, by the #752 decision).
+
+| Crate | Kind | May depend on (normal dependencies, workspace crates) |
+|-------|------|------------------------------------------------------|
+| `tole-core` | core | core (nothing else in the workspace) |
+| `tole-client` | integration | core, engine |
+| `tole-tui` | ui | core, app, ui |
+| `tole-desktop-model` | app | core, engine, integration, os, feature |
+| `tole-desktop` | bin | everything (until the headless core and the renderer are separate crates, #1241) |
+| `tole-cli` | bin | everything |
+
+A UI toolkit package (`crossterm`, `ratatui`, `gpui*`, `zed*`) is a normal dependency of `ui`, `feature-ui` and `bin` crates only. Build and dev dependencies are not checked (test and build wiring). `tole-core` is the kernel crate: its engine-level modules (delegation, discussion, MCP, web, skills) are one crate by decision (#752) and are kept apart by the layering test, not by the matrix. The desktop crates keep their stricter script, `scripts/desktop-check.sh`. A new crate declares its kind in its first commit; the full vocabulary is core, engine, integration, os, feature, app, ffi, ui, feature-ui, bin and tool (`scripts/arch-lint.py`).
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |

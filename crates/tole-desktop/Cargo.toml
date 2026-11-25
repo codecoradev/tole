@@ -22,6 +22,12 @@ publish = false
 # depends on `gpui-pre =0.3.12`, a crates.io snapshot of Zed's GPUI whose
 # library is named `gpui`; the `gpui` and `gpui_platform` pins below must stay
 # equal to that version.
+
+# Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
+# scripts/arch-check.sh. See "Crate kinds" in docs/architecture.md.
+[package.metadata.tole]
+kind = "bin"
+
 [features]
 default = []
 gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
