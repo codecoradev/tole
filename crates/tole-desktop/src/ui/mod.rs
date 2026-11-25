@@ -19,6 +19,7 @@ pub use self::task::TaskCall;
 #[cfg(feature = "gpui")]
 mod adapter;
 pub mod approvals;
+pub mod automations;
 #[cfg(feature = "render-harness")]
 pub mod harness;
 #[cfg(feature = "render-harness")]
@@ -42,6 +43,8 @@ mod sidebar;
 #[cfg(feature = "gpui")]
 mod skills;
 mod status;
+#[cfg(all(feature = "gpui", unix))]
+pub mod stops;
 pub mod task;
 
 /// Why [`run`] could not open a window.
