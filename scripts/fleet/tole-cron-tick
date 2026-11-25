@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run one `tole cron tick` pass, logged, with a lock so a slow tick is never
+# overlapped by the next scheduler call (the overlapping call exits 0, skipped).
+# Same environment as tole-serve-launcher; sessions dir defaults to the daemon's.
+# Note: agent jobs needing Writes are refused here; host them with `tole serve --cron`.
+#
+# Usage: tole-cron-tick [extra `tole cron tick` args]
+# Exit codes: tick's exit code; 0 when skipped because another tick is running.
+set -euo pipefail
+
+TOLE_BIN="${TOLE_BIN:-tole}"
+DIR="${TOLE_FLEET_DIR:-$HOME/.local/state/tole-fleet}"
+SESSIONS="${TOLE_FLEET_SESSIONS:-$DIR/sessions}"
+LOCK="$DIR/cron-tick.lock"
+LOG_FILE="$DIR/cron-tick.log"
+mkdir -p "$DIR" "$SESSIONS"
+cd "$DIR"  # script jobs run in the tick's cwd: keep it out of the caller's tree
+
+say() { printf '%s tole-cron-tick: %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG_FILE"; }
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  say "skipped, previous tick still running"
+  exit 0
+fi
+
+say "tick start"
+rc=0
+"$TOLE_BIN" cron --sessions-dir "$SESSIONS" tick "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+say "tick done rc=$rc"
+exit "$rc"

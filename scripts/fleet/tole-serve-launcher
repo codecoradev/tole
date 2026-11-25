@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Start / stop / inspect the 24/7 `tole serve` daemon on a host without systemd
+# (see docs/fleet-daemon.md). Idempotent: `start` on a live daemon is a no-op.
+#
+# Usage: tole-serve-launcher [start|stop|status] [-- extra `tole serve` args]
+#
+# Environment (all optional):
+#   TOLE_BIN             tole binary            (default: tole on PATH)
+#   TOLE_FLEET_DIR       state dir: pid, log, token   (default: ~/.local/state/tole-fleet)
+#   TOLE_FLEET_PORT      listen port            (default: 7801)
+#   TOLE_FLEET_BIND      bind address           (default: 127.0.0.1)
+#   TOLE_FLEET_SESSIONS  sessions dir           (default: $TOLE_FLEET_DIR/sessions)
+#   TOLE_FLEET_TOKEN_FILE bearer token file     (default: $TOLE_FLEET_DIR/token, created 0600 if absent)
+#
+# Exit codes: start 0 running (started or already up), 1 failed to start;
+# status 0 running, 3 not running; stop 0 always.
+set -euo pipefail
+
+TOLE_BIN="${TOLE_BIN:-tole}"
+DIR="${TOLE_FLEET_DIR:-$HOME/.local/state/tole-fleet}"
+PORT="${TOLE_FLEET_PORT:-7801}"
+BIND="${TOLE_FLEET_BIND:-127.0.0.1}"
+SESSIONS="${TOLE_FLEET_SESSIONS:-$DIR/sessions}"
+TOKEN_FILE="${TOLE_FLEET_TOKEN_FILE:-$DIR/token}"
+PID_FILE="$DIR/serve.pid"
+LOG_FILE="$DIR/serve.log"
+
+log() { printf '%s tole-serve-launcher: %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# Live = the pid answers AND its cmdline is a `tole serve` (a recycled pid
+# belonging to something else is not our daemon).
+is_running() {
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'tole.* serve'
+}
+
+cmd="${1:-start}"
+[[ $# -gt 0 ]] && shift
+[[ "${1:-}" == "--" ]] && shift
+
+case "$cmd" in
+  status)
+    if is_running; then log "running pid $(cat "$PID_FILE") port $PORT"; else log "not running"; exit 3; fi
+    ;;
+  stop)
+    if is_running; then
+      pid="$(cat "$PID_FILE")"
+      kill "$pid"
+      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+      log "stopped pid $pid"
+    else
+      log "not running"
+    fi
+    rm -f "$PID_FILE"
+    ;;
+  start)
+    if is_running; then log "already running pid $(cat "$PID_FILE")"; exit 0; fi
+    mkdir -p "$DIR" "$SESSIONS"
+    if [[ ! -s "$TOKEN_FILE" ]]; then
+      (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$TOKEN_FILE")
+      log "generated token file $TOKEN_FILE"
+    fi
+    # setsid detaches from the caller's session/terminal; nohup ignores SIGHUP.
+    # No start lock: two simultaneous starts could race. Add flock if a scheduler ever overlaps.
+    setsid nohup "$TOLE_BIN" serve --port "$PORT" --bind "$BIND" \
+      --sessions-dir "$SESSIONS" --token-file "$TOKEN_FILE" "$@" \
+      >>"$LOG_FILE" 2>&1 </dev/null &
+    echo $! >"$PID_FILE"
+    sleep 1
+    if is_running; then
+      log "started pid $(cat "$PID_FILE") on $BIND:$PORT (log $LOG_FILE)"
+    else
+      rm -f "$PID_FILE"
+      log "failed to start; see $LOG_FILE"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "usage: $0 [start|stop|status] [-- extra tole serve args]" >&2
+    exit 64
+    ;;
+esac

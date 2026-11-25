@@ -1,0 +1,15 @@
+# TEMPLATE for hosts WITH systemd (not installed on the fleet container; see docs/fleet-daemon.md).
+# Install as a user unit: cp to ~/.config/systemd/user/ && systemctl --user enable --now tole-serve
+# The token file is created by `scripts/fleet/tole-serve-launcher start` once, or by hand (mode 0600).
+[Unit]
+Description=tole serve (loopback, token-authenticated)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/tole serve --port 7801 --bind 127.0.0.1 --sessions-dir %h/.local/state/tole-fleet/sessions --token-file %h/.local/state/tole-fleet/token
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

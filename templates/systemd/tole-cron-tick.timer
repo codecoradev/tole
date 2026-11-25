@@ -1,0 +1,11 @@
+# TEMPLATE for hosts WITH systemd (not installed on the fleet container; see docs/fleet-daemon.md).
+[Unit]
+Description=Run tole cron tick every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
