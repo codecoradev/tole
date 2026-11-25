@@ -286,9 +286,18 @@ impl std::fmt::Debug for OpenAiProvider {
     }
 }
 
+/// Default global timeout of one chat-completions request, in seconds (#1236).
+///
+/// A reasoning model on a loaded gateway can legitimately think for minutes
+/// before the first byte of a streamed completion, so the former 120 s cap
+/// killed healthy requests as `timeout: global`. Short diagnostic calls
+/// (`tole doctor`) and discussion calls set their own value through
+/// [`OpenAiProvider::with_timeout`] and do not inherit this one.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 900;
+
 impl OpenAiProvider {
     pub fn new(cfg: OpenAiConfig) -> Self {
-        let timeout = Duration::from_secs(120);
+        let timeout = Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS);
         let agent = Self::build_chat_agent(timeout);
         let secrets = provider_secrets(&SecretSet::default(), &cfg);
         Self {
@@ -370,7 +379,7 @@ impl OpenAiProvider {
         self.timeout
     }
 
-    /// Override the default 120s timeout (the global timeout of one request:
+    /// Override the default timeout, [`DEFAULT_REQUEST_TIMEOUT_SECS`] (the global timeout of one request:
     /// connect, send and reading the whole response).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.agent = Self::build_chat_agent(timeout);
@@ -1244,6 +1253,18 @@ use crate::entry::Entry;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_request_timeout_is_900_seconds_and_with_timeout_overrides_it() {
+        // #1236: reasoning models on a loaded gateway outlast the former 120 s.
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 900);
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let p = OpenAiProvider::new(cfg);
+        assert_eq!(p.request_timeout(), Duration::from_secs(900));
+        // The short diagnostic calls opt out of the default explicitly.
+        let p = p.with_timeout(Duration::from_secs(45));
+        assert_eq!(p.request_timeout(), Duration::from_secs(45));
+    }
 
     #[test]
     fn context_window_is_read_from_the_usual_catalog_fields() {

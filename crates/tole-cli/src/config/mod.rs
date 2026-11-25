@@ -176,6 +176,18 @@ pub struct DiscussionsConfig {
     pub request_timeout_secs: Option<u64>,
 }
 
+/// The `[provider]` table (#1236). USER LAYER ONLY, like [`DiscussionsConfig`]:
+/// a cloned repository must not set network-level timeouts of the owner's
+/// provider.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    /// Seconds one chat or mission provider request may take in total
+    /// (connect, send and read of the whole streamed reply), 30 to 3600
+    /// (default 900).
+    pub request_timeout_secs: Option<u64>,
+}
+
 /// The `[sandbox]` table (#601). USER LAYER ONLY, like [`CronConfig`]: a
 /// cloned repository must never loosen or switch off its own sandbox.
 /// Off unless `mode` says otherwise; Linux (bubblewrap) only.
@@ -913,6 +925,9 @@ pub struct Config {
     /// Discussion request timeout (#786); user layer only, see
     /// [`DiscussionsConfig`].
     pub discussions: Option<DiscussionsConfig>,
+    /// Chat and mission request timeout (#1236); user layer only, see
+    /// [`ProviderConfig`].
+    pub provider: Option<ProviderConfig>,
     /// The sandbox of stdio MCP servers (#601); user layer only, see
     /// [`SandboxConfig`].
     pub sandbox: Option<SandboxConfig>,
@@ -1151,6 +1166,14 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             )));
         }
     }
+    if let Some(n) = cfg.provider.as_ref().and_then(|p| p.request_timeout_secs) {
+        if !crate::config_apply::chat_timeout_in_range(n) {
+            return Err(range(format!(
+                "provider.request_timeout_secs must be {}, got {n}",
+                crate::config_apply::chat_timeout_bounds()
+            )));
+        }
+    }
     for (name, p) in cfg.profiles.iter().flatten() {
         check_profile(name, p).map_err(range)?;
     }
@@ -1380,6 +1403,7 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         cron: user.cron.clone(),
         // Nor the discussion request timeout (#786).
         discussions: user.discussions.clone(),
+        provider: user.provider.clone(),
         // Nor the sandbox (#601): a repository must not loosen its own.
         sandbox: user.sandbox.clone(),
         // Nor the curator's settings (#593).
@@ -1426,6 +1450,13 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         .is_some_and(|d| d.request_timeout_secs.is_some())
     {
         from_user.insert("discussions.request_timeout_secs");
+    }
+    if user
+        .provider
+        .as_ref()
+        .is_some_and(|p| p.request_timeout_secs.is_some())
+    {
+        from_user.insert("provider.request_timeout_secs");
     }
     if let Some(s) = &user.sandbox {
         for (k, set) in [
@@ -1516,6 +1547,9 @@ pub const CRON_IGNORED_NOTE: &str =
 /// Suffix of a project config's `discussions` lines in `config check` (#786).
 pub const DISCUSSIONS_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set the discussion request timeout (user config only; also TOLE_DISCUSSION_TIMEOUT_SECS)";
+/// Suffix of a project config's `provider` lines in `config check` (#1236).
+pub const PROVIDER_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set the provider request timeout (user config only; also TOLE_REQUEST_TIMEOUT_SECS)";
 /// Suffix of a project config's `sandbox` lines in `config check` (#601).
 pub const SANDBOX_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set the sandbox (user config only)";
@@ -1590,6 +1624,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         }
         if tag == PROJECT_TAG && key.starts_with("cron.") {
             return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("provider.") {
+            return PROVIDER_IGNORED_NOTE;
         }
         if tag == PROJECT_TAG && key.starts_with("discussions.") {
             return DISCUSSIONS_IGNORED_NOTE;
@@ -1827,6 +1864,13 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             &mut out,
             "discussions.request_timeout_secs",
             d.request_timeout_secs.map(|n| n.to_string()),
+        );
+    }
+    if let Some(p) = &cfg.provider {
+        scalar(
+            &mut out,
+            "provider.request_timeout_secs",
+            p.request_timeout_secs.map(|n| n.to_string()),
         );
     }
     if let Some(c) = &cfg.cron {

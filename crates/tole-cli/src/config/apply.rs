@@ -204,6 +204,30 @@ pub fn discussion_timeout_env_bounds() -> String {
     )
 }
 
+/// Request timeout of one chat or mission provider request, in seconds
+/// (#1236). The discussion calls have their own knob above.
+pub const CHAT_TIMEOUT_ENV: &str = "TOLE_REQUEST_TIMEOUT_SECS";
+
+/// Default chat request timeout: the provider's own default (900 s).
+pub const DEFAULT_CHAT_TIMEOUT_SECS: u64 = tole_core::openai::DEFAULT_REQUEST_TIMEOUT_SECS;
+/// Lower bound of the chat request timeout, config and env alike (#1236), in
+/// seconds. A shorter cap would kill the slow-but-alive streamed completions
+/// this knob exists for.
+pub const MIN_CHAT_TIMEOUT_SECS: u64 = 30;
+/// Upper bound of the chat request timeout (#1236), in seconds.
+pub const MAX_CHAT_TIMEOUT_SECS: u64 = 3600;
+
+/// Whether `n` is an allowed `[provider] request_timeout_secs` or
+/// `TOLE_REQUEST_TIMEOUT_SECS`.
+pub fn chat_timeout_in_range(n: u64) -> bool {
+    (MIN_CHAT_TIMEOUT_SECS..=MAX_CHAT_TIMEOUT_SECS).contains(&n)
+}
+
+/// The wording of the chat timeout bounds, for the config and env errors.
+pub fn chat_timeout_bounds() -> String {
+    format!("a whole number of seconds from {MIN_CHAT_TIMEOUT_SECS} to {MAX_CHAT_TIMEOUT_SECS}")
+}
+
 /// Review gate policy (#534). Same name as `review_gate::ENV`, which only
 /// exists with `shell-tools`; a test below keeps the two equal.
 pub const REVIEW_GATE_ENV: &str = "TOLE_REVIEW_GATE";
@@ -444,6 +468,33 @@ pub fn discussion_timeout_line() -> String {
     format!("discussions: request timeout {n}s {src}")
 }
 
+static CHAT_TIMEOUT: OnceLock<(u64, String)> = OnceLock::new();
+
+/// Install the resolved chat request timeout and where it came from (first
+/// call wins), set once at startup so every provider factory and `tole
+/// doctor` need no new parameter (#1236).
+pub fn install_chat_timeout(e: &Eff<u64>) {
+    let _ = CHAT_TIMEOUT.set((e.value, e.describe()));
+}
+
+/// The chat and mission request timeout: the installed value, else the default.
+pub fn chat_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        CHAT_TIMEOUT
+            .get()
+            .map_or(DEFAULT_CHAT_TIMEOUT_SECS, |(n, _)| *n),
+    )
+}
+
+/// The `tole doctor` line for the chat request timeout (#1236).
+pub fn chat_timeout_line() -> String {
+    let (n, src) = CHAT_TIMEOUT
+        .get()
+        .cloned()
+        .unwrap_or((DEFAULT_CHAT_TIMEOUT_SECS, "(default)".to_string()));
+    format!("provider: request timeout {n}s {src}")
+}
+
 /// The config's `model`, for hosts that need the model name without a
 /// full provider (the ACP advertised "current model").
 pub fn config_model() -> Option<String> {
@@ -545,6 +596,14 @@ pub struct Settings {
     /// The env value of `request_timeout` when it is not a valid number in
     /// range, as typed.
     pub request_timeout_env_invalid: Option<String>,
+    /// `TOLE_REQUEST_TIMEOUT_SECS` > user config `[provider]
+    /// request_timeout_secs` > 900 (#1236): the chat and mission request
+    /// timeout. The project layer is not a source. An invalid env value is
+    /// skipped here and reported by [`Settings::chat_timeout_error`].
+    pub chat_timeout: Eff<u64>,
+    /// The env value of `chat_timeout` when it is not a valid number in
+    /// range, as typed.
+    pub chat_timeout_env_invalid: Option<String>,
     /// `--effort` > `TOLE_REASONING_EFFORT` > config `reasoning_effort`
     /// (#457), canonical lowercase; `None` = not sent. An invalid ENV value
     /// is kept as typed so [`Settings::effort_error`] can name it.
@@ -583,6 +642,16 @@ impl Settings {
         Some(format!(
             "{DISCUSSION_TIMEOUT_ENV} must be {}, got {v:?}",
             discussion_timeout_env_bounds()
+        ))
+    }
+
+    /// The startup error for an invalid `TOLE_REQUEST_TIMEOUT_SECS`
+    /// (non-numeric, 0 or out of range): never silently ignored (#1236).
+    pub fn chat_timeout_error(&self) -> Option<String> {
+        let v = self.chat_timeout_env_invalid.as_ref()?;
+        Some(format!(
+            "{CHAT_TIMEOUT_ENV} must be {}, got {v:?}",
+            chat_timeout_bounds()
         ))
     }
 
@@ -673,6 +742,15 @@ impl Settings {
             None => (None, None),
             Some(v) => match v.trim().parse::<u64>() {
                 Ok(n) if discussion_timeout_env_in_range(n) => (Some(n), None),
+                _ => (None, Some(v)),
+            },
+        };
+        // `TOLE_REQUEST_TIMEOUT_SECS` (#1236): same shape as the discussion one.
+        let env_chat_timeout: (Option<u64>, Option<String>) = match nonblank(env(CHAT_TIMEOUT_ENV))
+        {
+            None => (None, None),
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if chat_timeout_in_range(n) => (Some(n), None),
                 _ => (None, Some(v)),
             },
         };
@@ -781,6 +859,16 @@ impl Settings {
                 Eff::from_pair((v, s), DISCUSSION_TIMEOUT_ENV)
             },
             request_timeout_env_invalid: env_timeout.1,
+            chat_timeout: {
+                let (v, s) = resolve_or(
+                    None,
+                    env_chat_timeout.0,
+                    cfg.provider.as_ref().and_then(|p| p.request_timeout_secs),
+                    DEFAULT_CHAT_TIMEOUT_SECS,
+                );
+                Eff::from_pair((v, s), CHAT_TIMEOUT_ENV)
+            },
+            chat_timeout_env_invalid: env_chat_timeout.1,
             reasoning_effort: resolve_string(
                 flags.reasoning_effort.clone(),
                 env(REASONING_EFFORT_ENV),
@@ -867,6 +955,11 @@ impl Settings {
         one(
             &mut self.request_timeout,
             "discussions.request_timeout_secs",
+            user,
+        );
+        one(
+            &mut self.chat_timeout,
+            "provider.request_timeout_secs",
             user,
         );
         opt(&mut self.reasoning_effort, "reasoning_effort", user);
@@ -1092,6 +1185,17 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
                 "  effective: {}  {}",
                 s.request_timeout.value,
                 s.request_timeout.describe()
+            ),
+        },
+    );
+    m.insert(
+        "provider.request_timeout_secs",
+        match s.chat_timeout_error() {
+            Some(err) => format!("  INVALID: {err}"),
+            None => format!(
+                "  effective: {}  {}",
+                s.chat_timeout.value,
+                s.chat_timeout.describe()
             ),
         },
     );

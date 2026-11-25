@@ -91,7 +91,16 @@ pub fn build(
     // #595: every known secret of this process is redacted from what the
     // provider sees, not only its own key. Collected once per session build.
     let secrets = process_secrets(env);
-    let make = |cfg: OpenAiConfig| configure(OpenAiProvider::new(cfg).with_secrets(&secrets));
+    // #1236: the workload requests of the session take the resolved timeout;
+    // `doctor` and discussion calls build their own providers.
+    let timeout = crate::config_apply::chat_timeout();
+    let make = |cfg: OpenAiConfig| {
+        configure(
+            OpenAiProvider::new(cfg)
+                .with_secrets(&secrets)
+                .with_timeout(timeout),
+        )
+    };
     let reserve = fallback_config(&primary, env)?;
     // #596: the session log redacts with every secret a provider request
     // is redacted with (both providers' keys and URL passwords), so the log
