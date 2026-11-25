@@ -1,0 +1,8 @@
+# TEMPLATE for hosts WITH systemd (not installed on the fleet container; see docs/fleet-daemon.md).
+# One scheduler pass; fired by tole-cron-tick.timer. The wrapper holds the overlap lock.
+[Unit]
+Description=tole cron tick (one scheduler pass)
+
+[Service]
+Type=oneshot
+ExecStart=%h/tole/scripts/fleet/tole-cron-tick
