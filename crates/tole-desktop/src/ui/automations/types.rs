@@ -13,6 +13,9 @@ pub struct AutomationsHost<V: 'static> {
     pub toggle: fn(&mut V, &AutomationId, &mut Context<V>),
     /// The owner dismissed the notice under the table.
     pub dismiss_notice: fn(&mut V, &mut Context<V>),
+    /// The owner pressed "Open in Approvals" on a run that stopped to ask (by
+    /// the id of the request).
+    pub open_in_approvals: fn(&mut V, &str, &mut Context<V>),
 }
 
 impl<V: 'static> Clone for AutomationsHost<V> {
