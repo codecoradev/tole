@@ -60,7 +60,10 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   and clears the XDG overrides; `extra_env` is applied last, so a test that
   wants a shim or a decoy overrides there. Without it a test passes in CI and
   fails, or writes real state, on a machine that has those tools and a
-  `~/.codecora`.
+  `~/.codecora`. `crates/tole-cli/tests/hermetic_audit.rs` enforces it: a test file
+  that names `CARGO_BIN_EXE_tole` and neither uses the helper nor is listed there
+  (`OWN_ENVIRONMENT`, with the reason its own environment is hermetic) fails, on any
+  machine, with or without those tools. `hermetic_helper.rs` tests the helper itself.
 
   ```rust
   let home = dir.join("home");
@@ -74,7 +77,8 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   &home, &extra)`. The exception is a test that runs agent code in the test
   process (`cron_agent.rs`, `child_handoff_e2e.rs`): there is no child to
   configure, and it must not mutate the process environment to fake one;
-  see #993 for the options. Unconverted files are tracked in #993.
+  see #993 for the options. No file that spawns the binary is left unconverted: the
+  audit above lists the ones with an environment of their own.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 

@@ -4,7 +4,7 @@
 mod common;
 use common::TestDir;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tole_core::secrets::SecretSet;
 use tole_core::skill_curator::{UsageKind, UsageLedger, UsageRecord};
@@ -18,15 +18,16 @@ fn tmpdir() -> TestDir {
 }
 
 fn tole(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tole"))
-        .args(args)
-        .current_dir(home)
-        .env("TOLE_NO_UPDATE_CHECK", "1")
-        .env("CODECORA_HOME", home)
-        .env("HOME", home)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        home,
+        &[("TOLE_NO_UPDATE_CHECK", "1")],
+    )
+    .args(args)
+    .current_dir(home)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn out(o: &Output) -> String {
@@ -371,21 +372,22 @@ mod outcomes {
     }
 
     fn run(home: &Path, work: &Path, url: &str, prompt: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
-            .args(["run", prompt])
-            .current_dir(work)
-            .env("TOLE_NO_UPDATE_CHECK", "1")
-            .env("CODECORA_HOME", home)
-            .env("HOME", home)
-            .env("TOLE_STREAM", "0")
-            .env("TOLE_BASE_URL", url)
-            .env("TOLE_MODEL", "m")
-            .env("TOLE_API_KEY", "k")
-            .env("TOLE_SKILL_APPROVAL", "off")
-            .env_remove("TOLE_SKILL_INDEX")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+        common::hermetic_command(
+            env!("CARGO_BIN_EXE_tole"),
+            home,
+            &[("TOLE_NO_UPDATE_CHECK", "1")],
+        )
+        .args(["run", prompt])
+        .current_dir(work)
+        .env("TOLE_STREAM", "0")
+        .env("TOLE_BASE_URL", url)
+        .env("TOLE_MODEL", "m")
+        .env("TOLE_API_KEY", "k")
+        .env("TOLE_SKILL_APPROVAL", "off")
+        .env_remove("TOLE_SKILL_INDEX")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
     }
 
     fn ledger(home: &Path) -> tole_core::skill_curator::UsageSummary {
