@@ -36,6 +36,7 @@ fn tab_to(w: &mut Offscreen<ShellView>, stop: PageStop) {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn the_page_is_drawn_in_every_state_and_leaves_the_sidebar_alone() {
     let _one = lock();
     let dir = std::env::temp_dir().join(format!(
@@ -52,6 +53,7 @@ fn the_page_is_drawn_in_every_state_and_leaves_the_sidebar_alone() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn allow_once_reaches_the_app_once_with_the_id_of_the_card_that_was_pressed() {
     let _one = lock();
     let source = source_of("approvals-page-three-waiting");
@@ -85,6 +87,7 @@ fn allow_once_reaches_the_app_once_with_the_id_of_the_card_that_was_pressed() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_row_and_a_tab_are_sent_as_calls_and_dont_allow_is_its_own_decision() {
     let _one = lock();
     let source = source_of("approvals-page-three-waiting");
@@ -114,6 +117,7 @@ fn a_row_and_a_tab_are_sent_as_calls_and_dont_allow_is_its_own_decision() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_press_the_app_refuses_is_not_shown_as_if_it_had_worked() {
     let _one = lock();
     let scene = page_scenes()
@@ -135,6 +139,7 @@ fn a_press_the_app_refuses_is_not_shown_as_if_it_had_worked() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn the_notice_of_a_refused_press_goes_with_the_card_and_with_the_section() {
     let _one = lock();
     let source = source_of("approvals-page-three-waiting");
@@ -159,6 +164,7 @@ fn the_notice_of_a_refused_press_goes_with_the_card_and_with_the_section() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn shift_tab_from_nothing_lands_on_the_details_and_enter_there_sends_no_answer() {
     let _one = lock();
     let source = source_of("approvals-page-one-waiting");
