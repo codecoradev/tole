@@ -396,9 +396,6 @@ fn a_run_never_touches_the_machine_home() {
 /// child. The guard queues on the REAL load, which a test cannot raise on
 /// demand, hence this check that the opened limits are what the binary
 /// applies.
-// Linux only: the resource guard reads load, memory and pids from `/proc` and
-// cgroups; elsewhere `tole doctor` skips those checks and prints no load line (#1171).
-#[cfg(target_os = "linux")]
 #[test]
 fn a_run_opens_the_machine_guard() {
     let (base, _seen) = spawn_mock();
