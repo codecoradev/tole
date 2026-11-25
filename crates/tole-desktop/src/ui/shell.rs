@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use super::adapter::*;
 #[cfg(unix)]
 use super::approvals::ApprovalsUi;
+#[cfg(unix)]
+use super::automations::AutomationsWindow;
 use super::status::{badge_text, Source, Status, LOOK_EVERY};
 #[cfg(unix)]
 use super::task::TaskPanes;
@@ -39,6 +41,9 @@ pub struct ShellView {
     /// The Approvals page's own state.
     #[cfg(unix)]
     pub(super) approvals: ApprovalsUi,
+    /// The Automations page's own state.
+    #[cfg(unix)]
+    pub(super) automations: AutomationsWindow,
     /// A source the render harness gives a window that is not live.
     #[cfg(feature = "render-harness")]
     preview: Option<Box<dyn Source>>,
@@ -58,6 +63,8 @@ impl ShellView {
             tasks: TaskPanes::default(),
             #[cfg(unix)]
             approvals: ApprovalsUi::default(),
+            #[cfg(unix)]
+            automations: AutomationsWindow::default(),
             #[cfg(feature = "render-harness")]
             preview: None,
         }
@@ -208,6 +215,8 @@ impl ShellView {
             Section::SkillsAndTools => self.skills_page(cx).into_any_element(),
             #[cfg(unix)]
             Section::Approvals => self.approvals_main(cx).into_any_element(),
+            #[cfg(unix)]
+            Section::Automations => self.automations_main(cx).into_any_element(),
             other => frame
                 .child(
                     div()
