@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tole_core::ledger::{Lease, LedgerStore as _};
-use tole_core::resource_guard::{startup_notes, Admit, Census, LinuxProbe, Probe, Thresholds};
+use tole_core::resource_guard::{host_probe, startup_notes, Admit, Census, Probe, Thresholds};
 
 use crate::ledger_file::FileStore;
 
@@ -87,7 +87,7 @@ impl Guard {
     pub fn new(thresholds: Thresholds, probe: Option<SharedProbe>, dir: PathBuf) -> Self {
         Self {
             thresholds,
-            probe: probe.unwrap_or_else(|| SharedProbe(Arc::new(LinuxProbe))),
+            probe: probe.unwrap_or_else(|| SharedProbe(host_probe())),
             dir,
         }
     }

@@ -547,3 +547,112 @@ fn a_child_runs_at_least_at_the_child_niceness() {
     let out = plain.output().unwrap();
     assert_eq!(nice_of(&String::from_utf8_lossy(&out.stdout)), ours);
 }
+
+// ------------------------------------------------------------------ macOS
+
+#[test]
+fn memory_available_is_the_systems_percentage_of_the_total() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // The values of an 8 GiB Mac under moderate use: level 36 is 2949 MiB.
+    assert_eq!(memory_from_level(8 * GIB, 36), Some(2949));
+    assert_eq!(memory_from_level(8 * GIB, 100), Some(8192));
+    assert_eq!(memory_from_level(8 * GIB, 0), Some(0));
+    // Not a percentage: unknown, not "plenty".
+    assert_eq!(memory_from_level(8 * GIB, 101), None);
+    // A total that is not a whole number of MiB rounds down, never up.
+    assert_eq!(memory_from_level(GIB + 1, 50), Some(512));
+}
+
+#[test]
+fn the_tighter_process_limit_wins_whatever_the_order() {
+    let machine = Pids {
+        current: 469,
+        max: 2000,
+    }; // 76 % free
+    let user = Pids {
+        current: 1200,
+        max: 1333,
+    }; // 10 % free
+    assert_eq!(tighter_pid_limit(machine, user), user);
+    assert_eq!(tighter_pid_limit(user, machine), user);
+    // Equal shares: the first one.
+    let a = Pids {
+        current: 50,
+        max: 100,
+    };
+    let b = Pids {
+        current: 500,
+        max: 1000,
+    };
+    assert_eq!(tighter_pid_limit(a, b), a);
+    // A limit of 0 never divides by zero, and a count above the limit counts as no room.
+    let zero = Pids { current: 3, max: 0 };
+    assert_eq!(tighter_pid_limit(zero, machine), zero);
+}
+
+/// The system limit is reached sooner than the user's: the guard sees it.
+#[test]
+fn the_guard_queues_on_the_tighter_pid_limit() {
+    let probe = Fixed {
+        mem: Some(10_000),
+        load: Some((0.0, 4)),
+        pids: Some((1_300, 1_333)),
+        ..Default::default()
+    };
+    let t = Thresholds::default();
+    let census = Census {
+        live_machine: 0,
+        ramping: 0,
+        last_start: None,
+        now: 1_000,
+    };
+    match t.admit(&probe, census, &[]) {
+        Admit::Wait { reason } => assert!(reason.contains("process"), "{reason}"),
+        Admit::Go => panic!("2 % of the process ids free must queue"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_mac_probe_reads_load_memory_and_process_ids() {
+    let p = MacProbe;
+    let load = p.load().expect("getloadavg");
+    assert!(load.one_min >= 0.0 && load.one_min < 10_000.0, "{load:?}");
+    assert!(load.cpus >= 1, "{load:?}");
+
+    let mem = p.memory().expect("the memory sysctls");
+    let total_mb = MacProbe::sysctl_int::<u64>("hw.memsize").unwrap() / MIB;
+    assert!(mem.available_mb > 0, "{mem:?}");
+    assert!(mem.available_mb <= total_mb, "{mem:?} of {total_mb}");
+
+    let pids = p.pids().expect("proc_listpids");
+    assert!(pids.current >= 1, "{pids:?}");
+    assert!(pids.current < pids.max, "{pids:?}");
+    // This test process and its parent are in the count.
+    assert!(pids.current >= 2, "{pids:?}");
+
+    let tmp = std::env::temp_dir();
+    assert!(p.disk(&tmp).expect("statvfs").free_mb > 0);
+}
+
+/// The user's process count is read from the system, and is not larger than all of them.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_mac_probe_counts_the_users_processes_inside_all_of_them() {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let all = MacProbe::count_pids(PROC_ALL_PIDS, 0).unwrap();
+    let mine = MacProbe::count_pids(PROC_UID_ONLY, uid).unwrap();
+    assert!(mine >= 1 && mine <= all, "{mine} of {all}");
+    assert!(MacProbe::sysctl_int::<i32>("kern.maxproc").unwrap() > 0);
+    assert!(MacProbe::sysctl_int::<i32>("kern.maxprocperuid").unwrap() > 0);
+}
+
+#[test]
+fn the_host_probe_is_the_one_of_this_machine() {
+    let p = host_probe();
+    // Load and disk read everywhere tole runs; disk is `statvfs`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(p.load().is_some());
+    assert!(p.disk(&std::env::temp_dir()).is_some());
+}
