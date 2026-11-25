@@ -127,6 +127,7 @@ mod tests {
     /// Tab walks the page's own controls after the sidebar, in the model's
     /// order: the two tabs, then Refresh, and wraps to the toggle.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
     fn tab_visits_the_tabs_and_refresh_after_the_sidebar() {
         let state = skills_scenes()[0].shell();
         let order = state.tab_order();
@@ -149,6 +150,7 @@ mod tests {
     /// card that asks for care, red only for a failure or a refusal, green only
     /// for what is approved or trusted.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
     fn the_scenes_draw_the_colours_of_what_they_say() {
         let dir = std::env::temp_dir().join(format!("tole-skills-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
