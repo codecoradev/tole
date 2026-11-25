@@ -1610,6 +1610,154 @@ fn config_check_reports_the_discussion_timeout_and_ignores_a_project_one() {
     );
 }
 
+// ------------------------------------------- chat request timeout (#1236)
+
+#[test]
+fn chat_timeout_defaults_to_900_and_env_beats_user_config_beats_default() {
+    let st = timeout_of(&Config::default(), &[]);
+    assert_eq!(
+        (st.chat_timeout.value, st.chat_timeout.source),
+        (900, Source::Default),
+        "AC1: the default"
+    );
+    assert_eq!(st.chat_timeout_error(), None);
+    let user = cfg("[provider]\nrequest_timeout_secs = 300\n");
+    let c = crate::config::layered(&Config::default(), &user);
+    let st = timeout_of(&c, &[]);
+    assert_eq!(
+        (st.chat_timeout.value, st.chat_timeout.source),
+        (300, Source::UserConfig)
+    );
+    let st = timeout_of(&c, &[("TOLE_REQUEST_TIMEOUT_SECS", " 1200 ")]);
+    assert_eq!(st.chat_timeout.value, 1200);
+    assert_eq!(
+        st.chat_timeout.describe(),
+        "(env TOLE_REQUEST_TIMEOUT_SECS)"
+    );
+    // A blank env counts as unset.
+    let st = timeout_of(&c, &[("TOLE_REQUEST_TIMEOUT_SECS", "  ")]);
+    assert_eq!(st.chat_timeout.value, 300);
+    // The discussion knob is a separate setting.
+    let st = timeout_of(&c, &[("TOLE_DISCUSSION_TIMEOUT_SECS", "60")]);
+    assert_eq!((st.chat_timeout.value, st.request_timeout.value), (300, 60));
+}
+
+#[test]
+fn an_invalid_chat_timeout_env_is_an_error_naming_the_variable_and_range() {
+    for bad in [
+        "abc",
+        "0",
+        "-5",
+        "1.5",
+        "29",
+        "3601",
+        "99999999999999999999",
+    ] {
+        let st = timeout_of(&Config::default(), &[("TOLE_REQUEST_TIMEOUT_SECS", bad)]);
+        let msg = st
+            .chat_timeout_error()
+            .unwrap_or_else(|| panic!("{bad:?} must be an error"));
+        assert!(
+            msg.contains("TOLE_REQUEST_TIMEOUT_SECS")
+                && msg.contains(bad)
+                && msg.contains("30 to 3600"),
+            "{msg}"
+        );
+    }
+    for good in ["30", "3600"] {
+        let st = timeout_of(&Config::default(), &[("TOLE_REQUEST_TIMEOUT_SECS", good)]);
+        assert_eq!(st.chat_timeout_error(), None, "{good}");
+        assert_eq!(st.chat_timeout.value, good.parse::<u64>().unwrap());
+    }
+}
+
+#[test]
+fn the_chat_timeout_config_is_bounded_and_strict() {
+    for bad in [0u64, 1, 29, 3601] {
+        let e = crate::config::parse(
+            &format!("[provider]\nrequest_timeout_secs = {bad}\n"),
+            Path::new("c.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            e.message.contains("provider.request_timeout_secs") && e.message.contains("30 to 3600"),
+            "{e}"
+        );
+    }
+    for good in [30u64, 900, 3600] {
+        assert!(crate::config::parse(
+            &format!("[provider]\nrequest_timeout_secs = {good}\n"),
+            Path::new("c.toml")
+        )
+        .is_ok());
+    }
+    assert!(crate::config::parse("[provider]\ntimeout = 60\n", Path::new("c.toml")).is_err());
+}
+
+#[test]
+fn a_project_config_cannot_set_the_chat_timeout() {
+    let project = cfg("[provider]\nrequest_timeout_secs = 3600\n");
+    let merged = crate::config::layered(&project, &Config::default());
+    assert_eq!(merged.provider, None);
+    let st = timeout_of(&merged, &[]);
+    assert_eq!(
+        (st.chat_timeout.value, st.chat_timeout.source),
+        (900, Source::Default)
+    );
+    let user = cfg("[provider]\nrequest_timeout_secs = 200\n");
+    let st = timeout_of(&crate::config::layered(&project, &user), &[]);
+    assert_eq!(
+        (st.chat_timeout.value, st.chat_timeout.source),
+        (200, Source::UserConfig)
+    );
+}
+
+#[test]
+fn the_chat_timeout_doctor_line_names_the_value_and_its_source() {
+    // Nothing installed in a unit test: the default and its source.
+    assert_eq!(
+        chat_timeout_line(),
+        "provider: request timeout 900s (default)"
+    );
+    assert_eq!(chat_timeout(), std::time::Duration::from_secs(900));
+}
+
+#[test]
+fn config_check_reports_the_chat_timeout_and_ignores_a_project_one() {
+    let user = tmpdir();
+    let up = user.join("config.toml");
+    std::fs::write(&up, "[provider]\nrequest_timeout_secs = 600\n").unwrap();
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "[provider]\nrequest_timeout_secs = 3000\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    assert!(
+        out.contains(
+            "provider.request_timeout_secs = 600  [user config]  effective: 600  (user config)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "provider.request_timeout_secs = 3000  [config]  IGNORED: a project config cannot set"
+        ),
+        "{out}"
+    );
+    let env = env_of(&[("TOLE_REQUEST_TIMEOUT_SECS", "1500")]);
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env).unwrap();
+    assert!(
+        out.contains("effective: 1500  (env TOLE_REQUEST_TIMEOUT_SECS)"),
+        "{out}"
+    );
+    let env = env_of(&[("TOLE_REQUEST_TIMEOUT_SECS", "soon")]);
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env).unwrap();
+    assert!(
+        out.contains("INVALID: TOLE_REQUEST_TIMEOUT_SECS must be"),
+        "{out}"
+    );
+}
+
 // ---- #864: a user config that is not there, or cannot be inspected
 
 #[test]

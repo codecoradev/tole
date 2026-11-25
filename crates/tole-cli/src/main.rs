@@ -1447,7 +1447,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     if let Some(msg) = settings.discussion_timeout_error() {
         anyhow::bail!(msg);
     }
+    if let Some(msg) = settings.chat_timeout_error() {
+        anyhow::bail!(msg);
+    }
     config_apply::install_discussion_timeout(&settings.request_timeout);
+    config_apply::install_chat_timeout(&settings.chat_timeout);
     config_apply::install_effort(settings.reasoning_effort.as_ref().map(|e| e.value.clone()));
     // A config `review_gate` reaches the roster the same way the flag does:
     // as the env var (child agents inherit it). Flag and env already won

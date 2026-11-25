@@ -164,6 +164,7 @@ pub fn factory(
             tole_core::openai::OpenAiProvider::new(cfg.clone())
                 .with_secrets(&secrets)
                 .with_streaming(false)
+                .with_timeout(crate::config_apply::chat_timeout())
                 .with_system_prompt(advisor::SYSTEM_PROMPT),
         )
     })
