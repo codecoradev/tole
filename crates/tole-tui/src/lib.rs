@@ -17,6 +17,7 @@ mod keymap;
 #[cfg(test)]
 mod keymap_tests;
 mod menu;
+mod observer;
 mod paste;
 mod render;
 mod sanitize;
@@ -25,7 +26,7 @@ mod theme;
 mod transcript;
 
 use std::io::{self, Stdout};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,7 +40,6 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use serde_json::Value;
 use tole_core::approval::Verdict;
 use tole_core::cancel::CancelToken;
 use tole_core::turn::TurnObserver;
@@ -50,6 +50,8 @@ pub use host::{Footer, HostCmd, HostReply, ImageItem, SessionItem, TuiHost, Turn
 pub use input::{Input, Key, KeyPress, Mods};
 pub use keymap::{KeyAction, KeySpec, Keymap};
 pub use menu::{Item, PickKind};
+pub use observer::tool_line;
+use observer::ChanObserver;
 use render::{styled, wrap};
 pub(crate) use sanitize::{clip, one_line, sanitize};
 pub use theme::{parse_color, parse_spec, Role, Theme, BUILTIN as BUILTIN_THEMES};
@@ -59,43 +61,6 @@ pub use transcript::{Kind, Out, Transcript};
 const LIVE_ROWS: u16 = 5;
 const VIEWPORT_HEIGHT: u16 = LIVE_ROWS + 1 + 4 + 1;
 const EDITOR_ROWS: usize = 4;
-
-/// Observer callbacks -> UI messages.
-struct ChanObserver(Mutex<Sender<Msg>>);
-
-impl ChanObserver {
-    fn send(&self, m: Msg) {
-        let _ = self.0.lock().unwrap_or_else(|p| p.into_inner()).send(m);
-    }
-}
-
-/// `▸ write_file out.txt`: the tool plus its first short string argument.
-pub fn tool_line(tool: &str, input: &Value) -> String {
-    let arg = input
-        .as_object()
-        .and_then(|o| o.values().find_map(Value::as_str))
-        .map(|s| clip(&one_line(s.lines().next().unwrap_or("")), 60))
-        .unwrap_or_default();
-    format!("▸ {tool} {arg}").trim_end().to_string()
-}
-
-impl TurnObserver for ChanObserver {
-    fn tool_started(&self, tool: &str, input: &Value) {
-        self.send(Msg::Tool(tool_line(tool, input)));
-    }
-    fn tool_finished(&self, _tool: &str, ok: bool, preview: &str) {
-        self.send(Msg::ToolResult {
-            ok,
-            preview: preview.to_string(),
-        });
-    }
-    fn reasoning(&self, text: &str) {
-        self.send(Msg::Reasoning(text.to_string()));
-    }
-    fn text_delta(&self, text: &str) {
-        self.send(Msg::Text(text.to_string()));
-    }
-}
 
 pub enum Msg {
     Text(String),
