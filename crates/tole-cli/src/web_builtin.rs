@@ -412,7 +412,3 @@ impl Tool for BuiltinFetchTool {
         Ok(out)
     }
 }
-
-#[cfg(test)]
-#[path = "web_builtin_tests.rs"]
-mod tests;
