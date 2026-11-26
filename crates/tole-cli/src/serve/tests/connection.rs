@@ -1,7 +1,11 @@
 //! Tests of the connection layer: the token, the status line and the read deadline.
 
+use crate::serve::request::DeadlineReader;
 use crate::serve::*;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
+use tole_cli::serve_support::transport::Conn;
 
 /// #682: the token comes from a file first, then the flag, then the
 /// environment; an empty file is an error, and no error shows a token.
