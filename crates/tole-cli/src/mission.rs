@@ -16,10 +16,10 @@
 //! 4. the verify gate has failed [`VERIFY_FAILURE_CAP`] times in total
 //!    (the count is cumulative across the mission, never reset by a pass).
 //!
-//! Exhaustion settles RESUMABLY (durable summary + pc=Final): a mission
-//! never leaves a dead session — `tole mission --resume <id>` (or a
-//! plain `tole resume`) continues it. Destructive tools stay
-//! un-auto-allowable; approvals (interactive) and gates apply per turn.
+//! Exhaustion settles RESUMABLY (durable summary + pc=Final): a mission never
+//! leaves a dead session; `tole mission --resume <id>` (or `tole resume`)
+//! continues it. Destructive tools stay un-auto-allowable; approvals and
+//! gates apply per turn.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -37,6 +37,10 @@ pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 /// total (cumulative, not consecutive) settle the mission as `verify_failed` — the model gets each
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
+
+/// Turns in a row at the per-turn step cap (`MAX_STEPS`) before the mission
+/// stops as `exhausted_turn_cap` (#1239); a finished turn resets the count.
+pub const TURN_CAP_TRIPS: u32 = 3;
 
 /// Budget tier (issue #201, defaults raised by #1226): the default is sized
 /// for a real coding mission (the reference mission used 2.98M tokens over 87
@@ -77,8 +81,7 @@ impl BudgetTier {
 
 /// Resolved mission parameters.
 pub struct MissionConfig {
-    /// The session's cancel token: the turns and a parked delegated approver
-    /// (#714) watch the same one.
+    /// The session's cancel token, shared with a parked delegated approver (#714).
     pub cancel: tole_core::cancel::CancelToken,
     /// The goal, verbatim from the operator.
     pub goal: String,
@@ -86,26 +89,23 @@ pub struct MissionConfig {
     pub max_steps: u64,
     /// Wall-clock cap in minutes.
     pub max_minutes: u64,
-    /// Total token ceiling (prompt + completion, from the durable
-    /// usage ledger).
+    /// Total token ceiling (prompt + completion, from the usage ledger).
     pub max_tokens: u64,
     /// Optional verification command (ground truth for completion).
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
     pub resume_id: Option<String>,
-    /// The id of a FRESH mission session, when the caller must know it
-    /// before the loop runs (`tole serve` answers with it up front). `None`
-    /// mints one, as the CLI does. Ignored with `resume_id`.
+    /// The id of a FRESH session the caller must know before the loop runs
+    /// (`tole serve`); `None` mints one, as the CLI does. Ignored with `resume_id`.
     pub fresh_id: Option<String>,
-    /// Per-run timeout of the `--verify` command (seconds). Default 300
-    /// — `cargo test`-class suites are the advertised use.
+    /// Per-run timeout of the `--verify` command in seconds (default 300).
     pub verify_timeout_secs: u64,
     /// Context compaction between chained turns (#440).
     pub compaction: tole_cli::compaction_host::CompactionSettings,
     /// Images attached to the first turn only (#212).
     pub images: Vec<tole_core::image::ImageRef>,
-    /// The selected profile's persona (#584): replaces the default base
-    /// prompt of a fresh mission (the mission section is still appended).
+    /// The profile's persona (#584): replaces the default base prompt of a
+    /// fresh mission (the mission section is still appended).
     pub persona: Option<String>,
     /// The profile's advisor (#587): `(profile, model, max uses)`. `Some`
     /// registers `consult_advisor`, whose tokens come out of `max_tokens`.
@@ -137,13 +137,10 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
-/// The cora agent-as-reviewer guidance for a mission (#536). A mission gets
-/// the same `build_registry` tools as `run`, including the auto-attached
-/// `mcp_cora_*` surface, but its pinned prompt never named the review flow, so
-/// the one command meant to run unattended was the one that never learned it
-/// exists. Present only when both review tools are registered (no tools, no
-/// instruction). Guidance, not enforcement: a gate before `git commit` is a
-/// separate change.
+/// The cora agent-as-reviewer guidance for a mission (#536): a mission gets
+/// the `mcp_cora_*` tools like `run`, but its pinned prompt never named the
+/// review flow. Present only when both review tools are registered. Guidance,
+/// not enforcement: a gate before `git commit` is a separate change.
 fn mission_review_section(registry: &ToolRegistry) -> String {
     let review = crate::review_section(registry);
     if review.is_empty() {
@@ -196,9 +193,8 @@ fn validate_session_id(id: &str) -> Result<()> {
     }
 }
 
-/// Failure to run the verify command to completion. Carries the real cause
-/// (spawn failure, wait error or timeout) instead of reporting every
-/// subprocess error as a timeout.
+/// Failure to run the verify command to completion, with the real cause
+/// (spawn failure, wait error or timeout), not always "timed out".
 fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
     format!(
         "verify command did not complete: {cause} (--verify-timeout is {}s)",
@@ -215,12 +211,11 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
 /// secret unless a `[secrets]` entry grants one to `verify` (#676).
 ///
 /// With `[sandbox.consumers] verify` on (#748) the same `sh -c` runs in the
-/// `command` profile instead. A mission is an unattended run, so `optional`
-/// counts as `required`, and a sandbox that is required but missing is a
-/// [`Verify::Refused`], never a pass. So is a sandbox that is there but fails
-/// to start the command (the launcher failing is not the command failing, and
-/// the model must not be told to fix it): a spawn error of the launcher, or a
-/// non-zero exit for which `bwrap` reported no exit code of the command.
+/// `command` profile instead. A mission is unattended, so `optional` counts as
+/// `required`, and a required but missing sandbox is a [`Verify::Refused`],
+/// never a pass. So is one that fails to start the command (the launcher
+/// failing is not the command failing; the model must not be told to fix it):
+/// a launcher spawn error, or a non-zero exit with no exit code of the command.
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
     use tole_core::sandbox::command::{command_in_cwd, Consumer, Launched};
     let Launched { cmd: mut c, report } =
@@ -267,13 +262,21 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
 enum Verify {
     /// Exit 0.
     Passed,
-    /// Ran and failed, or did not complete: the output tail goes back to the
-    /// model, which can fix its cause.
+    /// Ran and failed, or did not complete: the tail goes back to the model.
     Failed(String),
-    /// Not run: the sandbox the owner requires is not available (#748). The
-    /// model cannot fix that, so it is not retried and never counts as a
-    /// pass: the mission ends `verify_refused`.
+    /// Not run: the owner's required sandbox is unavailable (#748). The model
+    /// cannot fix that: never retried, never a pass (`verify_refused`).
     Refused(String),
+}
+
+/// `tole-core`'s poll budget (120 polls in one turn) also settles as
+/// `BudgetExhausted`; it is a wait, not a step cap, and its error entry says so.
+fn poll_budget_spent(s: &JsonlStorage) -> bool {
+    let detail = s
+        .entries()
+        .last()
+        .and_then(|e| e.payload["detail"].as_str());
+    detail.is_some_and(|d| d.starts_with("poll budget"))
 }
 
 /// Snapshot the durable usage ledger (provider steps so far).
@@ -288,10 +291,10 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
     tole_core::transcript::tokens_in_out(storage.usages())
 }
 
-/// Run one mission to completion/exhaustion. The CALLER builds the
-/// registry (the same dual-cfg `build_registry` path as `run`, so MCP /
-/// trust / workspace flags behave identically); mission approval is the
-/// operator's flags — Destructive stays structurally un-allowable.
+/// Run one mission to completion/exhaustion. The CALLER builds the registry
+/// (the `build_registry` path of `run`, so MCP / trust / workspace flags
+/// behave identically); approval is the operator's flags, Destructive stays
+/// structurally un-allowable.
 pub fn run_mission(
     cfg: MissionConfig,
     registry: ToolRegistry,
@@ -306,13 +309,8 @@ pub fn run_mission(
         "turns: {}  steps: {}  verify failures: {}  wall: {}s",
         done.turns, done.steps, done.verify_failures, done.wall_secs
     );
-    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
-    // that did NOT complete successfully must exit NONZERO so scripts
-    // and the agent loop can branch on it. `complete` (and only a
-    // verified completion) exits 0. (CI cora round on #253: the first
-    // cut compared against a nonexistent "done" — every mission,
-    // including successful ones, exited nonzero. Caught by the
-    // mission_e2e suite.)
+    // Issue #253: --verify is a CI-style gate, so a mission that did NOT
+    // complete exits NONZERO and only `complete` exits 0.
     if done.status != "complete" {
         anyhow::bail!("mission ended with status: {}", done.status);
     }
@@ -338,8 +336,8 @@ pub struct MissionOutcome {
 
 /// [`run_mission`] without the console report or the nonzero exit: runs the
 /// loop, writes the durable summary and returns how it ended. An `Err` is a
-/// failure before or while writing the session; a mission that merely did
-/// not complete is an `Ok` outcome with its `status`.
+/// failure before or while writing the session; a mission that did not
+/// complete is an `Ok` outcome with its `status`.
 pub fn run_mission_outcome(
     cfg: MissionConfig,
     mut registry: ToolRegistry,
@@ -348,8 +346,8 @@ pub fn run_mission_outcome(
 ) -> Result<MissionOutcome> {
     let started = std::time::Instant::now();
     let deadline = started + max_minutes_duration(cfg.max_minutes);
-    // Resolve provider config BEFORE the session file exists — a config
-    // failure must not leave an empty, unsummarized session (cora CI).
+    // Resolve provider config BEFORE the session file exists: a config
+    // failure must not leave an empty, unsummarized session.
     let provider_cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
 
     // Session: fresh (goal pinned via first prompt) or resumed.
@@ -391,8 +389,8 @@ pub fn run_mission_outcome(
             (storage, session_id, Some(cfg.goal.clone()))
         }
     };
-    // Task-list tools (#198): hydrated from the transcript on resume.
-    // Missions refuse --plan-mode, so todo_write is always present.
+    // Task-list tools (#198), hydrated from the transcript on resume (a
+    // mission refuses --plan-mode, so todo_write is always present).
     tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
     // A fresh mission is routed once; a resumed one keeps its model.
     if cfg.resume_id.is_none() {
@@ -445,6 +443,7 @@ pub fn run_mission_outcome(
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
+    let mut cap_trips: u32 = 0;
     let mut continuation: Option<String> = match &first_prompt {
         Some(goal) => Some(format!(
             "MISSION GOAL: {goal}\n\nBegin the mission. Maintain the plan \
@@ -460,8 +459,7 @@ pub fn run_mission_outcome(
 
     let status;
     loop {
-        // Budget checkpoints — BEFORE each turn, same discipline as the
-        // cancel token's between-steps checks (#201 extends these).
+        // Budget checkpoints BEFORE each turn, like the cancel checks (#201).
         let used = steps_used(&storage);
         if used >= cfg.max_steps {
             eprintln!(
@@ -488,8 +486,11 @@ pub fn run_mission_outcome(
             status = "exhausted_time";
             break;
         }
-        // A verify the sandbox cannot run is known now: stop before a model turn
-        // is spent on a mission that cannot be verified.
+        if cap_trips >= TURN_CAP_TRIPS {
+            status = "exhausted_turn_cap";
+            break;
+        }
+        // A verify the sandbox cannot run: stop before a turn is spent on it.
         if turns == 0 && cfg.verify.is_some() {
             if let Err(why) = tole_core::sandbox::command::preflight(
                 tole_core::sandbox::command::Consumer::Verify,
@@ -505,8 +506,7 @@ pub fn run_mission_outcome(
             status = "error";
             break;
         };
-        // Context compaction (#440): between chained turns, after the
-        // budget checks; the summary call's tokens count toward them.
+        // Context compaction (#440) between turns; its tokens count too.
         compactor.before_turn(&mut storage, &mut *provider);
         let first_images = if turns == 0 {
             cfg.images.as_slice()
@@ -531,8 +531,7 @@ pub fn run_mission_outcome(
             }
         };
         turns += 1;
-        // The advisor's usage becomes session usage records, so the next
-        // budget check (and a resume) counts it.
+        // The advisor's usage becomes session records: budgets and a resume count it.
         if let Some(shared) = &advisor {
             if let Err(e) = tole_cli::advisor_host::record_usage(shared, &mut storage) {
                 eprintln!("mission: {e}");
@@ -542,16 +541,15 @@ pub fn run_mission_outcome(
         }
         match &outcome {
             TurnOutcome::Final { text, .. } => {
+                cap_trips = 0;
                 // Line-exact per the pinned contract ("a line containing
                 // exactly MISSION_COMPLETE"): a mere MENTION of the word
                 // (the model restating the rules) must not declare.
                 let declares = text.lines().any(|l| l.trim() == MISSION_COMPLETE_MARKER);
                 match &cfg.verify {
-                    // Per-turn verification (cora CI on #206): the gate
-                    // is the ground truth EVERY turn, not just on marker
-                    // turns — a pass without the marker keeps the mission
-                    // going (the model finishes remaining work), a fail
-                    // always returns the output to the model.
+                    // Per-turn verification (#206): the gate is the ground
+                    // truth EVERY turn — a pass without the marker keeps the
+                    // mission going, a fail returns the output to the model.
                     Some(cmd) => match run_verify(
                         cmd,
                         std::time::Duration::from_secs(cfg.verify_timeout_secs),
@@ -614,11 +612,22 @@ pub fn run_mission_outcome(
                     }
                 }
             }
+            TurnOutcome::BudgetExhausted if !poll_budget_spent(&storage) => {
+                // The per-turn step cap (#1239); the budgets are checked above.
+                cap_trips += 1;
+                let cap = tole_core::turn::MAX_STEPS;
+                eprintln!("mission: turn hit the {cap}-step cap ({cap_trips}/{TURN_CAP_TRIPS})");
+                continuation = Some(
+                    "Your last turn used its whole step limit without finishing. Stop \
+                     gathering information and produce the deliverable now, then verify \
+                     it if a verify gate exists."
+                        .into(),
+                );
+            }
             other => {
-                // ApprovalRequired / BudgetExhausted(turn) / loop guard /
-                // provider failure: every path settles pc=Final (#84) —
-                // the mission stops and reports; the session stays
-                // resumable for a later retry.
+                // ApprovalRequired / loop guard / provider failure: every
+                // path settles pc=Final (#84) — the mission stops and reports;
+                // the session stays resumable for a later retry.
                 eprintln!("mission: turn settled: {other:?}");
                 status = "stopped";
                 break;
@@ -626,28 +635,23 @@ pub fn run_mission_outcome(
         }
     }
 
-    // Durable cost report (issue #201): a fact register on the session
-    // — steps, turns, tokens, wall time, and tool-call counts by risk
-    // tier (folded from the durable intents; risk from the live
-    // registry). `tole status` renders it.
+    // Durable cost report (issue #201): a session fact register of steps,
+    // turns, tokens, wall time and tool-call counts by risk tier (from the
+    // durable intents, risk from the live registry); `tole status` renders it.
     let wall_secs = started.elapsed().as_secs();
     let mut tool_calls = json!({"readonly": 0, "write": 0, "destructive": 0});
-    use tole_core::entry::EntryType;
-    for e in storage.entries() {
-        if e.kind.as_str() == EntryType::INTENT {
-            if let Some(tool) = e.payload.get("tool").and_then(Value::as_str) {
-                let risk = registry
-                    .get(tool)
-                    .map(|t| t.risk())
-                    .unwrap_or(tole_core::tool::Risk::ReadOnly);
-                let key = match risk {
-                    tole_core::tool::Risk::ReadOnly => "readonly",
-                    tole_core::tool::Risk::Write => "write",
-                    tole_core::tool::Risk::Destructive => "destructive",
-                };
-                tool_calls[key] = json!(tool_calls[key].as_u64().unwrap_or(0) + 1);
-            }
-        }
+    use tole_core::{entry::EntryType, tool::Risk};
+    let intents = storage
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == EntryType::INTENT);
+    for tool in intents.filter_map(|e| e.payload.get("tool").and_then(Value::as_str)) {
+        let key = match registry.get(tool).map_or(Risk::ReadOnly, |t| t.risk()) {
+            Risk::ReadOnly => "readonly",
+            Risk::Write => "write",
+            Risk::Destructive => "destructive",
+        };
+        tool_calls[key] = json!(tool_calls[key].as_u64().unwrap_or(0) + 1);
     }
     let summary = json!({
         "goal": cfg.goal,
@@ -815,13 +819,11 @@ mod verify_error_tests {
         assert!(both.contains("mcp_cora_cora_review_prepare"), "{both}");
         assert!(both.contains("should_block"), "{both}");
         assert!(both.contains("review the change you made"), "{both}");
-        // The mission contract and the goal are untouched, and the review
-        // text comes AFTER them so it cannot displace the marker rules.
+        // The review text comes AFTER the contract, so it cannot displace it.
         assert!(both.contains("ship it") && both.contains(MISSION_COMPLETE_MARKER));
         assert!(both.rfind("# Code review").unwrap() > both.find("MISSION MODE").unwrap());
 
-        // #584: a profile's persona replaces the default base prompt; the
-        // mission contract still follows it.
+        // #584: a persona replaces the default base prompt; the contract follows.
         let p = fresh_mission_prompt("ship it", None, &reg, Some("You are the coder."));
         assert!(p.starts_with("You are the coder."), "{p}");
         assert!(!p.contains(&crate::default_prompt_for(false)));
@@ -842,18 +844,16 @@ mod verify_error_tests {
         assert!(e.contains("--verify-timeout is 300s"), "{e}");
     }
 
-    /// cora 0.19 scan MAJOR: the mission system prompt pinned in the
-    /// session header must reach the wire — on a fresh run and, after
-    /// reopening the file, on `--resume`.
+    /// cora 0.19 scan: the mission prompt pinned in the session header must
+    /// reach the wire, on a fresh run and after reopening on `--resume`.
     #[test]
     fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
         use tole_core::openai::{OpenAiConfig, OpenAiProvider};
         let d = crate::test_dir::TestDir::new("tole-mission-sys");
         let sys = format!("base{}", mission_prompt("ship it", None));
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
-        // One handle at a time: a writable open holds the session lock, and
-        // the handle must be DROPPED before the loop's next iteration opens
-        // the same file again (the writer-lock contract, #488).
+        // One handle at a time: a writable open holds the session lock, so
+        // drop it before the next iteration reopens the file (#488).
         for reopen in [false, true] {
             let body = {
                 let storage = if reopen {
@@ -879,7 +879,6 @@ mod verify_error_tests {
                 "{body}"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

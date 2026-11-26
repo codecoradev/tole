@@ -420,7 +420,7 @@
       "type": "object"
     },
     "Mission": {
-      "description": "`GET /missions/{id}`. While it runs only `id`, `status` (`running`) and\n`running` are set. Once it ended `status` is how (`complete`,\n`exhausted_steps`, `exhausted_tokens`, `exhausted_time`,\n`verify_failed`, `verify_refused`, `stopped`, or `error` with `error`\nset); `summary` is the durable `fact/mission` register as the server\nholds it. A figure the server sent as `null` reads as `None`.",
+      "description": "`GET /missions/{id}`. While it runs only `id`, `status` (`running`) and\n`running` are set. Once it ended `status` is how (`complete`,\n`exhausted_steps`, `exhausted_tokens`, `exhausted_time`,\n`exhausted_turn_cap`, `verify_failed`, `verify_refused`, `stopped`, or\n`error` with `error` set); `summary` is the durable `fact/mission`\nregister as the server holds it. A figure the server sent as `null` reads as `None`.",
       "properties": {
         "error": {"type":["string","null"]},
         "id": {"type":"string"},
