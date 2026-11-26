@@ -170,6 +170,7 @@ fn wait_until_looks_once_more_at_the_deadline() {
 /// returns how many runs failed with `ETXTBSY`. `write` is the way the
 /// script is written.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // SAFETY: pre_exec with a no-op hook, only to force a real fork.
 fn etxtbsy_failures(rounds: usize, write: impl Fn(&std::path::Path, &str)) -> usize {
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};

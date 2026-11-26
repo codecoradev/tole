@@ -13,6 +13,7 @@
 // Spawns the real `tole serve` binary (`shell-tools` feature, #349); signals are
 // a Unix feature.
 #![cfg(all(feature = "shell-tools", unix))]
+#![allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};

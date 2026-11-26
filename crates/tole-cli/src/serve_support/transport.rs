@@ -18,6 +18,7 @@
 //! ([`check_private_token_file`]), never in the arguments or the environment.
 //!
 //! Windows: a named pipe is not implemented yet ([`bind_socket`] says so).
+#![allow(unsafe_code)] // SAFETY: socket, flock and descriptor FFI of the serve transport; each block states its invariant.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};

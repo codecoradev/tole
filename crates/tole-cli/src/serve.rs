@@ -46,6 +46,7 @@
 //! plumbing): HTTP/1.1, Content-Length bodies only, one request per
 //! connection (`Connection: close`). Runs turn-by-turn synchronously per
 //! request; concurrent prompts on the same session get 409 (busy).
+#![allow(unsafe_code)] // SAFETY: termios echo guard of the token prompt; each block states its invariant.
 
 use anyhow::{Context, Result};
 use serde_json::json;

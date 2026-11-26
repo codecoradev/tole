@@ -923,6 +923,7 @@ mod server_skill_file_tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn a_fifo_fails_startup_without_hanging() {
         let dir = crate::test_dir::TestDir::new("tole-sf-fifo");
         let d = dir.join("demo");
