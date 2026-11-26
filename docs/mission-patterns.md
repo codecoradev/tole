@@ -79,8 +79,8 @@ tole mission --workspace . --sessions-dir /path/to/sessions \
 
 - The gate runs as `sh -c <command>`, so it must be executable (`chmod +x`).
   Under the default sandbox on a bubblewrap host it sees only the system
-  directories (`/usr`, `/bin`, `/lib*`, `/sbin`), its own install prefix, the
-  workspace and a fresh `/tmp` and `$HOME`. A gate in some other directory
+  directories (`/usr`, `/bin`, `/lib*`, `/sbin`), the workspace and a fresh `/tmp`
+  and `$HOME`; the gate's own directory is not bound. A gate in some other directory
   (`/home/x/gates`) is not there and ends in exit 127 on every run. Keep a
   tamper-proof gate in a system directory such as `/usr/local/bin`, or in the
   workspace's `.tole/` (bound read-only, but only while sandboxed), or set
@@ -93,7 +93,7 @@ tole mission --workspace . --sessions-dir /path/to/sessions \
   worktree and any layout other than a plain `.git` directory at the root
   ([sandbox-design.md](sandbox-design.md) §9.3). An implicit default `verify`
   does not count as a consumer written in config. Use a clone in that case.
-- With cora (>= 0.20.0) attached, which is automatic unless `--no-auto-mcp`, the
+- With cora (>= 0.20.0) on the PATH, attached automatically unless `--no-auto-mcp`, the
   review gate is on by default (`block`): a `git commit` (also through
   `run_command` or `job_start`) is refused until the staged diff has been
   reviewed. That is a tool refusal, not an approval stop, so the mission goes
@@ -156,8 +156,11 @@ set `verify = "off"` in the user config or make the gate self-contained (README,
 "Sandbox" in the status list at the top; [sandbox-design.md](sandbox-design.md)
 §9.4). When a backend exists but cannot run the gate (a refused workspace
 layout or grant, a launcher that fails), the mission stops as `verify_refused`,
-never as a pass; only a host with no backend at all falls back to unsandboxed.
-A preflight checks this before the first turn.
+never as a pass; only the default, on a host with no backend at all, falls back
+to unsandboxed. A preflight checks the sandbox plan (backend, layout, grant)
+before the first turn; it never checks that the gate path exists, and a
+launcher that fails at run time stops the mission as `verify_refused` after a
+turn.
 
 ## 3. Budgets, statuses and resuming
 
