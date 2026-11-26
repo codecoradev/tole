@@ -3,6 +3,10 @@
 # (see docs/fleet-daemon.md). Idempotent: `start` on a live daemon is a no-op.
 #
 # Usage: tole-serve-launcher [start|stop|status] [-- extra `tole serve` args]
+#   Extra args after `--` (even none) are saved to $TOLE_FLEET_DIR/serve.args; a `start`
+#   without `--` reuses the saved ones, so the watchdog restarts with the same flags.
+#   `stop` writes $TOLE_FLEET_DIR/disabled; the watchdog leaves a disabled daemon down,
+#   an operator `start` clears the marker.
 #
 # Environment (all optional):
 #   TOLE_BIN             tole binary            (default: tole on PATH)
@@ -29,6 +33,8 @@ TOKEN_FILE="${TOLE_FLEET_TOKEN_FILE:-$DIR/token}"
 PID_FILE="$DIR/serve.pid"
 LOG_FILE="$DIR/serve.log"
 LOCK_FILE="$DIR/serve.lock"
+ARGS_FILE="$DIR/serve.args"   # one extra `tole serve` arg per line, saved by `start -- ...`
+DISABLED="$DIR/disabled"      # written by `stop`, cleared by `start`; honoured by the watchdog
 STOP_WAIT=30  # seconds to wait after SIGTERM before SIGKILL (serve drains up to 20 s)
 
 log() { printf '%s tole-serve-launcher: %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -61,14 +67,21 @@ pid_alive() { kill -0 "$1" 2>/dev/null && [[ -n "$(tr -d '\0' <"/proc/$1/cmdline
 
 cmd="${1:-start}"
 [[ $# -gt 0 ]] && shift
-[[ "${1:-}" == "--" ]] && shift
+have_args=0
+if [[ "${1:-}" == "--" ]]; then have_args=1; shift; fi
 
 case "$cmd" in
   status)
-    if is_running; then log "running pid $(cat "$PID_FILE") port $PORT"; else log "not running"; exit 3; fi
+    if is_running; then
+      log "running pid $(cat "$PID_FILE") port $PORT"
+    else
+      if [[ -e "$DISABLED" ]]; then log "not running (disabled by stop)"; else log "not running"; fi
+      exit 3
+    fi
     ;;
   stop)
     lock
+    : >"$DISABLED"  # under the lock, before the kill: the watchdog must not undo this stop
     if is_running; then
       pid="$(cat "$PID_FILE")"
       kill "$pid" 2>/dev/null || true
@@ -90,7 +103,17 @@ case "$cmd" in
     ;;
   start)
     lock
+    # The watchdog sets TOLE_FLEET_AUTO=1 and is checked again here, under the lock, so a
+    # stop that ran while it waited for the lock is not undone.
+    if [[ -n "${TOLE_FLEET_AUTO:-}" && -e "$DISABLED" ]]; then log "disabled by stop; not starting"; exit 0; fi
+    rm -f "$DISABLED"
     if is_running; then log "already running pid $(cat "$PID_FILE")"; exit 0; fi
+    if (( have_args )); then
+      if (( $# )); then printf '%s\n' "$@" >"$ARGS_FILE"; else : >"$ARGS_FILE"; fi
+    elif [[ -r "$ARGS_FILE" ]]; then
+      mapfile -t saved <"$ARGS_FILE"
+      if (( ${#saved[@]} )); then set -- "${saved[@]}"; fi
+    fi
     # The token must be private even if the file pre-exists (0644, or empty).
     : >>"$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
