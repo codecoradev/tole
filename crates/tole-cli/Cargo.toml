@@ -8,6 +8,11 @@ repository.workspace = true
 # std `File::lock` (the cron job-store lock, #579) is stable since 1.89.
 rust-version = "1.89"
 
+# Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
+# scripts/arch-check.sh. See "Crate kinds" in docs/architecture.md.
+[package.metadata.tole]
+kind = "bin"
+
 [lib]
 name = "tole_cli"
 path = "src/lib.rs"

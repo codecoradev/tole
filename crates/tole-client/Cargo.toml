@@ -10,6 +10,11 @@ publish = false
 # std only below the JSON layer: no async runtime, no HTTP stack, no TLS yet.
 rust-version = "1.89"
 
+# Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
+# scripts/arch-check.sh. See "Crate kinds" in docs/architecture.md.
+[package.metadata.tole]
+kind = "integration"
+
 [dependencies]
 # Wire entries (`Entry`) are tole-core's own type, so the client and the
 # append-only log cannot drift. No default features: no shell tools, no MCP.
