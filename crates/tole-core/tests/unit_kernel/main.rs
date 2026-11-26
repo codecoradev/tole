@@ -5,3 +5,4 @@
 mod test_dir;
 
 mod approval;
+mod turn_compaction;
