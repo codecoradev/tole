@@ -1,0 +1,50 @@
+{
+  "busy": false,
+  "contextUsed": 1,
+  "contextWindow": null,
+  "effort": null,
+  "entries": 2,
+  "id": "<SESSION-A>",
+  "model": "mock-model",
+  "name": null,
+  "snapshotAt": "<clock>",
+  "stale": false,
+  "usage_report": {
+    "cache_hit_rate": null,
+    "cached_tokens": null,
+    "completion_tokens": 1,
+    "prompt_tokens": 1,
+    "reasoning_tokens": null,
+    "steps": 1,
+    "turns": [
+      {
+        "cache_read_tokens": null,
+        "cache_write_tokens": null,
+        "cost_usd": null,
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "reasoning_tokens": null,
+        "steps": 1,
+        "turn": 1,
+        "user_entry": "e_1"
+      }
+    ],
+    "wire": {
+      "first": {
+        "history_chars": "<chars>",
+        "messages": 2,
+        "prefix_chars": "<chars>",
+        "system_chars": "<chars>",
+        "tools_chars": "<chars>"
+      },
+      "history_growth_per_step": null,
+      "last": {
+        "history_chars": "<chars>",
+        "messages": 2,
+        "prefix_chars": "<chars>",
+        "system_chars": "<chars>",
+        "tools_chars": "<chars>"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "sessions": [
+    {
+      "busy": false,
+      "id": "<SESSION-A>"
+    },
+    {
+      "busy": false,
+      "id": "<SESSION-B>"
+    }
+  ]
+}

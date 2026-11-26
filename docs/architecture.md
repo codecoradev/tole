@@ -253,7 +253,7 @@ The turn loop remains the enforcement point: it maps each `Denied` to the existi
 | Tier | Scope | Examples |
 |---|---|---|
 | **A — Unit** | State machine & storage | CAS transition (seq race → mismatch), format version check on open, register upsert per namespace, entry append immutability, torn-last-line discard on replay |
-| **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract) |
+| **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract). The real-binary SIGKILL loops and what they pin: [crash-resume.md](crash-resume.md) |
 | **C — Adversarial** | Malicious input & abuse | Giant tool output, malformed tool args, approval spam, double-drive turn loop, state.seq collision, storage version mismatch, allowlist bypass patterns |
 
 ## 12. Phase Rules

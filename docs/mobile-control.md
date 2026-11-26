@@ -573,6 +573,57 @@ only for a change a client written against the previous number cannot handle, ne
 route or field. `version` is the `tole` binary's version. A client refuses a serve whose
 `protocol` it does not know. The fields are on both listeners.
 
+## Wire compatibility (#1024)
+
+The serve API is **additive-only**. Graphical clients (the desktop, Flutter, web), the chat
+gateway and `tole-client` are written against the bodies, routes and event frames in this
+document, and an old client must keep working against a newer `tole serve`.
+
+**Allowed in any release (additive):** a new route; a new key in a response body; a new
+optional key in a request body; a new SSE event name; a new entry `type` or a new key in an
+entry's `payload`; a new word in a vocabulary this document calls open (a `kind` or `effect`
+code, a `status`), which clients already read as "unknown".
+
+**A break:** removing or renaming a route, a response key, an SSE event or an entry `type`;
+changing the JSON type of a key or what a value means (including turning a number's unit or a
+string's vocabulary into another); making an optional request key required, or refusing input
+the document says is accepted; changing a status code this document names. A break
+
+1. raises `SERVE_PROTOCOL_VERSION` (`tole_cli::protocol`; reported as `protocol` by
+   `GET /health`, see above), and
+2. gets a line under `### BREAKING` in `CHANGELOG.md`, and
+3. is an owner decision: say so in the PR.
+
+**Clients ignore what they do not know:** unknown keys in a body or an entry payload, unknown SSE
+event names (`tole-client` keeps them as `Event::Other`), unknown codes in an open vocabulary. A
+client that refuses an unknown key turns every additive release into a break.
+
+**Entries are the ledger.** `GET /sessions/{id}/entries` and the `entry` frames return the
+`Entry` the append-only session file holds. A change to `Entry` or to a payload the turn loop
+writes is therefore also a ledger-format change: old session files must keep replaying, and
+AGENTS.md section 4 (callers, impact, tests to rerun) applies.
+
+**What makes a change visible.** None of these is a substitute for review; each fails a build
+when the surface moves, so the change is made on purpose:
+
+| Check | Pins |
+|---|---|
+| `cargo test -p tole-cli --test client_routes` | the route table: every route `serve.rs` registers is listed, answered by a real serve, in this document and (unless allowlisted) in `tole-client` |
+| `cargo test -p tole-cli --test serve_wire_routes` | golden JSON of the read routes and of the refusals (`tests/golden/serve/routes/`) |
+| `cargo test -p tole-cli --test serve_wire_entries` | golden transcripts, one per way a turn ends, with every entry kind; the session file's lines; one sample of each event frame (`tests/golden/serve/entries/`, `ledger/`, `events/`) |
+| `cargo test -p tole-core --test entry_wire` | the `Entry` serialization byte for byte, and the line the storage layer writes |
+| `scripts/client-schema.sh check` (CI job `Client schema`) | the JSON Schema of every request, response and event type of `tole-client` |
+
+A golden file that differs is accepted with `TOLE_UPDATE_GOLDEN=1 cargo test -p tole-cli --test
+<name>`; review the diff: only added lines are additive. Values that change from run to run (ids,
+clocks, paths, the binary version, the size of the prompt) are replaced by placeholders before the
+comparison; the `seq` numbers are replaced by their rank, so a new log line does not rewrite every
+file.
+
+There is no capability probe beyond `GET /health` (`protocol`, `version`) yet: a client that needs
+to know whether a route exists calls it and treats `404 {"error": "not found"}` as "this server is
+older".
+
 ## Shutdown on SIGTERM and SIGINT (#1014)
 
 `tole serve` (REST and `--transport mcp`) handles SIGTERM and SIGINT (Unix; on Windows Ctrl+C

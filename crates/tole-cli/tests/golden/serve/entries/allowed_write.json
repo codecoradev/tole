@@ -1,0 +1,79 @@
+{
+  "entries": [
+    {
+      "id": "e_1",
+      "parentId": null,
+      "payload": {
+        "role": "user",
+        "text": "TOOL_MISSION write it"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "e_2",
+      "parentId": "e_1",
+      "payload": {
+        "detail": "write_file",
+        "error": "approval required"
+      },
+      "seq": 2,
+      "timestamp": "<clock>",
+      "type": "error"
+    },
+    {
+      "id": "e_3",
+      "parentId": null,
+      "payload": {
+        "denial_note": true,
+        "role": "user",
+        "text": "[tole] Your call to `write_file` was denied (approval refused). Do not repeat it unchanged — use another approach or say what is blocked."
+      },
+      "seq": 3,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "intent_8",
+      "parentId": null,
+      "payload": {
+        "input": {
+          "content": "remote ok",
+          "path": "approved.txt"
+        },
+        "replay": "guarded",
+        "tool": "write_file"
+      },
+      "seq": 4,
+      "timestamp": "<clock>",
+      "type": "intent"
+    },
+    {
+      "id": "e_5",
+      "parentId": "intent_8",
+      "payload": {
+        "ok": true,
+        "output": {
+          "bytes": 9,
+          "path": "approved.txt"
+        }
+      },
+      "seq": 5,
+      "timestamp": "<clock>",
+      "type": "tool_result"
+    },
+    {
+      "id": "e_6",
+      "parentId": null,
+      "payload": {
+        "role": "assistant",
+        "text": "ENTRIES-ANSWER"
+      },
+      "seq": 6,
+      "timestamp": "<clock>",
+      "type": "message"
+    }
+  ],
+  "id": "<SESSION>"
+}

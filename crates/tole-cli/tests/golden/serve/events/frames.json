@@ -1,0 +1,101 @@
+[
+  {
+    "data": {
+      "createdAtMs": "<clock>",
+      "description": "write file approved.txt",
+      "expiresInSeconds": "<clock>",
+      "id": "<APPROVAL>",
+      "sessionId": "<SESSION>",
+      "status": "pending",
+      "summary": {
+        "effect": "adds",
+        "insideWorkspace": true,
+        "kind": "create_file",
+        "preview": [
+          "+ remote ok"
+        ],
+        "previewTruncated": false,
+        "target": "approved.txt",
+        "targetTruncated": false
+      },
+      "tool": "write_file"
+    },
+    "event": "approval_requested",
+    "hasSseId": false
+  },
+  {
+    "data": {
+      "createdAtMs": "<clock>",
+      "description": "write file approved.txt",
+      "expiresInSeconds": "<clock>",
+      "id": "<APPROVAL>",
+      "sessionId": "<SESSION>",
+      "status": "approved",
+      "summary": {
+        "effect": "adds",
+        "insideWorkspace": true,
+        "kind": "create_file",
+        "preview": [
+          "+ remote ok"
+        ],
+        "previewTruncated": false,
+        "target": "approved.txt",
+        "targetTruncated": false
+      },
+      "tool": "write_file"
+    },
+    "event": "approval_resolved",
+    "hasSseId": false
+  },
+  {
+    "data": {
+      "id": "e_1",
+      "parentId": null,
+      "payload": {
+        "role": "user",
+        "text": "hello"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    "event": "entry",
+    "hasSseId": true
+  },
+  {
+    "data": {
+      "after": 0,
+      "busy": false,
+      "id": "<SESSION>",
+      "lastSeq": 0
+    },
+    "event": "ready",
+    "hasSseId": false
+  },
+  {
+    "data": {
+      "text": "ENTRIES-ANSWER"
+    },
+    "event": "text_delta",
+    "hasSseId": false
+  },
+  {
+    "data": {
+      "ok": false,
+      "preview": "read_file: not found in jail: loop.txt",
+      "tool": "read_file"
+    },
+    "event": "tool_finished",
+    "hasSseId": false
+  },
+  {
+    "data": {
+      "input": {
+        "path": "loop.txt"
+      },
+      "tool": "read_file"
+    },
+    "event": "tool_started",
+    "hasSseId": false
+  }
+]
