@@ -75,7 +75,7 @@ impl TcpTransport {
     /// address is refused too. Without the flag only loopback addresses are
     /// connected to (`localhost` included).
     pub fn new(url: &str, trusted_private_network: bool) -> Result<Self> {
-        if url.starts_with("https://") {
+        if crate::tls::is_https(url) {
             return Err(Error::InvalidUrl(
                 "https:// is not plain http: use TlsTransport, or Client::connect, which picks \
                  the transport from the scheme"
@@ -114,8 +114,13 @@ pub(crate) struct Authority {
 /// both accept exactly the same addresses.
 pub(crate) fn parse_authority(url: &str, scheme: &str, default_port: u16) -> Result<Authority> {
     let bad = |why: &str| Error::InvalidUrl(why.to_string());
-    let prefix = format!("{scheme}://");
-    let Some(rest) = url.strip_prefix(prefix.as_str()) else {
+    // The scheme is case-insensitive (RFC 3986): `HTTPS://host` is https.
+    let n = scheme.len();
+    let rest = url.get(..n + 3).and_then(|p| {
+        let (s, sep) = p.as_bytes().split_at(n);
+        (s.eq_ignore_ascii_case(scheme.as_bytes()) && sep == b"://").then(|| &url[n + 3..])
+    });
+    let Some(rest) = rest else {
         return Err(Error::InvalidUrl(format!(
             "expected {scheme}://host[:port]"
         )));

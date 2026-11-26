@@ -1,6 +1,6 @@
 //! The blocking [`Client`]: one method per route.
 
-use crate::error::{Error, Result};
+use crate::error::{status_message, Error, Result};
 use crate::http::{self, Request, ResponseBody};
 use crate::resume::{ReconnectPolicy, ResumingStream};
 use crate::sse::FrameReader;
@@ -389,10 +389,7 @@ impl Client {
         resp.by_ref().take(limit + 1).read_to_end(&mut buf)?;
         if !(200..300).contains(&status) {
             let body: Value = serde_json::from_slice(&buf).unwrap_or(Value::Null);
-            let message = body.get("error").and_then(Value::as_str).map_or_else(
-                || String::from_utf8_lossy(&buf).into_owned(),
-                str::to_string,
-            );
+            let message = status_message(&body, &buf);
             return Err(Error::Status {
                 status,
                 message,

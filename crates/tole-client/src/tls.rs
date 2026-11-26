@@ -184,7 +184,7 @@ impl TlsTransport {
         sock.set_read_timeout(None).map_err(io_err)?;
         sock.set_write_timeout(None).map_err(io_err)?;
         Ok(TlsConnection {
-            stream: StreamOwned::new(conn, sock),
+            stream: StreamOwned::new(conn, Bounded::new(sock)),
         })
     }
 
@@ -227,6 +227,14 @@ impl Transport for TlsTransport {
     }
 }
 
+/// Does `url` start with the `https://` scheme, in any letter case (RFC 3986)?
+/// Anything else, a malformed scheme included, is left to the plain transport,
+/// which refuses what it does not accept: the choice fails closed.
+pub(crate) fn is_https(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+}
+
 /// The entry points that pick HTTPS. They live here, not in `client.rs`, whose
 /// size is capped (`scripts/arch-size-allow.txt`).
 impl Client {
@@ -241,7 +249,7 @@ impl Client {
         token: Option<String>,
         trusted_private_network: bool,
     ) -> Result<Self> {
-        if url.starts_with("https://") {
+        if is_https(url) {
             Self::connect_https(url, token)
         } else {
             Self::connect_tcp(url, token, trusted_private_network)
@@ -263,9 +271,73 @@ impl Client {
     }
 }
 
+/// The TCP socket under the TLS session, with deadlines instead of timeouts.
+///
+/// A socket timeout bounds ONE socket read. A single `read` of the TLS stream
+/// can make many (rustls loops over the socket until it holds one whole
+/// record, up to 16 KiB), so a peer that sends a byte just inside the timeout
+/// could hold one `read` for the timeout times the record size. Here a timeout
+/// set by the caller becomes an absolute point in time, and EVERY socket read
+/// or write below it is given what is left, failing with `TimedOut` once it is
+/// gone: the bound holds for the call, not for each of its pieces.
+struct Bounded {
+    sock: TcpStream,
+    read_until: Option<Instant>,
+    write_until: Option<Instant>,
+}
+
+/// What is left until `at`, for a socket timeout; `TimedOut` once it is spent.
+fn left_until(at: Instant) -> io::Result<Duration> {
+    let left = at.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the deadline has passed",
+        ));
+    }
+    Ok(left)
+}
+
+impl Bounded {
+    fn new(sock: TcpStream) -> Self {
+        Self {
+            sock,
+            read_until: None,
+            write_until: None,
+        }
+    }
+}
+
+impl Read for Bounded {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(at) = self.read_until {
+            self.sock.set_read_timeout(Some(left_until(at)?))?;
+        }
+        self.sock.read(buf)
+    }
+}
+
+impl Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(at) = self.write_until {
+            self.sock.set_write_timeout(Some(left_until(at)?))?;
+        }
+        self.sock.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+/// `now + timeout`; `None` for no bound (also when the sum overflows).
+fn deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|t| Instant::now().checked_add(t))
+}
+
 /// An established TLS session over a TCP socket.
 struct TlsConnection {
-    stream: StreamOwned<ClientConnection, TcpStream>,
+    stream: StreamOwned<ClientConnection, Bounded>,
 }
 
 impl Read for TlsConnection {
@@ -285,12 +357,20 @@ impl Write for TlsConnection {
 }
 
 impl Connection for TlsConnection {
+    /// A zero timeout is invalid, as for a socket. The bound is a deadline
+    /// that every socket read of the next `read` call shares (see [`Bounded`]).
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.sock.set_read_timeout(timeout)
+        let sock = &mut self.stream.sock;
+        sock.sock.set_read_timeout(timeout)?; // validates; `None` clears it
+        sock.read_until = deadline(timeout);
+        Ok(())
     }
 
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.sock.set_write_timeout(timeout)
+        let sock = &mut self.stream.sock;
+        sock.sock.set_write_timeout(timeout)?;
+        sock.write_until = deadline(timeout);
+        Ok(())
     }
 }
 
@@ -298,10 +378,7 @@ impl Drop for TlsConnection {
     /// Say goodbye (`close_notify`), best effort and briefly bounded.
     fn drop(&mut self) {
         self.stream.conn.send_close_notify();
-        let _ = self
-            .stream
-            .sock
-            .set_write_timeout(Some(Duration::from_millis(500)));
+        self.stream.sock.write_until = deadline(Some(Duration::from_millis(500)));
         let _ = self.stream.conn.write_tls(&mut self.stream.sock);
     }
 }
@@ -329,6 +406,24 @@ mod tests {
         ] {
             assert!(TlsTransport::new(ok).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn the_scheme_is_case_insensitive() {
+        assert!(is_https("HTTPS://example.com") && is_https("hTtPs://x") && is_https("https://"));
+        assert!(!is_https("http://example.com") && !is_https("https:/") && !is_https("é"));
+        let t = TlsTransport::new("HTTPS://example.com:8443").unwrap();
+        assert_eq!(t.host_header(), "example.com:8443");
+        // The plain transport refuses it in any case, and so does the other way.
+        assert!(matches!(
+            crate::TcpTransport::new("HtTpS://127.0.0.1", true),
+            Err(Error::InvalidUrl(_))
+        ));
+        assert!(crate::TcpTransport::new("HTTP://127.0.0.1:9", false).is_ok());
+        assert!(matches!(
+            TlsTransport::new("HTTP://127.0.0.1:9"),
+            Err(Error::InvalidUrl(_))
+        ));
     }
 
     #[test]

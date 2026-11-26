@@ -42,11 +42,15 @@ pub enum Error {
     /// host name). Nothing of the request, the token included, was sent, and
     /// there is no way to carry on without verification. Not transient: the
     /// same server answers the same way. The text is rustls's reason; it never
-    /// holds the token.
+    /// holds the token, but it can include names taken from the server's
+    /// certificate, so a UI must not render it unfiltered.
     #[error("{0}")]
     Tls(String),
     /// The server answered a non-2xx status. `message` is the server's
-    /// `{"error": ...}` text when it sent one.
+    /// `{"error": ...}` text when it sent one, else the start of the body as
+    /// text, cut to [`MAX_STATUS_MESSAGE`] bytes with a trailing `…` (a hostile
+    /// server must not make every error carry megabytes). `body` is the JSON
+    /// the server sent, whole (`null` when it was not JSON).
     #[error("server answered {status}: {message}")]
     Status {
         status: u16,
@@ -62,6 +66,28 @@ pub enum Error {
     /// The event stream could not be re-established.
     #[error("event stream lost: gave up after {0} failed reconnect attempts")]
     ReconnectExhausted(u32),
+}
+
+/// Most bytes of a server's error text kept in `Error::Status::message`.
+pub const MAX_STATUS_MESSAGE: usize = 4096;
+
+/// The `message` of an [`Error::Status`]: the `error` string of the JSON body,
+/// else the raw body as text, cut at a character boundary to
+/// [`MAX_STATUS_MESSAGE`] bytes (plus `…` when cut).
+pub(crate) fn status_message(body: &Value, raw: &[u8]) -> String {
+    let text = match body.get("error").and_then(Value::as_str) {
+        Some(s) => std::borrow::Cow::Borrowed(s),
+        // Only the part that can be kept is decoded.
+        None => String::from_utf8_lossy(&raw[..raw.len().min(MAX_STATUS_MESSAGE + 4)]),
+    };
+    if text.len() <= MAX_STATUS_MESSAGE {
+        return text.into_owned();
+    }
+    let mut end = MAX_STATUS_MESSAGE;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 impl From<std::io::Error> for Error {
@@ -110,6 +136,28 @@ impl Error {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn a_status_message_is_cut_and_the_body_stays_whole() {
+        let huge = "é".repeat(MAX_STATUS_MESSAGE);
+        // The error text of a JSON body.
+        let body = serde_json::json!({ "error": huge });
+        let m = status_message(&body, b"");
+        assert!(
+            m.len() <= MAX_STATUS_MESSAGE + '…'.len_utf8() && m.ends_with('…'),
+            "{}",
+            m.len()
+        );
+        assert!(m.starts_with("éé"));
+        // A raw (not JSON) body, longer than anything worth decoding.
+        let raw = vec![b'x'; 5 * 1024 * 1024];
+        let m = status_message(&Value::Null, &raw);
+        assert_eq!(m.len(), MAX_STATUS_MESSAGE + '…'.len_utf8());
+        // Short text is untouched, a cut never splits a character.
+        assert_eq!(status_message(&Value::Null, b"nope"), "nope");
+        let raw = "é".repeat(MAX_STATUS_MESSAGE);
+        assert!(status_message(&Value::Null, raw.as_bytes()).ends_with("é…"));
+    }
 
     #[test]
     fn io_errors_are_classified_by_what_they_say_about_the_request() {

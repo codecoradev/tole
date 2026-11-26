@@ -107,6 +107,41 @@ fn drip_fed_headers_hit_the_deadline() {
 }
 
 #[test]
+fn a_huge_error_body_is_cut_in_the_message_and_kept_whole_only_as_json() {
+    // 3 MiB of text, and a JSON body whose `error` is 3 MiB: neither makes the
+    // message of the error longer than a few KiB.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let json = format!("{{\"error\":\"{big}\"}}");
+    for body in [big.clone(), json] {
+        let url = server(move |mut s| {
+            let head = format!(
+                "HTTP/1.1 500 Oops\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+        });
+        let err = Client::connect_tcp(&url, None, false)
+            .unwrap()
+            .health()
+            .unwrap_err();
+        let Error::Status {
+            status, message, ..
+        } = &err
+        else {
+            panic!("{err:?}")
+        };
+        assert_eq!(*status, 500);
+        assert_eq!(
+            message.len(),
+            tole_client::MAX_STATUS_MESSAGE + '…'.len_utf8()
+        );
+        assert!(message.ends_with('…'));
+        assert!(err.to_string().len() < 5000);
+    }
+}
+
+#[test]
 fn unusable_settings_are_refused_up_front_and_a_huge_deadline_does_not_panic() {
     let c = Client::connect_tcp("http://127.0.0.1:1", None, false).unwrap();
     for refused in [

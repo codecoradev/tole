@@ -159,9 +159,10 @@ fn an_ip_url_needs_an_ip_name_in_the_certificate() {
 }
 
 #[test]
-fn there_is_no_way_to_turn_verification_off() {
-    // The whole public surface that shapes trust: a CA list, a connect
-    // timeout. Both keep verifying; a bad CA is a config error, not a bypass.
+fn a_bad_ca_pem_is_a_config_error_not_a_bypass() {
+    // The public surface that shapes trust is a CA list and a connect timeout,
+    // and both keep verifying: a CA that does not parse is refused up front, it
+    // does not fall back to trusting anything.
     let t = TlsTransport::new("https://localhost").unwrap();
     assert!(matches!(
         t.with_ca_pem(b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"),
@@ -339,10 +340,49 @@ fn a_stalled_body_hits_the_body_deadline() {
     server.join().unwrap();
 }
 
+/// An answer with no length and no chunking: it ends when the connection does.
+const UNTIL_CLOSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}";
+
 #[test]
-fn a_connection_cut_without_close_notify_is_not_a_clean_end() {
-    // The server promises 1000 bytes and vanishes (no TLS close_notify): the
-    // client must not take the short body for a complete answer.
+fn an_until_close_answer_cut_without_close_notify_is_not_a_clean_end() {
+    // Only the close of the TLS session says an until-close body is whole: a
+    // TCP close with no close_notify could be an attacker cutting the answer,
+    // so it must be an error, not a short body.
+    let ca = ca("tole test ca");
+    let leaf = server_cert(&ca);
+    let (port, server) = serve(&[&leaf], |s| {
+        s.write_all(UNTIL_CLOSE).unwrap();
+        s.flush().unwrap();
+        // The stream is dropped on return: the socket closes, no close_notify.
+    });
+    let err = client_trusting(&ca, "localhost", port)
+        .health()
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+        "{err:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn an_until_close_answer_ends_cleanly_with_close_notify() {
+    // The same answer, closed properly, is complete.
+    let ca = ca("tole test ca");
+    let leaf = server_cert(&ca);
+    let (port, server) = serve(&[&leaf], |s| {
+        s.write_all(UNTIL_CLOSE).unwrap();
+        s.conn.send_close_notify();
+        s.flush().unwrap();
+    });
+    let health = client_trusting(&ca, "localhost", port).health().unwrap();
+    assert_eq!(health.status, "ok");
+    server.join().unwrap();
+}
+
+#[test]
+fn a_content_length_answer_cut_short_is_an_error() {
     let ca = ca("tole test ca");
     let leaf = server_cert(&ca);
     let (port, server) = serve(&[&leaf], |s| {
@@ -353,5 +393,97 @@ fn a_connection_cut_without_close_notify_is_not_a_clean_end() {
         .health()
         .unwrap_err();
     assert!(matches!(err, Error::Io(_) | Error::Protocol(_)), "{err:?}");
+    server.join().unwrap();
+}
+
+// ---- chains and schemes --------------------------------------------------------
+
+#[test]
+fn a_chain_through_an_intermediate_verifies_against_the_root() {
+    let root = ca("tole test root");
+    let intermediate = issue(
+        &Spec {
+            cn: "tole test intermediate",
+            is_ca: true,
+            dns: &[],
+            ips: &[],
+            validity: Validity::Current,
+        },
+        Some(&root),
+    );
+    let leaf = server_cert(&intermediate);
+    // The server sends the leaf and the intermediate; only the root is trusted.
+    let (port, server) = serve(&[&leaf, &intermediate], ok);
+    assert_eq!(
+        client_trusting(&root, "localhost", port)
+            .health()
+            .unwrap()
+            .status,
+        "ok"
+    );
+    server.join().unwrap();
+    // Without the intermediate the chain does not reach the root.
+    let (port, server) = serve(&[&leaf], ok);
+    assert_refused(&client_trusting(&root, "localhost", port), server);
+}
+
+#[test]
+fn the_scheme_is_case_insensitive_and_never_falls_to_plain_http() {
+    let ca = ca("tole test ca");
+    let leaf = server_cert(&ca);
+    let (port, server) = serve(&[&leaf], ok);
+    let t = TlsTransport::new(&format!("HTTPS://localhost:{port}"))
+        .unwrap()
+        .with_ca_pem(&pem(&ca.cert_der))
+        .unwrap();
+    assert_eq!(Client::new(t).health().unwrap().status, "ok");
+    server.join().unwrap();
+    // `Client::connect` takes the same url to the TLS transport: the default
+    // roots refuse the test certificate as a certificate, not as a bad url.
+    let (port, server) = serve(&[&leaf], ok);
+    let err = Client::connect(&format!("HtTpS://localhost:{port}"), None, false)
+        .unwrap()
+        .health()
+        .unwrap_err();
+    assert!(matches!(err, Error::Tls(_)), "{err:?}");
+    server.join().unwrap();
+    // An uppercase plain scheme keeps the plain policy.
+    assert!(matches!(
+        Client::connect("HTTP://example.com", None, false),
+        Err(Error::InsecureTransport(_))
+    ));
+}
+
+// ---- deadlines under TLS -------------------------------------------------------
+
+#[test]
+fn a_record_trickled_a_byte_at_a_time_hits_the_read_timeout() {
+    // One byte of the TLS record every 100 ms, with a 300 ms read timeout: every
+    // socket read succeeds inside it, but one `read` of the TLS stream needs the
+    // whole record, so only a deadline over the whole read stops the call.
+    let ca = ca("tole test ca");
+    let leaf = server_cert(&ca);
+    let (port, server) = serve(&[&leaf], |s| {
+        s.conn.writer().write_all(OK).unwrap();
+        let mut record = Vec::new();
+        s.conn.write_tls(&mut record).unwrap();
+        for byte in record {
+            if s.sock.write_all(&[byte]).is_err() {
+                return; // the client gave up and closed
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let client = client_trusting(&ca, "localhost", port)
+        .with_request_timeout(Duration::from_millis(300))
+        .unwrap();
+    let started = Instant::now();
+    let err = client.health().unwrap_err();
+    assert_timed_out(&err, started);
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "the bound held for the whole read, not for each socket read: {:?}",
+        started.elapsed()
+    );
     server.join().unwrap();
 }
