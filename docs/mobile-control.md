@@ -22,6 +22,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict. Only the first decision counts: the same verdict again answers `200` with `"resuming":false` and audits and resumes nothing; the opposite verdict, or any decision on an entry that already expired, answers `409` with the current `status`. An allow for a session this server no longer hosts (evicted from the 256-session live map, or the server restarted) with no cron run parked on it answers `409` with `"resuming":false` and an `error` saying the decision is recorded but nothing was resumed (reopen with `POST /sessions {"resume":"<id>"}` and send a new prompt); it never answers `202`. A session with a pending approval is never evicted, and eviction takes the least recently used idle session |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
 | Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | `approval` is the `GET /approvals` row (summary included) (`description` is sanitized to one line but not length-capped, as there) of the entry THIS turn queued for this session, found by a queue snapshot taken before the turn; its `id` is what `POST /approvals/{id}/decision` takes. If that entry expired or was decided before the lookup, `approval` is omitted: use `GET /approvals?session=<id>`. A stop that queued nothing (a pre-tool hook denial, a blocked stop gate, an unknown tool, a provider failure, a loop) stays `refusal`; ACP and the MCP session tool keep their own vocabulary (`refusal`) |
+| Prompt on an interrupted turn | `POST /sessions/{id}/prompt` answers `409 {"error":"interrupted turn","state":"planning"}` (#1230) | The session's log ends in a turn that never settled, because the server died while the turn was in flight (a kill, a crash, an OOM kill): the user message is durable, the answer is not. `state` is the register (`planning` after a model call was cut off; `tool_call`, `awaiting_approval`, `executing` or `settling` for a cut-off tool step). `POST /sessions {"resume":"<id>"}` still answers `200`, but a prompt is refused until the turn is settled, and nothing is written for the refused prompt. It is a defined state, not a server error: do not retry it. Until serve can settle the turn itself (the next step of #1230), run `tole resume <id>` on the same sessions directory, then resume the session over serve and prompt again. A turn parked at an approval or after a denial is not this state: the next prompt is accepted. The `409` of a running turn keeps its own body (`session is busy running a turn` on `POST /sessions/{id}/prompt`, no `state`) |
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
@@ -43,7 +44,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Set the session model | `POST /sessions/{id}/model` `{"model": "<id>"}` (#574) | `200 {"id", "model"}`: writes the `fact/model` register the TUI `/model` writes (through `session_settings`), so it survives `resume`. The request carries an id only, never a provider URL or key: the session keeps the server's provider configuration. `400` for a missing, blank or control-character id and for an id that is not in `GET /models` (exact match), `404` unknown session, `409` while a turn runs |
 | Set the thinking level | `POST /sessions/{id}/effort` `{"effort": "minimal" \| "low" \| "medium" \| "high" \| null}` (#574) | `200 {"id", "effort"}` (canonical level, or `null`): writes or clears `fact/reasoning_effort` as the TUI `/thinking` and `--effort` do; `null` (or `"unset"`) goes back to the default. An invalid level is a `400`, never coerced; `404` unknown session, `409` while a turn runs |
 | Start a mission | `POST /missions` `{"goal", "max_steps"?, "max_minutes"?, "max_tokens"?}` (#947) | `202 {"id", "status": "running"}`. A mission is its own session (its own pinned mission prompt and writer lock, as `tole mission` makes one), so it is NOT under `/sessions/{id}`; it runs the CLI's own loop (`mission::run_mission_outcome`) on a background thread over the serve workspace root. The `fact/mission` summary and the session file are the ones the CLI writes; `POST /sessions {"resume": "<id>"}` opens the session after it ends. The owner's configuration, never the request, decides everything else: the **verify command** and its timeout (`[mission] verify`, `verify_timeout` of the user config, read at start-up like `tole mission`), the budget **ceilings** (the `tole mission` tier, trusted tier or config `max_*`; a request may ask for less, a value above is a `400`), the workspace, the allow list and the sandbox. A body with a `verify` key, or any key besides the four above, is a `400` and starts nothing. Write approvals queue in the same `GET /approvals` queue under the mission id (the mission stops at the first, as the CLI does). `409` while another mission runs (one at a time) and on a `--plan-mode` server, `400` for a bad body |
-| Read a mission | `GET /missions/{id}` (#947) | `200 {"id", "status", "running", ...}`: `status` is `running` or how it ended (the CLI's: `complete`, `exhausted_steps`, `exhausted_tokens`, `exhausted_time`, `verify_failed`, `verify_refused`, `stopped` for an approval stop, a cancel or a provider failure, `error`); once ended also `turns`, `steps`, `tokens`, `wallSeconds` and `summary` (the `fact/mission` register), and `error` when the run could not start. A mission of an earlier server process is read from its session file. `404` unknown |
+| Read a mission | `GET /missions/{id}` (#947) | `200 {"id", "status", "running", ...}`: `status` is `running` or how it ended (the CLI's: `complete`, `exhausted_steps`, `exhausted_tokens`, `exhausted_time`, `exhausted_turn_cap` (3 turns in a row ended at the 32-step per-turn cap, #1239; one such turn alone does not end a mission), `verify_failed`, `verify_refused`, `stopped` for an approval stop, a cancel or a provider failure, `error`); once ended also `turns`, `steps`, `tokens`, `wallSeconds` and `summary` (the `fact/mission` register), and `error` when the run could not start. A mission of an earlier server process is read from its session file. `404` unknown |
 | Cancel a mission | `POST /missions/{id}/cancel` (#947) | `202 {"id", "cancelled": true}`; the running turn is cancelled and the mission ends `stopped` with its durable summary. `404` unknown, `409` when it has already ended |
 
 The round trip the app must support (the cross-repo acceptance):
@@ -426,7 +427,8 @@ Two kinds of frames, deliberately separate:
   the server's overall connection cap but cannot starve `/approvals` and `/prompt`. A comment
   heartbeat (`: ping`) goes out after 15 s without any write and ends a stream whose peer is gone
   (the write fails); `TOLE_SERVE_HEARTBEAT_SECS` (1 to 3600) changes the interval, e.g. behind a proxy
-  with a short idle timeout.
+  with a short idle timeout. The proxy settings that keep the stream unbuffered (Caddy, nginx) and a
+  probe that checks them are in [container.md](container.md).
   `401` without the token, `404` for a session that is not live (resume it first), `400` for a
   bad `after`.
 - **Cost.** Following the log is one `stat` per poll (about every 150 ms) while nothing
@@ -571,6 +573,57 @@ No auth. Besides `{"status":"ok"}` it reports what a client needs to decide whet
 only for a change a client written against the previous number cannot handle, never for a new
 route or field. `version` is the `tole` binary's version. A client refuses a serve whose
 `protocol` it does not know. The fields are on both listeners.
+
+## Wire compatibility (#1024)
+
+The serve API is **additive-only**. Graphical clients (the desktop, Flutter, web), the chat
+gateway and `tole-client` are written against the bodies, routes and event frames in this
+document, and an old client must keep working against a newer `tole serve`.
+
+**Allowed in any release (additive):** a new route; a new key in a response body; a new
+optional key in a request body; a new SSE event name; a new entry `type` or a new key in an
+entry's `payload`; a new word in a vocabulary this document calls open (a `kind` or `effect`
+code, a `status`), which clients already read as "unknown".
+
+**A break:** removing or renaming a route, a response key, an SSE event or an entry `type`;
+changing the JSON type of a key or what a value means (including turning a number's unit or a
+string's vocabulary into another); making an optional request key required, or refusing input
+the document says is accepted; changing a status code this document names. A break
+
+1. raises `SERVE_PROTOCOL_VERSION` (`tole_cli::protocol`; reported as `protocol` by
+   `GET /health`, see above), and
+2. gets a line under `### BREAKING` in `CHANGELOG.md`, and
+3. is an owner decision: say so in the PR.
+
+**Clients ignore what they do not know:** unknown keys in a body or an entry payload, unknown SSE
+event names (`tole-client` keeps them as `Event::Other`), unknown codes in an open vocabulary. A
+client that refuses an unknown key turns every additive release into a break.
+
+**Entries are the ledger.** `GET /sessions/{id}/entries` and the `entry` frames return the
+`Entry` the append-only session file holds. A change to `Entry` or to a payload the turn loop
+writes is therefore also a ledger-format change: old session files must keep replaying, and
+AGENTS.md section 4 (callers, impact, tests to rerun) applies.
+
+**What makes a change visible.** None of these is a substitute for review; each fails a build
+when the surface moves, so the change is made on purpose:
+
+| Check | Pins |
+|---|---|
+| `cargo test -p tole-cli --test client_routes` | the route table: every route `serve.rs` registers is listed, answered by a real serve, in this document and (unless allowlisted) in `tole-client` |
+| `cargo test -p tole-cli --test serve_wire_routes` | golden JSON of the read routes and of the refusals (`tests/golden/serve/routes/`) |
+| `cargo test -p tole-cli --test serve_wire_entries` | golden transcripts, one per way a turn ends, with every entry kind; the session file's lines; one sample of each event frame (`tests/golden/serve/entries/`, `ledger/`, `events/`) |
+| `cargo test -p tole-core --test entry_wire` | the `Entry` serialization byte for byte, and the line the storage layer writes |
+| `scripts/client-schema.sh check` (CI job `Client schema`) | the JSON Schema of every request, response and event type of `tole-client` |
+
+A golden file that differs is accepted with `TOLE_UPDATE_GOLDEN=1 cargo test -p tole-cli --test
+<name>`; review the diff: only added lines are additive. Values that change from run to run (ids,
+clocks, paths, the binary version, the size of the prompt) are replaced by placeholders before the
+comparison; the `seq` numbers are replaced by their rank, so a new log line does not rewrite every
+file.
+
+There is no capability probe beyond `GET /health` (`protocol`, `version`) yet: a client that needs
+to know whether a route exists calls it and treats `404 {"error": "not found"}` as "this server is
+older".
 
 ## Shutdown on SIGTERM and SIGINT (#1014)
 

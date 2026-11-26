@@ -37,6 +37,48 @@ graph TD
 - **tole-client** — typed blocking client of the `tole serve` protocol (#1040): request/response types, a `Transport` trait (HTTP over TCP, and on macOS and Linux HTTP over the Unix socket of `tole serve --socket`, #1067), and an incremental SSE reader that reconnects with `after=<seq>`. A JSON Schema of its wire and event types is committed (`crates/tole-client/schema/`, regenerated and checked by `scripts/client-schema.sh`, #1068). Depends on tole-core for `Entry` only (never tole-cli or tole-tui), holds no agent logic; the graphical clients are its consumers.
 - **tole-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
+### Crate kinds (#1250)
+
+Every crate declares a kind in `[package.metadata.tole]` and `scripts/arch-check.sh` checks the crate graph against the dependency matrix of the CodeCora modular + thin-UI standard (rules L1 to L3). It runs in CI as a step of the `Check` job. The module layering inside `tole-core` and `tole-cli` is a separate test (#752, above); this is the crate level over it, and it adds no crate (the published crates stay three, by the #752 decision).
+
+| Crate | Kind | May depend on (normal dependencies, workspace crates) |
+|-------|------|------------------------------------------------------|
+| `tole-core` | core | core (nothing else in the workspace) |
+| `tole-client` | integration | core, engine |
+| `tole-tui` | ui | core, app, ui |
+| `tole-desktop-model` | app | core, engine, integration, os, feature |
+| `tole-desktop` | bin | everything (until the headless core and the renderer are separate crates, #1241) |
+| `tole-cli` | bin | everything |
+
+A UI toolkit package (`crossterm`, `ratatui`, `gpui*`, `zed*`) is a normal dependency of `ui`, `feature-ui` and `bin` crates only. Build and dev dependencies are not checked (test and build wiring). `tole-core` is the kernel crate: its engine-level modules (delegation, discussion, MCP, web, skills) are one crate by decision (#752) and are kept apart by the layering test, not by the matrix. The desktop crates keep their stricter script, `scripts/desktop-check.sh`. A new crate declares its kind in its first commit; the full vocabulary is core, engine, integration, os, feature, app, ffi, ui, feature-ui, bin and tool (`scripts/arch-lint.py`).
+
+### File and crate size (#1251)
+
+`scripts/arch-check.sh size` applies rule D1 of the same standard to every workspace crate: a `.rs` file (under `src/`, `tests/`, `examples/`, `benches/`, and `build.rs`) has at most 500 lines, and the `src/` of a crate at most 50,000 (the cap the desktop crates already have). The violations of the first run (138 files, and the `src/` of `tole-core` and `tole-cli`) are in `scripts/arch-size-allow.txt`, which has shrunk since as files were split, and that list **can only go down** (the one-time raises the owner approved are recorded in the header of the list): a file or crate over its cap and not listed fails the check; an entry smaller or larger than the measured size fails (stale, or grown past its entry); an entry within its cap fails (remove it); `--init` writes the first list once and refuses to run when it exists. There is no mode that adds an entry: split the file (one subsystem per pull request, pure moves, the #752 rules) and lower or remove its entry in the same PR. A file that cannot be measured (unreadable, not UTF-8, a link to nothing) or a crate with no source is exit 2, never a pass. The desktop crates keep `scripts/desktop-check.sh`, which this check does not weaken.
+
+### Portable crates and targets (#1254)
+
+Rules M3 and L5 of the same standard, proved in CI (measured 2026-11-26 at the commit of this change unless a row says otherwise):
+
+| Crate | Compiles for | Not for | Proved by |
+|-------|--------------|---------|-----------|
+| `tole-core` (`--no-default-features`) | Linux, macOS, Windows, `aarch64-apple-ios`, `aarch64-linux-android` | `wasm32-unknown-unknown`: `ureq` pulls `getrandom` 0.2 without its `js` feature and `ring` | `Cross-Compile` and `OS Check` jobs of `ci.yml` |
+| `tole-cli` | Linux, macOS, Windows (a host binary) | not planned: mobile, wasm | `OS Check` |
+| `tole-tui` | Linux, macOS, Windows | not planned: mobile, wasm (a terminal UI) | `OS Check` |
+| `tole-client` | Linux, macOS, Windows | `wasm32-unknown-unknown`: its `tole-core` dependency pulls `getrandom` and `ring`; fixing it needs the wire types split from `tole-core` (#1071) | `OS Check` |
+| `tole-desktop-model` | everything above and `wasm32-unknown-unknown` (no dependencies) | | `Desktop` workflow: `cargo check -p tole-desktop-model --target wasm32-unknown-unknown` |
+| `tole-desktop` | Linux, macOS, Windows with the `gpui` feature | not planned: wasm | `Desktop` workflow window builds |
+
+Each Cargo feature also builds alone. The `Features alone` jobs of `ci.yml` run `cargo check --no-default-features` for `tole-core` (`shell-tools`, `mcp`, `mcp-http`) and `tole-cli` (`shell-tools`, `mcp`, `mcp-http`, `tui`, `web-builtin`, `replay`) with each feature alone and with none, with warnings as errors, in parallel with the longest path. A new feature goes into the matrix of that job in the same PR. A crate that must stay portable to a new target gets a check step for it in the workflow that owns it; a crate that becomes portable is moved in this table in the same PR.
+
+### Licence gate (#1253)
+
+Rule D2 of the same standard: everything tole ships passes `cargo deny check licenses bans sources`, configured in `deny.toml` and run by the `Licences, bans and sources` job of `.github/workflows/security.yml` with a pinned cargo-deny release binary (version and sha256 in the workflow; no third-party action). The policy covers every feature of every workspace member (the desktop's optional GPUI stack included) and every target. `licenses` holds the owner-approved allowlist; a licence outside it is a named per-crate `exceptions` entry with a comment (MPL-2.0 is weak copyleft and only for dependencies), so a new dependency under such a licence fails until the owner extends the list. `bans` rejects OpenSSL and aws-lc (tole's TLS is rustls with `ring`), `sources` allows only the crates.io index and no git dependency. Advisories and yanked crates stay with `cargo audit`. The npm dependencies of the future React views have their own allowlist (#1243); tole ships no model weights.
+
+### `unsafe` (#1252)
+
+`unsafe_code = "deny"` is set once for the whole workspace (`[workspace.lints.rust]` in the root `Cargo.toml`, inherited by every crate with `[lints] workspace = true`), so an `unsafe` block, fn, impl or attribute (`#[no_mangle]`) is a compile error wherever a module has not opted in (rule D4 of the same standard). An opt-in is one `#[allow(unsafe_code)]` on a named module or function that wraps the FFI (libc: `getpwuid_r`, `prctl`, `flock`, `kill`, `openat`, sysctl probes, the desktop supervisor), with a `// SAFETY:` comment; test helpers (`mkfifo`, `pre_exec`, `setuid` in a fixture) opt in on the test function or module. The files that hold an opt-in are listed in `AGENTS.md` section 6, and `scripts/arch-check.sh unsafe` (part of `all`, run in CI) keeps the list equal to the code: a file with an opt-in that is not listed, a listed file without one, a site without a `SAFETY:` comment on it or within 3 lines, and a crate without `[lints] workspace = true` all exit 1. `tole-tui` and `tole-desktop-model` have no opt-in, and `tole-core` built with `--no-default-features` keeps the same rule for embedders. A change in the opt-in list is a review signal: it is the whole `unsafe` surface of the repository.
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |
@@ -112,6 +154,8 @@ Invariants (all backends):
 **Session forks (#210).** A fork is a NEW session file: the header carries `forkedFrom: {session, entry}` and the body is the source's lineage up to a settled entry (a final assistant answer), with entry ids and parents kept; the machine rests at `Final`. The source is only read. Because the copied prefix is an ordinary linear transcript, every reader (replay, compaction, todo hydration) is correct per branch with no lineage-aware folding. Usage rows and registers are not copied (the fork starts with a clean ledger). `tole branch <id> [--at <entry>]` creates one; `tole sessions --tree` nests forks under their source. In-file branching (several leaves in one file, lineage-following readers, resume by branch head) is deferred.
 
 **Claude Code import (#381).** `tole import-claude <transcript.jsonl>` (core: `ccimport::import_file`) turns a Claude Code transcript (`~/.claude/projects/*/<id>.jsonl` or `claude -p --output-format stream-json`) into a NEW session `cc-<claude-session-id>`; existing sessions are never touched and a second import of the same session is refused. User prompts and assistant text become `message` entries, `tool_use` blocks `intent` entries (id `cc_<tool_use_id>`, Claude Code's tool name kept as history only, `replay: never`, several calls of one response marked `batch`), `tool_result` blocks `tool_result`/`error` entries under their intent. Thinking blocks, sidechain (subagent) lines and unknown line types are skipped, malformed lines are skipped with a warning. Model, version, branch and first/last timestamps go to the `fact/cc_import` register; the header takes the transcript's `cwd`. The import is cut at the last settled assistant answer (a dangling prompt or open tool call is dropped and reported) so the session rests at `Final` and `tole resume <id> "<prompt>"` continues it. Attaching to a *running* `claude` process is deferred.
+
+**Retention (#1020, proposal).** Nothing removes or rotates session files today, and `Storage::compact()` drops no entry and has no host caller. What retention can mean under the append-only rule (whole-file archive, owner export-then-remove, a size report) and the open owner decisions are in [session-retention-design.md](session-retention-design.md).
 
 **Optional SQLite backend** (`feature = "sqlite"`): one `.db` file per session, WAL mode, all writes via `BEGIN IMMEDIATE`; same 3-store schema (entries WITHOUT ROWID + registers + usage_ledger). Chosen only when consumers need indexed queries (e.g. branch index scans); not used by the CLI in v0.
 
@@ -209,7 +253,7 @@ The turn loop remains the enforcement point: it maps each `Denied` to the existi
 | Tier | Scope | Examples |
 |---|---|---|
 | **A — Unit** | State machine & storage | CAS transition (seq race → mismatch), format version check on open, register upsert per namespace, entry append immutability, torn-last-line discard on replay |
-| **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract) |
+| **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract). The real-binary SIGKILL loops and what they pin: [crash-resume.md](crash-resume.md) |
 | **C — Adversarial** | Malicious input & abuse | Giant tool output, malformed tool args, approval spam, double-drive turn loop, state.seq collision, storage version mismatch, allowlist bypass patterns |
 
 ## 12. Phase Rules

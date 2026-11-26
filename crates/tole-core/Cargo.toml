@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
+# scripts/arch-check.sh. See "Crate kinds" in docs/architecture.md.
+[package.metadata.tole]
+kind = "core"
+
+[lints]
+workspace = true
+
 [features]
 # CLI-backed tools that spawn subprocesses (run_command, git, gh, cora,
 # uteke). Default-on for the CLI host; embedders on platforms without a

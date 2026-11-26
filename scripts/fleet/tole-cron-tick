@@ -1,31 +1,49 @@
 #!/usr/bin/env bash
 # Run one `tole cron tick` pass, logged, with a lock so a slow tick is never
 # overlapped by the next scheduler call (the overlapping call exits 0, skipped).
-# Same environment as tole-serve-launcher; sessions dir defaults to the daemon's.
+# Same environment as tole-serve-launcher. Jobs live in $TOLE_CRON_DIR (not in a
+# sessions dir); script jobs run in the job's --workdir, else in $TOLE_FLEET_DIR/cron-work.
 # Note: agent jobs needing Writes are refused here; host them with `tole serve --cron`.
 #
 # Usage: tole-cron-tick [extra `tole cron tick` args]
-# Exit codes: tick's exit code; 0 when skipped because another tick is running.
+# Linux only (flock). Needs flock(1); without it the wrapper fails loudly (exit 127)
+# instead of skipping every tick.
+# Exit codes: tick's exit code; 0 when skipped because another tick is running;
+# 127 when flock is not installed.
 set -euo pipefail
+umask 077
 
 TOLE_BIN="${TOLE_BIN:-tole}"
 DIR="${TOLE_FLEET_DIR:-$HOME/.local/state/tole-fleet}"
-SESSIONS="${TOLE_FLEET_SESSIONS:-$DIR/sessions}"
 LOCK="$DIR/cron-tick.lock"
 LOG_FILE="$DIR/cron-tick.log"
-mkdir -p "$DIR" "$SESSIONS"
-cd "$DIR"  # script jobs run in the tick's cwd: keep it out of the caller's tree
+mkdir -p "$DIR" "$DIR/cron-work"
+chmod 700 "$DIR"
+# Script jobs without a --workdir run in the tick's cwd. $DIR holds the token, so use an
+# empty subdirectory (also keeps the cwd out of the caller's tree).
+cd "$DIR/cron-work"
 
 say() { printf '%s tole-cron-tick: %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG_FILE"; }
 
+if ! command -v flock >/dev/null 2>&1; then
+  say "flock not found, tick NOT run (install util-linux)"
+  echo "tole-cron-tick: flock not found (install util-linux)" >&2
+  exit 127
+fi
 exec 9>"$LOCK"
-if ! flock -n 9; then
+lrc=0
+flock -n 9 || lrc=$?
+if [[ $lrc -eq 1 ]]; then
   say "skipped, previous tick still running"
   exit 0
+elif [[ $lrc -ne 0 ]]; then
+  say "flock failed rc=$lrc, tick NOT run"
+  exit "$lrc"
 fi
 
 say "tick start"
 rc=0
-"$TOLE_BIN" cron --sessions-dir "$SESSIONS" tick "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+# 9>&-: the tick's children (a script job that backgrounds something) must not inherit the lock.
+"$TOLE_BIN" cron tick "$@" >>"$LOG_FILE" 2>&1 9>&- || rc=$?
 say "tick done rc=$rc"
 exit "$rc"

@@ -73,6 +73,7 @@ fn the_probe_server_does_not_outlive_its_parent() {
 struct KillOnDrop(i32);
 
 impl Drop for KillOnDrop {
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn drop(&mut self) {
         // SAFETY: a plain kill(2) of a pid this test started.
         unsafe {

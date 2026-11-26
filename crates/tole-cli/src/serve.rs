@@ -46,6 +46,7 @@
 //! plumbing): HTTP/1.1, Content-Length bodies only, one request per
 //! connection (`Connection: close`). Runs turn-by-turn synchronously per
 //! request; concurrent prompts on the same session get 409 (busy).
+#![allow(unsafe_code)] // SAFETY: termios echo guard of the token prompt; each block states its invariant.
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -164,10 +165,12 @@ fn announce_turn(
     notifier: Option<&tole_cli::webhook_out::turn::TurnNotifier>,
     approvals: &tole_cli::approvals::ApprovalQueue,
     session_id: &str,
-    end: Option<tole_cli::webhook_out::turn::TurnEnd>,
-    approval_tool: Option<&str>,
-    queue_mark: Option<u64>,
+    turn: &Result<tole_cli::session_host::TurnResult, tole_cli::session_host::TurnError>,
 ) {
+    let (end, approval_tool, queue_mark) = match turn {
+        Ok(r) => (r.turn_end, r.approval_tool.as_deref(), r.queue_mark),
+        Err(e) => (e.end, None, None),
+    };
     let (Some(notify), Some(end)) = (notifier, end) else {
         return;
     };
@@ -2122,31 +2125,15 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 let turn_notifier = state.turn_events.get().cloned();
                 std::thread::spawn(move || {
                     if serve_session {
-                        match tole_cli::session_host::resume_session_turn_with_end(
+                        let turn = tole_cli::session_host::resume_session_turn_with_end(
                             Arc::clone(&sessions),
                             &sid,
                             Some(&queue),
-                        ) {
-                            Ok(r) => announce_turn(
-                                turn_notifier.as_ref(),
-                                &queue,
-                                &sid,
-                                r.turn_end,
-                                r.approval_tool.as_deref(),
-                                r.queue_mark,
-                            ),
-                            Err(e) => {
-                                eprintln!("tole serve: approval resume failed: {}", e.message);
-                                announce_turn(
-                                    turn_notifier.as_ref(),
-                                    &queue,
-                                    &sid,
-                                    e.end,
-                                    None,
-                                    None,
-                                );
-                            }
+                        );
+                        if let Err(e) = &turn {
+                            eprintln!("tole serve: approval resume failed: {}", e.message);
                         }
+                        announce_turn(turn_notifier.as_ref(), &queue, &sid, &turn);
                         let st = lock_sessions(&sessions).get(&sid).cloned();
                         if let Some(st) = st {
                             st.warm_status();
@@ -2331,24 +2318,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // The first turn gives the session a prompt to measure:
                     // learn the context window off this request path (#573).
                     warm_status(state, id);
-                    match &turn {
-                        Ok(r) => announce_turn(
-                            state.turn_events.get(),
-                            &state.approvals,
-                            id,
-                            r.turn_end,
-                            r.approval_tool.as_deref(),
-                            r.queue_mark,
-                        ),
-                        Err(e) => announce_turn(
-                            state.turn_events.get(),
-                            &state.approvals,
-                            id,
-                            e.end,
-                            None,
-                            None,
-                        ),
-                    }
+                    announce_turn(state.turn_events.get(), &state.approvals, id, &turn);
                     match turn {
                         // A turn waiting for an approval is not a refusal
                         // (#571). A stop that queued nothing (a pre-tool hook
@@ -2370,10 +2340,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                                 (None, None) => (200, json!({"stopReason": r.stop})),
                             }
                         }
-                        Err(e) if e.message.contains("session is busy") => {
-                            (409, json!({"error": e.message}))
-                        }
-                        Err(e) => (500, json!({"error": e.message})),
+                        Err(e) => tole_cli::session::interrupted::prompt_error(e.message),
                     }
                 }
                 ("POST", id, Some("cancel")) => {

@@ -20,6 +20,9 @@ use tole_core::turn::{run_turn, run_turn_with_cancel, TurnOutcome};
 
 const RETRY_RECORD: &str = "provider transient failure, retrying";
 
+/// Bound of a wait for a fact (#812); only a failing run waits this long.
+const WAIT: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Copy)]
 enum Reply {
     /// HTTP error status with an optional `Retry-After` (seconds).
@@ -247,23 +250,51 @@ fn empty_completion_is_retried_in_non_stream_mode() {
 
 #[test]
 fn cancel_during_backoff_sleep_returns_promptly() {
-    // Retry-After: 30 would sleep the full 30 s; the cancel lands 400 ms in.
+    // The server answers 429 with `Retry-After: 30`, so the turn would sleep
+    // the full 30 s. The cancel is sent only once the turn is provably inside
+    // that backoff: the durable retry record is written BEFORE the sleep
+    // starts (turn loop contract, #478). A fixed delay before the cancel
+    // (the old 400 ms) was a guess about how long connect + request + parse
+    // take, and on a loaded runner the cancel landed before the first
+    // request or before the record, so the turn settled as cancelled without
+    // ever reaching the backoff (#812: wait for the fact, not for a time).
+    const BACKOFF: Duration = Duration::from_secs(30);
     let (url, hits) = serve(vec![Reply::Fail("429 Too Many Requests", Some(30))], false);
     let mut p = provider(url, false);
-    let mut s = session("cancel");
+    // The directory outlives the turn: the watcher below reads the session
+    // file while the turn runs.
+    let dir = TestDir::new("tole-478-cancel");
+    let mut s = JsonlStorage::create(&dir, "cancel", None).unwrap();
+    let file = dir.path().join("cancel.jsonl");
     let cancel = CancelToken::new();
     let c = cancel.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
+    let watcher = std::thread::spawn(move || {
+        let in_backoff = test_dir::poll_until(WAIT, || {
+            let text = std::fs::read_to_string(&file).ok()?;
+            text.contains(RETRY_RECORD).then_some(())
+        })
+        .is_some();
+        // Cancel in any case, so a missing record fails the test below
+        // instead of leaving the turn asleep for the whole backoff.
         c.cancel();
+        (in_backoff, Instant::now())
     });
-    let started = Instant::now();
     let out = run_turn_with_cancel(&mut s, &mut p, &ToolRegistry::new(), "hi", &cancel).unwrap();
-    let took = started.elapsed();
-    assert!(matches!(out, TurnOutcome::Cancelled), "{out:?}");
+    let returned = Instant::now();
+    let (in_backoff, cancelled_at) = watcher.join().unwrap();
     assert!(
-        took < Duration::from_secs(3),
-        "slept through the cancel: {took:?}"
+        in_backoff,
+        "the retry record never reached the session file"
+    );
+    assert!(matches!(out, TurnOutcome::Cancelled), "{out:?}");
+    // Measured from the cancel, not from the start: time the machine spent
+    // before the backoff is not the turn's latency. The turn notices a cancel
+    // within one backoff slice (1 s); half the configured backoff leaves a
+    // wide margin and still fails a turn that slept through it.
+    let took = returned.saturating_duration_since(cancelled_at);
+    assert!(
+        took < BACKOFF / 2,
+        "slept through the cancel: {took:?} after it, backoff {BACKOFF:?}"
     );
     assert_eq!(
         hits.load(Ordering::SeqCst),

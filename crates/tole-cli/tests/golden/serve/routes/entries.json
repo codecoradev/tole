@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "id": "e_1",
+      "parentId": null,
+      "payload": {
+        "role": "user",
+        "text": "hello"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "e_4",
+      "parentId": null,
+      "payload": {
+        "role": "assistant",
+        "text": "ENTRIES-ANSWER"
+      },
+      "seq": 4,
+      "timestamp": "<clock>",
+      "type": "message"
+    }
+  ],
+  "hasMore": false,
+  "id": "<SESSION-A>",
+  "lastSeq": 4,
+  "nextAfter": 4
+}

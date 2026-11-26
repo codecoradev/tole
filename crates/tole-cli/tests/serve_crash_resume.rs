@@ -20,65 +20,32 @@
 //! What is pinned, and where the answer is not "it just works":
 //! - A turn killed while the provider is answering leaves its user message
 //!   durable and no settle. `tole resume <id>` finishes that turn in the same
-//!   session; over serve nothing does, and a prompt answers 500 (#1230). One
-//!   test pins today's answer; an ignored one states the answer #1230 asks for.
+//!   session; over serve nothing does yet (#1230): a prompt answers a defined
+//!   409 `{"error": "interrupted turn", "state": "planning"}` (step 1). One test
+//!   pins it, one states what #1230 asks for (accepted, or that 409).
 //! - A parked approval is in memory and is gone after a kill (documented in
 //!   `docs/desktop-design.md`, "Crash or restart"); the session resumes, the
 //!   write has not run, the model asks again, and one allow settles one write.
 //!
-//! Not in this slice (#1018 stays open for them): a kill inside a tool effect,
-//! a `tole mission`, and the webhook outbox.
+//! The other kill points are in sibling files, on the same helpers
+//! (`crash_loop/`): a kill inside a tool effect and around an approval
+//! (`serve_crash_effect.rs`), `tole mission` (`mission_crash_resume.rs`) and
+//! the webhook outbox (`serve_crash_outbox.rs`). The whole contract is in
+//! `docs/crash-resume.md`.
 
 // Spawns the real `tole serve` binary (`shell-tools` feature, #349).
 #![cfg(all(unix, feature = "shell-tools"))]
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::io::Write;
 use std::time::Duration;
 
 mod common;
+mod crash_loop;
 mod serve_harness;
+use crash_loop::{
+    entry_seqs, last_entry, last_pc, mid_flight, rounds, seed, send_prompt, user_messages_with, Rng,
+};
 use serve_harness::{home_of, new_session, prompt, spawn_mock, Serve};
-
-/// splitmix64: a seeded generator, so a failing round can be replayed.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        (z ^ (z >> 31)) % n
-    }
-}
-
-/// A number from the environment: unset is `None`; set and not a number is a
-/// failure, so a typo in the nightly cannot quietly run something else.
-fn env_number(name: &str) -> Option<u64> {
-    let value = std::env::var(name).ok()?;
-    Some(
-        value
-            .parse()
-            .unwrap_or_else(|_| panic!("{name}={value:?} is not a number")),
-    )
-}
-
-fn seed() -> u64 {
-    env_number("TOLE_CRASH_LOOP_SEED").unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1)
-    })
-}
-
-fn rounds() -> usize {
-    let n = env_number("TOLE_CRASH_LOOP_N").unwrap_or(2);
-    assert!(n >= 1, "TOLE_CRASH_LOOP_N must be at least 1");
-    n as usize
-}
 
 /// Milliseconds after the prompt is sent at which round `round` kills the
 /// serve: the three windows of the module doc, in turn.
@@ -90,72 +57,10 @@ fn kill_delay(rng: &mut Rng, round: usize) -> u64 {
     }
 }
 
-/// Send a prompt and do not wait for the answer: the connection stays open
-/// until the caller drops it, so the turn is certainly in flight at the kill.
-fn send_prompt(port: u16, id: &str, text: &str) -> std::net::TcpStream {
-    let body = json!({"text": text}).to_string();
-    let req = format!(
-        "POST /sessions/{id}/prompt HTTP/1.1\r\nAuthorization: Bearer t0ken\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(req.as_bytes()).unwrap();
-    s
-}
-
-/// The session file as the items it holds. The first line is the header; every
-/// other line is a commit (an array of items, `entry` and `state`) or one item
-/// (a `usage` record), each with a `seq`. Every complete line must parse, and
-/// `seq` only goes up across the whole file. An unterminated last line (a
-/// write the kill cut short) is the one damage tolerated, and is reported, not
-/// parsed.
+/// The session file as `(items, torn tail)`; see [`crash_loop::read_log`].
 fn read_log(serve: &Serve, id: &str, ctx: &str) -> (Vec<Value>, bool) {
-    let raw = std::fs::read(serve.session_file(id)).unwrap_or_else(|e| panic!("{ctx}: {e}"));
-    let torn = raw.last().is_some_and(|b| *b != b'\n');
-    let mut lines: Vec<&[u8]> = raw.split(|b| *b == b'\n').collect();
-    // `split` leaves an empty piece after the final newline, or the cut line.
-    lines.pop();
-    let mut items = Vec::new();
-    let mut last = 0u64;
-    let mut header = false;
-    for line in lines.into_iter().filter(|l| !l.is_empty()) {
-        let v: Value = serde_json::from_slice(line)
-            .unwrap_or_else(|e| panic!("{ctx}: a complete line does not parse ({e}): {line:?}"));
-        if v["kind"] == "header" {
-            assert!(!header, "{ctx}: two headers");
-            assert!(
-                items.is_empty(),
-                "{ctx}: a header that is not the first line"
-            );
-            header = true;
-            continue;
-        }
-        // A line is a commit (an array of items) or one item on its own.
-        let commit = match v {
-            Value::Array(items) => items,
-            single => vec![single],
-        };
-        for item in &commit {
-            let seq = item["seq"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("{ctx}: an item without a seq: {item}"));
-            assert!(seq > last, "{ctx}: seq {seq} does not follow {last}");
-            last = seq;
-            items.push(item.clone());
-        }
-    }
-    assert!(header, "{ctx}: the session file has no header");
-    (items, torn)
-}
-
-/// How many user messages of the log carry `needle`.
-fn user_messages_with(log: &[Value], needle: &str) -> usize {
-    log.iter()
-        .filter(|e| e["kind"] == "entry" && e["type"] == "message")
-        .filter(|e| e["payload"]["role"] == "user")
-        .filter(|e| e["payload"].to_string().contains(needle))
-        .count()
+    let log = crash_loop::read_log(&serve.session_file(id), ctx);
+    (log.items, log.torn)
 }
 
 /// How many assistant answers the log holds (the mock answers every turn with
@@ -168,50 +73,17 @@ fn answers(log: &[Value]) -> usize {
         .count()
 }
 
-/// How many `write_file` calls settled with a result that says they worked:
-/// a `tool_result` that is `ok` and whose parent intent is a `write_file`.
+/// How many `write_file` calls settled with a result that says they worked.
 fn settled_writes(log: &[Value]) -> usize {
-    let writes: HashSet<&str> = log
+    crash_loop::settles(log, "write_file")
         .iter()
-        .filter(|e| e["type"] == "intent" && e["payload"]["tool"] == "write_file")
-        .filter_map(|e| e["id"].as_str())
-        .collect();
-    log.iter()
         .filter(|e| e["type"] == "tool_result" && e["payload"]["ok"] == true)
-        .filter(|e| e["parentId"].as_str().is_some_and(|p| writes.contains(p)))
         .count()
-}
-
-/// The `seq` of the entries of the file, which is what `GET .../entries`
-/// lists (the state items take numbers of their own).
-fn entry_seqs(log: &[Value]) -> Vec<u64> {
-    log.iter()
-        .filter(|e| e["kind"] == "entry")
-        .filter_map(|e| e["seq"].as_u64())
-        .collect()
 }
 
 /// The `seq` of what `GET .../entries` returned.
 fn api_seqs(page: &[Value]) -> Vec<u64> {
     page.iter().filter_map(|e| e["seq"].as_u64()).collect()
-}
-
-/// The register state the log ends in (`planning`, `final`, ...).
-fn last_pc(log: &[Value]) -> Option<String> {
-    log.iter()
-        .rev()
-        .find(|e| e["kind"] == "state")
-        .and_then(|e| e["pc"].as_str())
-        .map(str::to_string)
-}
-
-/// A turn is mid-flight when the register is neither at rest nor settled.
-fn mid_flight(pc: Option<&str>) -> bool {
-    !matches!(pc, None | Some("idle") | Some("final"))
-}
-
-fn last_entry(log: &[Value]) -> Option<&Value> {
-    log.iter().rev().find(|e| e["kind"] == "entry")
 }
 
 fn api_entries(serve: &Serve, id: &str) -> Vec<Value> {
@@ -233,20 +105,8 @@ fn resume_over_serve(serve: &Serve, id: &str, ctx: &str) {
 /// `tole resume <id>` on the serve's sessions directory: the documented
 /// recovery of an interrupted turn. Returns the exit code and the answer.
 fn cli_resume(base: &str, serve: &Serve, id: &str) -> (Option<i32>, String) {
-    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home_of(&serve.dir), &[]);
-    cmd.arg("--sessions-dir")
-        .arg(serve.dir.join(".tole/sessions"))
-        .args(["resume", id])
-        .current_dir(&serve.dir)
-        .env("TOLE_BASE_URL", base)
-        .env("TOLE_MODEL", "mock-model")
-        .env("TOLE_API_KEY", "sk-test")
-        .env("TOLE_NO_UPDATE_CHECK", "1");
-    let out = cmd.output().unwrap();
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-    )
+    let ran = crash_loop::cli_resume(base, &serve.dir, &home_of(&serve.dir), id, &[]);
+    (ran.code, ran.stdout)
 }
 
 /// Wait until the session file holds `needle` (the prompt reached the log).
@@ -280,7 +140,7 @@ fn killed_mid_turn_then_resumed(base: &str, marker: &str) -> (Serve, Serve, Stri
 #[test]
 fn a_serve_killed_at_a_random_point_in_a_turn_leaves_a_session_that_resumes() {
     let seed = seed();
-    let rounds = rounds();
+    let rounds = rounds(2);
     eprintln!("crash loop: seed={seed} rounds={rounds} (TOLE_CRASH_LOOP_SEED / TOLE_CRASH_LOOP_N)");
     let mut rng = Rng(seed);
     let base = spawn_mock(1500);
@@ -368,11 +228,11 @@ fn a_serve_killed_at_a_random_point_in_a_turn_leaves_a_session_that_resumes() {
     );
 }
 
-/// Today's answer over serve, pinned (#1230): a session killed with its user
-/// message durable and no settle refuses a prompt with a 500, and writes
-/// nothing. When #1230 is decided, this test changes to the new answer.
+/// What #1230 step 1 pins: a session killed with its user message durable and
+/// no settle refuses a prompt with a defined 409 (never a 500) that names the
+/// state, and writes nothing. Recovering the session over serve is step 2.
 #[test]
-fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
+fn a_session_killed_mid_turn_answers_a_defined_409_to_a_prompt_over_serve() {
     let base = spawn_mock(1500);
     let (first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-pinned");
     let (log, _) = read_log(&first, &id, "pinned");
@@ -389,15 +249,10 @@ fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
         &format!("/sessions/{id}/prompt"),
         Some(&json!({"text": "next question"}).to_string()),
     );
+    assert_eq!(code, 409, "{body}");
     assert_eq!(
-        code, 500,
-        "#1230 changed the answer: update this test: {body}"
-    );
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("resolve the session first")),
-        "{body}"
+        body,
+        json!({"error": "interrupted turn", "state": "planning"})
     );
     assert_eq!(
         api_seqs(&api_entries(&second, &id)),
@@ -407,11 +262,9 @@ fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
 }
 
 /// What #1230 asks for: after a resume, a prompt on a session that was killed
-/// mid-turn is accepted, or refused with a defined 409, never a 500. Red
-/// today; run it with `--ignored`. When #1230 is fixed, drop the `ignore` and
-/// the pinned test above.
+/// mid-turn is accepted, or refused with a defined 409, never a 500. Step 1
+/// gives the 409; once the recovery of step 2 exists this answers 200.
 #[test]
-#[ignore = "#1230: a prompt after a resume answers 500 today"]
 fn a_session_killed_mid_turn_takes_a_prompt_or_a_defined_409_after_a_resume() {
     let base = spawn_mock(1500);
     let (_first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-wanted");
@@ -421,6 +274,9 @@ fn a_session_killed_mid_turn_takes_a_prompt_or_a_defined_409_after_a_resume() {
         Some(&json!({"text": "next question"}).to_string()),
     );
     assert!(code == 200 || code == 409, "{code}: {body}");
+    if code == 409 {
+        assert_eq!(body["error"], "interrupted turn", "{body}");
+    }
 }
 
 /// A kill while a turn is parked at an approval: the queue row is gone (it is

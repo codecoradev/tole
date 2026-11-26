@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![allow(unsafe_code)] // SAFETY: test-only libc calls (atexit, mkfifo) on paths the test owns.
 
 use super::*;
 use tole_core::delegation::NodeStatus;

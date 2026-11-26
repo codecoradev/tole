@@ -1,0 +1,18 @@
+{
+  "archived": [],
+  "drafts": [],
+  "notes": [],
+  "skills": [
+    {
+      "approved_at": null,
+      "approved_hash": null,
+      "hash": "sha256:c671cab5330353a221585dc7d75790872378cbabfd8932ead07ff2f42a0572d1",
+      "history": [],
+      "name": "weekly",
+      "source": null,
+      "source_text": "",
+      "state": "not_approved",
+      "status": "not approved: refused"
+    }
+  ]
+}

@@ -27,12 +27,18 @@ continuity, infra facts.
   typed client `tole-client`. It never lists `tole-core`, `tole-tui` or
   `tole-cli` (the session host) among its own dependencies; `tole-core` is in
   its closure only through `tole-client`, `tole-tui` and `tole-cli` nowhere.
+  Renderer decision (owner, 2026-11-25, epic #1241): the views will become
+  React on GPUIX with this crate as the headless core. None of it is built
+  yet, so `ui` and the `gpui` feature stay until the M2 parity gate and M3
+  (#1247); this section and sections 3 and 6 change in the PRs that make them
+  stale.
 - `docs/` — architecture, PRD, epics (roadmap + tracking issues), threat
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
   missions, Tier 3 baselines).
 - `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
-  branch before a PR).
+  branch before a PR; `arch-check.sh`: crate kinds and the crate dependency
+  matrix, #1249).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
   ignores.
@@ -83,6 +89,9 @@ continuity, infra facts.
   reviewed on `develop`, the Cora Review workflow no longer runs on PRs to
   `main`, and `Cora Review` is not a required check there. Every other
   required check still gates the release PR.
+  If `Cora Review` runs on a PR to `main` again, a release sync (one commit on the tip of
+  `main`, same git tree as a `develop` commit) is skipped by tree identity (#1022);
+  CONTRIBUTING, "Release sync PRs", has the by-hand check.
   **Exception (#914):** a PR whose every file is excluded by `review.exclude`
   in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
   job then skips the review, ends green and writes "Nothing to review" in its
@@ -98,14 +107,30 @@ continuity, infra facts.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250), the size guard (#1251) and the unsafe opt-in list (#1252); exits 1 on a crate without a kind, a dependency that points upward, a UI toolkit below a ui or bin crate, a file over 500 lines or a crate src/ over 50,000 that is not in scripts/arch-size-allow.txt, an allow-list entry that no longer matches, an unsafe_code opt-in without a SAFETY comment or not in the AGENTS.md list, or a crate without the workspace lints
+# only when you add or update a dependency (Cargo.toml / Cargo.lock; #1253): licence gate, needs the pinned cargo-deny (version in security.yml)
+cargo deny check licenses bans sources   # exits 1 on a licence outside deny.toml, a banned crate or a non-crates.io source
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
+# only when you touch scripts/arch-* (#1249):
+python3 scripts/test_arch_lint.py # self-test of the architecture guardrail (rules and fail-closed paths)
 # only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
 scripts/test-desktop-check.sh # self-test of the guardrail script
 scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 50,000 per crate). ADVISORY (warns only): literals in the ui layer
 scripts/desktop-render.sh <dir> # a desktop UI change: render the real window offscreen, one PNG per screen and state, and compare with the board (not a gate; see docs/design/desktop/README.md)
 ```
 
-CI enforces the first three. The desktop script runs in a separate `Desktop`
+CI enforces the first three, `scripts/arch-check.sh` and its self-test (steps of
+the `Check` job, so no new required check name; #1250). The `Features alone` jobs of
+`ci.yml` (#1254) `cargo check` `tole-core` and `tole-cli` with each Cargo feature
+alone and with none (`--no-default-features [--features X]`, warnings as
+errors): when you add or rewire a feature in a `[features]` table, run the
+same locally and add it to the matrix of that job. The `Desktop` workflow also
+checks `tole-desktop-model` for `wasm32-unknown-unknown`
+(`rustup target add wasm32-unknown-unknown`); which crates are portable to
+which targets is in "Portable crates and targets" in docs/architecture.md. The licence gate runs as the
+`Licences, bans and sources` job of the `Security` workflow (#1253) with a
+pinned cargo-deny release; install the same version locally from its GitHub
+release (checksum in the workflow) rather than `cargo install`. The desktop script runs in a separate `Desktop`
 workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, and not a
 required check unless the owner adds it to the branch protection: require only
 `Desktop model and guardrails`). The literals check is a heuristic: it
@@ -204,6 +229,90 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   difference with no row).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
+- Crate kinds (CodeCora modular + thin-UI standard, #1249): every crate
+  declares `[package.metadata.tole] kind` in its first commit and
+  `scripts/arch-check.sh` checks the crate graph against the standard's
+  matrix (core on core only; integration on core and engine; ui on core, app
+  and ui; app on core, engine, integration, os and feature; bin on
+  everything), and keeps a UI toolkit (`crossterm`, `ratatui`, `gpui*`,
+  `zed*`) below `ui`, `feature-ui` and `bin` crates. The published crates stay
+  three and layering inside `tole-core` and `tole-cli` stays a test
+  (`cargo test -p tole-core --test layering`, #752); the matrix is the crate
+  level above it. See "Crate kinds" in [docs/architecture.md](docs/architecture.md).
+- Size guard (standard rule D1, #1251): `scripts/arch-check.sh size` fails a
+  `.rs` file over 500 lines (`src/`, `tests/`, `examples/`, `benches/`,
+  `build.rs`) and a crate `src/` over 50,000 lines that is not in
+  `scripts/arch-size-allow.txt`. The list can only go down: never add or raise
+  an entry; when you split a file, lower or remove its entry in the same PR (an
+  entry that no longer matches the measured size fails the check). The desktop
+  crates keep their own, stricter script.
+- Licence gate (rule D2, #1253): everything tole ships, desktop GPUI stack
+  included, passes `deny.toml` (`cargo deny check licenses bans sources`): a
+  licence allowlist, `bans`, crates.io as the only source, no git
+  dependencies. A dependency under a licence outside the list is an OWNER
+  decision, never an agent's: do not widen `allow` or add an `exceptions` entry
+  to make CI green. Name the crate and the licence in the PR, and give each
+  non-permissive entry a comment (why, which crates). Advisories stay with
+  `cargo audit`.
+- `unsafe` is denied workspace-wide (standard rule D4, #1252):
+  `[workspace.lints.rust] unsafe_code = "deny"` in the root `Cargo.toml` and
+  `[lints] workspace = true` in every crate, so an `unsafe` block, fn, impl or
+  `#[no_mangle]`-style attribute fails the build unless its module opted in.
+  An opt-in is one `#[allow(unsafe_code)]` (or `#![allow(unsafe_code)]`) on a
+  **named module or function** that wraps the FFI, not one per call, with a
+  `// SAFETY:` comment on it or within 3 lines of it; each unsafe block keeps
+  its own `// SAFETY:` comment. Adding an opt-in is a last resort (prefer a
+  safe std API or an existing wrapper) and the file goes into the list below
+  in the same change. `scripts/arch-check.sh unsafe` (part of `all`, a step of
+  the `Check` job) fails when a site has no SAFETY comment, when a file holds
+  an opt-in that is not listed, when a listed file holds none, or when the lint
+  wiring is gone. `tole-tui` and `tole-desktop-model` have no opt-in and stay
+  that way. Opt-in files today (libc FFI and test helpers):
+
+<!-- unsafe-opt-ins:start -->
+- `crates/tole-cli/src/delegation/delegate.rs`: `kill` of a delegated child
+- `crates/tole-cli/src/delegation/delegate_tests.rs`: test; `atexit` cleanup, `mkfifo`
+- `crates/tole-cli/src/delegation/ledger_file.rs`: pid liveness probes (`kill 0`, macOS `proc_pidinfo`)
+- `crates/tole-cli/src/doctor.rs`: `flock` of the doctor lock file
+- `crates/tole-cli/src/plugin/cmd_tests.rs`: test; `mkfifo`
+- `crates/tole-cli/src/serve.rs`: termios echo guard of the token prompt
+- `crates/tole-cli/src/serve_support/shutdown.rs`: `sigaction` handler installation
+- `crates/tole-cli/src/serve_support/transport.rs`: serve socket (euid, `flock`, token descriptor)
+- `crates/tole-cli/src/session/assemble.rs`: test; `mkfifo`
+- `crates/tole-cli/src/webhook_out/store_tests.rs`: test; `mkfifo`
+- `crates/tole-cli/tests/common/test_dir.rs`: test helper; `fcntl` write lease
+- `crates/tole-cli/tests/cron_webhook_send.rs`: test; `mkfifo`
+- `crates/tole-cli/tests/mission_e2e.rs`: test; `pre_exec` privilege drop (`setuid`)
+- `crates/tole-cli/tests/serve_shutdown.rs`: test; signals, `flock`
+- `crates/tole-cli/tests/serve_socket.rs`: test; `geteuid`, `pipe`
+- `crates/tole-cli/tests/test_dir_helper.rs`: test; `pre_exec` to force a real fork
+- `crates/tole-cli/tests/tui_e2e.rs`: test; pty (`openpty`, `ioctl`)
+- `crates/tole-client/src/unix.rs`: local socket (euid, `poll`)
+- `crates/tole-core/src/children/agents.rs`: `flock` of the agents root lock
+- `crates/tole-core/src/delegation/report_tests.rs`: test; `mkfifo`
+- `crates/tole-core/src/delegation/resource_guard.rs`: host probes (macOS `sysctl`, `statvfs`, `setpriority`)
+- `crates/tole-core/src/delegation/resource_guard_tests.rs`: test; macOS probe
+- `crates/tole-core/src/integrations/git.rs`: closing inherited descriptors (`syscall`) in the git child; test
+- `crates/tole-core/src/jobs.rs`: `kill` / `killpg` of a detached job
+- `crates/tole-core/src/mcp/probe.rs`: `killpg` and `pre_exec` of the probe's process group
+- `crates/tole-core/src/paths.rs`: `getpwuid_r` account home
+- `crates/tole-core/src/plugin_lock_tests.rs`: test; `mkfifo`
+- `crates/tole-core/src/process_guard.rs`: `prctl` non-dumpable
+- `crates/tole-core/src/sandbox/command.rs`: command sandbox child hardening (`pipe2`, rlimits, descriptor close)
+- `crates/tole-core/src/sandbox/command_tests.rs`: test; `mkfifo`
+- `crates/tole-core/src/session/safe_dir.rs`: `openat` directory walk of the session store
+- `crates/tole-core/src/session/safe_dir_tests.rs`: test; `mkfifo`
+- `crates/tole-core/src/skills/mod.rs`: test; `mkfifo`
+- `crates/tole-core/src/tools/read_file.rs`: test; `mkfifo`
+- `crates/tole-core/tests/command_sandbox.rs`: test; `dup2`, `kill`
+- `crates/tole-core/tests/mcp_probe_parent_death.rs`: test; `kill` of the probe's group
+- `crates/tole-core/tests/process_guard.rs`: test; `pre_exec` privilege drop (`setuid`)
+- `crates/tole-core/tests/support/test_dir.rs`: test helper; `fcntl` write lease
+- `crates/tole-core/tests/test_dir_helper.rs`: test; `pre_exec` to force a real fork
+- `crates/tole-desktop/src/supervisor/sys.rs`: supervisor (euid, `flock`, `kill`, socket owner)
+- `crates/tole-desktop/src/supervisor/token.rs`: test; `mkfifo`
+<!-- unsafe-opt-ins:end -->
+
 - Desktop crates are modular monoliths (owner rule D1; the crate cap is 50,000
   lines, the file cap 500): one small module per page or capability, shared
   pieces (text cleaning, badges, caps, strings, tokens) in their own reusable
@@ -235,6 +344,8 @@ that makes them stale. This regression has happened twice (#33 and again
   release ranges (v0.9.0: 87 files, ~14.7k lines). The release PR was
   reviewed instead with `cora mcp` `review_prepare` / `review_finalize`
   (agent as reviewer) over ~4k-line chunks, with the verdict posted on the PR.
+  A release sync whose tree equals `develop`'s is no longer reviewed at all, by
+  tree identity (#1022, `scripts/cora-release-sync.sh`); see CONTRIBUTING.
 - **2026-11-17:** cora-code **0.21.1** is released. The CI action
   (`codecoradev/cora-review-action@v1`, `cora-version: latest`) therefore
   runs it: it chunks a large diff (`review.max_chunk_chars`, default 48,000

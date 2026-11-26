@@ -250,6 +250,7 @@ fn the_lock_round_trips_and_reads_fail_closed() {
 
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn the_lock_read_never_follows_a_symlink_or_hangs_on_a_fifo() {
     let dir = tmp("fifo");
     let real = dir.join("real.lock");

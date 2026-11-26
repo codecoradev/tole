@@ -15,7 +15,10 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
 - **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`,
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
-  warnings` → `cargo test --workspace`. CI enforces the same set. A change to
+  warnings` → `cargo test --workspace`. CI enforces the same set, plus
+  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252) and
+  its self-test `python3 scripts/test_arch_lint.py`, which run as steps of the
+  `Check` job; run the self-test when you touch `scripts/arch-*`. A change to
   `crates/tole-desktop` or `crates/tole-desktop-model` also runs
   `scripts/test-desktop-check.sh` and `scripts/desktop-check.sh` (#1028; see
   [docs/design/desktop/README.md](docs/design/desktop/README.md); run
@@ -27,6 +30,14 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   A desktop UI change is also reviewed on the rendered window:
   `scripts/desktop-render.sh <dir>` (offscreen, one PNG per screen and state;
   not a gate, see the same README).
+- **`unsafe`** (#1252): `unsafe_code` is denied for the whole workspace, so a
+  new `unsafe` block fails `cargo clippy` and `cargo build` outside a module
+  that opted in. Prefer a safe std API or an existing wrapper. If libc is the
+  only way, put one `#[allow(unsafe_code)]` with a `// SAFETY:` comment on the
+  named module or function that wraps the call (a test helper: on the test
+  function or module), keep a `// SAFETY:` comment on each `unsafe` block, and
+  add the file to the opt-in list in `AGENTS.md` section 6 in the same change;
+  `scripts/arch-check.sh unsafe` fails when the list and the code differ.
 - **Test directories** (#781): a test that needs a scratch directory uses
   `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
   and the `crate::test_dir` module in unit tests), never a hand-built
@@ -131,6 +142,57 @@ Never merge on schedule or assumption:
 6. CI must have run on the merge result: the branch is up to date with
    `develop` and green on that head (see "Series of dependent PRs" below).
 7. Squash-merge, delete the branch, sync `develop`.
+
+### Release sync PRs (#1022)
+
+A release sync (`chore/release-*` into `main`, one squash commit with the tree
+of `develop`) is one big diff in which every file was already reviewed by Cora
+in the PR that put it on `develop`, and it is more than the Cora Review job can
+cover. When the job runs on such a PR it **skips the review by tree identity**:
+the step `Is this a release sync with the tree of develop?` in
+`.github/workflows/cora-review.yml` runs `scripts/cora-release-sync.sh` (read
+from `develop`, tested by `scripts/test-cora-release-sync.sh`) and skips only
+when ALL of these hold; any mismatch or doubt runs the normal review:
+
+- the event is `pull_request`, the base is `main`, the head branch is
+  `chore/release-*`, and the PR is not from a fork;
+- the PR head is exactly one commit on top of the current tip of `main`;
+- the tree of the PR head equals the tree of a commit in the first-parent
+  history (newest 200) of `origin/develop`, fetched from this repository.
+
+The proof is the two tree hashes, never the PR text. The check keeps the name
+`Cora Review` and its summary says "skipped, tree identical to develop at
+`<sha>`"; that is a skip, not a Cora verdict, and the merge evidence is the
+tree check plus green CI. Check it by hand (same result as the job):
+
+```bash
+git fetch origin develop main <pr-branch>
+git rev-list --count origin/main..origin/<pr-branch>          # 1
+git rev-parse origin/<pr-branch>^                              # == git rev-parse origin/main
+git rev-parse origin/<pr-branch>^{tree}                        # == the next line
+git log --first-parent -n 200 --format='%H %T' origin/develop | grep "$(git rev-parse origin/<pr-branch>^{tree})"
+```
+
+A second commit (a version bump on top of the sync, say), a differing file, a
+fork or another branch name runs the review as before. The workflow file of a
+`pull_request` run comes from the merge ref, so a change to it only takes
+effect for a release branch built after it landed on `develop`. Since #1021 the
+trigger lists `develop` only, so a PR into `main` gets no `Cora Review` run at
+all until `main` is listed again; the skip applies from then on.
+
+Residual risks of the skip, for whoever merges the release PR:
+
+- The decision is made when the job runs. If `main` moves afterwards the job is
+  not re-run (the same holds for a PR retargeted to `main`). Merge only a sync
+  that is up to date with `main` (the owner's "require branches to be up to
+  date" or a merge queue), or push the release branch again.
+- Any of the newest 200 first-parent `develop` trees qualifies, not only the
+  tip, so a release cut some merges back is accepted (all of that content was
+  reviewed on `develop`, but main then lags the tip). Compare the sync with
+  `develop` yourself when the release is meant to be the tip.
+- The deciding script runs from `develop` with the job's environment minus the
+  Cora token (`env -u ACCESS_TOKEN`); it reads only git objects and the
+  checkout runs without credentials.
 
 ### Series of dependent PRs
 
@@ -278,6 +340,13 @@ result is recorded in the coverage ledger (`tole doctor --summary`).
 Release checklist, also before tagging: the latest push-to-`develop` CI run
 is green (and the release PR's own run), and no merged PR left `develop` red.
 
+The release sync PR (`chore/release-*` into `main`, one commit, the tree of
+`develop`) is not reviewed again by Cora when the job runs on it: it is skipped
+by tree identity (see "Release sync PRs (#1022)" under the merge gate for the
+rules and how to check it by hand). Build the release branch as one commit
+directly on the tip of `main`, from the `develop` commit you release; do not
+add a second commit, or the whole range is reviewed.
+
 ## Design rules
 
 - The core crate (`tole-core`) must stay platform-agnostic: no stdin/stdout,
@@ -291,6 +360,11 @@ is green (and the release PR's own run), and no merged PR left `develop` red.
   layers (registry / `AllowlistApprover` / host prompt).
 - MCP tools are always `Risk::Write`. Server-supplied metadata is never
   trusted for risk classification.
+- The `tole serve` wire is additive-only (#1024): a new route or key is
+  fine, a removed or renamed one, or a changed meaning, raises
+  `SERVE_PROTOCOL_VERSION` and gets a BREAKING line in `CHANGELOG.md`. The rule
+  and the tests that enforce it are in "Wire compatibility" in
+  [docs/mobile-control.md](docs/mobile-control.md).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
 

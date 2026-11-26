@@ -13,4 +13,13 @@ publish = false
 # none today. The compiler then makes "the model cannot name the toolkit"
 # true, and `scripts/desktop-check.sh deps` checks the resolved dependency
 # graph (cargo metadata) to keep it so.
+
+# Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
+# scripts/arch-check.sh. See "Crate kinds" in docs/architecture.md.
+[package.metadata.tole]
+kind = "app"
+
+[lints]
+workspace = true
+
 [dependencies]

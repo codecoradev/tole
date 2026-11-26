@@ -13,6 +13,10 @@
 //!    listed, and then until the client has a method for it or the allowlist
 //!    says why not);
 //! 3. the list is compared with `Route::ALL`, both ways.
+//!
+//! A fourth check (#1024) compares the list with the routes
+//! `docs/mobile-control.md` documents, both ways, so the document cannot lose
+//! or gain a route unnoticed.
 
 // Spawns the real `tole serve` binary (`shell-tools` feature, #349).
 #![cfg(feature = "shell-tools")]
@@ -271,4 +275,83 @@ fn the_scan_is_not_vacuous() {
         assert!(code.contains(needle), "the scan no longer sees `{needle}`");
     }
     assert_eq!(literals("a \"x\" b \"y\\\"z\" c").len(), 2);
+}
+
+/// Serve routes the document does not name as `METHOD /path`, with why.
+const NOT_DOCUMENTED: &[(&str, &str, &str)] = &[(
+    "GET",
+    "/sessions/{id}",
+    "an alias of GET /sessions/{id}/status, which the document names",
+)];
+
+/// A documented path as a route template: any `{name}`, `<name>` or `dap-…`
+/// segment is an id, but the image hash and the webhook name keep their words.
+fn template_of(path: &str) -> String {
+    let segs: Vec<&str> = path.split('/').collect();
+    let id_like = |s: &str| s.starts_with('{') || s.starts_with('<') || s.contains('…');
+    segs.iter()
+        .enumerate()
+        .map(|(i, s)| match (i, *s) {
+            (_, s) if !id_like(s) => s.to_string(),
+            (4, _) if segs[3] == "images" => "{hash}".to_string(),
+            (2, _) if segs[1] == "hooks" => "{name}".to_string(),
+            _ => "{id}".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The `` `METHOD /path` `` routes the document names, as `(method, template)`.
+fn documented() -> BTreeSet<(String, String)> {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mobile-control.md");
+    let text = std::fs::read_to_string(&doc).unwrap();
+    let mut out = BTreeSet::new();
+    for part in text.split('`') {
+        let Some((method, rest)) = part.split_once(' ') else {
+            continue;
+        };
+        if !matches!(method, "GET" | "POST") || !rest.starts_with('/') {
+            continue;
+        }
+        let path = rest.split(['?', ' ']).next().unwrap();
+        out.insert(pair(method, &template_of(path)));
+    }
+    out
+}
+
+/// Check 4: the document and serve name the same routes.
+#[test]
+fn the_documented_routes_are_the_served_routes() {
+    let doc = documented();
+    assert!(
+        doc.len() >= 35,
+        "the scan of the document found {}",
+        doc.len()
+    );
+    let served = served();
+    let skip: BTreeSet<_> = NOT_DOCUMENTED.iter().map(|(m, p, _)| pair(m, p)).collect();
+    for (m, p, why) in NOT_DOCUMENTED {
+        assert!(
+            !why.is_empty() && served.contains(&pair(m, p)),
+            "stale entry `{m} {p}`"
+        );
+        assert!(
+            !doc.contains(&pair(m, p)),
+            "`{m} {p}` is documented now: drop it from NOT_DOCUMENTED"
+        );
+    }
+    let missing: Vec<_> = served
+        .difference(&doc)
+        .filter(|r| !skip.contains(*r))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "serve answers routes docs/mobile-control.md does not name (document them, as `METHOD /path`): {missing:?}"
+    );
+    let gone: Vec<_> = doc.difference(&served).collect();
+    assert!(
+        gone.is_empty(),
+        "docs/mobile-control.md names routes serve does not have (removing a route is a protocol \
+         break; see \"Wire compatibility\"): {gone:?}"
+    );
 }

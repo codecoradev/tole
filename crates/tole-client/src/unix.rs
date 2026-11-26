@@ -7,6 +7,7 @@
 //! because the bearer token goes to whatever listens on the path: a directory
 //! another user can write to is a directory where that user can replace the
 //! socket and read the token (the squatter of a loopback port).
+#![allow(unsafe_code)] // SAFETY: euid and poll FFI on the local socket; each block states its invariant.
 
 use crate::error::{Error, Result};
 use crate::transport::{Connection, Transport};
