@@ -14,3 +14,7 @@ __pycache__/
 
 # Tier-2 runner transient output (baseline copies live in evals/baselines/)
 /evals/tier2/results.json
+
+# container recipe (#1044): the serve token, the provider key and the compose env
+/templates/container/secrets/
+/templates/container/.env

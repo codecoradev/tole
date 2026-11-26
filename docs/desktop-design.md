@@ -31,8 +31,9 @@ the same rows in section 4.
 
 Local first. A remote server (a VPS) is prepared but not the focus: the desktop
 can save remote server entries now; a container image and a compose example
-with a TLS proxy and an unbuffered event stream is #1044 (later). `tole-client`
-can connect to the proxy over `https://` (#1071). TLS stays out
+with a TLS proxy and an unbuffered event stream is #1044 (later; the recipe is
+[container.md](container.md), not yet run end to end). `tole-client` can connect
+to the proxy over `https://` (#1071); the desktop does not use it yet. TLS stays out
 of tole itself (D5 still open for confirmation, but the plan assumes (a)).
 
 Still open: D5 (confirmation), D7, **D8**, D9 (the design has no model picker
