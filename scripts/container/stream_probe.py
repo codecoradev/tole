@@ -21,7 +21,11 @@ To measure the proxy's own delay, compare `first text_delta` with the moment the
 provider emitted its first token (a mock provider can log it), and compare with
 a run straight against serve (the same script, the serve's own URL).
 
-Exit status: 0 both checks passed, 1 a check failed, 2 the probe could not run.
+A stream that stays silent longer than --stream-timeout (default 120 s) is read as
+broken: raise it when TOLE_SERVE_HEARTBEAT_SECS is set above that.
+
+Exit status: 0 both checks passed, 1 a check failed, 2 the probe could not run or
+could not reach a verdict (for example the turn ended before the stream was cut).
 """
 import argparse
 import http.client
@@ -48,8 +52,9 @@ def connect(base, cafile, insecure, timeout):
 
 
 class Api:
-    def __init__(self, base, token, cafile, insecure):
+    def __init__(self, base, token, cafile, insecure, stream_timeout=120):
         self.base, self.token, self.cafile, self.insecure = base, token, cafile, insecure
+        self.stream_timeout = stream_timeout
 
     def request(self, method, path, body=None, timeout=1800, auth=True):
         conn = connect(self.base, self.cafile, self.insecure, timeout)
@@ -70,7 +75,7 @@ class Api:
             return resp.status, raw.decode("utf-8", "replace")
 
     def open_stream(self, path):
-        conn = connect(self.base, self.cafile, self.insecure, 120)
+        conn = connect(self.base, self.cafile, self.insecure, self.stream_timeout)
         conn.request("GET", path, headers={
             "Authorization": "Bearer " + self.token,
             "Accept": "text/event-stream",
@@ -89,7 +94,8 @@ class Stream(threading.Thread):
         super().__init__(daemon=True)
         self.api, self.path = api, path
         self.frames = []
-        self.ready = threading.Event()
+        self.ready = threading.Event()  # set on the ready frame OR when the stream ends
+        self.got_ready = False
         self.error = None
         self.conn = None
 
@@ -106,6 +112,7 @@ class Stream(threading.Thread):
                     if data or fid is not None or event != "message":
                         self.frames.append((time.monotonic(), event, fid, "\n".join(data)))
                         if event == "ready":
+                            self.got_ready = True
                             self.ready.set()
                     event, fid, data = "message", None, []
                 elif line.startswith(":"):
@@ -120,6 +127,10 @@ class Stream(threading.Thread):
             self.error = e
         finally:
             self.ready.set()
+
+    def wait_ready(self, seconds=30):
+        """True only when the ready frame arrived (not on a stream that ended or failed)."""
+        return self.ready.wait(seconds) and self.got_ready and not self.error
 
     def cut(self):
         """Close the socket without a goodbye: a dropped connection."""
@@ -137,15 +148,18 @@ def entry_seqs(frames):
 
 def run_turn(api, sid, prompt, results):
     t0 = time.monotonic()
-    status, body = api.request("POST", "/sessions/%s/prompt" % sid, {"text": prompt})
+    try:
+        status, body = api.request("POST", "/sessions/%s/prompt" % sid, {"text": prompt})
+    except Exception as e:  # a thread must not die silently: record the failure
+        status, body = None, repr(e)
     results.update(status=status, body=body, start=t0, end=time.monotonic())
 
 
 def streaming_phase(api, sid, prompt):
     stream = Stream(api, "/sessions/%s/events" % sid)
     stream.start()
-    if not stream.ready.wait(30) or stream.error:
-        return None, "could not open the event stream: %s" % stream.error
+    if not stream.wait_ready():
+        return None, "could not open the event stream (no ready frame): %s" % stream.error
     res = {}
     t0 = time.monotonic()
     worker = threading.Thread(target=run_turn, args=(api, sid, prompt, res), daemon=True)
@@ -159,6 +173,9 @@ def streaming_phase(api, sid, prompt):
 
 def report_streaming(r):
     res, deltas, t0 = r["res"], r["deltas"], r["t0"]
+    if "end" not in res:
+        print("streaming: FAIL the prompt request did not finish within the probe's wait")
+        return False
     turn = res["end"] - res["start"]
     print("streaming: prompt answered %s after %.2f s" % (res["status"], turn))
     if res["status"] != 200:
@@ -189,30 +206,39 @@ def report_streaming(r):
 
 
 def resume_phase(api, sid, prompt):
+    """True passed, False failed, None inconclusive (the cut did not land mid-turn)."""
     a = Stream(api, "/sessions/%s/events" % sid)
     a.start()
-    if not a.ready.wait(30) or a.error:
-        print("resume: FAIL could not open the first stream: %s" % a.error)
+    if not a.wait_ready():
+        print("resume: FAIL could not open the first stream (no ready frame): %s" % a.error)
         return False
     res = {}
     worker = threading.Thread(target=run_turn, args=(api, sid, prompt, res), daemon=True)
     worker.start()
-    # Cut the stream as soon as the turn is under way (the first ephemeral frame,
-    # or after a short wait when the turn emits none).
+    # Wait (up to 30 s) for the first sign that the turn is under way, then cut.
+    # When the turn emits no ephemeral frame within that time, cut anyway.
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and not any(
+    while time.monotonic() < deadline and worker.is_alive() and not any(
             f[1] in ("text_delta", "tool_started") for f in a.frames):
         time.sleep(0.02)
+    mid_turn = worker.is_alive()
     a.cut()
     seen = entry_seqs(a.frames)
     last = max(seen) if seen else 0
-    print("resume: stream cut after %d entr%s (last seq %d)" % (len(seen), "y" if len(seen) == 1 else "ies", last))
+    print("resume: stream cut after %d entr%s (last seq %d), turn %s" % (
+        len(seen), "y" if len(seen) == 1 else "ies", last, "still running" if mid_turn else "already over"))
     worker.join(1800)
+    if res.get("status") != 200:
+        print("  FAIL the second prompt did not succeed: %s %s" % (res.get("status"), res.get("body")))
+        return False
+    if not mid_turn:
+        print("  INCONCLUSIVE the turn ended before the stream was cut; use a longer --prompt")
+        return None
     time.sleep(0.5)
     b = Stream(api, "/sessions/%s/events?after=%d" % (sid, last))
     b.start()
-    if not b.ready.wait(30) or b.error:
-        print("  FAIL could not reopen the stream with after=%d: %s" % (last, b.error))
+    if not b.wait_ready():
+        print("  FAIL could not reopen the stream with after=%d (no ready frame): %s" % (last, b.error))
         return False
     time.sleep(1.0)
     b.cut()
@@ -222,6 +248,9 @@ def resume_phase(api, sid, prompt):
         print("  FAIL GET /entries answered %s" % status)
         return False
     want = [e["seq"] for e in body["entries"]]
+    if not want:
+        print("  INCONCLUSIVE the log has no entry after seq %d, so nothing was resumed" % last)
+        return None
     if body.get("hasMore"):
         print("  note: more than 500 entries after the cut; comparing the first page only")
         got = got[:len(want)]
@@ -239,11 +268,13 @@ def main():
     ap.add_argument("--cwd", default="/workspace", help="session folder (inside serve's --workspace)")
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
     ap.add_argument("--cafile", help="PEM file to trust (a private CA, Caddy's local root)")
+    ap.add_argument("--stream-timeout", type=float, default=120,
+                    help="seconds of silence after which a stream counts as broken (default 120)")
     ap.add_argument("--insecure", action="store_true", help="do not verify the certificate (local tests only)")
     args = ap.parse_args()
     with open(args.token_file, encoding="utf-8") as f:
         token = f.read().strip()
-    api = Api(args.base_url.rstrip("/"), token, args.cafile, args.insecure)
+    api = Api(args.base_url.rstrip("/"), token, args.cafile, args.insecure, args.stream_timeout)
     try:
         status, health = api.request("GET", "/health", auth=False, timeout=15)
         if status != 200:
@@ -265,7 +296,9 @@ def main():
     except (OSError, http.client.HTTPException, RuntimeError) as e:
         print("probe error: %s" % e)
         return 2
-    return 0 if (ok1 and ok2) else 1
+    if not ok1 or ok2 is False:
+        return 1
+    return 0 if ok2 else 2
 
 
 if __name__ == "__main__":

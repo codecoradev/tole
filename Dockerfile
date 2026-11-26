@@ -5,6 +5,10 @@
 # Plain HTTP on 7801 inside the container: TLS ends at a reverse proxy (see
 # docs/container.md and templates/container/). Base images are pinned by tag AND
 # digest; bump both together (the digests are the multi-arch index digests).
+#
+# BuildKit is REQUIRED: `RUN --mount=type=cache` and `COPY --chmod` are BuildKit
+# features. It is the default builder of Docker 23 and later (and of `docker
+# buildx`); with an older engine set DOCKER_BUILDKIT=1.
 
 ARG RUST_IMAGE=rust:1.97.0-slim-bookworm@sha256:6d220bf85c74e842a79da63997af8d2e74455c0b8847d8bb3a5888572334991d
 ARG RUNTIME_IMAGE=debian:bookworm-20261123-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e

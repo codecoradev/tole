@@ -4,6 +4,7 @@
 #   mkdir -p secrets && umask 077
 #   openssl rand -hex 32 > secrets/tole_serve_token      # the serve credential
 #   printf '%s' "$PROVIDER_KEY" > secrets/tole_api_key    # the model provider key
+#   sudo chown 10001:10001 secrets/* && sudo chmod 0400 secrets/*   # see "secrets" below
 #   cp .env.example .env                                  # then edit it
 #   docker compose up --build -d
 #
@@ -30,17 +31,14 @@ services:
       # Lowest heartbeat that keeps a proxy with a short idle timeout happy
       # (default 15 s; 1 to 3600).
       TOLE_SERVE_HEARTBEAT_SECS: ${TOLE_SERVE_HEARTBEAT_SECS:-15}
+    # Compose (without swarm) bind-mounts each file secret as it is on the host
+    # and IGNORES uid, gid and mode: the container user (uid 10001) can read
+    # /run/secrets/* only if the host file is owned by 10001 or is readable by
+    # others. Hence the chown/chmod above (0400, owner 10001); without it serve
+    # fails to start with "--token-file ...: Permission denied".
     secrets:
-      - source: tole_serve_token
-        target: tole_serve_token
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-      - source: tole_api_key
-        target: tole_api_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
+      - tole_serve_token
+      - tole_api_key
     volumes:
       - tole-data:/data
       - tole-workspace:/workspace
@@ -59,6 +57,10 @@ services:
       - "7801"
 
   proxy:
+    # Not hardened like the tole service on purpose: the official image gives the
+    # binary a file capability (cap_net_bind_service), so `cap_drop: [ALL]` needs a
+    # matching `cap_add`, and a read-only root filesystem was not tried. Neither was
+    # run here; add them once you have checked them on your host.
     image: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     restart: unless-stopped
     depends_on:

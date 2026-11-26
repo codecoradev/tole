@@ -8,8 +8,9 @@
 !scripts/container/
 # Build output inside the allowed directories.
 **/target/
-# Local state that must never reach an image layer.
+# Local state that must never reach an image layer. (No `**/secrets/`: the Rust
+# module crates/tole-core/src/secrets/ is source. A top-level secrets/ or
+# templates/ is already out through the `*` above.)
 **/.tole/
 **/.env
 **/.env.*
-**/secrets/

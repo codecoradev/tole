@@ -26,11 +26,25 @@ umask 077
 mkdir -p secrets
 openssl rand -hex 32 > secrets/tole_serve_token       # the serve credential
 printf '%s' "$PROVIDER_KEY" > secrets/tole_api_key     # the model provider key
+sudo chown 10001:10001 secrets/* && sudo chmod 0400 secrets/*   # required, see below
 cp .env.example .env && $EDITOR .env                   # TOLE_DOMAIN, TOLE_BASE_URL, TOLE_MODEL
 docker compose up --build -d
 docker compose ps                                      # tole: healthy
 curl https://$TOLE_DOMAIN/health                       # {"protocol":1,"status":"ok","version":"..."}
 ```
+
+**The `chown` is required.** Compose (without swarm) bind-mounts a file secret
+exactly as it is on the host and ignores the `uid`, `gid` and `mode` of the
+compose file, so a `0600` file owned by you is unreadable by the container user
+(uid 10001) and serve stops at start with `--token-file ...: Permission
+denied`. The host files must be owned by 10001 (mode `0400`) or be readable by
+others; owner 10001 with `0400` is the narrow choice. You then read the token on
+the host with `sudo`; keep a copy of it where your clients need it (a password
+manager, the desktop's credential store), not next to the stack.
+
+`TOLE_BASE_URL`, `TOLE_MODEL` and the key are used together: tole has no
+built-in provider default, and with a blank `TOLE_BASE_URL` or `TOLE_MODEL` the
+provider has to come from the user config in `/data/codecora/tole/config.toml`.
 
 `TOLE_DOMAIN` is a public name that points at the VPS (Caddy fetches and renews
 its certificate; ports 80 and 443 must reach it). With `localhost` Caddy uses
@@ -42,6 +56,9 @@ lists both).
 
 ## The image
 
+- **Builder.** BuildKit is required (`RUN --mount=type=cache` and
+  `COPY --chmod`): the default of Docker 23 and later and of `docker buildx`;
+  older engines need `DOCKER_BUILDKIT=1`.
 - **Binary.** `cargo build --release --locked -p tole-cli`, stripped, from the
   committed `Cargo.lock`. Base images are pinned by tag **and** digest (the
   multi-arch index digest; bump both together). Build on the architecture you
@@ -76,7 +93,10 @@ lists both).
   The ledgers are kept outside the workspace so the model's file tools cannot
   reach them (they are jailed to `/workspace`). Commands the model runs are not
   confined that way, see "What the container does not add". Files are created
-  `0600` (the entrypoint sets `umask 077`).
+  `0600` and directories `0700`: the entrypoint sets `umask 077` and tole
+  inherits it, so files the model's tools create in `/workspace` get the same
+  modes. That matters on a bind-mounted workspace a person on the host also
+  edits; use a named volume or change the `umask` line in the entrypoint.
 - **Health.** `HEALTHCHECK` runs `healthcheck.sh` (bash `/dev/tcp`, no curl in
   the image): `GET /health` on the container's loopback must answer `200`. It
   answers `503` while serve drains after SIGTERM.
@@ -109,8 +129,10 @@ version step first. Do not run two servers on the same
 
 ## TLS and the live event stream
 
-tole serves plain HTTP; TLS ends at the proxy the owner runs (decision D5/D6 of
-[desktop-design.md](desktop-design.md)), or the owner uses a private network
+tole serves plain HTTP; TLS ends at the proxy the owner runs (decision D6 of
+[desktop-design.md](desktop-design.md) requires `https://` for a non-loopback
+server; D5, that reach is the owner's own means and tole ships none, is still
+awaiting the owner's confirmation and is what this recipe assumes), or the owner uses a private network
 (WireGuard, an SSH tunnel) and no public proxy at all.
 
 The stream is `GET /sessions/{id}/events?after=<seq>`: Server-Sent Events
@@ -125,7 +147,8 @@ must do:
 | Do not buffer the response | A buffer holds `text_delta` frames until it fills or the turn ends | `flush_interval -1` | `proxy_buffering off` |
 | Do not compress `text/event-stream` | A compressor waits for a full block | no `encode` block | `gzip off` |
 | Read timeout above the heartbeat | An idle stream carries only a ping every 15 s | none by default | `proxy_read_timeout` (the template: 3600 s) |
-| No short read timeout on `POST .../prompt` | It answers when the **turn ends**, which can take minutes, with no byte before that | none by default | `proxy_read_timeout` (the template: 3600 s) |
+| No short read timeout on `POST .../prompt` | It answers when the **turn ends**, which can take minutes, with no byte before that | none by default | `proxy_read_timeout`: the template's 3600 s is a choice, a longer turn is cut |
+| Send request bodies with a `Content-Length` | tole refuses chunked request bodies: any `Transfer-Encoding` header is a `400` (`serve.rs`, request smuggling guard) | `request_buffers 12MB` (reads the body, then sends it with a length; from Caddy's documentation, not run here) | the default request buffering does it; **never** `proxy_request_buffering off` |
 | HTTP/1.1 to the upstream | tole speaks HTTP/1.1 | `transport http { versions 1.1 }` | `proxy_http_version 1.1` + `Connection ""` |
 | Body cap above 10 MiB | An authenticated image upload is accepted up to 10 MiB | `request_body max_size 12MB` | `client_max_body_size 12m` |
 
@@ -153,7 +176,11 @@ sending the prompt to the first `text_delta` frame, the number of frames, and
 the gap between them (a buffering proxy shows one burst at the end of the turn,
 and the probe says so and fails). Then it cuts the stream in the middle of a
 second turn, reopens it with `after=<last seq>` and compares what arrives with
-`GET /entries`. It spends one prompt per phase on a real provider. Run it
+`GET /entries`. A stream silent for more than `--stream-timeout` (default 120 s) counts as broken:
+raise it if you set `TOLE_SERVE_HEARTBEAT_SECS` above 120. It exits 0 when both
+checks pass, 1 when one fails (including a prompt that did not succeed) and 2
+when it could not decide (the turn ended before the cut, or the log had nothing
+to resume). It spends one prompt per phase on a real provider. Run it
 against serve directly and through the proxy and compare the first-frame time;
 to measure first token against first frame exactly, point `TOLE_BASE_URL` at a
 mock provider that logs when it emitted its first token.
@@ -199,6 +226,11 @@ capabilities, no privilege gain and a process cap. A bug in a tool or a command
 the model runs reaches the volumes and the container network, not the VPS's
 files or its other services.
 
+The Caddy service is **not** hardened like this (no `cap_drop`, read-only
+filesystem or `no-new-privileges`): the official image gives its binary a file
+capability, so dropping all capabilities needs a matching `cap_add`, and none of
+it was run here. Add them once you have checked them on your host.
+
 ### What the container does not add
 
 The container is **not** the command sandbox of
@@ -238,6 +270,15 @@ The container is **not** the command sandbox of
 
 Run in the lane that wrote this:
 
+- **The build context.** `.dockerignore` was simulated with Docker's matching rules (a
+  small script over `git ls-files`): the context holds 869 of 1002 tracked files,
+  every file under `crates/`, `Cargo.toml`, `Cargo.lock` and `scripts/container/`,
+  and nothing else; the excluded ones are docs, CI, `evals`, `bench`, the other
+  scripts and `templates`. The context was copied to a scratch directory and
+  `cargo metadata --locked --offline` and `cargo check -p tole-cli --locked
+  --offline` pass there. The same check with the first version of the file (which
+  had `**/secrets/`) fails with `file not found for module secrets`: that pattern
+  dropped `crates/tole-core/src/secrets/`, and it is gone.
 - `sh -n` and `bash -n` of the entrypoint and the health check; the entrypoint run
   with a secret file (value read, `_FILE` variable unset, a missing file exits
   64) and the health check run against a local stub (200 gives 0, nothing
@@ -245,17 +286,16 @@ Run in the lane that wrote this:
 - `docker compose config` parses `compose.yaml`.
 - `stream_probe.py` run against a real `tole serve` (a debug build) with a mock
   streaming provider, **directly, without a proxy**: 30 `text_delta` frames
-  spread over the turn, and the stream reopened with `after=<seq>` delivered
-  exactly the log after that seq.
+  spread over the turn, the stream reopened with `after=<seq>` delivered exactly
+  the log after that seq (exit 0); with the provider down it fails with exit 1.
 
 **Not run:** `docker build` (no Docker daemon was available, so the image was not
 built and the Dockerfile has only been read, not executed), `docker compose up`,
 the health check inside a container, Caddy and nginx (no proxy was run, so the
-settings in the templates are written from their documentation and not tested),
-the stream probe through a proxy, a restart or an image upgrade with data on the
-volumes, `stream_probe.py` against a real provider, the Compose handling of the
-secret `uid`, `gid` and `mode` fields (if your Compose ignores them, make the
-host files readable by uid 10001), a build on arm64.
+settings in the templates, including `request_buffers`, are written from their
+documentation and not tested), the stream probe through a proxy, a restart or an
+image upgrade with data on the volumes, `stream_probe.py` against a real
+provider, a build on arm64, the secret files with owner 10001 and mode `0400`.
 
 ## Not in this change (follow-ups)
 
