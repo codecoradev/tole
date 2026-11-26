@@ -5,4 +5,5 @@
 mod test_dir;
 
 mod approval;
+mod provider_failover;
 mod turn_compaction;
