@@ -302,6 +302,11 @@ is green (and the release PR's own run), and no merged PR left `develop` red.
   layers (registry / `AllowlistApprover` / host prompt).
 - MCP tools are always `Risk::Write`. Server-supplied metadata is never
   trusted for risk classification.
+- The `tole serve` wire is additive-only (#1024): a new route or key is
+  fine, a removed or renamed one, or a changed meaning, raises
+  `SERVE_PROTOCOL_VERSION` and gets a BREAKING line in `CHANGELOG.md`. The rule
+  and the tests that enforce it are in "Wire compatibility" in
+  [docs/mobile-control.md](docs/mobile-control.md).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
 
