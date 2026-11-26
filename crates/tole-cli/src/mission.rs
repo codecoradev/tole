@@ -42,9 +42,11 @@ pub const VERIFY_FAILURE_CAP: u32 = 3;
 /// stops as `exhausted_turn_cap` (#1239); a finished turn resets the count.
 pub const TURN_CAP_TRIPS: u32 = 3;
 
-/// Budget tier (issue #201): conservative by default; a trusted
-/// ecosystem context (`--trust internal`) earns headroom, and explicit
-/// flags always win over any tier default.
+/// Budget tier (issue #201, defaults raised by #1226): the default is sized
+/// for a real coding mission (the reference mission used 2.98M tokens over 87
+/// steps). `--trust internal` earns no headroom beyond it: the old 96 / 30 /
+/// 500k trusted tier would sit BELOW the default. Explicit flags (or the
+/// `[mission]` config) always win over any tier default.
 #[derive(Clone, Copy, Debug)]
 pub struct BudgetTier {
     pub max_steps: u64,
@@ -53,19 +55,15 @@ pub struct BudgetTier {
 }
 
 pub const DEFAULT_TIER: BudgetTier = BudgetTier {
-    max_steps: 48,
-    max_minutes: 15,
-    max_tokens: 200_000,
+    max_steps: 160,
+    max_minutes: 60,
+    max_tokens: 4_000_000,
 };
-pub const TRUSTED_TIER: BudgetTier = BudgetTier {
-    max_steps: 96,
-    max_minutes: 30,
-    max_tokens: 500_000,
-};
+pub const TRUSTED_TIER: BudgetTier = DEFAULT_TIER;
 
 impl BudgetTier {
-    /// Resolve the tier: explicit flags win per-field; the trusted tier
-    /// applies only where the operator gave no explicit value.
+    /// Resolve the tier: explicit flags win per-field; the tier applies
+    /// only where the operator gave no explicit value.
     pub fn resolve(
         trusted: bool,
         max_steps: Option<u64>,
@@ -761,25 +759,26 @@ mod budget_tests {
         assert_eq!(tokens_used(&s), 28);
     }
 
-    /// Issue #201: explicit flags win per-field; the trusted tier only
-    /// fills where the operator gave nothing.
+    /// Issue #201: explicit flags win per-field; the tier only fills where
+    /// the operator gave nothing. Issue #1226 pins the default itself.
     #[test]
-    fn tier_resolution_explicit_wins_and_trusted_fills() {
+    fn tier_resolution_explicit_wins_and_default_fills() {
         let d = BudgetTier::resolve(false, None, None, None);
         assert_eq!(
             (d.max_steps, d.max_minutes, d.max_tokens),
-            (48, 15, 200_000)
+            (160, 60, 4_000_000)
         );
+        // `--trust internal` must never fall below the default.
         let t = BudgetTier::resolve(true, None, None, None);
         assert_eq!(
             (t.max_steps, t.max_minutes, t.max_tokens),
-            (96, 30, 500_000)
+            (160, 60, 4_000_000)
         );
         // Explicit values override BOTH tiers, per-field.
         let mixed = BudgetTier::resolve(true, Some(10), None, Some(1_000));
         assert_eq!(
             (mixed.max_steps, mixed.max_minutes, mixed.max_tokens),
-            (10, 30, 1_000)
+            (10, 60, 1_000)
         );
     }
 }

@@ -398,7 +398,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 |-----|---------|-----------------|
 | `model`, `base_url`, `system_prompt`, `memory` | the provider env, `--system`, `--memory` | flag > env > config |
 | `sessions_dir`, `workspace` | `--sessions-dir`, `--workspace` | flag > config > default |
-| `[mission]` `max_steps`, `max_minutes`, `max_tokens` | `mission --max-*` | flag > config > budget tier |
+| `[mission]` `max_steps`, `max_minutes`, `max_tokens` | `mission --max-*` | flag > config > default (160 / 60 / 4,000,000) |
 | `[tui]` `theme`, `[tui.colors]` | `TOLE_THEME`, `NO_COLOR` | **user config only** (a project's `[tui]` is ignored with a warning): env > user config > `NO_COLOR` (`mono`) > `default`; see docs/tui.md |
 | `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
 | `[discussions]` `request_timeout_secs` | `TOLE_DISCUSSION_TIMEOUT_SECS` | **user config only** (a project's `[discussions]` is ignored): env > user config > default (`120`); the config accepts 10 to 3600 seconds (1 to 9 is an error naming the key and the floor, #813), the env 1 to 3600. The global timeout of ONE discussion provider call (connect, send and reading the whole reply, which is not streamed), not an idle timeout; raise it for reasoning models that think for minutes. An invalid env value is a startup error. `tole config check` and `tole doctor` show the effective value and its source |
@@ -630,8 +630,10 @@ Run ergonomics (#216): `run --prompt-file <path>` (`-` = stdin),
 `--name <alias>` (stored in the session header — `tole sessions` shows
 it and `resume` accepts the alias), and `--timeout <secs>` (wall-clock
 cap; expiry cancels at a checkpoint — resumable, never dead).
-Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
-tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
+Budget default (#201, raised by #1226): 160 steps / 60 min / 4,000,000
+tokens, the same under `--trust internal`; to go back to the old, smaller
+ceiling (48 / 15 / 200k) set `--max-steps`, `--max-minutes` and
+`--max-tokens`, or `[mission]` in the config —
 explicit flags always win; a durable cost report (turns, steps, tokens,
 per-risk-tier tool calls, cached tokens) lands on the session and `tole status` renders it.
 `tole status` (and `GET /sessions/{id}/status`, as `usage_report`) also shows
