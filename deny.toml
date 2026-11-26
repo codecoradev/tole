@@ -1,0 +1,101 @@
+# cargo-deny policy (rule D2 of the architecture standard, #1249 / #1253).
+#
+# Gate: `cargo deny check licenses bans sources`, run by the `Licences, bans
+# and sources` job of .github/workflows/security.yml with a pinned cargo-deny
+# release. Advisories are NOT part of this gate: `cargo audit` (same workflow)
+# already covers them, and yanked crates are an advisories-section check in
+# cargo-deny, so they stay with `cargo audit` (it warns on a yanked crate).
+#
+# Scope: everything tole ships, so every feature of every workspace member
+# (the desktop's optional GPUI toolkit included) and every target (Windows and
+# macOS dependencies included). The npm dependencies of the future React
+# desktop views (#1243) have their own allowlist; model weights are not
+# shipped.
+#
+# The allowlist below needs the OWNER's approval (#1253, AC2). Every entry
+# that is not a plain permissive licence has a comment saying why it is there
+# and which crates need it; do not extend it without the same note.
+
+[graph]
+all-features = true
+
+[licenses]
+# A crate passes when its SPDX expression is satisfied by this list, so
+# `MIT OR Apache-2.0` needs one of the two, and `Unlicense OR MIT` passes
+# through MIT. The list is the owner's proposed start (#1253); everything
+# outside it is an explicit, named exception below.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+# Exceptions: licences outside the allowlist, each for named crates only, so
+# a NEW dependency under the same licence still fails the gate until the
+# owner extends this list.
+exceptions = [
+    # NON-PERMISSIVE (weak copyleft): MPL-2.0 is file-level copyleft. Allowed
+    # for dependencies only: tole's own crates are MIT and copy no MPL-2.0
+    # file; the MPL files stay unmodified in the cargo registry source, which
+    # keeps tole's own code under MIT. Needed by the HTML parser stack of
+    # nginjen-lite / scraper (feature `web-builtin`); none has an alternative
+    # licence.
+    { allow = ["MPL-2.0"], crate = "cssparser" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },
+    { allow = ["MPL-2.0"], crate = "selectors" },
+    # The same for the desktop's optional GPUI stack (feature `gpui` of
+    # tole-desktop), all MPL-2.0 with no alternative licence:
+    #   - dwrote: DirectWrite bindings under zed-font-kit (Windows build);
+    #   - option-ext: `dirs-sys` -> `dirs` -> zed-font-kit (every GPUI platform);
+    #   - cbindgen: a BUILD-time tool of gpui-pre-apple (macOS and iOS). It runs
+    #     during the build and is not linked into or shipped with the binary.
+    { allow = ["MPL-2.0"], crate = "dwrote" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["MPL-2.0"], crate = "cbindgen" },
+    # Permissive (BSD Zero Clause: no conditions at all, not even the notice).
+    # Not on the proposed list, so named here. Needed by the GPUI component
+    # library: enum-iterator and enum-iterator-derive (no alternative licence).
+    { allow = ["0BSD"], crate = "enum-iterator" },
+    { allow = ["0BSD"], crate = "enum-iterator-derive" },
+    # Permissive data licence (Linux Foundation, "community data licence,
+    # permissive"), not a software licence: it covers the bundled Mozilla root
+    # certificate list. No attribution beyond the notice. Needed by
+    # webpki-roots and webpki-root-certs (rustls certificate roots); no
+    # alternative licence.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+]
+
+[bans]
+# Duplicate versions are not a licence matter and today's tree has many
+# (windows-sys, zbus and friends, mostly from the GPUI stack); they are not
+# reported here so the log stays readable.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Known-bad for this project: tole's TLS is rustls with the `ring` provider
+# only (crates/tole-core/Cargo.toml: "no aws-lc"), and nothing in tole may link
+# a system or bundled OpenSSL. A dependency that pulls one in changes the
+# build requirements, the licence set (OpenSSL licence) and the portable
+# targets, so it needs a decision, not a silent upgrade.
+deny = [
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io only; no git dependencies (Cargo.lock has none).
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

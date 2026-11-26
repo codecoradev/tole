@@ -1,3 +1,6 @@
+# 2026-11-26: the owner approved ONE raise of entries: 23 files by 1 line each, for the
+# `#[allow(unsafe_code)]` lines of #1252 (11 in tole-core, 12 in the rest), and the crate
+# totals of tole-core (+16) and tole-cli (+11). Never again: split the file instead.
 # Size guard allow-list (#1251, standard rule D1). Written once by
 # `scripts/arch-check.sh size --init`; it can only go down:
 #   - a file or crate over its cap and not listed fails the check;
@@ -6,7 +9,7 @@
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
 crate tole-cli 85855
-crate tole-core 66980
+crate tole-core 66996
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -85,40 +88,40 @@ file crates/tole-client/src/sse.rs 540
 file crates/tole-client/src/types.rs 895
 file crates/tole-core/src/action_summary.rs 966
 file crates/tole-core/src/approval.rs 991
-file crates/tole-core/src/children/agents.rs 2325
+file crates/tole-core/src/children/agents.rs 2326
 file crates/tole-core/src/children/handoff.rs 659
 file crates/tole-core/src/children/memory.rs 682
 file crates/tole-core/src/children/sibling_watch.rs 675
 file crates/tole-core/src/delegation/approvals.rs 1038
 file crates/tole-core/src/delegation/approvals_tests.rs 1427
 file crates/tole-core/src/delegation/mod.rs 1301
-file crates/tole-core/src/delegation/resource_guard.rs 703
-file crates/tole-core/src/delegation/resource_guard_tests.rs 658
+file crates/tole-core/src/delegation/resource_guard.rs 704
+file crates/tole-core/src/delegation/resource_guard_tests.rs 659
 file crates/tole-core/src/delegation/tests.rs 823
 file crates/tole-core/src/discussion/log.rs 1153
 file crates/tole-core/src/discussion/log_tests.rs 1062
 file crates/tole-core/src/discussion/mod.rs 1004
 file crates/tole-core/src/discussion/tests.rs 534
 file crates/tole-core/src/integrations/gh.rs 657
-file crates/tole-core/src/integrations/git.rs 1335
+file crates/tole-core/src/integrations/git.rs 1336
 file crates/tole-core/src/integrations/gitea.rs 783
 file crates/tole-core/src/integrations/uteke.rs 699
 file crates/tole-core/src/integrations/verify_package.rs 667
-file crates/tole-core/src/jobs.rs 572
+file crates/tole-core/src/jobs.rs 573
 file crates/tole-core/src/ledger/cron.rs 534
 file crates/tole-core/src/ledger/mod.rs 1211
 file crates/tole-core/src/ledger/tz.rs 634
 file crates/tole-core/src/mcp.rs 1700
 file crates/tole-core/src/mcp_server.rs 898
 file crates/tole-core/src/plugin_lock.rs 1095
-file crates/tole-core/src/plugin_lock_tests.rs 932
+file crates/tole-core/src/plugin_lock_tests.rs 933
 file crates/tole-core/src/provider/failover.rs 567
 file crates/tole-core/src/provider/openai.rs 3053
 file crates/tole-core/src/provider/replay.rs 631
 file crates/tole-core/src/run_command.rs 652
 file crates/tole-core/src/sandbox.rs 872
-file crates/tole-core/src/sandbox/command.rs 1769
-file crates/tole-core/src/sandbox/command_tests.rs 2239
+file crates/tole-core/src/sandbox/command.rs 1770
+file crates/tole-core/src/sandbox/command_tests.rs 2240
 file crates/tole-core/src/sandbox_tests.rs 934
 file crates/tole-core/src/secrets/mod.rs 1384
 file crates/tole-core/src/session/storage.rs 1729
@@ -126,17 +129,17 @@ file crates/tole-core/src/skills/approval.rs 1289
 file crates/tole-core/src/skills/curator.rs 705
 file crates/tole-core/src/skills/draft.rs 844
 file crates/tole-core/src/skills/index.rs 1605
-file crates/tole-core/src/skills/mod.rs 657
+file crates/tole-core/src/skills/mod.rs 658
 file crates/tole-core/src/subprocess.rs 698
 file crates/tole-core/src/systemone.rs 681
 file crates/tole-core/src/tool.rs 610
 file crates/tole-core/src/tools/file_tools.rs 705
-file crates/tole-core/src/tools/read_file.rs 788
+file crates/tole-core/src/tools/read_file.rs 789
 file crates/tole-core/src/turn/compaction.rs 668
 file crates/tole-core/src/turn/mod.rs 1326
 file crates/tole-core/src/web.rs 2348
 file crates/tole-core/tests/action_summary.rs 684
-file crates/tole-core/tests/command_sandbox.rs 1305
+file crates/tole-core/tests/command_sandbox.rs 1306
 file crates/tole-core/tests/gate_characterization.rs 854
 file crates/tole-core/tests/git_tool_hardening.rs 651
 file crates/tole-core/tests/ledger_core.rs 959

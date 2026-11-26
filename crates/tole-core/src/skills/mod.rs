@@ -574,6 +574,7 @@ mod tests {
     /// The shared reader never reads past the cap: a 1 TiB sparse file is
     /// refused from its length, a FIFO is refused instead of blocking.
     #[test]
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn read_file_capped_refuses_huge_files_and_non_files() {
         let tmp = crate::test_dir::TestDir::new("tole-skills-capread");
         let huge = tmp.join("huge");
