@@ -409,9 +409,9 @@ wire! {
     /// `GET /missions/{id}`. While it runs only `id`, `status` (`running`) and
     /// `running` are set. Once it ended `status` is how (`complete`,
     /// `exhausted_steps`, `exhausted_tokens`, `exhausted_time`,
-    /// `verify_failed`, `verify_refused`, `stopped`, or `error` with `error`
-    /// set); `summary` is the durable `fact/mission` register as the server
-    /// holds it. A figure the server sent as `null` reads as `None`.
+    /// `exhausted_turn_cap`, `verify_failed`, `verify_refused`, `stopped`, or
+    /// `error` with `error` set); `summary` is the durable `fact/mission`
+    /// register as the server holds it. A figure the server sent as `null` reads as `None`.
     #[serde(rename_all = "camelCase")]
     pub struct Mission {
         pub id: String,

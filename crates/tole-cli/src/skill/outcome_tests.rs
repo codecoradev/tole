@@ -45,6 +45,7 @@ fn a_mission_status_maps_to_success_failure_or_nothing() {
         "exhausted_steps",
         "exhausted_tokens",
         "exhausted_time",
+        "exhausted_turn_cap",
     ] {
         assert_eq!(classify_mission(f), Outcome::Failure, "{f}");
     }
