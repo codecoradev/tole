@@ -730,6 +730,7 @@ impl Ledger {
 /// Open (creating, owner-only) and exclusively lock `path`; the lock is
 /// released when the returned file is dropped. Advisory and cooperative,
 /// like the agents-root lock. Non-unix hosts get no lock (single-writer).
+#[allow(unsafe_code)] // SAFETY: flock on a descriptor this function owns; see the block.
 fn lock_file(path: &Path) -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;

@@ -306,6 +306,7 @@ const GH_TOKEN: &str = "ghp_missionGithubToken0123456789";
 /// so under root tole runs as `nobody`: the guard is about same-user
 /// children.
 #[cfg(all(unix, feature = "shell-tools"))]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Command {
     let home = dir.join("home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));

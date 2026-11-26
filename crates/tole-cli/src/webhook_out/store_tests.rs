@@ -226,6 +226,7 @@ fn a_cut_fire_id_gives_no_row_instead_of_a_row_on_a_missing_run() {
 }
 
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn a_planted_huge_or_special_outbox_is_refused_not_read() {
     // A FIFO must not block the open, and a symlink must not be followed.
     #[cfg(unix)]

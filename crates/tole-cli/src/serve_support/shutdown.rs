@@ -43,6 +43,7 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 /// reported ready, so a signal that arrives right after the "listening" line is
 /// already counted.
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: signal handler installation; see the block.
 pub fn install() -> std::io::Result<()> {
     // SAFETY: `sigaction` is given a zeroed struct with a valid handler and an
     // emptied mask; the handler is `extern "C"` and async-signal-safe.
