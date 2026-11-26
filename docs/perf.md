@@ -248,3 +248,5 @@ benchmarked here, expected to trade hot-path speed). `cargo bloat --crates`
 figures cover the `.text` section only (17.1 MiB of the 22.7 MiB binary; the
 rest is rodata and other sections): std 2.9 MiB, tole_cli 2.6, rmcp 2.2,
 tole_core 2.1, serde_core 1.0, tole 0.9, tokio 0.5, serde_json 0.4, rustls 0.4.
+
+Bisected and attributed since 2026-11-26: see [binary-size.md](perf/binary-size.md).
