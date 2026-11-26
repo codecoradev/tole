@@ -1,6 +1,7 @@
 //! Tests: file format, validation, discovery, layering, secrets.
 
 use super::*;
+use std::path::Path;
 
 #[test]
 fn full_file_round_trips() {
