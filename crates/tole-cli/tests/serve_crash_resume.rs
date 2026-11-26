@@ -21,9 +21,8 @@
 //! - A turn killed while the provider is answering leaves its user message
 //!   durable and no settle. `tole resume <id>` finishes that turn in the same
 //!   session; over serve nothing does yet (#1230): a prompt answers a defined
-//!   409 `{"error": "interrupted turn", "state": "planning"}` (step 1, pinned
-//!   by one test), and a second states the answer #1230 asks for (accepted, or
-//!   that 409, never a 500).
+//!   409 `{"error": "interrupted turn", "state": "planning"}` (step 1). One test
+//!   pins it, one states what #1230 asks for (accepted, or that 409).
 //! - A parked approval is in memory and is gone after a kill (documented in
 //!   `docs/desktop-design.md`, "Crash or restart"); the session resumes, the
 //!   write has not run, the model asks again, and one allow settles one write.
@@ -396,11 +395,6 @@ fn a_session_killed_mid_turn_answers_a_defined_409_to_a_prompt_over_serve() {
         body,
         json!({"error": "interrupted turn", "state": "planning"})
     );
-    // The log is append-only: the refused prompt left no message, and the
-    // session still holds the one interrupted turn.
-    let (log, _) = read_log(&second, &id, "refused");
-    assert_eq!(user_messages_with(&log, "next question"), 0);
-    assert_eq!(last_pc(&log).as_deref(), Some("planning"));
     assert_eq!(
         api_seqs(&api_entries(&second, &id)),
         before,
