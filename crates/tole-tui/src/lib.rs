@@ -12,6 +12,7 @@ mod approval;
 mod clipboard;
 mod editor;
 mod files;
+mod guard;
 mod host;
 mod input;
 mod keymap;
@@ -31,12 +32,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossterm::{execute, queue};
+use crossterm::event::{self, Event};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -47,6 +43,7 @@ use tole_core::turn::TurnObserver;
 pub use app::{Action, Msg};
 pub use approval::{approval_channel, ApprovalRequest, Pending, Prompter};
 pub use editor::Editor;
+pub use guard::TerminalGuard;
 pub use host::{Footer, HostCmd, HostReply, ImageItem, SessionItem, TuiHost, TurnEnd};
 pub use input::{Input, Key, KeyPress, Mods};
 pub use keymap::{KeyAction, KeySpec, Keymap};
@@ -107,38 +104,6 @@ pub struct App {
 /// Follow-ups that may wait, and queue rows shown above the editor.
 const MAX_QUEUE: usize = 16;
 const QUEUE_ROWS: usize = 3;
-
-/// Raw mode (+ keyboard enhancement, so Shift+Enter is reported on terminals
-/// that speak the kitty protocol; others ignore the sequence; + bracketed
-/// paste, #560, so a pasted block arrives as one event instead of keys) for
-/// the guard's lifetime; Drop restores all three even when a panic unwinds
-/// through `run`.
-pub struct TerminalGuard;
-
-impl TerminalGuard {
-    pub fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut out = io::stdout();
-        let _ = queue!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            EnableBracketedPaste
-        );
-        let _ = io::Write::flush(&mut out);
-        Ok(Self)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            PopKeyboardEnhancementFlags
-        );
-        let _ = disable_raw_mode();
-    }
-}
 
 /// Run the TUI until quit. SIGINT is a plain `Ctrl+C` key event in raw mode.
 pub fn run(host: &dyn TuiHost, approvals: Receiver<Pending>) -> io::Result<()> {
