@@ -89,6 +89,9 @@ continuity, infra facts.
   reviewed on `develop`, the Cora Review workflow no longer runs on PRs to
   `main`, and `Cora Review` is not a required check there. Every other
   required check still gates the release PR.
+  If `Cora Review` runs on a PR to `main` again, a release sync (one commit on the tip of
+  `main`, same git tree as a `develop` commit) is skipped by tree identity (#1022);
+  CONTRIBUTING, "Release sync PRs", has the by-hand check.
   **Exception (#914):** a PR whose every file is excluded by `review.exclude`
   in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
   job then skips the review, ends green and writes "Nothing to review" in its
@@ -341,6 +344,8 @@ that makes them stale. This regression has happened twice (#33 and again
   release ranges (v0.9.0: 87 files, ~14.7k lines). The release PR was
   reviewed instead with `cora mcp` `review_prepare` / `review_finalize`
   (agent as reviewer) over ~4k-line chunks, with the verdict posted on the PR.
+  A release sync whose tree equals `develop`'s is no longer reviewed at all, by
+  tree identity (#1022, `scripts/cora-release-sync.sh`); see CONTRIBUTING.
 - **2026-11-17:** cora-code **0.21.1** is released. The CI action
   (`codecoradev/cora-review-action@v1`, `cora-version: latest`) therefore
   runs it: it chunks a large diff (`review.max_chunk_chars`, default 48,000

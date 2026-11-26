@@ -1,0 +1,25 @@
+{
+  "profiles": [
+    {
+      "error": "profiles.lost.system_prompt_file: <HOME>/tole/missing.md: No such file or directory (os error 2)",
+      "name": "lost"
+    },
+    {
+      "may_use": [
+        "web_search"
+      ],
+      "memory_room": "notes",
+      "models": {
+        "advisor": "m-adv",
+        "default": "standard",
+        "standard": "m-std"
+      },
+      "name": "reviewer",
+      "persona": "You check finished work.",
+      "persona_chars": 38,
+      "session_allow": [
+        "web_search"
+      ]
+    }
+  ]
+}

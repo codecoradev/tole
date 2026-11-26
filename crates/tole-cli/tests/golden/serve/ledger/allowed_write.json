@@ -1,0 +1,131 @@
+{
+  "entries": [
+    {
+      "id": "e_1",
+      "kind": "entry",
+      "payload": {
+        "role": "user",
+        "text": "TOOL_MISSION write it"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "e_2",
+      "kind": "entry",
+      "parentId": "e_1",
+      "payload": {
+        "detail": "write_file",
+        "error": "approval required"
+      },
+      "seq": 2,
+      "timestamp": "<clock>",
+      "type": "error"
+    },
+    {
+      "id": "e_3",
+      "kind": "entry",
+      "payload": {
+        "denial_note": true,
+        "role": "user",
+        "text": "[tole] Your call to `write_file` was denied (approval refused). Do not repeat it unchanged — use another approach or say what is blocked."
+      },
+      "seq": 3,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "intent_8",
+      "kind": "entry",
+      "payload": {
+        "input": {
+          "content": "remote ok",
+          "path": "approved.txt"
+        },
+        "replay": "guarded",
+        "tool": "write_file"
+      },
+      "seq": 4,
+      "timestamp": "<clock>",
+      "type": "intent"
+    },
+    {
+      "id": "e_5",
+      "kind": "entry",
+      "parentId": "intent_8",
+      "payload": {
+        "ok": true,
+        "output": {
+          "bytes": 9,
+          "path": "approved.txt"
+        }
+      },
+      "seq": 5,
+      "timestamp": "<clock>",
+      "type": "tool_result"
+    },
+    {
+      "id": "e_6",
+      "kind": "entry",
+      "payload": {
+        "role": "assistant",
+        "text": "ENTRIES-ANSWER"
+      },
+      "seq": 6,
+      "timestamp": "<clock>",
+      "type": "message"
+    }
+  ],
+  "header": {
+    "created_at": "<clock>",
+    "cwd": "",
+    "id": "<SESSION>",
+    "kind": "header",
+    "storageVersion": 1,
+    "systemPrompt": "<SYSTEM PROMPT>",
+    "v": 1
+  },
+  "otherLines": [
+    {
+      "keys": [
+        "kind",
+        "pc",
+        "seq",
+        "snapshot"
+      ],
+      "kind": "state"
+    },
+    {
+      "keys": [
+        "entryId",
+        "id",
+        "kind",
+        "seq",
+        "usage"
+      ],
+      "kind": "usage"
+    },
+    {
+      "keys": [
+        "key",
+        "kind",
+        "namespace",
+        "op",
+        "seq",
+        "value"
+      ],
+      "kind": "register"
+    },
+    {
+      "keys": [
+        "key",
+        "kind",
+        "namespace",
+        "op",
+        "seq"
+      ],
+      "kind": "register"
+    }
+  ]
+}

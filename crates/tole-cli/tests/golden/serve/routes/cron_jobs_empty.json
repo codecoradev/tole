@@ -1,0 +1,8 @@
+{
+  "jobs": [],
+  "scheduler": {
+    "age_seconds": null,
+    "alive": false,
+    "host": null
+  }
+}
