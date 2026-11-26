@@ -20,13 +20,16 @@ Sizes are bytes of the stripped `tole` for `cargo build --release -p tole-cli`
   `regex` stack (f525fbb) **+1.58 MB**; the built-in web tools (#672,
   `web-builtin`) **+1.31 MB**. The rest is first-party code, spread over
   hundreds of commits; between 268d75d and ac726bc no commit adds more than
-  about 930 lines of source.
+  about 930 lines of `src` (same filter, `*_tests.rs` excluded).
 - Inside the #991 window the split is 2.15 MB (50%) first-party code before
   f525fbb, 1.58 MB (37%) the regex stack in that one commit, 0.57 MB (13%)
-  first-party code after it.
+  first-party code after it: 63% first-party and 37% regex, which replaces the
+  "2/3 first-party, 1/6 regex" of the earlier #991 comment.
 - Everything ships by default. A user can switch off `mcp` (-9.15 MB),
   `mcp-http` (-1.98 MB), `web-builtin` (-1.31 MB) and `tui` (-0.63 MB); the
-  regex stack and the first-party core cannot be switched off.
+  regex stack and the first-party core cannot be switched off. The rows
+  overlap and are not additive: `mcp-http` sits on top of `mcp`, so switching
+  `mcp` off removes both.
 - The measured profile levers are larger than any single dependency fix:
   `opt-level = "s"` -5.55 MB, `lto = "fat"` -2.20 MB, `panic = "abort"` -2.78
   MB, all three -10.76 MB (see "Options").
@@ -37,9 +40,11 @@ One machine: Linux 6.18 x86_64, 4 vCPU Intel Xeon 2.10 GHz, 16 GB RAM; rustc
 and cargo 1.97.0 (2026-07-07); GNU strip 2.42. Same command and profile as
 `release.yml` (`cargo build --release -p tole-cli`, host target
 `x86_64-unknown-linux-gnu`): the root `[profile.release]` is `opt-level = 3`,
-`lto = "thin"`, `codegen-units = 1`, `strip = true`, with `--locked` and `-j
-2` (the patched `uteke-privacy` experiments run without `--locked`, because
-the lockfile changes).
+`lto = "thin"`, `codegen-units = 1`, `strip = true`. `release.yml` passes
+`--target` and neither `--locked` nor `-j`; these measurements add `--locked`
+and `-j 2` and leave `--target` out, so the host target is used. The patched
+`uteke-privacy` experiments run without `--locked`, because the lockfile
+changes.
 
 ```bash
 # one build per commit or feature set; symbols kept so nm can read them
@@ -81,22 +86,22 @@ Checks that the method is sound:
 | #533 HTTP MCP client | b04ff42 | 2026-11-10 | 14,743,208 | +3,326,832 | |
 | #672 web-builtin, the "before" of #991 | 268d75d | 2026-11-13 | 19,473,344 | +4,730,136 | 8,051,006 |
 | v0.11.0 | 52cd7bf | 2026-11-14 | 20,144,488 | +671,144 | 8,340,833 |
-| #789 | a434107 | 2026-11-15 | 20,747,064 | +602,576 | |
+| #789, midpoint of 268d75d..ac726bc by source lines added | a434107 | 2026-11-15 | 20,747,064 | +602,576 | |
 | test(sandbox), parent of the regex step | ac726bc | 2026-11-17 | 21,626,848 | +879,784 | |
 | `uteke-privacy` (regex stack) | f525fbb | 2026-11-18 | 23,209,768 | +1,582,920 | |
 | #984, the "after" of #991 | 70cffd7 | 2026-11-19 | 23,776,032 | +566,264 | 9,782,940 |
 | v0.12.0 | 33a7d04 | 2026-11-20 | 23,860,024 | +83,992 | 9,818,446 |
 | develop | 146ee4c | 2026-11-26 | 24,402,272 | +542,248 | 10,057,395 |
 
-b04ff42's parent, b573af2 (the develop commit before #533), builds to the
-same 11,416,376 bytes as v0.10.1. The table's "before" (19,473,344) is 9,368 bytes
+b04ff42's parent, b573af2 (the develop commit before #533), builds to the same
+11,416,376 bytes as v0.10.1. The table's "before" (19,473,344) is 9,368 bytes
 (0.05%) under the 19,482,712 in `docs/perf.md` for the same change; that page
 does not record its exact commit or toolchain.
 
 The "unexplained" gap in #987 between the local 9.8 MB tar.gz and the 8.4 MB
 published v0.11.0 asset is explained by the table: the local build was 70cffd7
 (2026-11-19), the published v0.11.0 is the 2026-11-14 code, before the regex
-stack and six days of work. The same code built here gives 8,340,833.
+stack and five days of work. The same code built here gives 8,340,833.
 
 ## Attribution
 
@@ -130,19 +135,22 @@ stack and six days of work. The same code built here gives 8,340,833.
 
 Symbol bytes of the first-party crates (`tole_cli`, `tole_core`, `tole`,
 `tole_tui`): 1,929,772 at v0.10.1, 3,966,933 at 268d75d, 5,851,140 at 70cffd7,
-6,130,379 at 146ee4c. The Rust source of those crates (files without
-`*_tests.rs`, inline test modules included) went from 46,882 lines at v0.10.1
-to 84,254, 117,329 and 125,059 lines.
+6,130,379 at 146ee4c. The Rust source of those crates
+(`crates/<crate>/src/**/*.rs` without `*_tests.rs`, `tests.rs` and anything
+under a `tests/` directory; inline `#[cfg(test)]` modules are included) went
+from 46,882 lines at v0.10.1 to 84,254, 117,329 and 125,059 lines.
 
-Between 268d75d and ac726bc (156 commits, 2.15 MB) no dependency was added
-(`Cargo.lock` differs only by version bumps of `toml`, `toml_datetime`,
-`toml_writer`, `serde_spanned`, `uuid` and `yoke-derive`); the commit at which
-half of the lines of that range were added (a434107) already carries
-+1,273,720 bytes, so the growth is steady, not a step. Between 70cffd7 and
-`develop` 64 commits touched `tole-cli` or `tole-core` for +626,240 bytes. A
-per-module table from `nm` is not given: module paths change as code is moved
-or inlined (`tole_cli::session` has no symbols at 268d75d and 237,969 bytes at
-70cffd7), so it would not be reliable.
+Between 268d75d and ac726bc (156 commits, 2.15 MB) no package was added to
+`Cargo.lock` (it changes by version bumps of `toml`, `toml_datetime`,
+`toml_writer`, `serde_spanned`, `uuid` and `yoke-derive`, the workspace crates
+0.10.1 to 0.11.0, two new dependency edges from `tole-cli` to `ring` and
+`base64`, both already in the tree, and `uuid` dropped from one package); the
+commit at which half of the lines of that range were added (a434107) already
+carries +1,273,720 bytes, so the growth is steady, not a step. Between 70cffd7
+and `develop` 64 commits touched `tole-cli` or `tole-core` for +626,240 bytes.
+A per-module table from `nm` is not given: module paths change as code is
+moved or inlined (`tole_cli::session` has no symbols at 268d75d and 237,969
+bytes at 70cffd7), so it would not be reliable.
 
 ### Symbol bytes by crate group
 
@@ -182,11 +190,16 @@ all of it. A user switches parts off with `cargo install tole-cli
 | `shell-tools,tui` only | 13,707,072 | -10,695,200 (-43.8%) | | |
 | `--no-default-features` | 10,344,608 | -14,057,664 (-57.6%) | 4,461,063 | 85 |
 
-`mcp` is the big one: rmcp, tokio, the whole HTTP and TLS client stack and the
-MCP client code. Switching it off removes the MCP client (and the auto-preset
-that needs it) and `tole serve --transport mcp`; that is a capability
-decision, not a free trim. The `regex` stack, the `std` code and the
-first-party core are in every row.
+Each row switches off the named part from the default, so they are
+alternatives, not additive: `mcp-http` requires `mcp`, and `web-builtin` costs
+more when `mcp` is off (`shell-tools,tui` only is 1,543,088 below the
+`shell-tools,tui,web-builtin` build, against 1,312,536 for `web-builtin` alone
+on the default), because the shared code no longer carries part of it. `mcp`
+is the big one: rmcp, tokio, the whole HTTP and TLS client stack and the MCP
+client code. Switching it off removes the MCP client (and the auto-preset that
+needs it) and `tole serve --transport mcp`; that is a capability decision, not
+a free trim. The `regex` stack, the `std` code and the first-party core are in
+every row.
 
 ## Options
 
@@ -223,7 +236,13 @@ Notes on the measured rows:
   crate's 23 unit tests pass (the 23rd reads a shared-cases file that is not
   in the crates.io package and fails the same way on the unmodified crate),
   and the 21 tests of `shape_redaction`, `shape_marker`, `shape_allowlist` and
-  `secret_encodings` in `tole-core` pass.
+  `secret_encodings` in `tole-core` pass. The two trimmed-`regex` variants
+  (-265,600 and -782,896) were only built and sized; no tests were run on
+  them. Passing tests does not show equal detection coverage, and ASCII-only
+  `\b`, `\s`, `\w` and `(?i)` change what a secret redactor detects (for
+  example next to non-ASCII text), which is security-relevant: the
+  `uteke-privacy` owner has to judge it, with its own corpus, before any of
+  these is taken.
 - The #991 comment reports `opt-level = "s"` for only the regex crates at
   -153,776 bytes (not re-run here). The dependency-wide row above is the same
   idea at full scale and is also small: most of what `"s"` shrinks is in the
@@ -235,8 +254,9 @@ Notes on the measured rows:
   `tole-cli`, `tole-core` and `tole-tui` (`approvals.rs`, `cron/webhook.rs`,
   `discuss/owner.rs`, `serve.rs`, `serve/missions.rs`,
   `webhook_out/approval_sender.rs`, `mcp.rs`, `update_check.rs` and the TUI
-  `lib.rs` at 146ee4c). With abort each of those would end the whole process,
-  including a `serve`, ACP or MCP daemon with other live sessions.
+  loop: `lib.rs` at 146ee4c, `event_loop.rs` since the split in #1274). With
+  abort each of those would end the whole process, including a `serve`, ACP or
+  MCP daemon with other live sessions.
 
 Runtime cost on the #921 harness (mock provider, `bench/run.py measure`,
 median of 5 runs per variant, taken interleaved, same machine, nothing else
@@ -256,12 +276,16 @@ not CPU-heavy paths such as secret redaction or the ledger fold:
 | without `mcp` | 3.92 | 10.52 | 14.98 | 4.80 |
 
 Across the five runs of one variant the per-turn figure spans 0.2 to 0.5 ms
-(default 4.7 to 5.1), so a difference of 0.2 ms is noise and the +0.5 ms of
-`opt-level = "s"` is the only clear cost. RSS is less stable than it looks: an
-earlier batch of three runs of the default binary, taken before the others,
-read 17.4 MB idle and 23.1 MB active against 12.4 and 17.7 here, so treat RSS
-differences below about 2 MB as unreliable; the cause of that shift was not
-investigated.
+(default 4.7 to 5.1). Every variant with `opt-level = "s"` reads +0.2 to +0.5
+ms above the default median (+4% to +11%): `"s"` alone +0.54, fat, "s" and
+abort +0.40, fat and "s" +0.30, dependencies only +0.23, first-party only
++0.21. The smaller ones are within the spread and cannot be told from noise
+with five runs; `"s"` alone is the largest. The variants without `"s"` (fat,
+abort, no `mcp`) do not differ from the default. RSS is less stable than it
+looks: an earlier batch of three runs of the default binary, taken before the
+others, read 17.4 MB idle and 23.1 MB active against 12.4 and 17.7 here, so
+treat RSS differences below about 2 MB as unreliable; the cause of that shift
+was not investigated.
 
 ## Recommendation
 
@@ -278,16 +302,17 @@ For the owner; nothing here is applied.
    window and tole cannot do it from its own manifest. `regex-lite` has no
    Unicode classes, so that choice belongs to the `uteke-privacy` owner.
 3. If a decision on the profile is wanted, `opt-level = "s"` is the largest
-   single lever (-5.5 MB) and costs about 0.5 ms on a 4.8 ms per-turn overhead
-   on the mock harness; an agent turn is bound by the provider call, so the
-   cost looks small, but the CPU-heavy paths were not measured and should be
-   (`cargo test -p tole-core --release --lib secrets::tests::throughput --
-   --ignored --nocapture`, before and after). `lto = "fat"` adds -2.2 MB for a
-   slower release build and is the weaker trade alone; with `"s"` the pair
-   gives -8.8 MB (-36%) with no behaviour change (per-turn 5.14 ms). If the
-   hot-path worry dominates, `"s"` on the three first-party crates only gives
-   -3.5 MB (-14.5%) with a per-turn figure inside the noise (5.05 ms); the
-   dependencies alone give -1.4 MB.
+   single lever (-5.5 MB) and costs about +0.5 ms on a 4.8 ms per-turn
+   overhead on the mock harness (the largest of the "s" variants); an agent
+   turn is bound by the provider call, so the cost looks small, but the
+   CPU-heavy paths were not measured and should be (`cargo test -p tole-core
+   --release --lib secrets::tests::throughput -- --ignored --nocapture`,
+   before and after). `lto = "fat"` adds -2.2 MB for a slower release build
+   and is the weaker trade alone; with `"s"` the pair gives -8.8 MB (-36%)
+   with no behaviour change (per-turn +0.30 ms, at the edge of the spread). If
+   the hot-path worry dominates, `"s"` on the three first-party crates only
+   gives -3.5 MB (-14.5%) with +0.21 ms, within the spread; the dependencies
+   alone give -1.4 MB.
 4. Keep `panic = "abort"` off. Its -2.8 MB is real but it turns every guarded
    panic into a daemon exit; do not take it without redesigning those guards.
 5. `codegen-units = 1` and `strip = true` are already at their smallest; no
