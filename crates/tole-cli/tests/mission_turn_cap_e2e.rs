@@ -17,11 +17,12 @@ use std::sync::Arc;
 const TURN_CAP: usize = tole_core::turn::MAX_STEPS;
 const TRIPS: u64 = 3;
 
-/// A mock that answers every request with a `todo_write` call whose input
-/// differs each time (so the repeated-call loop guard never fires) until
-/// `finish_at` requests were served; from then on it declares the mission
-/// complete. `usize::MAX` never finishes.
-fn spawn_mock(finish_at: usize) -> String {
+/// A mock that answers every request with a `todo_write` call (a `job_poll`
+/// call when `poll`: a model waiting on a job) whose input differs each time,
+/// so the repeated-call loop guard never fires, until `finish_at` requests
+/// were served; from then on it declares the mission complete.
+/// `usize::MAX` never finishes.
+fn spawn_mock(finish_at: usize, poll: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let served = Arc::new(AtomicUsize::new(0));
@@ -51,10 +52,14 @@ fn spawn_mock(finish_at: usize) -> String {
                 let (content, calls) = if n >= finish_at {
                     (json!("All done.\nMISSION_COMPLETE"), json!([]))
                 } else {
-                    let args = json!({"todos": [{"content": format!("step {n}"),
-                                                 "status": "in_progress"}]});
+                    let (name, args) = if poll {
+                        ("job_poll", json!({"job": format!("job-{n}")}))
+                    } else {
+                        let todo = json!({"content": format!("step {n}"), "status": "in_progress"});
+                        ("todo_write", json!({"todos": [todo]}))
+                    };
                     let call = json!({"index": 0, "id": format!("call_{n}"), "type": "function",
-                        "function": {"name": "todo_write", "arguments": args.to_string()}});
+                        "function": {"name": name, "arguments": args.to_string()}});
                     (Value::Null, json!([call]))
                 };
                 let (ctype, body) = if streamed {
@@ -114,9 +119,9 @@ impl Ran {
     }
 }
 
-fn run_mission(tag: &str, finish_at: usize, max_steps: u64) -> Ran {
+fn run_mission(tag: &str, finish_at: usize, poll: bool, max_steps: u64) -> Ran {
     let dir = TestDir::new(&format!("tole-mission-cap-{tag}"));
-    let base = spawn_mock(finish_at);
+    let base = spawn_mock(finish_at, poll);
     let sessions = dir.join("sessions");
     let work = dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -146,7 +151,7 @@ fn run_mission(tag: &str, finish_at: usize, max_steps: u64) -> Ran {
 /// the second turn completes it.
 #[test]
 fn a_first_turn_at_the_step_cap_is_followed_by_a_completing_turn() {
-    let r = run_mission("continue", TURN_CAP, 120);
+    let r = run_mission("continue", TURN_CAP, false, 120);
     assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
     assert_eq!(r.status(), "complete", "{}\n{}", r.out, r.err);
     assert_eq!(r.count("turns:"), 2, "{}", r.out);
@@ -159,7 +164,7 @@ fn a_first_turn_at_the_step_cap_is_followed_by_a_completing_turn() {
 /// (not a mission budget), and the session stays a normal durable one.
 #[test]
 fn consecutive_capped_turns_stop_with_a_status_naming_the_turn_cap() {
-    let r = run_mission("cap", usize::MAX, 200);
+    let r = run_mission("cap", usize::MAX, false, 200);
     assert_ne!(r.code, 0, "an unfinished mission exits nonzero: {}", r.out);
     assert_eq!(r.status(), "exhausted_turn_cap", "{}\n{}", r.out, r.err);
     assert_eq!(r.count("turns:"), TRIPS, "{}", r.out);
@@ -171,8 +176,31 @@ fn consecutive_capped_turns_stop_with_a_status_naming_the_turn_cap() {
 /// (as the budget, not as the cap), after the one turn that spent it.
 #[test]
 fn a_mission_step_budget_below_the_turn_cap_still_ends_the_mission() {
-    let r = run_mission("budget", usize::MAX, 10);
+    let r = run_mission("budget", usize::MAX, false, 10);
     assert_ne!(r.code, 0, "{}", r.out);
     assert_eq!(r.status(), "exhausted_steps", "{}\n{}", r.out, r.err);
     assert_eq!(r.count("turns:"), 1, "{}", r.out);
+}
+
+/// The mission budgets win over the cap count: with `--max-steps 96` the third
+/// capped turn also spends the budget, and the mission says so.
+#[test]
+fn a_spent_mission_budget_is_reported_before_the_turn_cap() {
+    let r = run_mission("budget-wins", usize::MAX, false, TRIPS * TURN_CAP as u64);
+    assert_eq!(r.status(), "exhausted_steps", "{}\n{}", r.out, r.err);
+    assert_eq!(r.count("turns:"), TRIPS, "{}", r.out);
+}
+
+/// The poll budget (120 `job_poll`s in one turn, a model correctly waiting) also
+/// settles a turn as `BudgetExhausted`, but it is not the step cap: the mission
+/// stops as before (`stopped`), is not nudged to stop gathering information and
+/// does not count toward `exhausted_turn_cap`.
+#[test]
+fn the_poll_budget_is_not_a_step_cap() {
+    let r = run_mission("poll", usize::MAX, true, 500);
+    assert_ne!(r.code, 0, "{}", r.out);
+    assert_eq!(r.status(), "stopped", "{}\n{}", r.out, r.err);
+    assert_eq!(r.count("turns:"), 1, "{}", r.out);
+    assert_eq!(r.count("steps:"), 120, "{}", r.out);
+    assert!(!r.err.contains("step cap"), "{}", r.err);
 }

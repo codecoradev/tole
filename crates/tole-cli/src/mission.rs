@@ -38,9 +38,8 @@ pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
 
-/// Turns in a row that may end at the per-turn step cap (`MAX_STEPS`) before
-/// the mission stops as `exhausted_turn_cap` (#1239); a finished turn resets
-/// the count. One capped turn never ends a mission, its own budgets do.
+/// Turns in a row at the per-turn step cap (`MAX_STEPS`) before the mission
+/// stops as `exhausted_turn_cap` (#1239); a finished turn resets the count.
 pub const TURN_CAP_TRIPS: u32 = 3;
 
 /// Budget tier (issue #201): conservative by default; a trusted
@@ -84,8 +83,7 @@ impl BudgetTier {
 
 /// Resolved mission parameters.
 pub struct MissionConfig {
-    /// The session's cancel token: the turns and a parked delegated approver
-    /// (#714) watch the same one.
+    /// The session's cancel token, shared with a parked delegated approver (#714).
     pub cancel: tole_core::cancel::CancelToken,
     /// The goal, verbatim from the operator.
     pub goal: String,
@@ -93,26 +91,23 @@ pub struct MissionConfig {
     pub max_steps: u64,
     /// Wall-clock cap in minutes.
     pub max_minutes: u64,
-    /// Total token ceiling (prompt + completion, from the durable
-    /// usage ledger).
+    /// Total token ceiling (prompt + completion, from the usage ledger).
     pub max_tokens: u64,
     /// Optional verification command (ground truth for completion).
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
     pub resume_id: Option<String>,
-    /// The id of a FRESH mission session, when the caller must know it
-    /// before the loop runs (`tole serve` answers with it up front). `None`
-    /// mints one, as the CLI does. Ignored with `resume_id`.
+    /// The id of a FRESH session the caller must know before the loop runs
+    /// (`tole serve`); `None` mints one, as the CLI does. Ignored with `resume_id`.
     pub fresh_id: Option<String>,
-    /// Per-run timeout of the `--verify` command (seconds). Default 300
-    /// — `cargo test`-class suites are the advertised use.
+    /// Per-run timeout of the `--verify` command in seconds (default 300).
     pub verify_timeout_secs: u64,
     /// Context compaction between chained turns (#440).
     pub compaction: tole_cli::compaction_host::CompactionSettings,
     /// Images attached to the first turn only (#212).
     pub images: Vec<tole_core::image::ImageRef>,
-    /// The selected profile's persona (#584): replaces the default base
-    /// prompt of a fresh mission (the mission section is still appended).
+    /// The profile's persona (#584): replaces the default base prompt of a
+    /// fresh mission (the mission section is still appended).
     pub persona: Option<String>,
     /// The profile's advisor (#587): `(profile, model, max uses)`. `Some`
     /// registers `consult_advisor`, whose tokens come out of `max_tokens`.
@@ -274,6 +269,16 @@ enum Verify {
     /// Not run: the owner's required sandbox is unavailable (#748). The model
     /// cannot fix that: never retried, never a pass (`verify_refused`).
     Refused(String),
+}
+
+/// `tole-core`'s poll budget (120 polls in one turn) also settles as
+/// `BudgetExhausted`; it is a wait, not a step cap, and its error entry says so.
+fn poll_budget_spent(s: &JsonlStorage) -> bool {
+    let detail = s
+        .entries()
+        .last()
+        .and_then(|e| e.payload["detail"].as_str());
+    detail.is_some_and(|d| d.starts_with("poll budget"))
 }
 
 /// Snapshot the durable usage ledger (provider steps so far).
@@ -456,8 +461,7 @@ pub fn run_mission_outcome(
 
     let status;
     loop {
-        // Budget checkpoints — BEFORE each turn, same discipline as the
-        // cancel token's between-steps checks (#201 extends these).
+        // Budget checkpoints BEFORE each turn, like the cancel checks (#201).
         let used = steps_used(&storage);
         if used >= cfg.max_steps {
             eprintln!(
@@ -484,8 +488,11 @@ pub fn run_mission_outcome(
             status = "exhausted_time";
             break;
         }
-        // A verify the sandbox cannot run is known now: stop before a model turn
-        // is spent on a mission that cannot be verified.
+        if cap_trips >= TURN_CAP_TRIPS {
+            status = "exhausted_turn_cap";
+            break;
+        }
+        // A verify the sandbox cannot run: stop before a turn is spent on it.
         if turns == 0 && cfg.verify.is_some() {
             if let Err(why) = tole_core::sandbox::command::preflight(
                 tole_core::sandbox::command::Consumer::Verify,
@@ -501,8 +508,7 @@ pub fn run_mission_outcome(
             status = "error";
             break;
         };
-        // Context compaction (#440): between chained turns, after the
-        // budget checks; the summary call's tokens count toward them.
+        // Context compaction (#440) between turns; its tokens count too.
         compactor.before_turn(&mut storage, &mut *provider);
         let first_images = if turns == 0 {
             cfg.images.as_slice()
@@ -527,8 +533,7 @@ pub fn run_mission_outcome(
             }
         };
         turns += 1;
-        // The advisor's usage becomes session usage records, so the next
-        // budget check (and a resume) counts it.
+        // The advisor's usage becomes session records: budgets and a resume count it.
         if let Some(shared) = &advisor {
             if let Err(e) = tole_cli::advisor_host::record_usage(shared, &mut storage) {
                 eprintln!("mission: {e}");
@@ -609,20 +614,17 @@ pub fn run_mission_outcome(
                     }
                 }
             }
-            TurnOutcome::BudgetExhausted => {
-                // The per-turn cap, not a mission budget (#1239): those are
-                // checked at the top of the loop and end the mission there.
+            TurnOutcome::BudgetExhausted if !poll_budget_spent(&storage) => {
+                // The per-turn step cap (#1239); the budgets are checked above.
                 cap_trips += 1;
                 let cap = tole_core::turn::MAX_STEPS;
                 eprintln!("mission: turn hit the {cap}-step cap ({cap_trips}/{TURN_CAP_TRIPS})");
-                if cap_trips >= TURN_CAP_TRIPS {
-                    status = "exhausted_turn_cap";
-                    break;
-                }
-                continuation = Some(format!(
-                    "Your last turn used all {cap} of its model steps without \
-                     finishing. Stop exploring: make the changes now, then verify."
-                ));
+                continuation = Some(
+                    "Your last turn used its whole step limit without finishing. Stop \
+                     gathering information and produce the deliverable now, then verify \
+                     it if a verify gate exists."
+                        .into(),
+                );
             }
             other => {
                 // ApprovalRequired / loop guard / provider failure: every
@@ -818,13 +820,11 @@ mod verify_error_tests {
         assert!(both.contains("mcp_cora_cora_review_prepare"), "{both}");
         assert!(both.contains("should_block"), "{both}");
         assert!(both.contains("review the change you made"), "{both}");
-        // The mission contract and the goal are untouched, and the review
-        // text comes AFTER them so it cannot displace the marker rules.
+        // The review text comes AFTER the contract, so it cannot displace it.
         assert!(both.contains("ship it") && both.contains(MISSION_COMPLETE_MARKER));
         assert!(both.rfind("# Code review").unwrap() > both.find("MISSION MODE").unwrap());
 
-        // #584: a profile's persona replaces the default base prompt; the
-        // mission contract still follows it.
+        // #584: a persona replaces the default base prompt; the contract follows.
         let p = fresh_mission_prompt("ship it", None, &reg, Some("You are the coder."));
         assert!(p.starts_with("You are the coder."), "{p}");
         assert!(!p.contains(&crate::default_prompt_for(false)));
