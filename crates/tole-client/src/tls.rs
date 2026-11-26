@@ -29,6 +29,7 @@
 
 use crate::client::Client;
 use crate::error::{Error, Result};
+use crate::tls_io::{deadline, Bounded};
 use crate::transport::{connect_budget, dial, parse_authority, Authority, Connection, Transport};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -271,73 +272,22 @@ impl Client {
     }
 }
 
-/// The TCP socket under the TLS session, with deadlines instead of timeouts.
-///
-/// A socket timeout bounds ONE socket read. A single `read` of the TLS stream
-/// can make many (rustls loops over the socket until it holds one whole
-/// record, up to 16 KiB), so a peer that sends a byte just inside the timeout
-/// could hold one `read` for the timeout times the record size. Here a timeout
-/// set by the caller becomes an absolute point in time, and EVERY socket read
-/// or write below it is given what is left, failing with `TimedOut` once it is
-/// gone: the bound holds for the call, not for each of its pieces.
-struct Bounded {
-    sock: TcpStream,
-    read_until: Option<Instant>,
-    write_until: Option<Instant>,
-}
-
-/// What is left until `at`, for a socket timeout; `TimedOut` once it is spent.
-fn left_until(at: Instant) -> io::Result<Duration> {
-    let left = at.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the deadline has passed",
-        ));
-    }
-    Ok(left)
-}
-
-impl Bounded {
-    fn new(sock: TcpStream) -> Self {
-        Self {
-            sock,
-            read_until: None,
-            write_until: None,
-        }
-    }
-}
-
-impl Read for Bounded {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(at) = self.read_until {
-            self.sock.set_read_timeout(Some(left_until(at)?))?;
-        }
-        self.sock.read(buf)
-    }
-}
-
-impl Write for Bounded {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(at) = self.write_until {
-            self.sock.set_write_timeout(Some(left_until(at)?))?;
-        }
-        self.sock.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.sock.flush()
-    }
-}
-
-/// `now + timeout`; `None` for no bound (also when the sum overflows).
-fn deadline(timeout: Option<Duration>) -> Option<Instant> {
-    timeout.and_then(|t| Instant::now().checked_add(t))
-}
+/// Bound of a write rustls makes on its own while reading (see
+/// [`TlsConnection::flush`]).
+const INCIDENTAL_WRITE: Duration = Duration::from_secs(10);
 
 /// An established TLS session over a TCP socket.
 struct TlsConnection {
     stream: StreamOwned<ClientConnection, Bounded>,
+}
+
+impl TlsConnection {
+    /// Drop the deadline of writing the request; see [`Write::flush`] below.
+    fn end_write_deadline(&mut self) -> io::Result<()> {
+        let sock = &mut self.stream.sock;
+        sock.write_until = None;
+        sock.sock.set_write_timeout(Some(INCIDENTAL_WRITE))
+    }
 }
 
 impl Read for TlsConnection {
@@ -351,8 +301,14 @@ impl Write for TlsConnection {
         self.stream.write(buf)
     }
 
+    /// The request is out once this returns. The deadline that bounded writing
+    /// it must not outlive it: rustls also writes by itself while the answer is
+    /// read (the reply to a `key_update`, an alert), possibly long after that
+    /// deadline, and those writes would fail with a spurious `TimedOut`. They
+    /// are a few bytes, so a fixed generous bound stands in for the deadline.
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        self.stream.flush()?;
+        self.end_write_deadline()
     }
 }
 
@@ -406,6 +362,31 @@ mod tests {
         ] {
             assert!(TlsTransport::new(ok).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn the_write_deadline_ends_with_the_request() {
+        // rustls writes by itself while the answer is read (the reply to a
+        // key_update a peer asked for, an alert), possibly long after the
+        // deadline that bounded writing the request. Once the request is
+        // flushed that deadline is gone and a fixed bound stands in for it.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let t = TlsTransport::new("https://localhost").unwrap();
+        let conn = ClientConnection::new(Arc::clone(&t.config), t.server_name.clone()).unwrap();
+        let mut c = TlsConnection {
+            stream: StreamOwned::new(conn, Bounded::new(sock)),
+        };
+        c.set_write_timeout(Some(Duration::from_secs(300))).unwrap();
+        assert!(c.stream.sock.write_until.is_some());
+        c.end_write_deadline().unwrap(); // what `flush` does once the bytes are out
+        assert!(c.stream.sock.write_until.is_none());
+        assert_eq!(
+            c.stream.sock.sock.write_timeout().unwrap(),
+            Some(INCIDENTAL_WRITE)
+        );
     }
 
     #[test]

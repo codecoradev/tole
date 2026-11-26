@@ -84,7 +84,7 @@ file crates/tole-cli/tests/serve_webhook_turn.rs 808
 file crates/tole-cli/tests/skill_approval_e2e.rs 605
 file crates/tole-cli/tests/tui_e2e.rs 1157
 file crates/tole-cli/tests/verify_sandbox.rs 1171
-file crates/tole-client/src/client.rs 773
+file crates/tole-client/src/client.rs 769
 file crates/tole-client/src/http.rs 807
 file crates/tole-client/src/sse.rs 540
 file crates/tole-client/src/types.rs 895

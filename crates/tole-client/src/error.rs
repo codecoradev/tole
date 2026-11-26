@@ -50,7 +50,9 @@ pub enum Error {
     /// `{"error": ...}` text when it sent one, else the start of the body as
     /// text, cut to [`MAX_STATUS_MESSAGE`] bytes with a trailing `…` (a hostile
     /// server must not make every error carry megabytes). `body` is the JSON
-    /// the server sent, whole (`null` when it was not JSON).
+    /// the server sent (`null` when it was not JSON, or longer than
+    /// [`MAX_ERROR_BODY`], 1 MiB: only that much of an error answer is read,
+    /// and a longer one is not parsed).
     #[error("server answered {status}: {message}")]
     Status {
         status: u16,
@@ -66,6 +68,27 @@ pub enum Error {
     /// The event stream could not be re-established.
     #[error("event stream lost: gave up after {0} failed reconnect attempts")]
     ReconnectExhausted(u32),
+}
+
+/// Most bytes of the body of a non-2xx answer the client reads and parses. A
+/// longer one is cut there and not parsed (`body` is `null`): a JSON array of
+/// ones is 2 bytes on the wire and 32 in memory (`serde_json::Value`), so the
+/// 64 MiB a success body may have would be gigabytes as an error body.
+pub const MAX_ERROR_BODY: usize = 1024 * 1024;
+
+/// The [`Error::Status`] of a non-2xx answer whose body (at most
+/// `MAX_ERROR_BODY + 1` bytes were read) is `raw`.
+pub(crate) fn status_error(status: u16, raw: &[u8]) -> Error {
+    let body = if raw.len() <= MAX_ERROR_BODY {
+        serde_json::from_slice(raw).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    Error::Status {
+        status,
+        message: status_message(&body, raw),
+        body,
+    }
 }
 
 /// Most bytes of a server's error text kept in `Error::Status::message`.

@@ -1,6 +1,6 @@
 //! The blocking [`Client`]: one method per route.
 
-use crate::error::{status_message, Error, Result};
+use crate::error::{status_error, Error, Result, MAX_ERROR_BODY};
 use crate::http::{self, Request, ResponseBody};
 use crate::resume::{ReconnectPolicy, ResumingStream};
 use crate::sse::FrameReader;
@@ -385,16 +385,12 @@ impl Client {
             Some(self.body_deadline),
         )?;
         let mut buf = Vec::new();
-        // One byte over the limit tells a body that fits from one that does not.
-        resp.by_ref().take(limit + 1).read_to_end(&mut buf)?;
-        if !(200..300).contains(&status) {
-            let body: Value = serde_json::from_slice(&buf).unwrap_or(Value::Null);
-            let message = status_message(&body, &buf);
-            return Err(Error::Status {
-                status,
-                message,
-                body,
-            });
+        let ok = (200..300).contains(&status);
+        // One byte over the cap tells a body that fits from one that does not.
+        let cap = limit.min(if ok { limit } else { MAX_ERROR_BODY as u64 });
+        resp.by_ref().take(cap + 1).read_to_end(&mut buf)?;
+        if !ok {
+            return Err(status_error(status, &buf));
         }
         if buf.len() as u64 > limit {
             return Err(Error::Protocol(format!(
