@@ -38,12 +38,16 @@ Extra `tole serve` flags go after `--`, e.g. `tole-serve-launcher start -- --tra
 |---|---|
 | `serve.pid` | daemon pid; liveness checks the pid *and* that its cmdline is `tole … serve`, so a recycled pid is not mistaken for the daemon |
 | `serve.log` | daemon stdout/stderr |
+| `serve.lock` | `flock` guard: `start` and `stop` run one at a time, so two simultaneous starts cannot orphan a daemon |
 | `watchdog.log` | one line per watchdog run (`alive` / `restarted` / `FAILED`) |
 | `cron-tick.log` | tick start/done lines plus the tick output |
-| `cron-tick.lock` | `flock` guard; an overlapping tick exits 0 and logs `skipped` |
-| `token` | bearer token |
+| `cron-tick.lock` | `flock` guard; an overlapping tick exits 0 and logs `skipped`; without `flock(1)` the wrapper exits 127 instead of skipping |
+| `token` | bearer token (forced to mode 0600 at every `start`, even if it already existed with looser rights; `$TOLE_FLEET_DIR` is mode 0700) |
 
 The daemon is started with `setsid nohup`, so it survives the parent shell exiting.
+`stop` sends SIGTERM (the daemon drains in-flight requests for up to 20 s,
+`--shutdown-grace`), waits up to 30 s, then sends SIGKILL; the pid file is removed
+only once the process is gone.
 
 ## Watchdog integration
 
