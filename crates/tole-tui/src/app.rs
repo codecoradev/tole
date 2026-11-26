@@ -3,6 +3,8 @@
 //! into the submodules below, all `impl App` blocks over the one state struct
 //! defined in the crate root.
 
+mod at;
+
 use crate::{menu, App, Footer, Item, KeyAction, Keymap, Kind, Out, PickKind, Theme};
 
 impl App {
