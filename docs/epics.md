@@ -441,6 +441,12 @@ Layering rules (#752, closed; details in `docs/architecture.md`):
 - A new top-level module must be added to one of the level lists. A moved module stays reachable at its old path through a `pub use` alias, so public paths do not change.
 - Moves are pure (`git mv` plus `pub use`), one subsystem per pull request, and never touch a file an open PR is changing.
 
+Architecture standard (epic #1249, CodeCora modular and thin-UI standard; the checks run in the `Check` job, the `Features alone` jobs of `ci.yml`, the `Desktop` workflow and the `Security` workflow):
+
+- In: crate kinds and the crate dependency matrix (#1250), the size guard with an allow-list that only shrinks (#1251, rule D1), the `unsafe_code` deny with a named opt-in list (#1252, rule D4), the licence gate with `cargo-deny` (#1253, rule D2), and each Cargo feature built alone plus a `wasm32` check of the desktop model (#1254, rules M3 and L5). Details and the rules are in `docs/architecture.md`.
+- Ratchets (files taken off the allow-list by pure moves): `crates/tole-cli/src/config/mod.rs` is done; `crates/tole-tui/src/lib.rs` is in review; `crates/tole-cli/src/main.rs`, `crates/tole-cli/src/serve.rs` and the large `tole-core` files are open and held on one owner decision (below).
+- Owner decision open: a split adds module glue (docs, imports, `mod` and `pub use` lines) to a crate that is already over the 50,000 line cap, so it raises that crate's total in the allow-list (the first split added 84 lines for about 3,100 moved lines, about 3 percent). The owner approved two one-time raises on 2026-11-26, three crate-total changes in all: the `unsafe` opt-in lines (+16 in `tole-core`, +11 in `tole-cli`) and the `config/mod.rs` split (+84 in `tole-cli`); how later splits count is not decided.
+
 ## Parked and owner decisions
 
 Parked means: an issue exists and is open, and nobody works on it until the owner decides.
