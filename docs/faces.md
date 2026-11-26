@@ -42,11 +42,11 @@ the issue lands, and the test then fails until it is.
 <!-- parity:begin -->
 | tool | cli | mcp-server | server-session | cron | status | reason |
 |---|---|---|---|---|---|---|
-| `delegate` | yes | no | no | no | drift #945 | Delegation over the delegation tree (#585) is wired for the CLI faces only; server sessions keep the classic depth-1 agent tools. `tole mcp` and cron start no child agents on purpose. |
-| `delegate_poll` | yes | no | no | no | drift #945 | The poll half of `delegate`; same reason. |
-| `discuss` | yes | no | no | no | drift #945 | The owner-started model discussions (#588) are a CLI session tool today; whether server sessions get them is decided with the other session capabilities. Not offered to `tole mcp` or cron on purpose. |
-| `discuss_status` | yes | no | no | no | drift #945 | Same as `discuss`. |
-| `discuss_stop` | yes | no | no | no | drift #945 | Same as `discuss`. |
+| `delegate` | yes | no | no | no | drift #994 | Delegation over the delegation tree (#585) is wired for the CLI faces only: `FacePolicy::SERVER_SESSION` is `AgentsPolicy::Classic`, so a server session keeps the depth-1 `agent_start` / `agent_poll` tools. Whether server sessions should delegate is the owner's decision, open in #994. `tole mcp` and cron start no child agents on purpose. |
+| `delegate_poll` | yes | no | no | no | drift #994 | The poll half of `delegate`; same reason. |
+| `discuss` | yes | no | no | no | drift #994 | The `discuss` tools (#588) are registered only where `delegate` is (same host, same depth limit), so a server session has none. The owner can still list, start, resume and stop a discussion over the `/discussions` routes of `tole serve` (#1042); a model cannot start one from a server session, and a `--plan-mode` server starts none (409). Whether server sessions get the tools is the owner's decision, open in #994. Not offered to `tole mcp` or cron on purpose. |
+| `discuss_status` | yes | no | no | no | drift #994 | Same as `discuss`. |
+| `discuss_stop` | yes | no | no | no | drift #994 | Same as `discuss`. |
 | `agent_start` | yes | no | yes | no | policy | The classic depth-1 child agent tools belong to a session. `tole mcp` is a stateless tool server with no session, and a scheduled run starts no children. |
 | `agent_poll` | yes | no | yes | no | policy | The poll half of `agent_start`; same reason. |
 | `cron_create` | yes | no | yes | no | policy | A session may schedule work for later. `tole mcp` has no session, and a scheduled run must not create schedules (no unattended recursion). |
