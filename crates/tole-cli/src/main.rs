@@ -4,16 +4,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 // The binary probe backs the uteke memory loop and the cora MCP preset.
+#[cfg(feature = "tui")]
+use tole_cli::approver::InteractiveApprover;
 use tole_cli::session::assemble::{
     apply_skills, build_default_prompt, civil_from_days, default_prompt_for, resolve_system_prompt,
-    resolve_workspace_root, review_section, roster_for, FacePolicy, RosterInputs,
+    resolve_workspace_root, review_section,
 };
 use tole_cli::tool_roster;
 use tole_cli::trust::expand_trust;
-#[cfg(all(feature = "mcp", feature = "shell-tools"))]
-use tole_core::approval::AllowlistApprover;
 
 // Test-only scratch directory shared with the integration tests (#781).
 #[cfg(feature = "shell-tools")]
@@ -34,17 +33,18 @@ mod mcp_specs;
 mod memory;
 mod mission;
 mod owner_cmds;
+mod registry;
 #[cfg(feature = "shell-tools")]
 mod serve;
 mod setup;
 mod upgrade;
 use cli_actions::{ConfigAction, DelegationAction, DiscussAction};
+#[cfg(feature = "shell-tools")]
+use flags::refuse_unattended;
 use flags::{
     check_server_face_flags, config_layer, from_config, pretool_from_config, refuse,
     resolve_serve_url, with_trust,
 };
-#[cfg(feature = "shell-tools")]
-use flags::{refuse_for, refuse_unattended};
 use gate::{config_flags, gate_policy, runs_cron_jobs, sandbox_flag_class, GatePolicy};
 use host_config::HostConfig;
 #[cfg(feature = "mcp")]
@@ -52,8 +52,14 @@ use mcp_specs::{auto_mcp_specs, helper_mcp_servers, merge_mcp_specs};
 #[cfg(feature = "shell-tools")]
 use memory::resolve_memory;
 use owner_cmds::{delegation_command, discuss_command};
+#[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+use registry::build_server_registry_for_mcp;
+#[cfg(feature = "shell-tools")]
+use registry::install_owner_mcp;
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
+use registry::mcp_server_command;
+use registry::{build_approver, build_registry};
 use tole_core::storage::{JsonlStorage, Storage};
-use tole_core::tool::ToolRegistry;
 use tole_core::turn::{TurnOutcome, LOOP_TRIP_AFTER};
 
 /// Session id → path (`<dir>/<id>.jsonl`).
@@ -2190,152 +2196,6 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn build_approver(allow_patterns: &[String], yes: bool) -> InteractiveApprover<StdioPrompt> {
-    InteractiveApprover::stdio()
-        .with_allow_patterns(allow_patterns.to_vec())
-        .with_auto_write(yes)
-}
-
-/// The MCP client servers of the OWNER for a server session (#946), read once
-/// at startup: the `--mcp-server` flag or the user config (the owner typed
-/// both). The merged list the CLI uses is NOT read here: it also holds the
-/// `cora` auto-preset, which attaches on a PATH lookup and must never happen
-/// on a server face. A server specification that comes from the PROJECT
-/// config (a file of the served repository) is refused loudly, as hooks from
-/// it are: a repository must not choose a process to start in the owner's
-/// account.
-#[cfg(feature = "shell-tools")]
-fn owner_mcp_specs(face: &str, settings: &tole_cli::config_apply::Settings) -> Result<Vec<String>> {
-    use tole_cli::config_apply::Source;
-    let Some(e) = settings.mcp_server.as_ref() else {
-        return Ok(Vec::new());
-    };
-    match e.source {
-        Source::Flag | Source::UserConfig => Ok(e.value.clone()),
-        _ => Err(refuse_for(
-            &format!(
-                "an MCP server specification from the project config is not supported by \
-                 `tole {face}` (a repository file must not choose a process to start; set \
-                 `mcp_server` in the user config or pass --mcp-server)"
-            ),
-            Some(Source::Config),
-            true,
-        )),
-    }
-}
-
-/// Installs the owner's MCP servers for the server sessions of `face`.
-#[cfg(feature = "shell-tools")]
-fn install_owner_mcp(face: &str, settings: &tole_cli::config_apply::Settings) -> Result<()> {
-    let specs = owner_mcp_specs(face, settings)?;
-    tole_cli::session::owner_mcp::set(specs).map_err(anyhow::Error::msg)
-}
-
-/// The CLI faces' registry: the shared tool roster behind the
-/// interactive approver.
-fn build_registry(
-    approver: impl tole_core::approval::Approver + 'static,
-    host: &HostConfig,
-    allow_patterns: &[String],
-) -> Result<ToolRegistry> {
-    // Hook wiring (run/chat/resume) is shell-tools-gated; without it these
-    // flags would be silently ignored — refuse loudly instead.
-    #[cfg(not(feature = "shell-tools"))]
-    if host.on_pretool_non_empty() || host.on_posttool_non_empty() || !host.on_turnend.is_empty() {
-        bail!(
-            "--on-pretool/--on-posttool/--on-turnend require the shell-tools feature \
-             (this build lacks it); rebuild with default features"
-        );
-    }
-    let roster = roster_for(
-        &FacePolicy::CLI,
-        RosterInputs {
-            workspace: resolve_workspace_root(host.workspace.as_ref())?,
-            plan_mode: host.plan_mode,
-            allow_patterns,
-            agents_worktree: host.agents_worktree,
-            delegation: Some(&host.delegation),
-            #[cfg(feature = "mcp")]
-            mcp_specs: &host.mcp_server,
-            #[cfg(not(feature = "mcp"))]
-            mcp_specs: &[],
-        },
-    )?;
-    tool_roster::build(approver, roster)
-}
-
-/// Server-mode registry: the same hardened tools as `build_registry`,
-/// minus two things a server cannot have — the interactive approver
-/// (stdin is the MCP protocol) and Destructive tools (structurally
-/// refused without one; skipped here with a note). Write tools need
-/// explicit `--allow` pre-authorization.
-#[cfg(all(feature = "mcp", feature = "shell-tools"))]
-fn build_server_registry(
-    workspace: Option<&String>,
-    allow_patterns: &[String],
-    plan_mode: bool,
-) -> Result<ToolRegistry> {
-    let roster = roster_for(
-        &FacePolicy::MCP_SERVER,
-        RosterInputs {
-            workspace: resolve_workspace_root(workspace)?,
-            plan_mode,
-            allow_patterns,
-            agents_worktree: false,
-            delegation: None,
-            mcp_specs: &[],
-        },
-    )?;
-    // No child agents and no MCP client tools behind an MCP server face;
-    // delete_file (Destructive) is absent behind the allowlist approver.
-    let reg = tool_roster::build(
-        AllowlistApprover::allow_only(allow_patterns.to_vec()),
-        roster,
-    )?;
-    eprintln!("tole mcp: {} tool(s) registered", reg.specs().len());
-    Ok(reg)
-}
-
-/// Server-mode registry for the MCP-over-HTTP host (#137): the same
-/// hardened tools as stdio MCP (D1); the session tools join separately
-/// via RegistryServer::with_extra_tools.
-#[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-fn build_server_registry_for_mcp(
-    workspace: Option<&String>,
-    plan_mode: bool,
-) -> Result<ToolRegistry> {
-    // Empty allowlist: the session tools carry their own approver per
-    // session; registry Write tools stay pre-auth-off (deny by default).
-    // `--workspace` roots the server-level file tools exactly like the
-    // stdio `tole mcp` face — without it they jailed to the process cwd.
-    // Plan mode (#294): the roster's absence semantics, as on every face.
-    build_server_registry(workspace, &[], plan_mode)
-}
-
-/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
-/// client disconnects.
-///
-/// Gated as a whole (issue #175): only the gated `Command::Mcp` arm
-/// calls it, but an ungated definition still references
-/// `build_server_registry` and `tole_core::mcp_server::serve_stdio` —
-/// both absent without the `mcp` feature — so the no-mcp profile
-/// failed to compile even though every call site was gated.
-#[cfg(all(feature = "mcp", feature = "shell-tools"))]
-fn mcp_server_command(
-    workspace: Option<&String>,
-    allow_patterns: &[String],
-    plan_mode: bool,
-) -> Result<()> {
-    // Plan mode (issue #109) applies to server mode too (cora scan-3
-    // #9): serve read-only tools only when the operator asked for it.
-    let registry = build_server_registry(workspace, allow_patterns, plan_mode)?;
-    tokio::runtime::Runtime::new()
-        .context("creating tokio runtime")?
-        .block_on(tole_core::mcp_server::serve_stdio(registry))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -3574,136 +3434,6 @@ fn new_session_id() -> String {
     format!("s-{ms:x}-{pid:x}", pid = std::process::id())
 }
 
-#[cfg(all(test, feature = "shell-tools"))]
-mod gh_repo_tests {
-    use super::*;
-
-    #[test]
-    fn parses_https_ssh_and_git_suffix() {
-        assert_eq!(
-            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/foo/bar.git")
-                .as_deref(),
-            Some("foo/bar")
-        );
-        assert_eq!(
-            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/foo/bar")
-                .as_deref(),
-            Some("foo/bar")
-        );
-        assert_eq!(
-            tole_cli::tool_roster::github_repo_from_remote_url("git@github.com:foo/bar.git")
-                .as_deref(),
-            Some("foo/bar")
-        );
-        assert_eq!(
-            tole_cli::tool_roster::github_repo_from_remote_url(
-                "https://user:token@github.com/Foo/Bar.git"
-            )
-            .as_deref(),
-            Some("Foo/Bar")
-        );
-    }
-
-    #[test]
-    fn rejects_non_github_and_garbage() {
-        assert!(tole_cli::tool_roster::github_repo_from_remote_url(
-            "https://gitlab.com/foo/bar.git"
-        )
-        .is_none());
-        assert!(tole_cli::tool_roster::github_repo_from_remote_url(
-            "https://github.com/only-owner"
-        )
-        .is_none());
-        assert!(tole_cli::tool_roster::github_repo_from_remote_url("not a url").is_none());
-        assert!(
-            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/-bad/name")
-                .is_none()
-        );
-    }
-
-    /// #352: only a host that is EXACTLY github.com counts; the string
-    /// "github.com" inside a longer hostname, userinfo or the path must not
-    /// redirect the gh tool to an attacker-named repo.
-    #[test]
-    fn host_must_be_exactly_github_com() {
-        let parse = tole_cli::tool_roster::github_repo_from_remote_url;
-        for bad in [
-            "https://notgithub.com/owner/name",
-            "https://github.com.evil.io/owner/name",
-            "ssh://git@github.com.evil.io/o/r",
-            "https://evil.io/github.com/owner/name",
-            "https://gitea.example/github.com/owner/name.git",
-            "https://github.com@evil.io/owner/name",
-            "https://user:github.com@evil.io/owner/name",
-            "ssh://git@evil.io:github.com/o/r",
-            "git@evil.io:github.com/o/r",
-            "git@github.com.evil.io:o/r",
-            "evil.io:github.com:o/r",
-            "https://githubxcom/owner/name",
-            "https://gist.github.com/owner/name",
-            "github.com/owner/name",
-        ] {
-            assert!(parse(bad).is_none(), "{bad} must not resolve to a repo");
-        }
-    }
-
-    #[test]
-    fn accepts_the_real_github_forms() {
-        let parse = tole_cli::tool_roster::github_repo_from_remote_url;
-        for (url, want) in [
-            ("https://github.com/o/r", "o/r"),
-            ("https://github.com/o/r/", "o/r"),
-            ("https://GitHub.COM/o/r.git", "o/r"),
-            ("https://github.com:443/o/r.git", "o/r"),
-            ("https://user:tok@github.com/o/r.git", "o/r"),
-            ("ssh://git@github.com/o/r.git", "o/r"),
-            ("ssh://git@github.com:22/o/r.git", "o/r"),
-            ("git@github.com:o/r.git", "o/r"),
-            ("github.com:o/r", "o/r"),
-            ("git://github.com/o/r.git", "o/r"),
-        ] {
-            assert_eq!(parse(url).as_deref(), Some(want), "{url}");
-        }
-    }
-
-    #[test]
-    fn gh_tool_not_registered_without_detected_repo() {
-        // Issue #293: a non-GitHub cwd must yield NO gh tool (no
-        // hardcoded fallback repo).
-        let dir = crate::test_dir::TestDir::new("tole-gh-none");
-        let reg = tool_roster::build(
-            tole_core::approval::AllowlistApprover::allow_only(vec![]),
-            tool_roster::Roster::new(dir.to_path_buf()),
-        )
-        .unwrap();
-        assert!(reg.get("gh").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn detects_repo_from_checkout() {
-        // A real checkout: init + remote origin, then detect.
-        let dir = crate::test_dir::TestDir::new("tole-gh-detect");
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .output()
-                .unwrap()
-        };
-        run(&["init", "-q"]);
-        run(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/detected/owner-name.git",
-        ]);
-        let detected = tole_cli::tool_roster::detect_github_repo(&dir);
-        assert_eq!(detected.as_deref(), Some("detected/owner-name"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 #[cfg(test)]
 mod session_id_rule_tests {
     /// Issue #295: the CLI (`--resume`/`status`) and serve/ACP must agree
@@ -3731,72 +3461,6 @@ mod session_id_rule_tests {
                 "validate_session_id({id:?})"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod chat_todo_tests {
-    use super::*;
-
-    /// Issue #276 regression: the chat face registers both todo tools
-    /// (and only todo_read in plan mode).
-    #[test]
-    fn chat_registers_todo_tools_and_respects_plan_mode() {
-        let mut reg =
-            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        tool_roster::register_todo(&mut reg, &[], false).unwrap();
-        assert!(reg.get("todo_read").is_some());
-        assert!(reg.get("todo_write").is_some());
-        let mut plan = ToolRegistry::new();
-        tool_roster::register_todo(&mut plan, &[], true).unwrap();
-        assert!(plan.get("todo_read").is_some());
-        assert!(plan.get("todo_write").is_none());
-    }
-
-    /// Issue #294 regression: the server-level registry of the MCP HTTP
-    /// face must be read-only under plan mode (absent, not just denied).
-    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-    #[test]
-    fn mcp_server_registry_is_read_only_under_plan_mode() {
-        use tole_core::tool::Risk;
-        let normal = build_server_registry_for_mcp(None, false).unwrap();
-        assert!(
-            normal.specs().iter().any(|s| normal
-                .get(s["function"]["name"].as_str().unwrap())
-                .unwrap()
-                .risk()
-                != Risk::ReadOnly),
-            "non-plan registry must expose write tools"
-        );
-        let plan = build_server_registry_for_mcp(None, true).unwrap();
-        let specs = plan.specs();
-        assert!(!specs.is_empty());
-        for spec in &specs {
-            let name = spec["function"]["name"].as_str().unwrap();
-            assert_eq!(
-                plan.get(name).unwrap().risk(),
-                Risk::ReadOnly,
-                "{name} must not survive plan mode"
-            );
-        }
-    }
-
-    /// cora 0.19 scan MAJOR: the MCP HTTP face's server-level file tools
-    /// must be rooted at `--workspace`, not the process cwd.
-    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-    #[test]
-    fn mcp_server_registry_file_tools_are_rooted_at_workspace() {
-        let ws = crate::test_dir::TestDir::new("tole-mcp-ws");
-        std::fs::write(ws.join("only-in-ws.txt"), "rooted").unwrap();
-        let ws_arg = ws.to_str().unwrap().to_string();
-        let reg = build_server_registry_for_mcp(Some(&ws_arg), false).unwrap();
-        let out = reg
-            .get("read_file")
-            .unwrap()
-            .execute(serde_json::json!({ "path": "only-in-ws.txt" }))
-            .unwrap();
-        assert_eq!(out["content"], serde_json::json!("rooted"));
-        let _ = std::fs::remove_dir_all(&ws);
     }
 }
 
