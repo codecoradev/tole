@@ -46,7 +46,7 @@ timeout_secs    = 10       # default 10, 1..=30
 ```
 
 - **Name:** `[a-z0-9_-]{1,32}`. Section is `webhook_out`, not `hooks`, so the
-  inbound table (`HookConfig`, `config/mod.rs`) keeps its meaning.
+  inbound table (`HookConfig`, `config/tables.rs`) keeps its meaning.
 - **Key names:** `hmac_key_env` and `hmac_key_file`, the names `[hooks.*]` uses.
   The first draft said `secret_env` / `secret_file`, but the config parser
   refuses every key that contains `secret`, `password`, `token` or `api_key`
@@ -103,7 +103,7 @@ timeout_secs    = 10       # default 10, 1..=30
   destination **name**, and only under the rule above.
 
 Code: `crates/tole-cli/src/webhook_out/{mod,config,payload,outbox,worker}.rs`
-(new), `config/mod.rs` (struct + user-only layering), `cron/deliver.rs`
+(new), `config/mod.rs` (the `webhook_out` field), `config/tables.rs` (`WebhookOutConfig`) and `config/layering.rs` (user-only layering), `cron/deliver.rs`
 (`Target`), `doctor.rs`.
 
 ## 2. Events and payload (schema v1)
