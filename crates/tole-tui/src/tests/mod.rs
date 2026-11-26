@@ -1,4 +1,5 @@
 use super::*;
+use crate::host::unsupported;
 use crate::render::inline_spans;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
