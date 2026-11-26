@@ -143,5 +143,4 @@ file crates/tole-core/tests/ledger_core.rs 959
 file crates/tole-core/tests/turn_loop.rs 2050
 file crates/tole-core/tests/wire_size_missions.rs 809
 file crates/tole-tui/src/keymap.rs 641
-file crates/tole-tui/src/lib.rs 3319
 file crates/tole-tui/src/theme.rs 539
