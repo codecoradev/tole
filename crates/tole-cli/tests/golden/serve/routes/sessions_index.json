@@ -1,0 +1,29 @@
+{
+  "nextCursor": null,
+  "scanTruncated": false,
+  "sessions": [
+    {
+      "busy": false,
+      "entries": 3,
+      "folder": "<WORKSPACE>",
+      "id": "<SESSION-B>",
+      "lastActivity": "<clock>",
+      "live": true,
+      "name": null,
+      "parent": null,
+      "turns": 1
+    },
+    {
+      "busy": false,
+      "entries": 2,
+      "folder": "<WORKSPACE>",
+      "id": "<SESSION-A>",
+      "lastActivity": "<clock>",
+      "live": true,
+      "name": null,
+      "parent": null,
+      "turns": 1
+    }
+  ],
+  "skipped": 0
+}

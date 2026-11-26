@@ -1,0 +1,6 @@
+{
+  "default": "mock-model",
+  "models": [
+    "mock-model"
+  ]
+}

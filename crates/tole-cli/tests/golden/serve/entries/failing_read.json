@@ -1,0 +1,77 @@
+{
+  "entries": [
+    {
+      "id": "e_1",
+      "parentId": null,
+      "payload": {
+        "role": "user",
+        "text": "LOOP_TOOL please"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "intent_4",
+      "parentId": null,
+      "payload": {
+        "input": {
+          "path": "loop.txt"
+        },
+        "replay": "idempotent",
+        "tool": "read_file"
+      },
+      "seq": 2,
+      "timestamp": "<clock>",
+      "type": "intent"
+    },
+    {
+      "id": "e_3",
+      "parentId": "intent_4",
+      "payload": {
+        "error": "read_file: not found in jail: loop.txt",
+        "ok": false
+      },
+      "seq": 3,
+      "timestamp": "<clock>",
+      "type": "error"
+    },
+    {
+      "id": "intent_12",
+      "parentId": null,
+      "payload": {
+        "input": {
+          "path": "loop.txt"
+        },
+        "replay": "idempotent",
+        "tool": "read_file"
+      },
+      "seq": 4,
+      "timestamp": "<clock>",
+      "type": "intent"
+    },
+    {
+      "id": "e_5",
+      "parentId": "intent_12",
+      "payload": {
+        "error": "read_file: not found in jail: loop.txt",
+        "ok": false
+      },
+      "seq": 5,
+      "timestamp": "<clock>",
+      "type": "error"
+    },
+    {
+      "id": "e_6",
+      "parentId": "e_1",
+      "payload": {
+        "detail": "tool read_file called with identical input 3 times in a row (guard trips at 3)",
+        "error": "loop detected"
+      },
+      "seq": 6,
+      "timestamp": "<clock>",
+      "type": "error"
+    }
+  ],
+  "id": "<SESSION>"
+}
