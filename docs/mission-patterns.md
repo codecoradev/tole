@@ -3,9 +3,12 @@
 `tole mission` chains turns toward a goal (see [Mission mode](../README.md#mission-mode)).
 Started in the background, from CI or by a script, nobody is there to press
 `y`, and two things decide whether it finishes: **which tools you pre-approve**
-and **what `--verify` checks**. This page is what a first real coding mission
-(#1223: one function, an index migration and tests, on 0.12.0, in the
-background) taught. References are to the tree at `develop` of 2026-11-26.
+and **what `--verify` checks**. The first real coding mission (#1223: one function, an
+index migration and tests, on 0.12.0, in the background) hit the `todo_write`
+and `job_*` stalls, the goal required on `--resume`, two budget ceilings and a
+verify gate that failed twice before it passed. The rest of this page is read
+from the code of the tree at `develop` of 2026-11-26 (references are to it), not
+observed in that run; section 1 says where that matters.
 
 ## 1. Approvals when nobody can answer
 
@@ -28,7 +31,9 @@ resumable (section 3).
 `--yes` would end the question for every Write (`--yes` auto-allows each Write
 tool, `run_command` and `git` included), so most unattended runs use a narrow
 allow list instead. `Destructive` tools (`delete_file`) are never covered by
-`--yes`, `--allow` or `--trust`; headless they are denied and stop the mission.
+`--yes`, `--allow` or `--trust`. They prompt like any other Write: with stdin at
+end of file they are denied and stop the mission, with stdin open they wait at
+the prompt.
 
 ### What `--trust workspace` does not cover
 
@@ -53,7 +58,8 @@ with it, so a mission without that allow stops at its first step.
 presets add up (`--trust internal --trust workspace`).
 
 The tool is called `git`. `--allow 'git_*'` is a glob over tool names and
-matches no tool of this tree. Patterns match tool names only (README, "Useful
+matches no tool of this tree. Patterns are globs over tool names, with one
+argument-matching form, `run_command:<argv>`, and `!` to deny (README, "Useful
 flags"); a tool you did not name keeps asking.
 
 ### The recipe
@@ -63,7 +69,7 @@ cd /path/to/worktree
 tole mission --workspace . --sessions-dir /path/to/sessions \
   --trust workspace \
   --allow todo_write --allow 'job_*' --allow run_command --allow git \
-  --verify ./scripts/gate.sh \
+  --verify /path/outside/the/workspace/gate.sh \
   "<goal>" < /dev/null
 ```
 
@@ -74,6 +80,14 @@ tole mission --workspace . --sessions-dir /path/to/sessions \
   (`run_command`, `job_start`, ...), the `git` tool refuses a linked git
   worktree and any layout other than a plain `.git` directory at the root
   ([sandbox-design.md](sandbox-design.md) §9). Use a clone in that case.
+- With `cora` on the PATH its review gate is on by default (`block`): a `git
+  commit` (also through `run_command` or `job_start`) is refused until the staged
+  diff has been reviewed. That is a tool refusal, not an approval stop, so the
+  mission does not stop; the model sees the refusal and loops. Review before the
+  commit, or pass `--review-gate off` (or `warn`) for the run (README, "Review
+  gate before commit").
+- A mission refuses `--on-pretool`, `--on-posttool`, `--on-turnend` and
+  `--memory`.
 - A project `.tole/config.toml` must be trusted before a headless run:
   without a terminal tole refuses an untrusted config and runs nothing
   (`tole config trust`; README, "Configuration (project and user files)").
@@ -86,12 +100,15 @@ truth a mission has. How the loop uses it (`crates/tole-cli/src/mission.rs`):
 - It runs (`sh -c`) after every turn that ends in a final answer, not only
   when the model says it is done.
 - The mission completes only when the command **exits 0 and** a final message
-  has a line that is exactly `MISSION_COMPLETE`. A pass without the marker
+  has a line that is `MISSION_COMPLETE` on its own (trimmed). A pass without the marker
   keeps the mission going; the marker without a pass does too.
-- On a failure the last 800 characters of its stdout and stderr go back to the
-  model, which fixes the cause and tries again. Three failures in one run end
-  it as `verify_failed`. A run that does not finish in `--verify-timeout`
-  seconds (default 300) counts as a failure.
+- On a failure the model gets `verify FAILED (exit N):` and the last 800
+  characters of the command's output (stdout, then stderr), which it uses to
+  fix the cause and try again. Three failures in one run end it as
+  `verify_failed`; they add up and a pass does not reset the count. A run that
+  does not finish in `--verify-timeout` seconds (default 300), or that cannot
+  be started, counts as a failure and the model gets the error text instead of
+  an output tail.
 - Without `--verify`, the marker alone completes the mission.
 
 So: **always pass a gate whose only success path is exit 0.** A gate that
@@ -115,10 +132,13 @@ A gate worth passing:
   sandbox does not protect it ([sandbox-design.md](sandbox-design.md) §9.4).
 
 The gate has no secrets unless a `[secrets]` entry grants `verify` one. By
-default it also runs sandboxed (`[sandbox.consumers] verify`): a `cargo` gate
-cannot see `~/.cargo` there, so set `verify = "off"` in the user config or
-make the gate self-contained (README, "Ecosystem position", Sandbox). If a required sandbox
-cannot start, the mission stops as `verify_refused`, never as a pass.
+default it also runs sandboxed where it can (`[sandbox.consumers] verify` is
+`optional`: sandboxed where bubblewrap works, unsandboxed with a warning on a
+host with no sandbox at all): a `cargo` gate cannot see `~/.cargo` there, so
+set `verify = "off"` in the user config or make the gate self-contained (README,
+"Sandbox" in the status list at the top; [sandbox-design.md](sandbox-design.md)
+§9.4). If a required sandbox cannot start, the mission stops as
+`verify_refused`, never as a pass.
 
 ## 3. Budgets, statuses and resuming
 
@@ -128,27 +148,34 @@ How a mission ended is its `status` (printed at the end, and in the
 | Status | Meaning | Next step |
 |---|---|---|
 | `complete` | marker declared and, with `--verify`, the gate passed | review the diff |
-| `exhausted_steps`, `exhausted_tokens`, `exhausted_time` | `--max-steps`, `--max-tokens` or `--max-minutes` reached | resume with a larger ceiling |
-| `exhausted_turn_cap` | three turns in a row used the per-turn step cap without finishing | look at the transcript, then resume |
+| `exhausted_steps`, `exhausted_tokens`, `exhausted_time` | `--max-steps`, `--max-tokens` or `--max-minutes` reached | resume with a larger `--max-steps` or `--max-tokens`; `--max-minutes` restarts per invocation anyway |
+| `exhausted_turn_cap` | three turns used the per-turn step cap (32 steps) without finishing | look at the transcript, then resume |
 | `verify_failed` | the gate failed three times | read the last failure, fix the gate or the goal |
 | `verify_refused` | the owner's sandbox could not run the gate | fix the sandbox setting |
-| `stopped` | a turn ended without a final answer: a denied approval, the loop guard or a provider failure | read the `mission: turn settled:` line on stderr |
+| `stopped` | a turn settled for a reason the mission does not continue from: a denied approval, the loop guard, a provider failure, an unknown tool, a blocked stop gate, a cancel, or the 120-poll budget | read the `mission: turn settled:` line on stderr |
 | `error` | a storage failure or a loop error | the session file is the record |
 
-A summary is written to the session whatever the status, and a stopped or
-exhausted mission can be resumed.
+A turn that hits the per-turn step cap does not end the mission: it gets a
+"produce the deliverable now" nudge and the mission goes on; only the third such
+turn ends it as `exhausted_turn_cap`, and that count restarts on `--resume`.
+Every status reached inside the loop (`error` included) writes a summary to the
+session; a failure before the loop (provider config, creating or opening the
+session) returns an error and writes none. A stopped or exhausted mission can
+be resumed.
 
 ### Resuming
 
 ```bash
-tole mission --resume <session-id> --max-steps 320 --max-tokens 8000000 \
-  --trust workspace --allow todo_write --allow 'job_*' ... "<goal>" < /dev/null
+tole mission --resume <session-id> --sessions-dir /path/to/sessions \
+  --max-steps 320 --max-tokens 8000000 --trust workspace --allow todo_write --allow 'job_*' ... "<goal>" < /dev/null
 ```
 
 - **The goal is still required** (the positional argument; there is no
   `--goal-file`). On a resume it is not sent to the model again, since the
   original is pinned in the session's system prompt, but it is recorded in the
-  new summary. Pass the same text.
+  new summary. Pass the same text. The session keeps its pinned system prompt,
+  which names the original `--verify` command: resume with the same gate.
+  The session is looked up in `--sessions-dir` (the same one as the first run).
 - **Approvals are not stored in the session.** Repeat `--trust` and `--allow`.
   If the mission stopped on a denied call, add the pattern it names.
 - **Steps and tokens count the whole session**, from its durable usage
