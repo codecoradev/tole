@@ -37,7 +37,8 @@ continuity, infra facts.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
   missions, Tier 3 baselines).
 - `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
-  branch before a PR).
+  branch before a PR; `arch-check.sh`: crate kinds and the crate dependency
+  matrix, #1249).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
   ignores.
@@ -103,14 +104,18 @@ continuity, infra facts.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250); exits 1 on a crate without a kind, a dependency that points upward, or a UI toolkit below a ui or bin crate
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
+# only when you touch scripts/arch-* (#1249):
+python3 scripts/test_arch_lint.py # self-test of the architecture guardrail (rules and fail-closed paths)
 # only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
 scripts/test-desktop-check.sh # self-test of the guardrail script
 scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 50,000 per crate). ADVISORY (warns only): literals in the ui layer
 scripts/desktop-render.sh <dir> # a desktop UI change: render the real window offscreen, one PNG per screen and state, and compare with the board (not a gate; see docs/design/desktop/README.md)
 ```
 
-CI enforces the first three. The desktop script runs in a separate `Desktop`
+CI enforces the first three, `scripts/arch-check.sh` and its self-test (steps of
+the `Check` job, so no new required check name; #1250). The desktop script runs in a separate `Desktop`
 workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, and not a
 required check unless the owner adds it to the branch protection: require only
 `Desktop model and guardrails`). The literals check is a heuristic: it
@@ -209,6 +214,16 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   difference with no row).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
+- Crate kinds (CodeCora modular + thin-UI standard, #1249): every crate
+  declares `[package.metadata.tole] kind` in its first commit and
+  `scripts/arch-check.sh` checks the crate graph against the standard's
+  matrix (core on core only; integration on core and engine; ui on core, app
+  and ui; app on core, engine, integration, os and feature; bin on
+  everything), and keeps a UI toolkit (`crossterm`, `ratatui`, `gpui*`,
+  `zed*`) below `ui`, `feature-ui` and `bin` crates. The published crates stay
+  three and layering inside `tole-core` and `tole-cli` stays a test
+  (`cargo test -p tole-core --test layering`, #752); the matrix is the crate
+  level above it. See "Crate kinds" in [docs/architecture.md](docs/architecture.md).
 - Desktop crates are modular monoliths (owner rule D1; the crate cap is 50,000
   lines, the file cap 500): one small module per page or capability, shared
   pieces (text cleaning, badges, caps, strings, tokens) in their own reusable

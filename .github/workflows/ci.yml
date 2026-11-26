@@ -22,6 +22,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+      # Architecture guardrails (#1249): crate kinds and the crate dependency
+      # matrix; the self-test proves the check fails closed. Part of this job so
+      # no required check name changes. Python 3 is preinstalled on the runner.
+      - run: python3 scripts/test_arch_lint.py
+      - run: scripts/arch-check.sh
 
   # Issue #175: the embedder/mobile checks only cover tole-core's
   # --no-default-features profile, so the tole-cli no-mcp host profile
