@@ -17,6 +17,7 @@
 //!   a reason to refuse forever.
 //! - [`apply_child_nice`] lowers a delegated child's CPU priority so the
 //!   orchestrator and the server stay responsive.
+#![allow(unsafe_code)] // SAFETY: host resource probes (sysctl, statvfs, setpriority); each block states its invariant.
 
 use std::path::Path;
 

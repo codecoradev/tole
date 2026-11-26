@@ -84,6 +84,7 @@ fn children_of(parent: u32) -> Vec<u32> {
 /// in a session of its own, and the death of the init takes every process of
 /// the PID namespace with it, while killing the launcher alone would leave
 /// them all running (a job's sandbox does not die with its parent).
+#[allow(unsafe_code)] // SAFETY: kill/killpg of a process this function started; see the blocks.
 pub fn kill_detached(mut child: std::process::Child) {
     #[cfg(unix)]
     {

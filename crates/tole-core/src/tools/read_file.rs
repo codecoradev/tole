@@ -738,6 +738,7 @@ mod tests {
     /// blocking, checked on the handle).
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn a_fifo_never_hangs_the_read() {
         let dir = tmpdir("fifo-env");
         let p = dir.join(".env");

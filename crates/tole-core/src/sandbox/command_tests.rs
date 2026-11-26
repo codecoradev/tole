@@ -1433,6 +1433,7 @@ fn another_name_or_link_into_what_git_runs_is_refused() {
 /// plan (opening a FIFO for reading blocks until a writer shows up).
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn a_fifo_in_the_protected_names_does_not_hang_the_plan() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
