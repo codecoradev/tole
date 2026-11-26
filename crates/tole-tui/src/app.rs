@@ -4,6 +4,7 @@
 //! defined in the crate root.
 
 mod at;
+mod images;
 
 use crate::{menu, App, Footer, Item, KeyAction, Keymap, Kind, Out, PickKind, Theme};
 

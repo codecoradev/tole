@@ -167,33 +167,6 @@ impl App {
         rows
     }
 
-    /// The images queued for the next message, as the host last reported.
-    pub fn images(&self) -> &[ImageItem] {
-        &self.images
-    }
-
-    /// Replace the queued-image list with what the host reports.
-    pub fn set_images(&mut self, images: Vec<ImageItem>) {
-        self.images = images;
-    }
-
-    /// The row for queued images (#560), or `None` when nothing is attached.
-    pub fn image_row(&self, width: usize) -> Option<String> {
-        let row = match self.images.as_slice() {
-            [] => return None,
-            [one] => format!("image: {} · next message", one.label()),
-            many => format!(
-                "images ({}): {} · next message",
-                many.len(),
-                many.iter()
-                    .map(ImageItem::label)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        Some(clip(&row, width.saturating_sub(1)))
-    }
-
     /// Rows above the editor: the image row, then the follow-up queue, at
     /// most `QUEUE_ROWS` together.
     pub fn pending_rows(&self, width: usize) -> Vec<String> {
@@ -201,12 +174,6 @@ impl App {
         let left = QUEUE_ROWS - rows.len();
         rows.extend(self.queue_rows_max(width, left));
         rows
-    }
-
-    /// The host's queue goes with the message that starts a turn.
-    fn images_sent(&mut self) {
-        self.images_in_flight = !self.images.is_empty();
-        self.images.clear();
     }
 
     /// Put queued (and `extra`) messages back in front of the draft; nothing
