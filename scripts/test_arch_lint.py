@@ -204,14 +204,25 @@ class Wrapper(unittest.TestCase):
         rc, _ = self.check(mode="bogus")
         self.assertEqual(rc, 2)
 
-    def test_all_runs_kinds_and_size(self):
-        rc, out = self.check(metadata([pkg("a", "core")]), mode="all", files={**SMALL, LIST: "# empty\n"})
+    def test_all_runs_kinds_size_and_unsafe(self):
+        rc, out = self.check(metadata([pkg("a", "core")]), mode="all", files={**SMALL, **UNSAFE_OK, LIST: "# empty\n"})
         self.assertEqual(rc, 0, out)
         self.assertIn("kinds:", out)
         self.assertIn("size:", out)
+        self.assertIn("unsafe:", out)
 
 LIST = "scripts/arch-size-allow.txt"
 SMALL = {"crates/a/src/lib.rs": "fn a() {}\n"}
+ROOT_TOML = '[workspace]\nmembers = ["crates/a"]\n\n[workspace.lints.rust]\nunsafe_code = "deny"\n'
+CRATE_TOML = '[package]\nname = "a"\n\n[lints]\nworkspace = true\n'
+
+
+def agents(*paths, start=arch.UNSAFE_START, end=arch.UNSAFE_END):
+    """An AGENTS.md whose opt-in list holds `paths` (one bullet each)."""
+    return "# Agents\n\nSome prose.\n\n" + start + "\n" + "".join(f"- `{p}`: why\n" for p in paths) + end + "\n\nMore prose.\n"
+
+
+UNSAFE_OK = {"Cargo.toml": ROOT_TOML, "crates/a/Cargo.toml": CRATE_TOML, "AGENTS.md": agents()}
 
 
 def lines(n):
@@ -421,6 +432,222 @@ class SizeWrapper(unittest.TestCase):
     def test_init_is_for_the_size_mode_only(self):
         rc, _ = self.run_size(SMALL, extra=("--init",), mode="kinds")
         self.assertEqual(rc, 2)
+
+
+def opt_ins(text):
+    return arch.find_opt_ins(text)
+
+
+class UnsafeSites(unittest.TestCase):
+    def test_outer_and_inner_attributes_are_sites_with_their_line(self):
+        text = "// SAFETY: a\n#![allow(unsafe_code)]\nfn a() {}\n\n// SAFETY: b\n#[allow(unsafe_code)]\nfn b() {}\n"
+        self.assertEqual(opt_ins(text), [(2, True), (6, True)])
+
+    def test_the_safety_comment_may_trail_the_attribute_or_sit_within_three_lines(self):
+        self.assertEqual(opt_ins("#[allow(unsafe_code)] // SAFETY: why\nfn a() {}\n"), [(1, True)])
+        self.assertEqual(opt_ins("// SAFETY: why\n//\n//\n#[allow(unsafe_code)]\nfn a() {}\n"), [(4, True)])
+        self.assertEqual(opt_ins("#[allow(unsafe_code)]\n// SAFETY: why\nfn a() {}\n"), [(1, True)])
+
+    def test_a_safety_comment_four_lines_away_or_a_bare_word_does_not_count(self):
+        far = "// SAFETY: why\n//\n//\n//\n#[allow(unsafe_code)]\nfn a() {}\n"
+        self.assertEqual(opt_ins(far), [(5, False)])
+        self.assertEqual(opt_ins("#[allow(unsafe_code)] // safety, trust me\nfn a() {}\n"), [(1, False)])
+        self.assertEqual(opt_ins("#[allow(unsafe_code)]\nfn a() {}\n"), [(1, False)])
+
+    def test_expect_cfg_attr_lists_and_multiline_attributes_are_sites(self):
+        for attr in ("#[expect(unsafe_code)]", "#[allow(dead_code, unsafe_code)]", '#[cfg_attr(unix, allow(unsafe_code))]',
+                     "#[allow(\n    unsafe_code,\n)]", "#[allow(unsafe_code, reason = \"ffi\")]"):
+            with self.subTest(attr=attr):
+                found = opt_ins(f"// SAFETY: ok\n{attr}\nfn a() {{}}\n")
+                self.assertEqual(found, [(2, True)])
+
+    def test_other_lints_deny_forbid_and_comments_are_not_sites(self):
+        for text in ("#[allow(dead_code)]\nfn a() {}\n", "#![deny(unsafe_code)]\n", "#![forbid(unsafe_code)]\n",
+                     "// #[allow(unsafe_code)] in a comment\n", "//! Use `#![allow(unsafe_code)]` to opt in.\n",
+                     "/// `#[allow(unsafe_code)]`\nfn a() {}\n", "#[allow(not_unsafe_code_at_all)]\nfn a() {}\n"):
+            with self.subTest(text=text):
+                self.assertEqual(opt_ins(text), [])
+
+    def test_a_multiline_attribute_is_one_site(self):
+        self.assertEqual(len(opt_ins("#[allow(\n    unsafe_code,\n    dead_code,\n)]\nfn a() {}\n")), 1)
+
+
+class UnsafeList(unittest.TestCase):
+    def parse(self, text):
+        found = []
+        listed = arch.parse_unsafe_list(text, report=lambda p, l, m: found.append((p, l, m)))
+        return listed, found
+
+    def test_bullets_between_the_markers_are_the_list_with_their_lines(self):
+        listed, found = self.parse(agents("crates/a/src/x.rs", "crates/b/tests/y.rs"))
+        self.assertEqual(found, [])
+        self.assertEqual(listed, {"crates/a/src/x.rs": 6, "crates/b/tests/y.rs": 7})
+
+    def test_an_empty_list_is_valid(self):
+        self.assertEqual(self.parse(agents()), ({}, []))
+
+    def test_the_text_after_the_path_is_a_description(self):
+        listed, found = self.parse(f"{arch.UNSAFE_START}\n* `crates/a/src/x.rs`: a, b (c)\n{arch.UNSAFE_END}\n")
+        self.assertEqual((list(listed), found), (["crates/a/src/x.rs"], []))
+
+    def test_a_line_that_is_not_a_bullet_with_a_path_is_reported_not_ignored(self):
+        for bad in ("crates/a/src/x.rs", "- crates/a/src/x.rs", "- `x.rs`", "- `crates/a/src/x.toml`", "prose here"):
+            with self.subTest(bad=bad):
+                listed, found = self.parse(f"{arch.UNSAFE_START}\n{bad}\n{arch.UNSAFE_END}\n")
+                self.assertEqual(listed, {})
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("not understood", found[0][2])
+                self.assertEqual(found[0][1], 2)
+
+    def test_a_duplicate_is_reported(self):
+        _, found = self.parse(agents("crates/a/src/x.rs", "crates/a/src/x.rs"))
+        self.assertEqual(len(found), 1)
+        self.assertIn("duplicate entry", found[0][2])
+
+    def test_markers_that_are_missing_repeated_or_reversed_fail_closed(self):
+        s, e = arch.UNSAFE_START, arch.UNSAFE_END
+        for text in ("", f"{s}\n", f"{e}\n", f"{e}\n{s}\n", f"{s}\n{s}\n{e}\n", f"{s}\n{e}\n{e}\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(RuntimeError):
+                    self.parse(text)
+
+    def test_a_marker_named_in_prose_is_not_a_marker(self):
+        listed, found = self.parse(f"Write `{arch.UNSAFE_START}` and `{arch.UNSAFE_END}` around it.\n\n" + agents("crates/a/src/x.rs"))
+        self.assertEqual((list(listed), found), (["crates/a/src/x.rs"], []))
+
+
+def unsafe_check(sites, listed):
+    found = []
+    arch.check_unsafe(sites, listed, report=lambda p, l, m: found.append((p, l, m)))
+    return found
+
+
+class UnsafeRules(unittest.TestCase):
+    def test_a_site_with_safety_in_a_listed_file_passes(self):
+        self.assertEqual(unsafe_check({"crates/a/src/x.rs": [(3, True), (9, True)]}, {"crates/a/src/x.rs": 5}), [])
+
+    def test_no_opt_ins_and_an_empty_list_pass(self):
+        self.assertEqual(unsafe_check({}, {}), [])
+
+    def test_a_file_with_an_opt_in_that_is_not_listed_fails_naming_file_and_line(self):
+        found = unsafe_check({"crates/a/src/new.rs": [(7, True)]}, {})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][:2], ("crates/a/src/new.rs", 7))
+        self.assertIn("not in the opt-in list", found[0][2])
+
+    def test_a_listed_file_without_an_opt_in_fails_naming_the_list_line(self):
+        found = unsafe_check({}, {"crates/a/src/old.rs": 12})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][:2], (arch.AGENTS_FILE, 12))
+        self.assertIn("holds no #[allow(unsafe_code)]", found[0][2])
+
+    def test_a_site_without_a_safety_comment_fails(self):
+        found = unsafe_check({"crates/a/src/x.rs": [(3, True), (9, False)]}, {"crates/a/src/x.rs": 5})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][:2], ("crates/a/src/x.rs", 9))
+        self.assertIn("SAFETY", found[0][2])
+
+    def test_the_lint_wiring_is_checked(self):
+        def lints(root, crates):
+            found = []
+            arch.check_lints(root, crates, report=lambda p, l, m: found.append((p, l, m)))
+            return found
+        self.assertEqual(lints(ROOT_TOML, {"crates/a/Cargo.toml": CRATE_TOML}), [])
+        ok_inline = '[package]\nname = "a"\n[lints] # inherit\nworkspace = true # D4\n[features]\n'
+        self.assertEqual(lints(ROOT_TOML + '[profile.release]\nopt-level = 3\n', {"c": ok_inline}), [])
+        for bad_root in ("[workspace]\n", '[workspace.lints.rust]\nunsafe_code = "warn"\n',
+                         '[workspace.lints.rust]\nfoo = 1\n[other]\nunsafe_code = "deny"\n', '[workspace.lints.clippy]\nunsafe_code = "deny"\n'):
+            with self.subTest(root=bad_root):
+                self.assertEqual(len(lints(bad_root, {})), 1)
+        for bad_crate in ('[package]\nname = "a"\n', '[lints]\nrust = {}\n', '[lints.rust]\nunsafe_code = "allow"\n',
+                          '[lints]\nworkspace = false\n', '[package]\nname="a"\n[dependencies]\nworkspace = true\n'):
+            with self.subTest(crate=bad_crate):
+                found = lints(ROOT_TOML, {"crates/a/Cargo.toml": bad_crate})
+                self.assertEqual(len(found), 1, found)
+                self.assertEqual(found[0][0], "crates/a/Cargo.toml")
+
+
+class UnsafeWrapper(unittest.TestCase):
+    meta = metadata([pkg("a", "core")])
+
+    def run_unsafe(self, files):
+        return Wrapper().check(self.meta, mode="unsafe", files=files)
+
+    def test_the_list_equal_to_the_code_passes(self):
+        files = {**SMALL, **UNSAFE_OK, "AGENTS.md": agents("crates/a/src/ffi.rs"),
+                 "crates/a/src/ffi.rs": "// SAFETY: ok\n#![allow(unsafe_code)]\n"}
+        rc, out = self.run_unsafe(files)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("arch-check (unsafe): ok", out)
+        self.assertIn("1 opt-ins in 1 files", out)
+
+    def test_an_opt_in_that_the_list_does_not_name_fails_with_exit_1(self):
+        rc, out = self.run_unsafe({**SMALL, **UNSAFE_OK, "crates/a/src/ffi.rs": "// SAFETY: ok\n#![allow(unsafe_code)]\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("crates/a/src/ffi.rs:2", out)
+        self.assertIn("not in the opt-in list", out)
+
+    def test_a_listed_file_that_lost_its_opt_in_fails_with_exit_1(self):
+        rc, out = self.run_unsafe({**SMALL, **UNSAFE_OK, "AGENTS.md": agents("crates/a/src/ffi.rs"), "crates/a/src/ffi.rs": "fn a() {}\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("AGENTS.md:6", out)
+        self.assertIn("remove the entry", out)
+
+    def test_an_opt_in_in_tests_examples_and_a_build_script_is_found(self):
+        site = "// SAFETY: ok\n#![allow(unsafe_code)]\n"
+        files = {**SMALL, **UNSAFE_OK, "crates/a/tests/t.rs": site, "crates/a/examples/e.rs": site, "crates/a/build.rs": site}
+        rc, out = self.run_unsafe(files)
+        self.assertEqual(rc, 1, out)
+        for name in ("tests/t.rs", "examples/e.rs", "build.rs"):
+            self.assertIn(f"crates/a/{name}:2", out)
+
+    def test_a_target_directory_is_not_scanned(self):
+        rc, out = self.run_unsafe({**SMALL, **UNSAFE_OK, "crates/a/target/debug/build/x.rs": "#![allow(unsafe_code)]\n"})
+        self.assertEqual(rc, 0, out)
+
+    def test_a_site_without_safety_exits_1(self):
+        files = {**SMALL, **UNSAFE_OK, "AGENTS.md": agents("crates/a/src/ffi.rs"), "crates/a/src/ffi.rs": "#![allow(unsafe_code)]\n"}
+        rc, out = self.run_unsafe(files)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("without a `SAFETY:` comment", out)
+
+    def test_a_crate_without_the_lints_table_exits_1(self):
+        rc, out = self.run_unsafe({**SMALL, **UNSAFE_OK, "crates/a/Cargo.toml": '[package]\nname = "a"\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("crates/a/Cargo.toml", out)
+        self.assertIn("workspace = true", out)
+
+    def test_a_missing_agents_file_or_broken_markers_fail_closed(self):
+        files = {**SMALL, **UNSAFE_OK}
+        del files["AGENTS.md"]
+        rc, out = self.run_unsafe(files)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NOT passed", out)
+        rc, out = self.run_unsafe({**SMALL, **UNSAFE_OK, "AGENTS.md": "# no markers\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn(": ok", out)
+
+    def test_a_missing_root_manifest_or_a_non_utf8_source_fails_closed(self):
+        files = {**SMALL, **UNSAFE_OK}
+        del files["Cargo.toml"]
+        self.assertEqual(self.run_unsafe(files)[0], 2)
+        self.assertEqual(self.run_unsafe({**SMALL, **UNSAFE_OK, "crates/a/src/bad.rs": b"\xff\xfe"})[0], 2)
+
+    def test_init_is_for_the_size_mode_only(self):
+        rc, _ = Wrapper().check(self.meta, mode="unsafe", files={**SMALL, **UNSAFE_OK}, extra=("--init",))
+        self.assertEqual(rc, 2)
+
+
+class RepositoryList(unittest.TestCase):
+    def test_the_committed_agents_list_parses_and_names_real_files(self):
+        root = os.path.dirname(HERE)
+        with open(os.path.join(root, arch.AGENTS_FILE), encoding="utf-8") as f:
+            found = []
+            listed = arch.parse_unsafe_list(f.read(), report=lambda p, l, m: found.append((p, l, m)))
+        self.assertEqual(found, [])
+        self.assertTrue(listed, "the committed opt-in list is empty")
+        for name in listed:
+            self.assertTrue(os.path.isfile(os.path.join(root, name)), name)
 
 
 if __name__ == "__main__":
