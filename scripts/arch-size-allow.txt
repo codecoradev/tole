@@ -41,7 +41,7 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 3367
+file crates/tole-cli/src/serve.rs 1112
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
