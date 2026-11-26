@@ -291,19 +291,19 @@ enum Command {
         goal: String,
 
         /// Total provider steps across all chained turns (from the
-        /// durable usage ledger). Default: budget tier (48; 96 with
-        /// --trust internal).
+        /// durable usage ledger). Default: 160 (config `[mission]
+        /// max_steps`).
         #[arg(long)]
         max_steps: Option<u64>,
 
-        /// Wall-clock cap in minutes. Default: budget tier (15; 30 with
-        /// --trust internal).
+        /// Wall-clock cap in minutes. Default: 60 (config `[mission]
+        /// max_minutes`).
         #[arg(long)]
         max_minutes: Option<u64>,
 
         /// Total token ceiling (prompt + completion, from the usage
-        /// ledger). Default: budget tier (200k; 500k with
-        /// --trust internal).
+        /// ledger). Default: 4,000,000 (config `[mission]
+        /// max_tokens`).
         #[arg(long)]
         max_tokens: Option<u64>,
 
