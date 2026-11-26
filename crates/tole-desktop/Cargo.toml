@@ -52,7 +52,7 @@ tole-client = { path = "../tole-client" }
 serde_json = { workspace = true }
 gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", optional = true, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-component = { version = "=0.9.1", optional = true }
+gpui-component = { version = "=0.10.0", optional = true }
 
 # The local serve supervisor (macOS, Linux) needs flock, kill and the peer
 # credentials of a socket, which std does not expose. Already a dependency of
