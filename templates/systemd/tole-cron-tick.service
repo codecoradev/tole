@@ -1,8 +1,14 @@
 # TEMPLATE for hosts WITH systemd (not installed on the fleet container; see docs/fleet-daemon.md).
-# One scheduler pass; fired by tole-cron-tick.timer. The wrapper holds the overlap lock.
+# Linux only. One scheduler pass; fired by tole-cron-tick.timer. The wrapper holds the overlap lock.
+# ExecStart assumes a checkout of this repository at ~/tole. After `cargo install tole-cli`
+# there is no checkout: copy scripts/fleet/tole-cron-tick somewhere stable (e.g. ~/.local/bin)
+# and point ExecStart at it. As with tole-serve.service, enable lingering for a user unit:
+# loginctl enable-linger $USER
 [Unit]
 Description=tole cron tick (one scheduler pass)
 
 [Service]
 Type=oneshot
+Environment=TOLE_BIN=%h/.cargo/bin/tole
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/tole/scripts/fleet/tole-cron-tick

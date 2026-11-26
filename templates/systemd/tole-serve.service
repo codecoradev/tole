@@ -1,12 +1,19 @@
 # TEMPLATE for hosts WITH systemd (not installed on the fleet container; see docs/fleet-daemon.md).
-# Install as a user unit: cp to ~/.config/systemd/user/ && systemctl --user enable --now tole-serve
-# The token file is created by `scripts/fleet/tole-serve-launcher start` once, or by hand (mode 0600).
+# Linux only. Install as a user unit: cp to ~/.config/systemd/user/ && systemctl --user enable --now tole-serve
+# A user unit stops at logout unless lingering is on: loginctl enable-linger $USER
+# ExecStartPre below creates the sessions dir and the token (mode 0600) when missing; no
+# launcher script is needed. Extra flags (--cron, --transport mcp) go at the end of ExecStart.
 [Unit]
 Description=tole serve (loopback, token-authenticated)
 After=network.target
 
 [Service]
 Type=simple
+UMask=0077
+# A user unit has a minimal PATH; tole spawns git and other tools from it.
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/mkdir -p %h/.local/state/tole-fleet/sessions
+ExecStartPre=/bin/sh -c 'f=%h/.local/state/tole-fleet/token; [ -s "$$f" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d "[:space:]" >"$$f"; chmod 600 "$$f"'
 ExecStart=%h/.cargo/bin/tole serve --port 7801 --bind 127.0.0.1 --sessions-dir %h/.local/state/tole-fleet/sessions --token-file %h/.local/state/tole-fleet/token
 Restart=on-failure
 RestartSec=5

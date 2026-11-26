@@ -2,9 +2,12 @@
 # Restart the `tole serve` daemon if it died. Safe to call repeatedly from any
 # scheduler (Hermes cron, cron(8), a systemd timer): one log line per call.
 # Uses the same environment as tole-serve-launcher (TOLE_FLEET_DIR, ..._PORT, ...).
+# A restart reuses the args the last `tole-serve-launcher start -- ...` saved
+# ($TOLE_FLEET_DIR/serve.args), so `--cron` / `--transport mcp` survive a crash.
+# A daemon stopped with `tole-serve-launcher stop` stays down until the next `start`.
 #
-# Usage: tole-watchdog [-- extra `tole serve` args for a restart]
-# Exit codes: 0 alive or restarted, 1 restart failed.
+# Usage: tole-watchdog [-- extra `tole serve` args, saved like `start -- ...` on a restart]
+# Exit codes: 0 alive, restarted or disabled by stop, 1 restart failed.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,12 +18,21 @@ WATCHDOG_LOG="$DIR/watchdog.log"
 
 say() { printf '%s tole-watchdog: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$WATCHDOG_LOG"; }
 
-[[ "${1:-}" == "--" ]] && shift
+have_args=0
+if [[ "${1:-}" == "--" ]]; then have_args=1; shift; fi
+# AUTO: the launcher re-checks the `disabled` marker under its lock.
+export TOLE_FLEET_AUTO=1
+start=("$launcher" start)
+(( have_args )) && start+=(-- "$@")
 
 if "$launcher" status >/dev/null 2>&1; then
   say "alive"
-elif "$launcher" start -- "$@" >/dev/null; then
+elif [[ -e "$DIR/disabled" ]]; then
+  say "disabled by stop, not restarting (run tole-serve-launcher start)"
+elif "${start[@]}" >/dev/null && "$launcher" status >/dev/null 2>&1; then
   say "was dead, restarted pid $(cat "$DIR/serve.pid")"
+elif [[ -e "$DIR/disabled" ]]; then
+  say "disabled by stop, not restarting (run tole-serve-launcher start)"
 else
   say "was dead, restart FAILED (see $DIR/serve.log)"
   exit 1
