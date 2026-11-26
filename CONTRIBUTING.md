@@ -16,7 +16,7 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
   warnings` → `cargo test --workspace`. CI enforces the same set, plus
-  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250) and
+  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251) and
   its self-test `python3 scripts/test_arch_lint.py`, which run as steps of the
   `Check` job; run the self-test when you touch `scripts/arch-*`. A change to
   `crates/tole-desktop` or `crates/tole-desktop-model` also runs

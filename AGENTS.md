@@ -104,7 +104,7 @@ continuity, infra facts.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250); exits 1 on a crate without a kind, a dependency that points upward, or a UI toolkit below a ui or bin crate
+scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250) and the size guard (#1251); exits 1 on a crate without a kind, a dependency that points upward, a UI toolkit below a ui or bin crate, a file over 500 lines or a crate src/ over 50,000 that is not in scripts/arch-size-allow.txt, or an allow-list entry that no longer matches
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
 # only when you touch scripts/arch-* (#1249):
 python3 scripts/test_arch_lint.py # self-test of the architecture guardrail (rules and fail-closed paths)
@@ -224,6 +224,13 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   three and layering inside `tole-core` and `tole-cli` stays a test
   (`cargo test -p tole-core --test layering`, #752); the matrix is the crate
   level above it. See "Crate kinds" in [docs/architecture.md](docs/architecture.md).
+- Size guard (standard rule D1, #1251): `scripts/arch-check.sh size` fails a
+  `.rs` file over 500 lines (`src/`, `tests/`, `examples/`, `benches/`,
+  `build.rs`) and a crate `src/` over 50,000 lines that is not in
+  `scripts/arch-size-allow.txt`. The list can only go down: never add or raise
+  an entry; when you split a file, lower or remove its entry in the same PR (an
+  entry that no longer matches the measured size fails the check). The desktop
+  crates keep their own, stricter script.
 - Desktop crates are modular monoliths (owner rule D1; the crate cap is 50,000
   lines, the file cap 500): one small module per page or capability, shared
   pieces (text cleaning, badges, caps, strings, tokens) in their own reusable
