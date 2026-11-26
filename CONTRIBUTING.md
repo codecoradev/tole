@@ -16,7 +16,7 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
   warnings` → `cargo test --workspace`. CI enforces the same set, plus
-  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251) and
+  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252) and
   its self-test `python3 scripts/test_arch_lint.py`, which run as steps of the
   `Check` job; run the self-test when you touch `scripts/arch-*`. A change to
   `crates/tole-desktop` or `crates/tole-desktop-model` also runs
@@ -30,6 +30,14 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   A desktop UI change is also reviewed on the rendered window:
   `scripts/desktop-render.sh <dir>` (offscreen, one PNG per screen and state;
   not a gate, see the same README).
+- **`unsafe`** (#1252): `unsafe_code` is denied for the whole workspace, so a
+  new `unsafe` block fails `cargo clippy` and `cargo build` outside a module
+  that opted in. Prefer a safe std API or an existing wrapper. If libc is the
+  only way, put one `#[allow(unsafe_code)]` with a `// SAFETY:` comment on the
+  named module or function that wraps the call (a test helper: on the test
+  function or module), keep a `// SAFETY:` comment on each `unsafe` block, and
+  add the file to the opt-in list in `AGENTS.md` section 6 in the same change;
+  `scripts/arch-check.sh unsafe` fails when the list and the code differ.
 - **Test directories** (#781): a test that needs a scratch directory uses
   `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
   and the `crate::test_dir` module in unit tests), never a hand-built
