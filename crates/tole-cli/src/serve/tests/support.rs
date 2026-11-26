@@ -2,6 +2,7 @@
 //! helpers that open a session in-process.
 
 use crate::serve::*;
+use tole_cli::session_host::Sessions;
 
 pub(super) fn test_state(root: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> State {
     // The entrypoint fixes the process's skills choice before any
