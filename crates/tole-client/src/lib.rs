@@ -41,12 +41,15 @@
 //! A [`Transport`] opens the byte connection; HTTP and SSE framing sit above
 //! it. Today: HTTP over TCP ([`TcpTransport`]), plain `http://` only to
 //! loopback, or to a private-network address or host when the caller sets
-//! `trusted_private_network` (a public IP is never accepted). On macOS and
+//! `trusted_private_network` (a public IP is never accepted); and HTTPS over
+//! TCP ([`TlsTransport`], #1071) for a remote serve behind a TLS reverse
+//! proxy, to any host, with the certificate always verified. On macOS and
 //! Linux a Unix socket (`UnixTransport`, for `tole serve --socket`) is the
 //! local transport of the desktop; it refuses a socket in a directory that is
-//! not owner-only. HTTPS (#1044) and the Windows named pipe (#1051) are the
-//! same trait; see [`transport`]. A transport is chosen when the [`Client`] is
-//! built; nothing else in it depends on which one:
+//! not owner-only. The Windows named pipe (#1051) is the same trait; see
+//! [`transport`]. A transport is chosen when the [`Client`] is built; nothing
+//! else in it depends on which one. [`Client::connect`] picks plain HTTP or
+//! HTTPS from the scheme of the url:
 //!
 //! ```no_run
 //! # #[cfg(unix)] {
@@ -58,10 +61,37 @@
 //! # Ok::<(), tole_client::Error>(())
 //! ```
 //!
+//! # HTTPS
+//!
+//! `tole serve` does not speak TLS; a remote one is reached through a reverse
+//! proxy that terminates it (`docs/mobile-control.md`). The client verifies the
+//! proxy's certificate against the bundled public roots, and there is no way to
+//! turn that off: a certificate that does not verify is [`Error::Tls`], raised
+//! before the token is written. A server with a private CA or a self-signed
+//! certificate is reached by trusting exactly that certificate, which replaces
+//! the public roots for the connection:
+//!
+//! ```no_run
+//! use tole_client::{Client, TlsTransport};
+//!
+//! let ca = std::fs::read("serve-ca.pem")?;
+//! let transport = TlsTransport::new("https://tole.example.com")?.with_ca_pem(&ca)?;
+//! let client = Client::new(transport).with_token("token");
+//! println!("{:?}", client.health()?);
+//! // Or, with the public roots: Client::connect_https("https://tole.example.com", Some(token))
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Redirects are never followed (a 3xx is an [`Error::Status`]), so the token
+//! cannot be carried to another host.
+//!
 //! # Secrets
 //!
-//! The bearer token is sent in the `Authorization` header only. It is not in
-//! `Debug` output, errors or any log (this crate does not log).
+//! The bearer token is sent in the `Authorization` header only: never in a url
+//! (a url with a user, path or query is refused, without echoing it), never on a
+//! command line. It is not in `Debug` output, errors or any log (this crate does
+//! not log), and over HTTPS it is written only after the handshake verified the
+//! server.
 //!
 //! # JSON Schema
 //!
@@ -87,6 +117,7 @@ mod resume;
 #[cfg(test)]
 mod schema;
 mod sse;
+mod tls;
 pub mod transport;
 mod types;
 #[cfg(unix)]
@@ -97,6 +128,7 @@ pub use error::{Error, Result};
 pub use http::ResponseBody;
 pub use resume::{ReconnectPolicy, ResumingStream, StreamItem};
 pub use sse::{Event, Frame, FrameReader, Ready, SseItem, SseParser};
+pub use tls::TlsTransport;
 pub use transport::{Connection, TcpTransport, Transport};
 pub use types::*;
 #[cfg(unix)]

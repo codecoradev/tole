@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 # Not published yet: publish.yml does not list it and the protocol surface is partial (#1040).
 publish = false
-# std only below the JSON layer: no async runtime, no HTTP stack, no TLS yet.
+# std only below the JSON layer: no async runtime, no HTTP stack; the one TLS
+# stack is rustls (see the HTTPS transport below).
 rust-version = "1.89"
 
 # Crate kind of the CodeCora modular + thin-UI standard (#1250); checked by
@@ -26,6 +27,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# The HTTPS transport (#1071), blocking, no async runtime. rustls with the
+# `ring` provider only (no aws-lc, no OpenSSL: deny.toml bans both), the same
+# configuration tole-core's `mcp` feature uses, plus `tls12` for proxies that
+# offer nothing newer. webpki-roots is the bundled Mozilla root list
+# (CDLA-Permissive-2.0, already covered by the deny.toml exception); rustls
+# re-exports rustls-pki-types, so it is not named here. All three are already in
+# Cargo.lock (ureq, rmcp): no new package. Nothing of tole-core or tole-cli
+# depends on tole-client (tole-cli only as a dev-dependency, for its tests), so
+# their default and published builds gain none of it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
 # The local socket transport (macOS, Linux) needs the caller's effective uid
 # (geteuid), which std does not expose. Already a dependency of tole-core and
 # tole-cli, so no new package enters the tree.
@@ -33,6 +46,9 @@ thiserror = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+# Test-only: signs the throwaway certificates the HTTPS tests generate
+# (tests/support/tls_pki.rs). Already a dependency of tole-cli.
+ring = "0.17"
 # Test-only: derives the committed JSON Schema (src/schema.rs, #1068).
 # Already in the lockfile through rmcp; never a normal dependency, so no
 # build of a published crate reaches it through this crate.

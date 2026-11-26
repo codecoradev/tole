@@ -6,11 +6,12 @@
 //!
 //! # Transports
 //!
-//! [`TcpTransport`] is HTTP over TCP. On Unix, `UnixTransport` (in the crate
-//! root) is HTTP over the local socket of `tole serve --socket` (#1067). Each
-//! is a small type behind this trait and the client does not know which it
-//! has. A Windows named pipe (#1051) and an HTTPS transport over a TLS stream
-//! (#1044; no TLS stack is a dependency yet) are the same shape.
+//! [`TcpTransport`] is plain HTTP over TCP (loopback, or a trusted private
+//! network). [`TlsTransport`](crate::TlsTransport) is HTTPS over TCP, for a
+//! remote serve behind a TLS reverse proxy (#1071). On Unix, `UnixTransport`
+//! (in the crate root) is HTTP over the local socket of `tole serve --socket`
+//! (#1067). Each is a small type behind this trait and the client does not
+//! know which it has. A Windows named pipe (#1051) is the same shape.
 
 use crate::error::{Error, Result};
 use std::io::{self, Read, Write};
@@ -57,8 +58,8 @@ pub struct TcpTransport {
 
 impl TcpTransport {
     /// `url` is `http://host[:port]` (no userinfo, path, query or fragment: the
-    /// serve face is root-mounted). `https://` is refused for now
-    /// ([`Error::HttpsUnsupported`]).
+    /// serve face is root-mounted). `https://` is refused here
+    /// ([`Error::InvalidUrl`]): it is [`TlsTransport`](crate::TlsTransport)'s.
     ///
     /// The host must be an IP literal (IPv6 in brackets, no scope id) or a DNS
     /// name; shorthand numeric forms (`134744072`, `0x08080808`, `8.8.8`),
@@ -74,65 +75,96 @@ impl TcpTransport {
     /// address is refused too. Without the flag only loopback addresses are
     /// connected to (`localhost` included).
     pub fn new(url: &str, trusted_private_network: bool) -> Result<Self> {
-        let bad = |why: &str| Error::InvalidUrl(why.to_string());
-        let rest = if let Some(r) = url.strip_prefix("http://") {
-            r
-        } else if url.starts_with("https://") {
-            return Err(Error::HttpsUnsupported);
-        } else {
-            return Err(bad("expected http://host[:port]"));
-        };
-        let authority = rest.strip_suffix('/').unwrap_or(rest);
-        if authority.is_empty() || authority.contains(['/', '?', '#', '@', ' ']) {
-            return Err(bad("expected only host[:port] after http://"));
+        if url.starts_with("https://") {
+            return Err(Error::InvalidUrl(
+                "https:// is not plain http: use TlsTransport, or Client::connect, which picks \
+                 the transport from the scheme"
+                    .into(),
+            ));
         }
-        let (host, port) = match authority.strip_prefix('[') {
-            Some(v6) => {
-                let (h, tail) = v6
-                    .split_once(']')
-                    .ok_or_else(|| bad("unclosed [ in host"))?;
-                match tail {
-                    "" => (h, 80),
-                    t => (
-                        h,
-                        parse_port(t.strip_prefix(':').ok_or_else(|| bad("bad port"))?)?,
-                    ),
-                }
-            }
-            None => match authority.rsplit_once(':') {
-                Some((h, p)) => (h, parse_port(p)?),
-                None => (authority, 80),
-            },
-        };
-        if host.is_empty() {
-            return Err(bad("empty host"));
-        }
-        // Only forms the connect-time policy can reason about: a strict IP
-        // literal, or a DNS name. Anything else (a scope id, `0x08080808`,
-        // `8.8.8`) is left to the system resolver's looser syntax, which can
-        // turn it into a public IP.
-        let ip = host.parse::<IpAddr>().ok();
-        let bracketed = authority.starts_with('[');
-        let host_ok = match ip {
-            Some(ip) => ip.is_ipv6() == bracketed,
-            None => !bracketed && is_dns_name(host),
-        };
-        if !host_ok {
-            return Err(bad("the host must be an IP address or a DNS name"));
-        }
-        if !is_loopback(host) {
+        let Authority { host, port, ip } = parse_authority(url, "http", 80)?;
+        if !is_loopback(&host) {
             let literal_ok = ip.is_none_or(is_private_or_local);
             if !trusted_private_network || !literal_ok {
-                return Err(Error::InsecureTransport(host.to_string()));
+                return Err(Error::InsecureTransport(host));
             }
         }
         Ok(Self {
-            host: host.to_string(),
+            host,
             port,
             trusted: trusted_private_network,
             connect_timeout: Duration::from_secs(10),
         })
     }
+}
+
+/// The host and port of a validated server url.
+pub(crate) struct Authority {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    /// The host when it is an IP literal.
+    pub(crate) ip: Option<IpAddr>,
+}
+
+/// Parse `<scheme>://host[:port]` (no userinfo, path, query or fragment: the
+/// serve face is root-mounted; a trailing `/` is allowed). The host must be an
+/// IP literal (IPv6 in brackets, no scope id) or a DNS name; shorthand numeric
+/// forms (`134744072`, `0x08080808`, `8.8.8`), which the system resolver would
+/// turn into an IP, are refused. Shared by the plain and the TLS transport so
+/// both accept exactly the same addresses.
+pub(crate) fn parse_authority(url: &str, scheme: &str, default_port: u16) -> Result<Authority> {
+    let bad = |why: &str| Error::InvalidUrl(why.to_string());
+    let prefix = format!("{scheme}://");
+    let Some(rest) = url.strip_prefix(prefix.as_str()) else {
+        return Err(Error::InvalidUrl(format!(
+            "expected {scheme}://host[:port]"
+        )));
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', ' ']) {
+        return Err(Error::InvalidUrl(format!(
+            "expected only host[:port] after {scheme}://"
+        )));
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (h, tail) = v6
+                .split_once(']')
+                .ok_or_else(|| bad("unclosed [ in host"))?;
+            match tail {
+                "" => (h, default_port),
+                t => (
+                    h,
+                    parse_port(t.strip_prefix(':').ok_or_else(|| bad("bad port"))?)?,
+                ),
+            }
+        }
+        None => match authority.rsplit_once(':') {
+            Some((h, p)) => (h, parse_port(p)?),
+            None => (authority, default_port),
+        },
+    };
+    if host.is_empty() {
+        return Err(bad("empty host"));
+    }
+    // Only forms the connect-time policy can reason about: a strict IP
+    // literal, or a DNS name. Anything else (a scope id, `0x08080808`,
+    // `8.8.8`) is left to the system resolver's looser syntax, which can
+    // turn it into a public IP.
+    let ip = host.parse::<IpAddr>().ok();
+    let bracketed = authority.starts_with('[');
+    let host_ok = match ip {
+        Some(ip) => ip.is_ipv6() == bracketed,
+        None => !bracketed && is_dns_name(host),
+    };
+    if !host_ok {
+        return Err(bad("the host must be an IP address or a DNS name"));
+    }
+    Ok(Authority {
+        host: host.to_string(),
+        port,
+        ip,
+    })
 }
 
 /// 1 to 65535, ASCII digits only (no sign, no port 0: it cannot be connected to).
@@ -212,9 +244,29 @@ fn allowed_addrs(resolved: Vec<SocketAddr>, trusted: bool, host: &str) -> Result
 }
 
 /// What is left of the connect budget, or `None` when it is spent.
-fn connect_budget(started: Instant, total: Duration) -> Option<Duration> {
+pub(crate) fn connect_budget(started: Instant, total: Duration) -> Option<Duration> {
     let left = total.saturating_sub(started.elapsed());
     (!left.is_zero()).then_some(left)
+}
+
+/// Try `addrs` one after the other within ONE connect budget of `total`,
+/// counted from `started` (not per address). Failures are [`Error::Connect`].
+pub(crate) fn dial(addrs: &[SocketAddr], started: Instant, total: Duration) -> Result<TcpStream> {
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address resolved");
+    for addr in addrs {
+        let Some(left) = connect_budget(started, total) else {
+            last = io::Error::new(io::ErrorKind::TimedOut, "the connect budget is spent");
+            break;
+        };
+        match TcpStream::connect_timeout(addr, left) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(Error::Connect(last))
 }
 
 impl Transport for TcpTransport {
@@ -229,21 +281,8 @@ impl Transport for TcpTransport {
             .map_err(Error::Connect)?
             .collect();
         let started = Instant::now();
-        let mut last = io::Error::new(io::ErrorKind::NotFound, "no address resolved");
-        for addr in allowed_addrs(resolved, self.trusted, &self.host)? {
-            let Some(left) = connect_budget(started, self.connect_timeout) else {
-                last = io::Error::new(io::ErrorKind::TimedOut, "the connect budget is spent");
-                break;
-            };
-            match TcpStream::connect_timeout(&addr, left) {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    return Ok(Box::new(s));
-                }
-                Err(e) => last = e,
-            }
-        }
-        Err(Error::Connect(last))
+        let addrs = allowed_addrs(resolved, self.trusted, &self.host)?;
+        Ok(Box::new(dial(&addrs, started, self.connect_timeout)?))
     }
 
     fn host_header(&self) -> String {
@@ -378,9 +417,11 @@ mod tests {
 
     #[test]
     fn https_and_malformed_urls_are_refused() {
+        // https is the TLS transport's: this one never speaks it, even to
+        // loopback or when trusted.
         assert!(matches!(
             TcpTransport::new("https://127.0.0.1", true),
-            Err(Error::HttpsUnsupported)
+            Err(Error::InvalidUrl(_))
         ));
         for bad in [
             "127.0.0.1:80",

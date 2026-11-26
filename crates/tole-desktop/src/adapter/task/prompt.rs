@@ -59,7 +59,7 @@ pub fn may_have_been_received(e: &Error) -> bool {
         | Error::InsecureTransport(_)
         | Error::InsecureSocket { .. }
         | Error::InvalidConfig(_)
-        | Error::HttpsUnsupported
+        | Error::Tls(_)
         | Error::ReconnectExhausted(_) => false,
     }
 }

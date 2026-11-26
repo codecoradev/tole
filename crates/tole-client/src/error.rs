@@ -16,7 +16,7 @@ pub enum Error {
     /// `From<io::Error>` conversion.
     #[error("i/o error: {0}")]
     Io(std::io::Error),
-    /// The server url is not `http://host[:port]`.
+    /// The server url is not `http://host[:port]` or `https://host[:port]`.
     #[error("invalid server url: {0}")]
     InvalidUrl(String),
     /// Plain http to a host that policy does not allow: not loopback and not
@@ -37,9 +37,14 @@ pub enum Error {
     /// A setting the client cannot honor (a zero timeout). Not transient.
     #[error("invalid client setting: {0}")]
     InvalidConfig(String),
-    /// `https://` needs a TLS transport, which this crate does not have yet.
-    #[error("https is not supported yet: no TLS transport is built into tole-client")]
-    HttpsUnsupported,
+    /// The TLS handshake of an `https://` server failed, most often because
+    /// its certificate does not verify (unknown issuer, expired, not for this
+    /// host name). Nothing of the request, the token included, was sent, and
+    /// there is no way to carry on without verification. Not transient: the
+    /// same server answers the same way. The text is rustls's reason; it never
+    /// holds the token.
+    #[error("{0}")]
+    Tls(String),
     /// The server answered a non-2xx status. `message` is the server's
     /// `{"error": ...}` text when it sent one.
     #[error("server answered {status}: {message}")]
@@ -133,6 +138,7 @@ mod tests {
         assert!(!Error::Protocol("x".into()).is_transient());
         assert!(!Error::InvalidConfig("x".into()).is_transient());
         assert!(!Error::InsecureTransport("x".into()).is_transient());
+        assert!(!Error::Tls("x".into()).is_transient());
         let socket = Error::InsecureSocket {
             path: "/p".into(),
             reason: "r".into(),
