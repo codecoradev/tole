@@ -195,6 +195,7 @@ fn a_spent_mission_budget_is_reported_before_the_turn_cap() {
 /// settles a turn as `BudgetExhausted`, but it is not the step cap: the mission
 /// stops as before (`stopped`), is not nudged to stop gathering information and
 /// does not count toward `exhausted_turn_cap`.
+#[cfg(feature = "shell-tools")] // `job_poll` is a shell tool: the bare profile has no such tool to call
 #[test]
 fn the_poll_budget_is_not_a_step_cap() {
     let r = run_mission("poll", usize::MAX, true, 500);
