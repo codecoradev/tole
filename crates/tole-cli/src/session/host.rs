@@ -945,7 +945,6 @@ pub fn run_session_turn_with_end(
         profile,
         ..
     } = state;
-    let mut final_text: Option<String> = None;
 
     // Memory loop, pre-turn (first prompt of a fresh session only). An
     // image-only prompt (#559) has no text to recall on.
@@ -961,6 +960,7 @@ pub fn run_session_turn_with_end(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    crate::session::interrupted::refuse(&*storage).map_err(TurnError::before_turn)?;
     // Model routing (#586, #945): once, at the first prompt of a NEW session.
     if !*first_prompt_done.lock().expect("fpd lock") && model.is_none() {
         route_first_prompt(&mut *storage, profile.as_deref(), prompt, &registry)
@@ -993,27 +993,7 @@ pub fn run_session_turn_with_end(
     // The turn is over: the footer's last-known values are these (#573).
     refresher.refresh_status(&*storage);
 
-    if let tole_core::turn::TurnOutcome::Final { text, .. } = &outcome {
-        final_text = Some(text.clone());
-    }
-    log_outcome(&outcome);
-    let turn_end =
-        TurnEnd::from_outcome(&outcome, last_seq(&*storage)).map(|e| e.with_settle(settle));
-    let stop = stop_reason(&outcome).map_err(|message| TurnError {
-        message,
-        end: turn_end,
-    })?;
-    let approval_tool = match &outcome {
-        tole_core::turn::TurnOutcome::ApprovalRequired { name } => Some(name.clone()),
-        _ => None,
-    };
-    Ok(TurnResult {
-        stop,
-        text: final_text,
-        approval_tool,
-        queue_mark,
-        turn_end,
-    })
+    finish(&outcome, &*storage, settle, queue_mark)
 }
 
 /// Approvals-only recovery over the serve face (issue #200): no new
@@ -1077,28 +1057,7 @@ pub fn resume_session_turn_with_end(
     let outcome = crate::turn_runner::resume_turn_on(&mut *storage, &plan)
         .map_err(|e| run_error(e, &*storage, settle))?;
     refresher.refresh_status(&*storage);
-    let final_text = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
-        _ => None,
-    };
-    log_outcome(&outcome);
-    let turn_end =
-        TurnEnd::from_outcome(&outcome, last_seq(&*storage)).map(|e| e.with_settle(settle));
-    let stop = stop_reason(&outcome).map_err(|message| TurnError {
-        message,
-        end: turn_end,
-    })?;
-    let approval_tool = match &outcome {
-        tole_core::turn::TurnOutcome::ApprovalRequired { name } => Some(name.clone()),
-        _ => None,
-    };
-    Ok(TurnResult {
-        stop,
-        text: final_text,
-        approval_tool,
-        queue_mark,
-        turn_end,
-    })
+    finish(&outcome, &*storage, settle, queue_mark)
 }
 
 /// A runner error as a failed turn: the code says which part failed, the text
@@ -1110,6 +1069,35 @@ fn run_error(e: crate::turn_runner::TurnRunError, storage: &dyn Storage, settle:
         E::Storage(_) => TurnCode::Storage,
     };
     TurnError::failed(e.into_message(), code, storage, settle)
+}
+
+/// What both turn hosts do with an outcome: the operator log line, the typed
+/// end (#962), the stop reason and the approval tool of an approval stop.
+fn finish(
+    outcome: &tole_core::turn::TurnOutcome,
+    storage: &dyn Storage,
+    settle: u64,
+    queue_mark: Option<u64>,
+) -> Result<TurnResult, TurnError> {
+    use tole_core::turn::TurnOutcome as O;
+    log_outcome(outcome);
+    let turn_end = TurnEnd::from_outcome(outcome, last_seq(storage)).map(|e| e.with_settle(settle));
+    let stop = stop_reason(outcome).map_err(|message| TurnError {
+        message,
+        end: turn_end,
+    })?;
+    let (text, approval_tool) = match outcome {
+        O::Final { text, .. } => (Some(text.clone()), None),
+        O::ApprovalRequired { name } => (None, Some(name.clone())),
+        _ => (None, None),
+    };
+    Ok(TurnResult {
+        stop,
+        text,
+        approval_tool,
+        queue_mark,
+        turn_end,
+    })
 }
 
 /// Single stop-reason mapping for `run_session_turn` and
