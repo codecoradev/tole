@@ -50,6 +50,14 @@ pub(crate) fn one_line(s: &str) -> String {
     clean(s, " ⏎ ")
 }
 
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
