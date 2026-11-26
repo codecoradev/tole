@@ -8,7 +8,10 @@ index migration and tests, on 0.12.0, in the background) hit the `todo_write`
 and `job_*` stalls, the goal required on `--resume`, two budget ceilings and a
 verify gate that failed twice before it passed. The rest of this page is read
 from the code of the tree at `develop` of 2026-11-26 (references are to it), not
-observed in that run; section 1 says where that matters.
+observed in that run. What #1223 saw: the `todo_write` stall, the `job_*` stall,
+the goal required on `--resume`, two ceilings and the gate failing twice.
+Everything else here, the end-of-file behaviour included, is derived from the
+code.
 
 ## 1. Approvals when nobody can answer
 
@@ -31,9 +34,9 @@ resumable (section 3).
 `--yes` would end the question for every Write (`--yes` auto-allows each Write
 tool, `run_command` and `git` included), so most unattended runs use a narrow
 allow list instead. `Destructive` tools (`delete_file`) are never covered by
-`--yes`, `--allow` or `--trust`. They prompt like any other Write: with stdin at
-end of file they are denied and stop the mission, with stdin open they wait at
-the prompt.
+`--yes`, `--allow` or `--trust`: they always prompt, so with stdin at end of
+file they are denied and stop the mission, and with stdin open they wait at the
+prompt.
 
 ### What `--trust workspace` does not cover
 
@@ -58,9 +61,10 @@ with it, so a mission without that allow stops at its first step.
 presets add up (`--trust internal --trust workspace`).
 
 The tool is called `git`. `--allow 'git_*'` is a glob over tool names and
-matches no tool of this tree. Patterns are globs over tool names, with one
-argument-matching form, `run_command:<argv>`, and `!` to deny (README, "Useful
-flags"); a tool you did not name keeps asking.
+matches no tool of this tree. Patterns are globs over tool names, with two
+special forms, `run_command:<argv>` (matches the command by argument) and
+`<tool>@workspace` (a resolved-path guard; `--trust workspace` is built on it),
+and `!` to deny (README, "Useful flags"); a tool you did not name keeps asking.
 
 ### The recipe
 
@@ -69,23 +73,34 @@ cd /path/to/worktree
 tole mission --workspace . --sessions-dir /path/to/sessions \
   --trust workspace \
   --allow todo_write --allow 'job_*' --allow run_command --allow git \
-  --verify /path/outside/the/workspace/gate.sh \
+  --verify /usr/local/bin/mission-gate.sh \
   "<goal>" < /dev/null
 ```
 
+- The gate runs as `sh -c <command>`, so it must be executable (`chmod +x`).
+  Under the default sandbox on a bubblewrap host it sees only the system
+  directories (`/usr`, `/bin`, `/lib*`, `/sbin`), its own install prefix, the
+  workspace and a fresh `/tmp` and `$HOME`. A gate in some other directory
+  (`/home/x/gates`) is not there and ends in exit 127 on every run. Keep a
+  tamper-proof gate in a system directory such as `/usr/local/bin`, or in the
+  workspace's `.tole/` (bound read-only, but only while sandboxed), or set
+  `verify = "off"` ([sandbox-design.md](sandbox-design.md) §9.4).
 - `--workspace` is the jail of the file tools. `run_command`, `git` and the
   `--verify` command run in the process's working directory, so start tole in
   the checkout you want changed. There is no `--worktree` flag.
 - If `[sandbox.consumers]` in your user config turns a command consumer on
   (`run_command`, `job_start`, ...), the `git` tool refuses a linked git
   worktree and any layout other than a plain `.git` directory at the root
-  ([sandbox-design.md](sandbox-design.md) §9). Use a clone in that case.
-- With `cora` on the PATH its review gate is on by default (`block`): a `git
-  commit` (also through `run_command` or `job_start`) is refused until the staged
-  diff has been reviewed. That is a tool refusal, not an approval stop, so the
-  mission does not stop; the model sees the refusal and loops. Review before the
-  commit, or pass `--review-gate off` (or `warn`) for the run (README, "Review
-  gate before commit").
+  ([sandbox-design.md](sandbox-design.md) §9.3). An implicit default `verify`
+  does not count as a consumer written in config. Use a clone in that case.
+- With cora (>= 0.20.0) attached, which is automatic unless `--no-auto-mcp`, the
+  review gate is on by default (`block`): a `git commit` (also through
+  `run_command` or `job_start`) is refused until the staged diff has been
+  reviewed. That is a tool refusal, not an approval stop, so the mission goes
+  on and the model sees the refusal; if it repeats the identical commit three
+  times in a row the loop guard settles the mission `stopped`. The gate fails
+  open on tooling trouble. Review before the commit, or pass `--review-gate off`
+  (or `warn`) for the run (README, "Review gate before commit").
 - A mission refuses `--on-pretool`, `--on-posttool`, `--on-turnend` and
   `--memory`.
 - A project `.tole/config.toml` must be trusted before a headless run:
@@ -99,24 +114,26 @@ truth a mission has. How the loop uses it (`crates/tole-cli/src/mission.rs`):
 
 - It runs (`sh -c`) after every turn that ends in a final answer, not only
   when the model says it is done.
-- The mission completes only when the command **exits 0 and** a final message
-  has a line that is `MISSION_COMPLETE` on its own (trimmed). A pass without the marker
-  keeps the mission going; the marker without a pass does too.
+- The mission completes only when the command **exits 0 and** the same turn's
+  final message has a line that is `MISSION_COMPLETE` on its own (trimmed). A
+  pass without the marker keeps the mission going; the marker without a pass
+  does too.
 - On a failure the model gets `verify FAILED (exit N):` and the last 800
   characters of the command's output (stdout, then stderr), which it uses to
   fix the cause and try again. Three failures in one run end it as
   `verify_failed`; they add up and a pass does not reset the count. A run that
   does not finish in `--verify-timeout` seconds (default 300), or that cannot
-  be started, counts as a failure and the model gets the error text instead of
-  an output tail.
+  be spawned unsandboxed, counts as a failure and the model gets the error text
+  instead of an output tail. A sandbox that exists but cannot run the gate is
+  not a failure of the gate: see `verify_refused`.
 - Without `--verify`, the marker alone completes the mission.
 
 So: **always pass a gate whose only success path is exit 0.** A gate that
 always exits 0 (`true`, `echo ok`, a script that swallows the test runner's
 status) lets the model's own `MISSION_COMPLETE` through: a false completion
 with a green exit code. tole does not check for this. It does not warn when no
-gate is set (none found in `mission.rs` or `main.rs`), and it does not look
-inside the command.
+gate is set (tole has no such warning today), and it does not look inside the
+command.
 
 A gate worth passing:
 
@@ -137,8 +154,10 @@ default it also runs sandboxed where it can (`[sandbox.consumers] verify` is
 host with no sandbox at all): a `cargo` gate cannot see `~/.cargo` there, so
 set `verify = "off"` in the user config or make the gate self-contained (README,
 "Sandbox" in the status list at the top; [sandbox-design.md](sandbox-design.md)
-§9.4). If a required sandbox cannot start, the mission stops as
-`verify_refused`, never as a pass.
+§9.4). When a backend exists but cannot run the gate (a refused workspace
+layout or grant, a launcher that fails), the mission stops as `verify_refused`,
+never as a pass; only a host with no backend at all falls back to unsandboxed.
+A preflight checks this before the first turn.
 
 ## 3. Budgets, statuses and resuming
 
@@ -167,7 +186,11 @@ be resumed.
 
 ```bash
 tole mission --resume <session-id> --sessions-dir /path/to/sessions \
-  --max-steps 320 --max-tokens 8000000 --trust workspace --allow todo_write --allow 'job_*' ... "<goal>" < /dev/null
+  --max-steps 320 --max-tokens 8000000 \
+  --workspace . --trust workspace \
+  --allow todo_write --allow 'job_*' --allow run_command --allow git \
+  --verify /usr/local/bin/mission-gate.sh \
+  "<goal>" < /dev/null
 ```
 
 - **The goal is still required** (the positional argument; there is no
