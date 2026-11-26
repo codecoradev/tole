@@ -1,0 +1,24 @@
+{
+  "jobs": [
+    {
+      "awaiting_review": false,
+      "blocked": 0,
+      "created_by": "cli",
+      "id": "nightly",
+      "last": null,
+      "missed": 0,
+      "mode": "script",
+      "name": "Nightly report",
+      "next": "<clock>",
+      "next_run": "<clock>",
+      "schedule": "0 9 * * *",
+      "state": "active",
+      "timezone": "UTC"
+    }
+  ],
+  "scheduler": {
+    "age_seconds": null,
+    "alive": false,
+    "host": null
+  }
+}
