@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Architecture guardrails of the CodeCora modular + thin-UI standard (#1249).
 #
-# Usage: scripts/arch-check.sh [kinds|size|all] [workspace-root] [--init]
+# Usage: scripts/arch-check.sh [kinds|size|unsafe|all] [workspace-root] [--init]
 #   workspace-root defaults to the repository root (the self-test points it at
 #   fixture workspaces). Needs bash, cargo and Python 3.8+. Nothing is
 #   downloaded: `cargo metadata --no-deps --offline`.
@@ -40,6 +40,22 @@
 #             The desktop crates keep their own check, which this one does not
 #             weaken.
 #
+# unsafe    (#1252, standard rule D4)
+#             - the root Cargo.toml sets `[workspace.lints.rust] unsafe_code =
+#               "deny"` and every workspace crate has `[lints] workspace = true`,
+#               so the compiler rejects an `unsafe` block, fn, impl or
+#               attribute that is not in an opt-in;
+#             - an opt-in is `#[allow(unsafe_code)]` (or `#![allow(...)]`, also
+#               `expect` and `cfg_attr`) on a named module or function, with a
+#               `SAFETY:` comment on it or within 3 lines of it;
+#             - the files that hold an opt-in are exactly the files listed in
+#               AGENTS.md between the `unsafe-opt-ins:start` and
+#               `unsafe-opt-ins:end` marker comments: a file with an opt-in that
+#               is not listed fails, and so does a listed file without one.
+#             To add an opt-in: put the allow and its SAFETY comment on the
+#             module or function that wraps the FFI, and add the file to the
+#             AGENTS.md list in the same change.
+#
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this
 # script exit 2 with a message. It never prints `ok` for a check that did not
@@ -53,12 +69,12 @@ mode="${1:-all}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${2:-$(cd "$here/.." && pwd)}"
 init=""
-if [ "${3:-}" = "--init" ]; then init="--init"; elif [ -n "${3:-}" ]; then echo "usage: $0 [kinds|size|all] [workspace-root] [--init]" >&2; exit 2; fi
+if [ "${3:-}" = "--init" ]; then init="--init"; elif [ -n "${3:-}" ]; then echo "usage: $0 [kinds|size|unsafe|all] [workspace-root] [--init]" >&2; exit 2; fi
 fails=0
 
 fail() { echo "error: $*"; fails=$((fails + 1)); }
 
-# lint <kinds|size> [--init]: run the Python rules; exit 2 unless they finished.
+# lint <kinds|size|unsafe> [--init]: run the Python rules; exit 2 unless they finished.
 lint() {
   local out rc=0 err line
   command -v python3 > /dev/null 2>&1 || { echo "error: python3 is needed by the architecture guardrails and was not found"; exit 2; }
@@ -83,8 +99,9 @@ if [ -n "$init" ] && [ "$mode" != "size" ]; then echo "usage: --init is for the 
 case "$mode" in
   kinds) lint kinds ;;
   size) lint size "$init" ;;
-  all) lint kinds; lint size ;;
-  *) echo "usage: $0 [kinds|size|all] [workspace-root] [--init]" >&2; exit 2 ;;
+  unsafe) lint unsafe ;;
+  all) lint kinds; lint size; lint unsafe ;;
+  *) echo "usage: $0 [kinds|size|unsafe|all] [workspace-root] [--init]" >&2; exit 2 ;;
 esac
 
 if [ "$fails" -gt 0 ]; then

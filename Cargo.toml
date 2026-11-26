@@ -18,6 +18,13 @@ anyhow = "1"
 ureq = { version = "3", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 
+# D4 (#1252): `unsafe` is denied in every crate. A module that has to call into
+# libc opts in with one `#[allow(unsafe_code)]` and a `// SAFETY:` comment;
+# AGENTS.md lists the opt-in files and `scripts/arch-check.sh unsafe` keeps that
+# list equal to the code.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 # Size-conscious release profile. The "16.7 MB, now ~9 MB" figure from #482 is
 # stale. Measured 2026-11-19 at 70cffd7 (one machine: x86_64 Linux, 4 cores),
 # `cargo build --release -p tole-cli` (default features): 23.8 MB stripped

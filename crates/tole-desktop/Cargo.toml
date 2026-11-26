@@ -28,6 +28,9 @@ publish = false
 [package.metadata.tole]
 kind = "bin"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]

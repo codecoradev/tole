@@ -20,8 +20,9 @@
 //! What is pinned, and where the answer is not "it just works":
 //! - A turn killed while the provider is answering leaves its user message
 //!   durable and no settle. `tole resume <id>` finishes that turn in the same
-//!   session; over serve nothing does, and a prompt answers 500 (#1230). One
-//!   test pins today's answer; an ignored one states the answer #1230 asks for.
+//!   session; over serve nothing does yet (#1230): a prompt answers a defined
+//!   409 `{"error": "interrupted turn", "state": "planning"}` (step 1). One test
+//!   pins it, one states what #1230 asks for (accepted, or that 409).
 //! - A parked approval is in memory and is gone after a kill (documented in
 //!   `docs/desktop-design.md`, "Crash or restart"); the session resumes, the
 //!   write has not run, the model asks again, and one allow settles one write.
@@ -368,11 +369,11 @@ fn a_serve_killed_at_a_random_point_in_a_turn_leaves_a_session_that_resumes() {
     );
 }
 
-/// Today's answer over serve, pinned (#1230): a session killed with its user
-/// message durable and no settle refuses a prompt with a 500, and writes
-/// nothing. When #1230 is decided, this test changes to the new answer.
+/// What #1230 step 1 pins: a session killed with its user message durable and
+/// no settle refuses a prompt with a defined 409 (never a 500) that names the
+/// state, and writes nothing. Recovering the session over serve is step 2.
 #[test]
-fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
+fn a_session_killed_mid_turn_answers_a_defined_409_to_a_prompt_over_serve() {
     let base = spawn_mock(1500);
     let (first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-pinned");
     let (log, _) = read_log(&first, &id, "pinned");
@@ -389,15 +390,10 @@ fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
         &format!("/sessions/{id}/prompt"),
         Some(&json!({"text": "next question"}).to_string()),
     );
+    assert_eq!(code, 409, "{body}");
     assert_eq!(
-        code, 500,
-        "#1230 changed the answer: update this test: {body}"
-    );
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("resolve the session first")),
-        "{body}"
+        body,
+        json!({"error": "interrupted turn", "state": "planning"})
     );
     assert_eq!(
         api_seqs(&api_entries(&second, &id)),
@@ -407,11 +403,9 @@ fn a_session_killed_mid_turn_refuses_a_prompt_over_serve_today() {
 }
 
 /// What #1230 asks for: after a resume, a prompt on a session that was killed
-/// mid-turn is accepted, or refused with a defined 409, never a 500. Red
-/// today; run it with `--ignored`. When #1230 is fixed, drop the `ignore` and
-/// the pinned test above.
+/// mid-turn is accepted, or refused with a defined 409, never a 500. Step 1
+/// gives the 409; once the recovery of step 2 exists this answers 200.
 #[test]
-#[ignore = "#1230: a prompt after a resume answers 500 today"]
 fn a_session_killed_mid_turn_takes_a_prompt_or_a_defined_409_after_a_resume() {
     let base = spawn_mock(1500);
     let (_first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-wanted");
@@ -421,6 +415,9 @@ fn a_session_killed_mid_turn_takes_a_prompt_or_a_defined_409_after_a_resume() {
         Some(&json!({"text": "next question"}).to_string()),
     );
     assert!(code == 200 || code == 409, "{code}: {body}");
+    if code == 409 {
+        assert_eq!(body["error"], "interrupted turn", "{body}");
+    }
 }
 
 /// A kill while a turn is parked at an approval: the queue row is gone (it is
