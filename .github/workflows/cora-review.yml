@@ -131,6 +131,50 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # #1022: a release sync PR (base main, head chore/release-*, from this
+      # repository, ONE commit on top of main) whose tree is identical to the
+      # tree of a commit on develop has nothing to review that was not already
+      # reviewed on develop, and its range (hundreds of files) is more than
+      # the job can cover. Skip the review step for that case only.
+      # The decision is made by git plumbing on two tree hashes (the PR head
+      # and a develop commit fetched from THIS repository), in a script that
+      # is read from develop, never from the PR: a PR can neither edit the
+      # check nor supply a develop of its own. Nothing from the PR checkout is
+      # executed here, and no PR text (title, body, commit message) is read;
+      # the branch name and the repository names only narrow the cases down.
+      # If develop has no script yet, or anything is unclear, the review runs.
+      # The workflow file of a pull_request run comes from the merge ref, so
+      # this step takes effect for a release branch built after it landed.
+      # Note: the trigger above lists develop only (#1021); this step does
+      # nothing for a PR to main until `main` is listed there again.
+      - name: Is this a release sync with the tree of develop?
+        id: release_sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git show "refs/remotes/origin/develop:scripts/cora-release-sync.sh" > "$RUNNER_TEMP/cora-release-sync.sh" \
+            && proof=$(bash "$RUNNER_TEMP/cora-release-sync.sh" \
+              "$EVENT_NAME" "$BASE_REF" "$HEAD_REF" "$HEAD_REPO" "$BASE_REPO" "$HEAD_SHA") \
+            && [[ $proof =~ ^([0-9a-f]{40})\ ([0-9a-f]{40})$ ]]; then
+            develop_sha="${BASH_REMATCH[1]}"
+            tree="${BASH_REMATCH[2]}"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Cora Review::skipped, tree identical to develop at $develop_sha"
+            {
+              echo "### Cora review"
+              echo "**skipped, tree identical to develop at \`$develop_sha\`** (tree \`$tree\`)."
+              echo "This is a release sync: one commit on top of \`main\` whose tree equals a commit on \`develop\`, so every file was reviewed in the PR that put it there."
+              echo "No Cora verdict exists for this PR. Check by hand: \`git rev-parse <pr-head>^{tree}\` equals \`git rev-parse $develop_sha^{tree}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # #914: a PR whose every file is excluded by `review.exclude` leaves
       # Cora an empty diff, and it answers "Review could not complete". Skip
       # the review step for that case only. The script and the patterns both
@@ -139,6 +183,7 @@ jobs:
       # or anything is unclear, the review runs.
       - name: Is the whole diff excluded from the review?
         id: scope
+        if: steps.release_sync.outputs.skip != 'true'
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -155,7 +200,7 @@ jobs:
           fi
 
       - name: Run Cora AI Code Review
-        if: steps.scope.outputs.all_excluded != 'true'
+        if: steps.release_sync.outputs.skip != 'true' && steps.scope.outputs.all_excluded != 'true'
         uses: codecoradev/cora-review-action@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
