@@ -4,6 +4,7 @@
 //! defined in the crate root.
 
 mod at;
+mod command;
 mod images;
 mod queue;
 
