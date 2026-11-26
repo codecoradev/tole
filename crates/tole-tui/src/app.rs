@@ -7,9 +7,11 @@ mod at;
 mod command;
 mod images;
 mod keys;
+mod msg;
 mod queue;
 
 pub use keys::Action;
+pub use msg::Msg;
 
 use crate::{menu, App, Footer, Item, KeyAction, Keymap, Kind, Out, PickKind, Theme};
 
