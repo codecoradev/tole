@@ -8,7 +8,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 85844
+crate tole-cli 85855
 crate tole-core 66996
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
@@ -24,27 +24,27 @@ file crates/tole-cli/src/cron/webhook.rs 780
 file crates/tole-cli/src/delegation/approvals_owner_tests.rs 655
 file crates/tole-cli/src/delegation/approver_tests.rs 570
 file crates/tole-cli/src/delegation/decide_tests.rs 510
-file crates/tole-cli/src/delegation/delegate.rs 1335
-file crates/tole-cli/src/delegation/delegate_tests.rs 1752
+file crates/tole-cli/src/delegation/delegate.rs 1336
+file crates/tole-cli/src/delegation/delegate_tests.rs 1753
 file crates/tole-cli/src/discuss/host.rs 1325
 file crates/tole-cli/src/discuss/host_tests.rs 1308
 file crates/tole-cli/src/discuss/tests.rs 1056
 file crates/tole-cli/src/discuss/tool.rs 637
 file crates/tole-cli/src/discuss/tool_tests.rs 898
-file crates/tole-cli/src/doctor.rs 1560
+file crates/tole-cli/src/doctor.rs 1561
 file crates/tole-cli/src/main.rs 4999
 file crates/tole-cli/src/mission.rs 923
 file crates/tole-cli/src/plugin/cmd.rs 1658
-file crates/tole-cli/src/plugin/cmd_tests.rs 1988
+file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 3400
+file crates/tole-cli/src/serve.rs 3401
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
-file crates/tole-cli/src/serve_support/transport.rs 881
-file crates/tole-cli/src/session/assemble.rs 954
+file crates/tole-cli/src/serve_support/transport.rs 882
+file crates/tole-cli/src/session/assemble.rs 955
 file crates/tole-cli/src/session/export.rs 546
 file crates/tole-cli/src/session/host.rs 1840
 file crates/tole-cli/src/session/index.rs 503
@@ -70,17 +70,17 @@ file crates/tole-cli/tests/config_sensitive.rs 1141
 file crates/tole-cli/tests/cron_agent.rs 791
 file crates/tole-cli/tests/cron_profile_e2e.rs 522
 file crates/tole-cli/tests/cron_sandbox.rs 679
-file crates/tole-cli/tests/cron_webhook_send.rs 979
-file crates/tole-cli/tests/mission_e2e.rs 841
+file crates/tole-cli/tests/cron_webhook_send.rs 980
+file crates/tole-cli/tests/mission_e2e.rs 842
 file crates/tole-cli/tests/serve_basic_e2e.rs 834
 file crates/tole-cli/tests/serve_profile_e2e.rs 653
 file crates/tole-cli/tests/serve_session_cancel.rs 551
-file crates/tole-cli/tests/serve_shutdown.rs 614
-file crates/tole-cli/tests/serve_socket.rs 614
+file crates/tole-cli/tests/serve_shutdown.rs 615
+file crates/tole-cli/tests/serve_socket.rs 615
 file crates/tole-cli/tests/serve_webhook_out.rs 649
 file crates/tole-cli/tests/serve_webhook_turn.rs 808
 file crates/tole-cli/tests/skill_approval_e2e.rs 605
-file crates/tole-cli/tests/tui_e2e.rs 1156
+file crates/tole-cli/tests/tui_e2e.rs 1157
 file crates/tole-cli/tests/verify_sandbox.rs 1171
 file crates/tole-client/src/client.rs 776
 file crates/tole-client/src/http.rs 807

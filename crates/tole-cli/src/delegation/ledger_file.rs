@@ -162,6 +162,7 @@ pub fn lease_of(pid: u32) -> Lease {
 /// and, checked on macOS 26.5.1, for a zombie too (while `kill(pid, 0)` still
 /// succeeds for it); `EPERM` for a process the kernel keeps private.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // SAFETY: pid probe FFI (kill 0, proc_pidinfo); see the blocks.
 fn bsd_info(pid: u32) -> Result<libc::proc_bsdinfo, i32> {
     let pid = libc::c_int::try_from(pid).map_err(|_| libc::ESRCH)?;
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
@@ -267,6 +268,7 @@ pub fn lease_alive(lease: &Lease) -> bool {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: pid probe FFI (kill 0, proc_pidinfo); see the blocks.
 fn pid_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;

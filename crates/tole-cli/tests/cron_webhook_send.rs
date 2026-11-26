@@ -886,6 +886,7 @@ fn reconcile_never_guesses_silent_from_a_missing_output_file() {
 
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn reconcile_does_not_follow_or_block_on_a_planted_output_file() {
     let dir = tmp("rec-planted");
     let (port, rx) = receiver(vec![]);

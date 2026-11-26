@@ -1172,6 +1172,7 @@ fn launch(
     Ok(out)
 }
 
+#[allow(unsafe_code)] // SAFETY: kill of a pid the delegation started; see the block.
 fn kill(pid: u32) {
     #[cfg(unix)]
     if let Ok(pid) = libc::pid_t::try_from(pid) {
