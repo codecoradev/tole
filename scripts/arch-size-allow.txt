@@ -1,3 +1,6 @@
+# 2026-11-26: a second owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 84 lines of module
+# glue (`//!` docs, imports, `mod` and `pub use`) that splitting config/mod.rs adds. It is for this split only;
+# later splits must offset their glue or wait for the owner's durable rule. Never again without the owner.
 # 2026-11-26: the owner approved ONE raise of entries: 23 files by 1 line each, for the
 # `#[allow(unsafe_code)]` lines of #1252 (11 in tole-core, 12 in the rest), and the crate
 # totals of tole-core (+16) and tole-cli (+11). Never again: split the file instead.
@@ -8,13 +11,12 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 85850
+crate tole-cli 85934
 crate tole-core 66996
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
-file crates/tole-cli/src/config/mod.rs 3270
 file crates/tole-cli/src/config/project_trust.rs 594
 file crates/tole-cli/src/config/project_trust_tests.rs 518
 file crates/tole-cli/src/cron/agent.rs 519
