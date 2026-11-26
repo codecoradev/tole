@@ -75,6 +75,10 @@ child that could not do that step (`tole audit` shows the request as `decided
 deny` or `expired (timeout), never decided`). Nothing ran. To retry, delegate
 again, or allow the pattern up front in the child's `--allow` or profile.
 
+The same applies to a mission you start yourself with nobody at the terminal:
+see [mission-patterns.md](mission-patterns.md) for what to pre-approve and how
+to resume.
+
 ## Letting a parent answer (`chain`)
 
 `approvals = "chain"` adds agent levels: a parent can answer for its own
