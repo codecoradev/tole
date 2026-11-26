@@ -83,6 +83,7 @@ fn resolve_root(
 /// `None` when the account has no passwd entry, and on non-unix hosts (the
 /// command sandbox is Linux only, so no consumer is on there).
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: getpwuid_r with a caller-owned buffer; see the blocks.
 pub fn account_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0u8; 1024];

@@ -45,6 +45,7 @@ fn plain_name(name: &OsStr) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: openat-based directory walk; every descriptor is owned and checked.
 mod imp {
     use super::*;
     use std::ffi::CString;
