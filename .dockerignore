@@ -1,0 +1,16 @@
+# Docker build context for the root Dockerfile: only Cargo.toml, Cargo.lock,
+# crates/ and scripts/container/ are used. Everything else stays out so a change
+# to docs or CI does not invalidate the build cache and no local state is sent.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!scripts/container/
+# Build output inside the allowed directories.
+**/target/
+# Local state that must never reach an image layer. (No `**/secrets/`: the Rust
+# module crates/tole-core/src/secrets/ is source. A top-level secrets/ or
+# templates/ is already out through the `*` above.)
+**/.tole/
+**/.env
+**/.env.*
