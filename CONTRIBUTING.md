@@ -288,7 +288,14 @@ three levels:
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
 argv-validated subprocess tools, known-value redaction at the egress sinks — plus ignore rules for
-known FP categories).
+known FP categories). The deterministic `index-breaking-change` check ("Symbol
+`X` is being removed but has N caller(s)") resolves Rust calls by bare name
+(#669): integration tests (`crates/*/tests/**`) are kept out of the symbol index
+(`ignore.files`), and the binary-only modules `crates/tole-cli/src/main.rs` and
+`serve.rs` (not part of the library API, the compiler catches their callers)
+have a rule scoped to those two files in `ignore.rules`, so a refactor that
+moves items out of them is not reported as a removal. Do not add a file the
+library re-exports.
 
 Exit-code reference:
 
