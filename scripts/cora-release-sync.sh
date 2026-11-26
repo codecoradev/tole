@@ -41,6 +41,11 @@
 # branch, a tag or a PR-supplied ref of a similar name cannot stand in for it.
 set -euo pipefail
 
+# Compare real objects only: a refs/replace entry or a grafts file must never
+# make one commit stand in for another (defence in depth; the PR checkout does
+# not fetch refs/replace/*).
+export GIT_NO_REPLACE_OBJECTS=1
+
 why() { echo "cora-release-sync: $*" >&2; exit 1; }
 
 [ "$#" -eq 6 ] || why "usage: cora-release-sync.sh <event> <base-ref> <head-ref> <head-repo> <base-repo> <head-sha>"

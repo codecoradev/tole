@@ -180,6 +180,20 @@ effect for a release branch built after it landed on `develop`. Since #1021 the
 trigger lists `develop` only, so a PR into `main` gets no `Cora Review` run at
 all until `main` is listed again; the skip applies from then on.
 
+Residual risks of the skip, for whoever merges the release PR:
+
+- The decision is made when the job runs. If `main` moves afterwards the job is
+  not re-run (the same holds for a PR retargeted to `main`). Merge only a sync
+  that is up to date with `main` (the owner's "require branches to be up to
+  date" or a merge queue), or push the release branch again.
+- Any of the newest 200 first-parent `develop` trees qualifies, not only the
+  tip, so a release cut some merges back is accepted (all of that content was
+  reviewed on `develop`, but main then lags the tip). Compare the sync with
+  `develop` yourself when the release is meant to be the tip.
+- The deciding script runs from `develop` with the job's environment minus the
+  Cora token (`env -u ACCESS_TOKEN`); it reads only git objects and the
+  checkout runs without credentials.
+
 ### Series of dependent PRs
 
 Two PRs can each be green alone and still break `develop` together (a

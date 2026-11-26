@@ -158,7 +158,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if git show "refs/remotes/origin/develop:scripts/cora-release-sync.sh" > "$RUNNER_TEMP/cora-release-sync.sh" \
-            && proof=$(bash "$RUNNER_TEMP/cora-release-sync.sh" \
+            && proof=$(env -u ACCESS_TOKEN bash "$RUNNER_TEMP/cora-release-sync.sh" \
               "$EVENT_NAME" "$BASE_REF" "$HEAD_REF" "$HEAD_REPO" "$BASE_REPO" "$HEAD_SHA") \
             && [[ $proof =~ ^([0-9a-f]{40})\ ([0-9a-f]{40})$ ]]; then
             develop_sha="${BASH_REMATCH[1]}"

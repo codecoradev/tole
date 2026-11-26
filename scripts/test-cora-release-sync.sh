@@ -262,6 +262,20 @@ new_repo
 git fetch -q origin
 run "the matching develop commit is 150 commits back: still found" 0
 
+# --- replace refs ------------------------------------------------------------
+
+# A head with an extra file whose object is replaced by the clean release
+# commit: the script must compare the real objects and refuse.
+new_repo
+evil_blob=$(echo x | git hash-object -w --stdin)
+evil_tree=$( { git ls-tree "$RELEASE^{tree}"; printf '100644 blob %s\tevil.sh\n' "$evil_blob"; } | git mktree)
+evil=$(git -c user.name=t -c user.email=t@example.invalid commit-tree "$evil_tree" \
+  -p refs/remotes/origin/main -m "chore(release): sync")
+git update-ref "refs/replace/$evil" "$RELEASE"
+git checkout -q --detach "$evil"
+run "a refs/replace entry cannot make an evil head look like develop" 1 \
+  pull_request main chore/release-v1.0.0 codecoradev/tole codecoradev/tole "$evil"
+
 # --- shallow history -------------------------------------------------------
 
 new_repo
