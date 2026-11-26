@@ -94,11 +94,11 @@ the one directory, non-recursively; most replay each file in full:
 
 | Reader | What it does with a file | Reference |
 |---|---|---|
-| `tole sessions` | replays every file read-only to show state and turn count | `main.rs:3579` |
+| `tole sessions` | replays every file read-only to show state and turn count | `sessions.rs:106` |
 | `tole sessions --tree` | replays every file, nests forks under `forkedFrom.session` | `session/index.rs:237` |
 | `tole sessions --all` | reads the global index, opens each indexed file, skips ones that are gone | `session/index.rs:169` |
-| `tole resume <id-or-name>` | exact id first; otherwise replays every file to match a name; then the global index | `main.rs:3332` |
-| `tole resume --last` | newest mtime of a valid `*.jsonl` | `main.rs:3772` |
+| `tole resume <id-or-name>` | exact id first; otherwise replays every file to match a name; then the global index | `run.rs:161` |
+| `tole resume --last` | newest mtime of a valid `*.jsonl` | `sessions.rs:295` |
 | `tole serve` `GET /sessions/index` | metadata only, bounded: 10,000 entries scanned, 200 opened, files over 16 MiB skipped, 64 MiB replayed in total | `serve/past_sessions.rs:39` |
 
 Consequences: a file that is not named `<valid id>.jsonl` in that directory is
@@ -123,7 +123,7 @@ approval gate on `run_command` and `job_start`, plus a best-effort blocklist
 that the threat model itself calls bypassable (`docs/threat-model.md:44`). The
 command sandbox is opt-in (`[sandbox.consumers] run_command` / `job_start`,
 default `off`); only when it is enabled, and the effective sessions directory is
-inside the workspace, is that directory bound read-only (#866, `main.rs:1490`,
+inside the workspace, is that directory bound read-only (#866, `main.rs:1208`,
 `sandbox/command.rs:285`). So the note does not claim a model cannot touch
 session files; it proposes that retention be an owner command, not a tool.
 
@@ -132,7 +132,7 @@ settled entry into a new file; only the header's `forkedFrom: {session, entry}`
 points back (`storage.rs:585`; `docs/architecture.md:154`). Outside the
 listings and the `branch`/serve responses that print it, `forkedFrom` is read
 nowhere (grep of `forked_from` users: `index.rs:263`, `past_sessions.rs:194`,
-`main.rs:3684`, `serve.rs:2490`, `session/tui.rs`). `sessions --tree` already
+`sessions.rs:211`, `serve.rs:2490`, `session/tui.rs`). `sessions --tree` already
 copes with a missing source: a fork whose source is gone is listed as a root
 (doc comment of `tree_lines`, `index.rs:216`).
 
@@ -226,7 +226,7 @@ whether C3 writes an index line.
 | `tole sessions` | not listed | not listed |
 | `tole sessions --tree` | its forks show as roots (source gone) | same |
 | `tole sessions --all` | not listed: `rows` skips entries whose file cannot be opened (`index.rs:169`) | **listed**, from the archive file (and ordered by the pointer line's `created_at`) |
-| `tole resume <id>` | "no session with id or name ... (nor in the session index)": `find` needs `is_file()` on the old path (`index.rs:122`) | `find` checks only that the file name is `<id>.jsonl` and `is_file()`, not the directory, so it returns the archive entry and `resume` bails with "belongs to another project; resume it there" and a `cd <cwd> && tole resume <id>` hint that would not work (`main.rs:3376` to `:3392`). A new "archived, restore with ..." message or a restore step is needed |
+| `tole resume <id>` | "no session with id or name ... (nor in the session index)": `find` needs `is_file()` on the old path (`index.rs:122`) | `find` checks only that the file name is `<id>.jsonl` and `is_file()`, not the directory, so it returns the archive entry and `resume` bails with "belongs to another project; resume it there" and a `cd <cwd> && tole resume <id>` hint that would not work (`run.rs:205` to `:221`). A new "archived, restore with ..." message or a restore step is needed |
 | `tole resume --last` | newest remaining file | same |
 | `tole serve` `GET /sessions/index` | not listed | not listed (directory only) |
 
@@ -244,7 +244,7 @@ file under a live writer would leave the writer appending to an unlinked inode;
 `compact()` already documents that hazard and poisons the handle for it
 (`storage.rs:1546`). The mtime of a restored file would be the restore time, not
 the last turn, unless restore preserves it; `resume --last`, `sessions` and the
-serve index all order by mtime (`main.rs:3614`, `past_sessions.rs` cursor). A
+serve index all order by mtime (`sessions.rs:141`, `past_sessions.rs` cursor). A
 copy-based archive must preserve mtime or record the last-activity time in the
 index line (**not designed**; a decision of the implementation).
 
