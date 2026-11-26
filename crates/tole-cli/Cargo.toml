@@ -13,6 +13,9 @@ rust-version = "1.89"
 [package.metadata.tole]
 kind = "bin"
 
+[lints]
+workspace = true
+
 [lib]
 name = "tole_cli"
 path = "src/lib.rs"
