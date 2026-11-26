@@ -117,7 +117,14 @@ scripts/desktop-render.sh <dir> # a desktop UI change: render the real window of
 ```
 
 CI enforces the first three, `scripts/arch-check.sh` and its self-test (steps of
-the `Check` job, so no new required check name; #1250). The licence gate runs as the
+the `Check` job, so no new required check name; #1250). The `Features alone` jobs of
+`ci.yml` (#1254) `cargo check` `tole-core` and `tole-cli` with each Cargo feature
+alone and with none (`--no-default-features [--features X]`, warnings as
+errors): when you add or rewire a feature in a `[features]` table, run the
+same locally and add it to the matrix of that job. The `Desktop` workflow also
+checks `tole-desktop-model` for `wasm32-unknown-unknown`
+(`rustup target add wasm32-unknown-unknown`); which crates are portable to
+which targets is in "Portable crates and targets" in docs/architecture.md. The licence gate runs as the
 `Licences, bans and sources` job of the `Security` workflow (#1253) with a
 pinned cargo-deny release; install the same version locally from its GitHub
 release (checksum in the workflow) rather than `cargo install`. The desktop script runs in a separate `Desktop`
