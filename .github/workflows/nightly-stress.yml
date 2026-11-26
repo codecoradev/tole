@@ -49,8 +49,10 @@ jobs:
         env:
           TMPDIR: ${{ env.TOLE_TEST_TMP }}
           RUST_TEST_THREADS: "8"
-          # #1018: rounds of the SIGKILL crash-resume loop (2 when unset;
-          # the seed is printed by the test, so a red night replays).
+          # #1018: rounds of the SIGKILL crash-resume loops (serve, serve tool
+          # effect and approval, mission, webhook outbox; 2 to 4 when unset,
+          # see tests/crash_loop). The seed is printed by each test, so a red
+          # night replays: TOLE_CRASH_LOOP_SEED=<seed>.
           TOLE_CRASH_LOOP_N: "25"
       - name: No test directory left behind
         run: |
