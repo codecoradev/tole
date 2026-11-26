@@ -34,6 +34,7 @@ mod memory;
 mod mission;
 mod owner_cmds;
 mod registry;
+mod report;
 #[cfg(feature = "shell-tools")]
 mod serve;
 mod sessions;
@@ -60,12 +61,13 @@ use registry::install_owner_mcp;
 #[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use registry::mcp_server_command;
 use registry::{build_approver, build_registry};
+use report::report_outcome;
 use sessions::{
     all_sessions_command, branch_command, import_claude_command, latest_session_id, new_session_id,
     session_path, sessions_command, sessions_tree_command, status_command, valid_session_id,
 };
 use tole_core::storage::{JsonlStorage, Storage};
-use tole_core::turn::{TurnOutcome, LOOP_TRIP_AFTER};
+use tole_core::turn::TurnOutcome;
 
 /// `tole` — a durable agent loop with approval gates.
 #[derive(Parser)]
@@ -3055,72 +3057,6 @@ fn tui_command(
     let id = session.session_id();
     println!("session {id} closed (resume: tole resume {id} \"…\")");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// System prompt (B2)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Reporting
-// ---------------------------------------------------------------------------
-
-/// Human-readable exit summary. Non-Final outcomes exit non-zero so
-/// scripts notice.
-fn report_outcome(session_id: &str, outcome: TurnOutcome) {
-    // How the run ended, for the skill curator (#593), before any exit below.
-    tole_cli::skill_outcome::record_turn(&outcome);
-    match outcome {
-        TurnOutcome::Final { text, .. } => {
-            println!("{text}");
-        }
-        TurnOutcome::StopGateBlocked { reason } => {
-            eprintln!(
-                "tole: stop gate blocked the turn: {reason} (resume with: tole resume {session_id})"
-            );
-            std::process::exit(6);
-        }
-        TurnOutcome::ApprovalRequired { name } => {
-            eprintln!(
-                "tole: approval denied for '{name}' — turn aborted, denial recorded \
-                 (resume with: tole resume {session_id})"
-            );
-            std::process::exit(2);
-        }
-        TurnOutcome::UnknownTool { name } => {
-            eprintln!("tole: unknown tool '{name}' — turn aborted, error recorded");
-            std::process::exit(3);
-        }
-        TurnOutcome::ProviderFailed { message } => {
-            eprintln!(
-                "tole: provider failed: {message}{} (resume with: tole resume {session_id})",
-                tole_cli::compaction_host::overflow_hint(&message)
-            );
-            std::process::exit(4);
-        }
-        TurnOutcome::BudgetExhausted => {
-            eprintln!("tole: step budget exhausted (resume with: tole resume {session_id})");
-            std::process::exit(5);
-        }
-        TurnOutcome::Cancelled => {
-            eprintln!("tole: turn cancelled (resume with: tole resume {session_id})");
-            std::process::exit(8);
-        }
-        TurnOutcome::Detached => {
-            eprintln!("tole: turn detached (resume with: tole resume {session_id})");
-            std::process::exit(9);
-        }
-        TurnOutcome::LoopDetected { tool, count } => {
-            eprintln!(
-                "tole: loop detected — tool `{tool}` called with identical input {count} times in a row (guard trips at {LOOP_TRIP_AFTER}); resume with: tole resume {session_id}"
-            );
-            std::process::exit(7);
-        }
-        TurnOutcome::Storage(e) => {
-            eprintln!("tole: storage error: {e}");
-            std::process::exit(6);
-        }
-    }
 }
 
 #[cfg(test)]
