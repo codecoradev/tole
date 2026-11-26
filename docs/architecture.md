@@ -56,6 +56,25 @@ A UI toolkit package (`crossterm`, `ratatui`, `gpui*`, `zed*`) is a normal depen
 
 `scripts/arch-check.sh size` applies rule D1 of the same standard to every workspace crate: a `.rs` file (under `src/`, `tests/`, `examples/`, `benches/`, and `build.rs`) has at most 500 lines, and the `src/` of a crate at most 50,000 (the cap the desktop crates already have). Today's violations (138 files, and the `src/` of `tole-core` and `tole-cli`) are in `scripts/arch-size-allow.txt`, and that list **can only go down**: a file or crate over its cap and not listed fails the check; an entry smaller or larger than the measured size fails (stale, or grown past its entry); an entry within its cap fails (remove it); `--init` writes the first list once and refuses to run when it exists. There is no mode that adds an entry: split the file (one subsystem per pull request, pure moves, the #752 rules) and lower or remove its entry in the same PR. A file that cannot be measured (unreadable, not UTF-8, a link to nothing) or a crate with no source is exit 2, never a pass. The desktop crates keep `scripts/desktop-check.sh`, which this check does not weaken.
 
+### Portable crates and targets (#1254)
+
+Rules M3 and L5 of the same standard, proved in CI (measured 2026-11-26 at the commit of this change unless a row says otherwise):
+
+| Crate | Compiles for | Not for | Proved by |
+|-------|--------------|---------|-----------|
+| `tole-core` (`--no-default-features`) | Linux, macOS, Windows, `aarch64-apple-ios`, `aarch64-linux-android` | `wasm32-unknown-unknown`: `ureq` pulls `getrandom` 0.2 without its `js` feature and `ring` | `Cross-Compile` and `OS Check` jobs of `ci.yml` |
+| `tole-cli` | Linux, macOS, Windows (a host binary) | not planned: mobile, wasm | `OS Check` |
+| `tole-tui` | Linux, macOS, Windows | not planned: mobile, wasm (a terminal UI) | `OS Check` |
+| `tole-client` | Linux, macOS, Windows | `wasm32-unknown-unknown`: its `tole-core` dependency pulls `getrandom` and `ring`; fixing it needs the wire types split from `tole-core` (#1071) | `OS Check` |
+| `tole-desktop-model` | everything above and `wasm32-unknown-unknown` (no dependencies) | | `Desktop` workflow: `cargo check -p tole-desktop-model --target wasm32-unknown-unknown` |
+| `tole-desktop` | Linux, macOS, Windows with the `gpui` feature | not planned: wasm | `Desktop` workflow window builds |
+
+Each Cargo feature also builds alone. The `Features alone` jobs of `ci.yml` run `cargo check --no-default-features` for `tole-core` (`shell-tools`, `mcp`, `mcp-http`) and `tole-cli` (`shell-tools`, `mcp`, `mcp-http`, `tui`, `web-builtin`, `replay`) with each feature alone and with none, with warnings as errors, in parallel with the longest path. A new feature goes into the matrix of that job in the same PR. A crate that must stay portable to a new target gets a check step for it in the workflow that owns it; a crate that becomes portable is moved in this table in the same PR.
+
+### Licence gate (#1253)
+
+Rule D2 of the same standard: everything tole ships passes `cargo deny check licenses bans sources`, configured in `deny.toml` and run by the `Licences, bans and sources` job of `.github/workflows/security.yml` with a pinned cargo-deny release binary (version and sha256 in the workflow; no third-party action). The policy covers every feature of every workspace member (the desktop's optional GPUI stack included) and every target. `licenses` holds the owner-approved allowlist; a licence outside it is a named per-crate `exceptions` entry with a comment (MPL-2.0 is weak copyleft and only for dependencies), so a new dependency under such a licence fails until the owner extends the list. `bans` rejects OpenSSL and aws-lc (tole's TLS is rustls with `ring`), `sources` allows only the crates.io index and no git dependency. Advisories and yanked crates stay with `cargo audit`. The npm dependencies of the future React views have their own allowlist (#1243); tole ships no model weights.
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |

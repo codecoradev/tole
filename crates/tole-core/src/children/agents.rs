@@ -449,6 +449,7 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
 /// created after the check) and is advisory — cooperative by design,
 /// matching every other tole on-host contract.
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: flock on a descriptor this function owns; see the block.
 fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
     let lock = open_lock_file(root)?;
     use std::os::fd::AsRawFd;

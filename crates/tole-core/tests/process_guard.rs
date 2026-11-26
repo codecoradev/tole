@@ -30,6 +30,7 @@ fn child_reads_parent_environ() -> (bool, String) {
 /// carries the canary. Root reads every process's files whatever the flag
 /// (CAP_SYS_PTRACE), so under root the inner run drops to `nobody`: the
 /// guard is about a same-user, unprivileged child.
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn rerun_with_canary(test: &str) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(std::env::current_exe().unwrap());

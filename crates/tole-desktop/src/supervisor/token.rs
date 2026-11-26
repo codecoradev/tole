@@ -210,6 +210,7 @@ mod tests {
     /// once. Opening a pipe for reading would otherwise wait for a writer
     /// that never comes, and the supervisor would hang on its own credential.
     #[test]
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn a_pipe_or_a_directory_in_place_of_the_file_is_refused_without_waiting() {
         use std::os::unix::ffi::OsStrExt;
         let dir = scratch("kind");

@@ -37,6 +37,7 @@
 //!
 //! State is owner config set once per process, never per session: the
 //! workspace travels with each call.
+#![allow(unsafe_code)] // SAFETY: pipe2/rlimit/close FFI in the child-hardening path; each block states its invariant.
 
 use super::{bwrap_args_for, check_grant, Availability, Env, Mode, Network, Profile, Workspace};
 use std::ffi::OsString;

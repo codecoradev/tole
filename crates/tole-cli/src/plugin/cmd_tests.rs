@@ -303,6 +303,7 @@ fn revoke_blocks_the_next_connect_and_writes_the_ledger() {
 
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn a_lock_that_does_not_read_safely_is_never_written() {
     let h = H::new("unsafe", &["cora"]);
     let (user, real) = (h.user(), h.dir.join("elsewhere.lock"));

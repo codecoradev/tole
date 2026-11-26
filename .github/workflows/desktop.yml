@@ -96,6 +96,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # Rule L5 (#1254): the portable model also compiles for the web.
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: desktop-model
@@ -110,6 +112,12 @@ jobs:
       - run: cargo clippy -p tole-desktop-model -p tole-desktop --all-targets -- -D warnings
       - name: Model tests (no window, no GUI toolkit)
         run: cargo test -p tole-desktop-model -p tole-desktop
+      # Rule L5 (#1254): the view model has no dependencies and must stay
+      # compilable for wasm32 (a web renderer is planned). Check-only, no
+      # runtime. tole-client does not compile there yet (its tole-core
+      # dependency pulls getrandom and ring, #1071), so it is not listed.
+      - name: Model compiles for wasm32
+        run: cargo check -p tole-desktop-model --target wasm32-unknown-unknown
 
   window-linux:
     name: Desktop window build (ubuntu-latest)

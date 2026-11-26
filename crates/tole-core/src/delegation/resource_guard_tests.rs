@@ -638,6 +638,7 @@ fn the_mac_probe_reads_load_memory_and_process_ids() {
 /// The user's process count is read from the system, and is not larger than all of them.
 #[cfg(target_os = "macos")]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn the_mac_probe_counts_the_users_processes_inside_all_of_them() {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
