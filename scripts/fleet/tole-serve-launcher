@@ -12,9 +12,13 @@
 #   TOLE_FLEET_SESSIONS  sessions dir           (default: $TOLE_FLEET_DIR/sessions)
 #   TOLE_FLEET_TOKEN_FILE bearer token file     (default: $TOLE_FLEET_DIR/token, created 0600 if absent)
 #
+# Linux only (/proc, flock, setsid). start and stop serialise on $TOLE_FLEET_DIR/serve.lock;
+# stop sends SIGTERM (tole serve drains up to 20 s, --shutdown-grace), waits 30 s, then SIGKILL.
+#
 # Exit codes: start 0 running (started or already up), 1 failed to start;
-# status 0 running, 3 not running; stop 0 always.
+# status 0 running, 3 not running; stop 0 stopped or not running, 1 could not stop.
 set -euo pipefail
+umask 077  # pid, log, token and lock files are private to the owner
 
 TOLE_BIN="${TOLE_BIN:-tole}"
 DIR="${TOLE_FLEET_DIR:-$HOME/.local/state/tole-fleet}"
@@ -24,6 +28,8 @@ SESSIONS="${TOLE_FLEET_SESSIONS:-$DIR/sessions}"
 TOKEN_FILE="${TOLE_FLEET_TOKEN_FILE:-$DIR/token}"
 PID_FILE="$DIR/serve.pid"
 LOG_FILE="$DIR/serve.log"
+LOCK_FILE="$DIR/serve.lock"
+STOP_WAIT=30  # seconds to wait after SIGTERM before SIGKILL (serve drains up to 20 s)
 
 log() { printf '%s tole-serve-launcher: %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -37,6 +43,22 @@ is_running() {
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'tole.* serve'
 }
 
+# Serialise start and stop: the lock fd (8) is held by this shell only; the
+# daemon is started with 8>&- so it never inherits it.
+lock() {
+  mkdir -p "$DIR" "$SESSIONS"
+  chmod 700 "$DIR"
+  exec 8>"$LOCK_FILE"
+  if command -v flock >/dev/null 2>&1; then
+    flock -w 60 8 || { log "could not take $LOCK_FILE within 60 s"; exit 1; }
+  else
+    log "warning: flock not installed, start/stop are not serialised"
+  fi
+}
+
+# Alive = signalable and not a zombie (a zombie has an empty cmdline).
+pid_alive() { kill -0 "$1" 2>/dev/null && [[ -n "$(tr -d '\0' <"/proc/$1/cmdline" 2>/dev/null)" ]]; }
+
 cmd="${1:-start}"
 [[ $# -gt 0 ]] && shift
 [[ "${1:-}" == "--" ]] && shift
@@ -46,10 +68,20 @@ case "$cmd" in
     if is_running; then log "running pid $(cat "$PID_FILE") port $PORT"; else log "not running"; exit 3; fi
     ;;
   stop)
+    lock
     if is_running; then
       pid="$(cat "$PID_FILE")"
-      kill "$pid"
-      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 $((STOP_WAIT * 10))); do pid_alive "$pid" || break; sleep 0.1; done
+      if pid_alive "$pid"; then
+        log "pid $pid still alive after ${STOP_WAIT}s, sending SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do pid_alive "$pid" || break; sleep 0.1; done
+      fi
+      if pid_alive "$pid"; then
+        log "could not stop pid $pid; pid file kept"
+        exit 1
+      fi
       log "stopped pid $pid"
     else
       log "not running"
@@ -57,23 +89,28 @@ case "$cmd" in
     rm -f "$PID_FILE"
     ;;
   start)
+    lock
     if is_running; then log "already running pid $(cat "$PID_FILE")"; exit 0; fi
-    mkdir -p "$DIR" "$SESSIONS"
+    # The token must be private even if the file pre-exists (0644, or empty).
+    : >>"$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
     if [[ ! -s "$TOKEN_FILE" ]]; then
-      (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$TOKEN_FILE")
+      head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$TOKEN_FILE"
       log "generated token file $TOKEN_FILE"
     fi
     # setsid detaches from the caller's session/terminal; nohup ignores SIGHUP.
-    # No start lock: two simultaneous starts could race. Add flock if a scheduler ever overlaps.
+    # 8>&- keeps the daemon from holding the start/stop lock.
     setsid nohup "$TOLE_BIN" serve --port "$PORT" --bind "$BIND" \
       --sessions-dir "$SESSIONS" --token-file "$TOKEN_FILE" "$@" \
-      >>"$LOG_FILE" 2>&1 </dev/null &
-    echo $! >"$PID_FILE"
+      >>"$LOG_FILE" 2>&1 </dev/null 8>&- &
+    pid=$!
+    echo "$pid" >"$PID_FILE"
     sleep 1
     if is_running; then
-      log "started pid $(cat "$PID_FILE") on $BIND:$PORT (log $LOG_FILE)"
+      log "started pid $pid on $BIND:$PORT (log $LOG_FILE)"
     else
-      rm -f "$PID_FILE"
+      # Only drop the pid file if it is still ours.
+      [[ "$(cat "$PID_FILE" 2>/dev/null)" == "$pid" ]] && rm -f "$PID_FILE"
       log "failed to start; see $LOG_FILE"
       exit 1
     fi
