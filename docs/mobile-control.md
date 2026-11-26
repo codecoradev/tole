@@ -427,7 +427,8 @@ Two kinds of frames, deliberately separate:
   the server's overall connection cap but cannot starve `/approvals` and `/prompt`. A comment
   heartbeat (`: ping`) goes out after 15 s without any write and ends a stream whose peer is gone
   (the write fails); `TOLE_SERVE_HEARTBEAT_SECS` (1 to 3600) changes the interval, e.g. behind a proxy
-  with a short idle timeout.
+  with a short idle timeout. The proxy settings that keep the stream unbuffered (Caddy, nginx) and a
+  probe that checks them are in [container.md](container.md).
   `401` without the token, `404` for a session that is not live (resume it first), `400` for a
   bad `after`.
 - **Cost.** Following the log is one `stat` per poll (about every 150 ms) while nothing

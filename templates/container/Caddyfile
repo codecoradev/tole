@@ -1,0 +1,33 @@
+# TLS reverse proxy for `tole serve` (issue #1044, docs/container.md).
+#
+# Caddy gets and renews the certificate itself (Let's Encrypt for a public
+# name; for `localhost` its own local CA). The settings that matter for the
+# live event stream (GET /sessions/{id}/events, Server-Sent Events):
+#   - flush_interval -1: every write from tole is forwarded at once, nothing is
+#     batched into a buffer.
+#   - no `encode` block: do not compress text/event-stream (a compressor holds
+#     data back until its buffer fills).
+#   - no timeouts on the upstream: serve sends a `: ping` comment every 15 s
+#     (TOLE_SERVE_HEARTBEAT_SECS), and POST /sessions/{id}/prompt answers only
+#     when the whole turn is over (minutes), so any read timeout would cut a
+#     healthy request. Caddy sets none by default; do not add one.
+{$TOLE_DOMAIN:localhost} {
+	# The largest body tole accepts is an image upload of 10 MiB.
+	request_body {
+		max_size 12MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	reverse_proxy tole:7801 {
+		flush_interval -1
+		# tole speaks HTTP/1.1 and ends a streamed response by closing it.
+		transport http {
+			versions 1.1
+		}
+	}
+}
