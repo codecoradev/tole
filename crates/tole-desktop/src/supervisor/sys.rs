@@ -1,6 +1,7 @@
 //! The few operating-system calls the supervisor needs, in one place (macOS
 //! and Linux): the owner of the process, a private directory, `flock`, signals
 //! and the process that listens on a socket.
+#![allow(unsafe_code)] // SAFETY: euid, flock, kill and socket-owner FFI; each block states its invariant.
 
 use std::fs::File;
 use std::io;
