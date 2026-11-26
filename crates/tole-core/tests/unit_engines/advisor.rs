@@ -1,6 +1,8 @@
-use super::*;
-use crate::entry::EntryType;
 use serde_json::json;
+use tole_core::advisor::*;
+use tole_core::entry::Entry;
+use tole_core::entry::EntryType;
+use tole_core::secrets::SecretSet;
 
 const SECRET: &str = "adv-secret-value-0123456789";
 
