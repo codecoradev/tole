@@ -30,7 +30,7 @@ file crates/tole-cli/src/discuss/tool.rs 637
 file crates/tole-cli/src/discuss/tool_tests.rs 898
 file crates/tole-cli/src/doctor.rs 1560
 file crates/tole-cli/src/main.rs 4999
-file crates/tole-cli/src/mission.rs 924
+file crates/tole-cli/src/mission.rs 923
 file crates/tole-cli/src/plugin/cmd.rs 1658
 file crates/tole-cli/src/plugin/cmd_tests.rs 1988
 file crates/tole-cli/src/plugin/gate.rs 940
