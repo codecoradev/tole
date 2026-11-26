@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier, Style};
 use std::time::Instant;
+use tole_core::approval::Verdict;
 use tole_core::tool::Risk;
 
 fn key(c: KeyCode) -> KeyEvent {

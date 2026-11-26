@@ -6,7 +6,10 @@
 mod at;
 mod command;
 mod images;
+mod keys;
 mod queue;
+
+pub use keys::Action;
 
 use crate::{menu, App, Footer, Item, KeyAction, Keymap, Kind, Out, PickKind, Theme};
 

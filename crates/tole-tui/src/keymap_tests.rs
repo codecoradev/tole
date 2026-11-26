@@ -3,6 +3,7 @@
 
 use super::*;
 use std::sync::mpsc;
+use tole_core::approval::Verdict;
 use tole_core::tool::Risk;
 
 fn keymap(items: &[(&str, &[&str])]) -> Keymap {
