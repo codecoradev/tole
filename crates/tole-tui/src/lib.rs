@@ -7,6 +7,7 @@
 //! lines are committed to the terminal scrollback, the viewport only holds the
 //! live stream line, the editor and the footer.
 
+mod app;
 mod approval;
 mod clipboard;
 mod editor;
@@ -142,37 +143,6 @@ const MAX_QUEUE: usize = 16;
 const QUEUE_ROWS: usize = 3;
 
 impl App {
-    pub fn new(footer: Footer) -> Self {
-        Self {
-            recent: footer.model.iter().cloned().collect(),
-            footer,
-            ..Self::default()
-        }
-    }
-
-    pub fn with_theme(footer: Footer, theme: Theme) -> Self {
-        Self {
-            theme,
-            ..Self::new(footer)
-        }
-    }
-
-    /// Use `keymap` for the rebindable actions (and for the key hints).
-    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
-        self.transcript.tools_key = keymap.label(KeyAction::ToggleTools);
-        self.keymap = keymap;
-        self
-    }
-
-    /// Command names matching the draft while it is a bare `/word`.
-    pub fn menu(&self) -> Vec<&'static str> {
-        let t = self.editor.text();
-        if self.running || !t.starts_with('/') || t.contains(char::is_whitespace) {
-            return Vec::new();
-        }
-        menu::matching(t)
-    }
-
     /// Replace the `@` file list (tests; the loop lists the cwd lazily).
     pub fn set_files(&mut self, files: Vec<String>) {
         self.files = Some(files);
@@ -346,32 +316,6 @@ impl App {
         self.editor.set(text);
     }
 
-    pub fn open_picker(&mut self, kind: PickKind, items: Vec<Item>) {
-        self.picker = Some(menu::Picker::new(kind, items));
-    }
-
-    /// Lines of the open picker (empty when closed).
-    pub fn picker_lines(&self) -> Vec<String> {
-        self.picker.as_ref().map_or_else(Vec::new, |p| p.lines(80))
-    }
-
-    /// Record a model switch for Ctrl+P (most recent first).
-    pub fn note_model_chosen(&mut self, id: &str) {
-        self.recent.retain(|m| m != id);
-        self.recent.insert(0, id.to_string());
-    }
-
-    /// The pending `/copy` sequence, if any (drains).
-    pub fn take_osc52(&mut self) -> Option<String> {
-        self.osc52.take()
-    }
-
-    /// A one-line note in the transcript (command feedback).
-    pub fn note(&mut self, text: &str) {
-        let lines = self.transcript.line(Kind::Note, text);
-        self.out.extend(lines);
-    }
-
     fn cycle_effort(&self) -> Action {
         Action::Host(HostCmd::SetEffort(menu::next_effort(
             self.footer.effort.as_deref(),
@@ -476,15 +420,6 @@ impl App {
                 Action::Redraw
             }
         }
-    }
-
-    pub fn running(&self) -> bool {
-        self.running
-    }
-
-    /// Lines to commit to scrollback (drains).
-    pub fn take_out(&mut self) -> Vec<Out> {
-        std::mem::take(&mut self.out)
     }
 
     /// One input (UI-neutral, #526): a key press or a paste. The terminal
