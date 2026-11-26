@@ -1,0 +1,14 @@
+{
+  "id": "<SESSION-A>",
+  "tree": [
+    {
+      "at": null,
+      "current": true,
+      "depth": 0,
+      "id": "<SESSION-A>",
+      "parent": null,
+      "state": "Final",
+      "turns": 1
+    }
+  ]
+}

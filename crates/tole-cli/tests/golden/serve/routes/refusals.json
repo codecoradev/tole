@@ -1,0 +1,52 @@
+[
+  {
+    "authenticated": false,
+    "body": {
+      "error": "unauthorized"
+    },
+    "request": "GET /sessions",
+    "status": 401
+  },
+  {
+    "authenticated": false,
+    "body": {
+      "protocol": 1,
+      "status": "ok",
+      "version": "<VERSION>"
+    },
+    "request": "GET /health",
+    "status": 200
+  },
+  {
+    "authenticated": true,
+    "body": {
+      "error": "not found"
+    },
+    "request": "GET /no/such/route",
+    "status": 404
+  },
+  {
+    "authenticated": true,
+    "body": {
+      "error": "<message>"
+    },
+    "request": "GET /sessions/nope/entries",
+    "status": 404
+  },
+  {
+    "authenticated": true,
+    "body": {
+      "error": "<message>"
+    },
+    "request": "GET /sessions/<SESSION>/entries?after=x",
+    "status": 400
+  },
+  {
+    "authenticated": true,
+    "body": {
+      "error": "<message>"
+    },
+    "request": "POST /sessions/<SESSION>/prompt",
+    "status": 400
+  }
+]
