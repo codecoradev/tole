@@ -8,6 +8,7 @@
 //! that needs no bwrap is in `command_sandbox_none.rs`.
 
 #![cfg(unix)]
+#![allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 
 #[path = "support/test_dir.rs"]
 mod test_dir;

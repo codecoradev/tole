@@ -102,6 +102,7 @@ fn within_2s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn mkfifo(p: &std::path::Path) {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: a valid NUL-terminated path.

@@ -67,6 +67,7 @@ fn swapping_the_directory_for_a_symlink_after_open_redirects_nothing() {
 
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn a_file_that_is_a_link_a_fifo_or_a_directory_is_refused() {
     let b = base("kinds");
     let dir = SafeDir::open(&b).unwrap();

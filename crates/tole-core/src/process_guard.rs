@@ -25,6 +25,7 @@
 //! Windows process memory) expose a same-user process's environment by
 //! other means, and anything the owner stores in a readable file stays
 //! readable; both belong to the sandbox work (#601).
+#![allow(unsafe_code)] // SAFETY: prctl(2) wrapper; each block states its invariant.
 
 use std::io;
 

@@ -178,6 +178,7 @@ impl Pty {
         Pty::spawn_full(cwd, url, args, &[])
     }
 
+    #[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
     fn spawn_full(cwd: &Path, url: &str, args: &[String], envs: &[(&str, &str)]) -> Pty {
         let (mut m, mut sl) = (0, 0);
         let mut ws = libc::winsize {

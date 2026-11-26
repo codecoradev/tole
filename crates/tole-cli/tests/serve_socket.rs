@@ -9,6 +9,7 @@
 // Spawns the real `tole serve` binary (`shell-tools` feature, #349); the local
 // socket is a Unix feature (a Windows named pipe is a follow-up).
 #![cfg(all(feature = "shell-tools", unix))]
+#![allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 
 use serde_json::Value;
 use std::io::{Read, Write};
