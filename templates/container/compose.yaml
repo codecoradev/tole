@@ -1,0 +1,89 @@
+# tole serve on a VPS behind a TLS reverse proxy (issue #1044).
+# See docs/container.md. Run from this directory:
+#
+#   mkdir -p secrets && umask 077
+#   openssl rand -hex 32 > secrets/tole_serve_token      # the serve credential
+#   printf '%s' "$PROVIDER_KEY" > secrets/tole_api_key    # the model provider key
+#   sudo chown 10001:10001 secrets/* && sudo chmod 0400 secrets/*   # see "secrets" below
+#   cp .env.example .env                                  # then edit it
+#   docker compose up --build -d
+#
+# Only the proxy publishes ports. tole itself speaks plain HTTP on the private
+# compose network and publishes nothing.
+name: tole
+
+services:
+  tole:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: tole-serve:${TOLE_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    # `tole serve` drains for --shutdown-grace (default 20 s) after SIGTERM;
+    # the stop timeout must be longer or Docker kills it mid-drain.
+    stop_grace_period: 30s
+    environment:
+      # The entrypoint reads these files into TOLE_API_KEY; no value is here.
+      TOLE_API_KEY_FILE: /run/secrets/tole_api_key
+      TOLE_BASE_URL: ${TOLE_BASE_URL:-}
+      TOLE_MODEL: ${TOLE_MODEL:-}
+      # Lowest heartbeat that keeps a proxy with a short idle timeout happy
+      # (default 15 s; 1 to 3600).
+      TOLE_SERVE_HEARTBEAT_SECS: ${TOLE_SERVE_HEARTBEAT_SECS:-15}
+    # Compose (without swarm) bind-mounts each file secret as it is on the host
+    # and IGNORES uid, gid and mode: the container user (uid 10001) can read
+    # /run/secrets/* only if the host file is owned by 10001 or is readable by
+    # others. Hence the chown/chmod above (0400, owner 10001); without it serve
+    # fails to start with "--token-file ...: Permission denied".
+    secrets:
+      - tole_serve_token
+      - tole_api_key
+    volumes:
+      - tole-data:/data
+      - tole-workspace:/workspace
+    # Hardening that costs nothing. This is NOT a replacement for the command
+    # sandbox, see docs/container.md ("What the container does not add").
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # No `ports:`: only the proxy, on the compose network, can reach 7801.
+    # (The service keeps outbound access: it calls the model provider.)
+    expose:
+      - "7801"
+
+  proxy:
+    # Not hardened like the tole service on purpose: the official image gives the
+    # binary a file capability (cap_net_bind_service), so `cap_drop: [ALL]` needs a
+    # matching `cap_add`, and a read-only root filesystem was not tried. Neither was
+    # run here; add them once you have checked them on your host.
+    image: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+    restart: unless-stopped
+    depends_on:
+      tole:
+        condition: service_healthy
+    environment:
+      TOLE_DOMAIN: ${TOLE_DOMAIN:-localhost}
+    ports:
+      - "${TOLE_HTTP_PORT:-80}:80"
+      - "${TOLE_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+secrets:
+  tole_serve_token:
+    file: ./secrets/tole_serve_token
+  tole_api_key:
+    file: ./secrets/tole_api_key
+
+volumes:
+  tole-data:
+  tole-workspace:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,27 @@
+{
+  "entries": [
+    {
+      "id": "e_1",
+      "parentId": null,
+      "payload": {
+        "role": "user",
+        "text": "UNKNOWN_TOOL please"
+      },
+      "seq": 1,
+      "timestamp": "<clock>",
+      "type": "message"
+    },
+    {
+      "id": "e_2",
+      "parentId": "e_1",
+      "payload": {
+        "detail": "no_such_tool",
+        "error": "unknown tool"
+      },
+      "seq": 2,
+      "timestamp": "<clock>",
+      "type": "error"
+    }
+  ],
+  "id": "<SESSION>"
+}

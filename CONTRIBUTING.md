@@ -288,7 +288,14 @@ three levels:
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
 argv-validated subprocess tools, known-value redaction at the egress sinks — plus ignore rules for
-known FP categories).
+known FP categories). The deterministic `index-breaking-change` check ("Symbol
+`X` is being removed but has N caller(s)") resolves Rust calls by bare name
+(#669): integration tests (`crates/*/tests/**`) are kept out of the symbol index
+(`ignore.files`), and the binary-only modules `crates/tole-cli/src/main.rs` and
+`serve.rs` (not part of the library API, the compiler catches their callers)
+have a rule scoped to those two files in `ignore.rules`, so a refactor that
+moves items out of them is not reported as a removal. Do not add a file the
+library re-exports.
 
 Exit-code reference:
 
@@ -360,6 +367,11 @@ add a second commit, or the whole range is reviewed.
   layers (registry / `AllowlistApprover` / host prompt).
 - MCP tools are always `Risk::Write`. Server-supplied metadata is never
   trusted for risk classification.
+- The `tole serve` wire is additive-only (#1024): a new route or key is
+  fine, a removed or renamed one, or a changed meaning, raises
+  `SERVE_PROTOCOL_VERSION` and gets a BREAKING line in `CHANGELOG.md`. The rule
+  and the tests that enforce it are in "Wire compatibility" in
+  [docs/mobile-control.md](docs/mobile-control.md).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
 
