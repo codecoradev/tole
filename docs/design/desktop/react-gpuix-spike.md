@@ -2,8 +2,8 @@
 
 Status: **PARTIAL: the Linux half of M0 (#1240, epic #1241).** G6, G7 and G8 were run on a Linux x86_64 cloud container; G2, G3, G4, G5 and the macOS
 half of G1 are NOT done (they need a Mac) and are marked as such. This report is merged as it stands so the numbers and the open items are in the
-repository; it is completed when the Mac kit has been run, and M1 does not start before G2 and G7 pass and the owner has given the six confirmations
-of `docs/desktop-design.md` section 0.1. The code behind it is throwaway and outside the repository (a container directory and local branches that
+repository; it is completed when the Mac kit has been run. G1 and G2 are the tripwires (if either fails the epic stops at M0, issue #1240), and M1 does not
+start before the owner has given the six confirmations of `docs/desktop-design.md` section 0.1. The code behind it is throwaway and outside the repository (a container directory and local branches that
 were never pushed). Nothing here is a decision; the owner confirms or changes the gates.
 
 ## Summary
@@ -11,12 +11,12 @@ were never pushed). Nothing here is a decision; the owner confirms or changes th
 | Gate | Verdict | Where | Evidence |
 |---|---|---|---|
 | G1 no fork, exact pin | PASS on linux-x64, macOS pending | Linux | stock `@gpuix/native` and `@gpuix/react` 0.11.0 exact, React 19.2.0, no patch; macOS addon SHA via the Mac kit |
-| G2 IME | **NOT RUN (blocks M1)** | macOS | Mac kit, `g45-form.tsx`, checklist in its README |
-| G3 frame cost vs Rust baseline | NOT RUN on a Mac (both instruments built and run on Linux) | macOS | Mac kit `g3-stream.tsx` (GPUIX) and `frame-bench.patch` (real-window Rust instrument, same overlay quantity) |
+| G2 IME | **NOT RUN (tripwire: a failure stops the epic at M0)** | macOS | Mac kit, `g45-form.tsx`, checklist in its README |
+| G3 frame cost vs Rust baseline | NOT RUN on a Mac (both instruments are built; the Linux runs are software-rendered and invalid) | macOS | Mac kit `g3-stream.tsx` (GPUIX) and `frame-bench.patch` (real-window Rust instrument, same overlay quantity) |
 | G4 idle | NOT RUN (Linux numbers invalid, software GL) | macOS | Mac kit `g4-idle.mjs` |
 | G5 accessibility | PARTIAL | macOS | aria/role reach the native batch on Linux (45 ops, 17 elements); VoiceOver and Tab order need macOS |
 | G6 Tailwind | **PASS** for the subset used | Linux | 123 of 123 classes of S9 and the transcript compile, zero hand-written style objects |
-| G7 pipe | **PASS** | Linux | p95 0.32 ms (900 px viewport), 0.59 ms (about 40 rows), 0.26 ms (snapshot); messages 9 to 62 KB, under 256 KB |
+| G7 pipe | **PASS** | Linux | p95 0.32 ms (900 px viewport), 0.59 ms (about 40 rows), 0.26 ms (snapshot); measured messages 9 to 62 KB, under 256 KB (a `BackendView` at its caps is not, see "Items M1 must solve") |
 | G8 effort | PASS | Linux | S9 + shell + transcript 275 lines of TSX; compiler about 660 lines; about 16 minutes |
 
 ## Environment
@@ -36,7 +36,7 @@ Built: a build-time compiler that runs Tailwind's own `compile()` (tailwindcss 4
 extra switch, native input and Save card (labelled "not on the board"), and a transcript with a 2,000-row `<virtual-list>`,
 a `<markdown>` block every 10th row and a `<diff>` block every 50th.
 
-- Coverage: 123 classes used, 123 compile. A broad probe of 378 typical classes: 288 compile (76%), 89 cannot be expressed.
+- Coverage: 123 classes used, 123 compile. A broad probe of 378 class tokens (one is a duplicate): 288 compile (76%), 90 cannot be expressed.
 - Fidelity to the board: about 90% at a glance. Palette and structure match; layout is within about 10 px. Missing: sidebar
   and top-bar icons, a real select popup, some card padding. Pictures: `compare-s9-board-over-ours-1440.png`.
 - GPUIX knows `hover`, `active` and `focusVisible` only. `focus:` and `disabled:` are resolved in a small JS wrapper.
@@ -87,12 +87,20 @@ Serde cost: 67 types needed `Serialize` + `JsonSchema` behind a `schema` feature
 - napi addon in the same process: not built. The pipe costs 0.1 to 0.3 ms against a 16.7 ms frame, so napi has no performance
   case and gives up crash isolation.
 - TypeScript client straight to `tole serve`: the `tole-client` schema generates 934 lines of types easily, but the model,
-  adapter, driver and backend (about 44k lines, about 25.6k outside dedicated test files, about 911 tests; with supervisor
+  adapter, driver and backend (about 44k lines excluding the supervisor, app and `tole-client`, about 25.6k outside dedicated test files, about 911 tests; with supervisor
   and app 990 tests) would be duplicated in TypeScript. The epic's 33k figure was not reproduced; this breakdown is measured.
-- Conclusion: the sidecar stays the choice.
+- Conclusion of the data: the sidecar is the better choice; the owner confirms it (`docs/desktop-design.md` section 0.1).
 
 Not measured: macOS, a real `tole serve`, React in the loop (the frame budget is pipe + parse + render).
 
+
+## G1, G5 and G8
+
+- G1: the stock `@gpuix/native` and `@gpuix/react` 0.11.0 at an exact pin with React 19.2.0 run the screens with no patch to `gpuix` or `zed`.
+  This is verified on linux-x64 only; the checksum of the macOS addon is taken on the Mac with the kit.
+- G5: `aria-*` and `role` props reach the native batch on Linux (45 operations and 17 elements carried them in the S9 screen). VoiceOver and
+  the Tab and Shift+Tab order need macOS, so G5 stays PARTIAL.
+- G8: S9 with its shell and the transcript are 275 lines of TSX; the Tailwind compiler is about 660 lines; the work took about 16 minutes.
 
 ## G3: how the baseline is measured (found by the spike)
 
@@ -108,8 +116,14 @@ invalid for the gate; it proves the path and the JSON shape; on-screen overlay v
 Caveat of fairness: the Rust rows are real Markdown with diff blocks in a 1200x780 window, the TSX rows are plain text in 1000x700,
 so Rust is heavier by construction. The comparable quantity is overlay draw time; compare both with the frame budget.
 
+## Files that are not in the repository
+
+The Mac kit (a tarball with its README and the files `g45-form.tsx`, `g3-stream.tsx` and `g4-idle.mjs`), `frame-bench.patch`, `bench.mjs` and
+the comparison pictures (for example `compare-s9-board-over-ours-1440.png`) are in the authoring container, not in the repository. They are
+handed to the owner out of band; issue #1240 asks for screenshots and repro steps, which this partial report does not yet include.
+
 ## Still open before M0 can close
-1. Run the Mac kit: G1 on macOS, **G2 (blocks M1)**, G3, G4, G5.
+1. Run the Mac kit: G1 on macOS, **G2 (tripwire)**, G3, G4, G5.
 2. Run both G3 instruments on the same Mac in the same session (`frame-bench.patch` for Rust, `g3-stream.tsx` for GPUIX).
 3. Owner decision on the six confirmations of `docs/desktop-design.md` section 0.1 and on the gate thresholds.
 4. Decide how `focus:` and `disabled:` are handled in #1244 (JS wrapper versus a design rule), and what to do with the
