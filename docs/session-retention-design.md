@@ -18,8 +18,14 @@ file per session means "deletion = unlink" (line 125).
 
 So "retention" cannot mean editing or trimming a session file. It can only mean
 an operation on a **whole file** (keep it, move it, compress it, remove it) or a
-**new** file that is a faithful copy of the old one. The owner, not a model,
-performs it (section 3).
+**new** file that is a faithful copy of the old one. Whether §6 permits moving
+or removing a whole file at all is itself an owner question (decision 1 in
+section 8): the text forbids changing or deleting *entries*, and `architecture.md`
+calls removal of a session file "deletion = unlink", but nothing says an owner
+may or may not do it. Options C and D below assume the answer is yes; D is
+literal deletion. This note also proposes, as a constraint for the owner to
+accept, that such an operation is an owner command on the host and never a
+model-callable tool (see "Model commands" in section 2).
 
 ## 2. What the code does today
 
@@ -37,8 +43,10 @@ umask (`crates/tole-core/src/session/safe_dir.rs:164`), not `0600`; the global
 index is `0600` (`crates/tole-cli/src/session/index.rs:82`).
 
 **Growth.** Nothing removes or rotates a session file. A grep of `crates/` for
-"archive", "prune", "retention" finds only the skill curator, approvals, cron and
-unrelated code, as the issue says. The documented position for images is "not
+"archive", "prune", "retention" has many hits (skill curator, approvals, cron,
+the webhook-delivery ledger `ledger/mod.rs`, `children/agents.rs`,
+`provider/replay.rs`, `integrations/git.rs`, desktop UI code) but none is
+retention of session files; I did not read every hit. The documented position for images is "not
 pruned, an operator cleanup" (`docs/threat-model.md:893`) and, for serve uploads,
 "not garbage-collected; removing a session does not remove its uploads"
 (`docs/mobile-control.md:487`). Cron's `jobs.jsonl` and the approvals log are
@@ -54,7 +62,10 @@ and no host calls it (grep of `tole-cli/src`, `tole-core/src`, `tole-tui/src`,
 `tole-client/src`). `docs/architecture.md:127` says compaction happens "only
 when dead-bytes ratio crosses a threshold"; no such trigger exists in the code
 (**not verified** beyond the grep). It is therefore not a retention mechanism
-and must not be presented as one.
+and must not be presented as one. (It does clear a poisoned handle after a
+failed append, which its comment calls "the sanctioned recovery path"
+(`storage.rs:1555`); since no host calls it, today the recovery is to re-open
+the session.)
 
 **Context compaction is a different thing.** `crates/tole-core/src/turn/compaction.rs`
 (#440) appends a `compaction` entry (a summary plus the id of the first entry
@@ -62,20 +73,24 @@ kept) so the provider sees less. The file keeps growing; it saves tokens, not
 bytes.
 
 **The session file does not hold images.** The log keeps a reference (path, mime,
-size, FNV-1a hash); the bytes live under `$CODECORA_HOME/tole/images/`, and
-`tole serve` uploads under `images/serve/<session id>/<hash>.<ext>` with quotas
-of 64 MiB per session and 512 MiB in total
-(`crates/tole-cli/src/serve_support/images.rs:31`). The CLI `--image` and the
-TUI spill to `images/<hash>.<ext>`, content-addressed and shared by every
-session that sent the same bytes (`crates/tole-core/src/provider/image.rs:57`,
-`crates/tole-cli/src/session/runner.rs:46`). Every request re-reads the file and
-re-checks size and hash (`image::data_url`, `image.rs:165`): a missing file is an
-error for that image, not a silent skip. How a missing image affects a whole
-`resume` turn (does the turn fail, or only that part?) is **not verified**
-(`crates/tole-core/src/provider/openai.rs:489` is the call site).
+size, FNV-1a hash), in two forms (`crates/tole-core/src/provider/image.rs:120`
+to `:149`). An inline `data:` URL (and an ACP image block) is spilled,
+content-addressed, to `$CODECORA_HOME/tole/images/<hash>.<ext>`, shared by every
+session that sent the same bytes (`image.rs:57`, `session/runner.rs:46`); `tole
+serve` uploads go to `images/serve/<session id>/<hash>.<ext>` with quotas of
+64 MiB per session and 512 MiB in total (`serve_support/images.rs:31`). A
+`--image <path>` or `/image <path>` is a workspace-jailed path **referenced in
+place**: the file stays where it was, outside every sessions directory and
+outside any archive of it. Every request re-reads the file, re-checks the jail
+(workspace plus the spill dir) and size and hash (`image::data_url`,
+`image.rs:165`). A missing or unreadable image does not fail the turn: its one
+non-test caller turns the error into a text part `[image unavailable: <err>]`
+and the turn continues (`provider/openai.rs:489`). A session resumed from a
+different workspace therefore loses its path images the same way, through the
+jail check.
 
 **Readers of the directory.** All of them list `*.jsonl` files by `read_dir` of
-the one directory, non-recursively, and replay each file in full:
+the one directory, non-recursively; most replay each file in full:
 
 | Reader | What it does with a file | Reference |
 |---|---|---|
@@ -87,25 +102,30 @@ the one directory, non-recursively, and replay each file in full:
 | `tole serve` `GET /sessions/index` | metadata only, bounded: 10,000 entries scanned, 200 opened, files over 16 MiB skipped, 64 MiB replayed in total | `serve/past_sessions.rs:39` |
 
 Consequences: a file that is not named `<valid id>.jsonl` in that directory is
-invisible to every one of them (so a `.jsonl.zst` or a subdirectory is simply
-not listed); and the cost of `tole sessions` and of a name lookup grows with
-the number of files and their sizes, because each file is replayed in memory
-(`storage.rs:3`: the file is a replay recipe; queries run in RAM). Serve's
-index route already skips files over 16 MiB.
+invisible to the directory readers (so a `.jsonl.gz` or a subdirectory is
+simply not listed); and the cost of `tole sessions`, `--tree` and a name lookup
+grows with the number of files and their sizes, because each file is replayed
+in memory (`storage.rs:3`: the file is a replay recipe; queries run in RAM).
+`resume --last` reads only mtimes, an exact-id `resume` opens one file, and
+serve's index route is bounded and metadata only (it skips files over 16 MiB).
 
 **Failure when the disk is full.** A failed append (the code names ENOSPC)
 poisons that open handle: every later commit is refused until the session is
-re-opened, and the torn tail is discarded at the next open
-(`storage.rs:1010`). `tole serve` has no readiness route today (only
+re-opened (or `compact()` is run, see above), and the torn tail is discarded at
+the next open (`storage.rs:1010`). `tole serve` has no readiness route today (only
 `GET /health`, liveness, `serve.rs:6`); the "readiness issue" the issue text
 mentions is separate and is **not verified** here. `[delegation] min_free_disk_mb`
 guards child spawns on the data dir, workspace and worktree filesystems
 (`docs/threat-model.md:1139`); nothing guards the sessions directory itself.
 
-**Model commands cannot delete sessions.** The command sandbox binds the
-effective sessions directory read-only when it is inside the workspace
-(#866, `main.rs:1490`, `sandbox/command.rs:285`). A retention command is an
-owner action on the host, never a tool.
+**Model commands and the sessions directory.** By default the barrier is the
+approval gate on `run_command` and `job_start`, plus a best-effort blocklist
+that the threat model itself calls bypassable (`docs/threat-model.md:44`). The
+command sandbox is opt-in (`[sandbox.consumers] run_command` / `job_start`,
+default `off`); only when it is enabled, and the effective sessions directory is
+inside the workspace, is that directory bound read-only (#866, `main.rs:1490`,
+`sandbox/command.rs:285`). So the note does not claim a model cannot touch
+session files; it proposes that retention be an owner command, not a tool.
 
 **Forks are self-contained.** `JsonlStorage::fork` copies the lineage up to a
 settled entry into a new file; only the header's `forkedFrom: {session, entry}`
@@ -132,30 +152,40 @@ No new code. Works today because deletion is an unlink.
 **C. Archive: move a whole file out of the active directory.** The file is moved
 (or copied, verified, then the original removed) byte for byte to an archive
 location, optionally compressed. The bytes of the log are unchanged, so the log
-itself is never edited. "Never deleted" is read as "never deleted by the
-store"; the active directory loses the file. Variants:
+itself is never edited. This reads "never deleted" as "never deleted by the
+store" (decision 1); the active directory loses the file. Variants:
 
 - C1, plain move to `<sessions dir>/archive/<id>.jsonl` or to an owner-chosen
   directory: no new dependency; `*.jsonl` is not listed from a subdirectory, so
-  it disappears from every reader in the table above; restore is a move back.
+  it disappears from the directory readers in the table above (what the global
+  index does depends on C3, section 4); restore is a move back.
 - C2, compressed (`.jsonl.gz` or `.zst`): saves bytes on a text log, needs a
-  compression implementation. `flate2` is in `Cargo.lock` but is not a direct
-  dependency of `tole-core` or `tole-cli`, and no zstd crate is in the lockfile
-  (grep of `Cargo.lock`, `Cargo.toml`); who pulls `flate2` was **not
-  verified**. A new dependency goes through the licence gate (`AGENTS.md` §6,
-  an owner decision if the licence is outside `deny.toml`), or the command can
-  shell out to an installed `gzip` at the cost of a runtime dependency.
+  compression implementation. `flate2` is in `Cargo.lock`, pulled by `ureq` (a
+  direct `tole-core` dependency; the workspace takes `ureq` with default
+  features, and `ureq` 3.5.2's default includes `gzip`, which enables
+  `flate2`), `png`, `tiff` and `usvg`; no zstd crate is in the lockfile. It is
+  not a direct dependency of `tole-core` or `tole-cli`, so using it as the codec
+  means adding it to a manifest (same crate, already in the tree; whether its
+  licence passes `deny.toml` was not run). Otherwise a new dependency goes
+  through the licence gate (`AGENTS.md` §6), or the command can shell out to an
+  installed `gzip` at the cost of a runtime dependency.
 - C3, a **pointer record** for the archive: one more line in the global index
   (`sessions-index.jsonl`, append-only, last line for an id wins,
-  `index.rs:101`) saying the session is archived and where. This is the only
-  place a "pointer entry" fits the rule: the index is already an append-only
-  log of "this session lives here" and was designed to be added to. Writing a
-  pointer *into the session file* is not available, because the session file
-  must stay byte-identical, and the live file is being removed anyway.
+  `index.rs:101`) saying where the session now is. This is the only place a
+  "pointer entry" fits the rule: the index is already an append-only log of
+  "this session lives here". Writing a pointer *into the session file* is not
+  available, because the session file must stay byte-identical, and the live
+  file is being removed anyway. C3 needs a schema decision: `index::Entry` has
+  fixed fields (`id`, `file`, `cwd`, `face`, `created_at`, `index.rs:30`), so
+  the pointer either reuses `file` (the archive path) or adds a field, and a
+  last-line-wins line also replaces `created_at`, which orders `--all`. That
+  choice decides which rows of the table in section 4 apply.
 
 **D. Export, then remove, by the owner.** The owner exports (copies) the session
 to storage they control (the TUI `/export` writes a JSONL or HTML copy,
-`session/export.rs`, owner-only `0600`, never overwrites) and then deletes the
+`session/export.rs`, owner-only `0600`, never overwrites; its JSONL is only the
+entries, `render_jsonl` at `export.rs:63`, with no header, registers, usage or
+state, so it is a transcript, not a file `resume` can open) and then deletes the
 file. Retention is then "the owner deleted it": the same as `rm`, which the
 architecture already calls deletion. It satisfies a request to erase; C does not
 (section 5).
@@ -187,17 +217,23 @@ does this, and that `compact()` does not either (section 2).
 
 ## 4. What a reader or a resume sees after an archive (C)
 
-Assuming C1 with a C3 index line, from the code in section 2:
+From the code in section 2. The first column is what the code does **today** for
+a session whose file is gone from the directory; the last two columns differ by
+whether C3 writes an index line.
 
-| Command | After the session is archived |
-|---|---|
-| `tole sessions` | not listed (file not in the directory) |
-| `tole sessions --tree` | its forks show as roots (source gone) |
-| `tole sessions --all` | not listed: `rows` leaves out entries whose file is gone (`index.rs:169`); an archived-aware listing needs a new `--archived` path |
-| `tole resume <id>` | "no session with id or name ... (nor in the session index)" today. `index::find` also requires the file to exist and to be named `<id>.jsonl` (`index.rs:122`), so an index line pointing into an archive is ignored by it. A restore step first, or a new "archived, restore with ..." message, would be needed |
-| `tole resume --last` | picks the newest remaining file |
-| `tole serve` `GET /sessions/index` | not listed |
-| a running `serve`/`chat` holding the session | holds the writer lock; archiving must take the same lock or refuse (below) |
+| Command | C1 move, no C3 line (index still names the old path) | C1 move plus a C3 line whose `file` is the archive path |
+|---|---|---|
+| `tole sessions` | not listed | not listed |
+| `tole sessions --tree` | its forks show as roots (source gone) | same |
+| `tole sessions --all` | not listed: `rows` skips entries whose file cannot be opened (`index.rs:169`) | **listed**, from the archive file (and ordered by the pointer line's `created_at`) |
+| `tole resume <id>` | "no session with id or name ... (nor in the session index)": `find` needs `is_file()` on the old path (`index.rs:122`) | `find` checks only that the file name is `<id>.jsonl` and `is_file()`, not the directory, so it returns the archive entry and `resume` bails with "belongs to another project; resume it there" and a `cd <cwd> && tole resume <id>` hint that would not work (`main.rs:3376` to `:3392`). A new "archived, restore with ..." message or a restore step is needed |
+| `tole resume --last` | newest remaining file | same |
+| `tole serve` `GET /sessions/index` | not listed | not listed (directory only) |
+
+With C2 (`.jsonl.gz`) the name check in `find` fails, so a pointer to a
+compressed archive is ignored by `find`; `rows` would fail to open it as JSONL
+and skip it. A running `serve`/`chat` holding the session holds the writer lock,
+so archiving must take the same lock or refuse (below).
 
 **Concurrency.** A session open for writing holds an exclusive advisory `flock`
 on `<id>.jsonl.lock` (`storage.rs:1099`); a second opener gets
@@ -229,7 +265,8 @@ docs say so plainly:
 - The audit promises are that entries are append-only and never dropped
   (`docs/threat-model.md:54`). An archive that preserves the file satisfies "not
   dropped", but the log is no longer in the place the host reads, so for as
-  long as it is archived `status`, `resume` and the listings cannot show it.
+  long as it is archived `status`, `resume` and the directory listings cannot show it
+  (`--all` may, depending on C3).
   Other logs name sessions by id (cron run records carry `session_id`,
   `cron/agent.rs:234`; the delegation tree records sessions,
   `docs/threat-model.md:1013`); whether any reader opens a session by that id
@@ -250,19 +287,23 @@ choice, not a need.
 ## 6. Images and the index
 
 Images are the larger and more awkward half of the disk problem (up to 512 MiB
-of serve uploads by quota alone, plus unbounded `--image` and TUI spill).
+of serve uploads by quota alone, plus the unbounded spill of inline and ACP
+images).
 
 - The image file is not in the session file, and nothing records which sessions
-  reference a CLI-spilled image: the name is the content hash and shared. To
-  remove or archive an image safely, a command must scan every session file
-  for references (`ImageRef.fnv1a64`) before it removes a file another session
-  or a fork still names. Serve's `images/serve/<session id>/` directories are
-  attributable by directory name and are the safe half.
+  reference a spilled image: the name is the content hash and shared. To
+  remove or archive one safely, a command must scan every session file for
+  references (`ImageRef.fnv1a64`) before it removes a file another session or a
+  fork still names. Serve's `images/serve/<session id>/` directories are
+  attributable by directory name and are the safe half. Path images
+  (`--image <path>`) live in the workspace and are outside any sessions-dir
+  archive; retention would not touch them.
 - A session archived without its images keeps working as a log (the log holds
-  references) but any later `resume` that replays those images would hit the
-  error in section 2 (impact **not verified**). An archive that moves the
-  session-scoped serve images with it, and leaves shared spill images in place
-  with a count of remaining references, avoids that.
+  references); a later `resume` that replays a missing image degrades to the
+  text `[image unavailable: ...]` and continues (section 2), so the loss is
+  that image's content for the model, not the resume. An archive that moves
+  the session-scoped serve images with it, and leaves shared spill images in
+  place until no session references them, avoids that.
 - The global index (`sessions-index.jsonl`) is append-only and never shrinks;
   a stale line for a removed session is skipped at list time. Retention does
   not need to touch it except for the pointer line of C3 and, for D, an owner
@@ -292,15 +333,24 @@ of serve uploads by quota alone, plus unbounded `--image` and TUI spill).
 
 Not decided here.
 
-1. Is the goal only to warn (A) and document (B), or to also ship an archive
-   command (C)? The issue calls A the cheapest and safe on its own.
+1. Does `AGENTS.md` §6 permit moving or removing a whole session file at all?
+   C and D depend on a yes (D is literal deletion), and so does the reading
+   "never deleted by the store". If no, only A and B remain. Separately: is the
+   goal only to warn (A) and document (B), or also an archive command (C)? The
+   issue calls A the cheapest and safe on its own.
 2. If C: plain move (C1) or compressed (C2)? If C2: a new dependency under the
    licence gate, or shelling out to `gzip`?
-3. Where does an archive live: inside the sessions directory (inherits the
-   read-only sandbox bind, section 2), or an owner-chosen directory (needs its
-   own protection and permissions)?
-4. Does the index get a pointer line (C3), and does `resume` of an archived id
-   restore it, print the restore command, or refuse?
+3. Where does an archive live: inside the sessions directory (covered by the
+   read-only bind only when the opt-in command sandbox is on and the directory
+   is inside the workspace, section 2), or an owner-chosen directory (needs its
+   own protection and permissions)? Should a retention command be strictly an
+   owner command and never a model tool (proposed, section 1)?
+4. Does the index get a pointer line (C3), and with which schema (reuse `file`
+   or a new field, which also decides whether `--all` lists archived sessions
+   and what `created_at` means)? And what does `resume` of an archived id do:
+   restore it, print the restore command, or refuse? Today a pointer into the
+   archive makes `resume` print a misleading "belongs to another project" hint
+   (section 4).
 5. Selection: age only (`--older-than DAYS`), size, or an explicit id list; by
    last-activity time (which the file's mtime only approximates).
 6. Are images in scope of the first piece, or documented as an operator cleanup
@@ -316,15 +366,18 @@ Not decided here.
 ## 9. Out of scope, and what is not verified
 
 Out of scope for this note: editing or trimming any entry; rotation inside one
-session (E); a SQLite backend (the optional `sqlite` feature in
-`docs/architecture.md` §4; whether it behaves differently was not checked);
+session (E); a SQLite backend (`docs/architecture.md` §4 describes an optional `sqlite`
+feature, but none exists in the tree: no crate has a `sqlite` feature or uses
+`rusqlite`, which is only declared in the workspace `Cargo.toml` and is absent
+from `Cargo.lock`, so that text is stale);
 deleting anything automatically or on a timer; a model-callable retention tool;
 retention of cron, approvals, outbox, delegation and job logs; remote archives
 (object storage); a readiness signal on `tole serve`.
 
-Not verified: whether `compact()` has any trigger (grep says none); how a
-missing image affects a whole `resume` turn; who depends on `flate2`; whether any
-reader opens a session by the id found in cron or delegation logs; what
+Not verified: whether `compact()` has any trigger (grep says none); whether
+`flate2`'s licence passes `deny.toml` (`cargo deny` not run); whether any
+reader opens a session by the id found in cron or delegation logs; the
+unread grep hits for "archive/prune/retention" (section 2); what
 `face_parity` would require of an archived-sessions listing; the server's
 behaviour on ENOSPC beyond the storage layer (the poison path is read, not run);
 the size of real session stores. No command was run against a real session
