@@ -3,6 +3,7 @@
 
 use super::*;
 use std::sync::mpsc;
+use tole_core::tool::Risk;
 
 fn keymap(items: &[(&str, &[&str])]) -> Keymap {
     let over: Vec<(String, Vec<String>)> = items
