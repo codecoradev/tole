@@ -105,6 +105,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250) and the size guard (#1251); exits 1 on a crate without a kind, a dependency that points upward, a UI toolkit below a ui or bin crate, a file over 500 lines or a crate src/ over 50,000 that is not in scripts/arch-size-allow.txt, or an allow-list entry that no longer matches
+# only when you add or update a dependency (Cargo.toml / Cargo.lock; #1253): licence gate, needs the pinned cargo-deny (version in security.yml)
+cargo deny check licenses bans sources   # exits 1 on a licence outside deny.toml, a banned crate or a non-crates.io source
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
 # only when you touch scripts/arch-* (#1249):
 python3 scripts/test_arch_lint.py # self-test of the architecture guardrail (rules and fail-closed paths)
@@ -115,7 +117,10 @@ scripts/desktop-render.sh <dir> # a desktop UI change: render the real window of
 ```
 
 CI enforces the first three, `scripts/arch-check.sh` and its self-test (steps of
-the `Check` job, so no new required check name; #1250). The desktop script runs in a separate `Desktop`
+the `Check` job, so no new required check name; #1250). The licence gate runs as the
+`Licences, bans and sources` job of the `Security` workflow (#1253) with a
+pinned cargo-deny release; install the same version locally from its GitHub
+release (checksum in the workflow) rather than `cargo install`. The desktop script runs in a separate `Desktop`
 workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, and not a
 required check unless the owner adds it to the branch protection: require only
 `Desktop model and guardrails`). The literals check is a heuristic: it
@@ -231,6 +236,14 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   an entry; when you split a file, lower or remove its entry in the same PR (an
   entry that no longer matches the measured size fails the check). The desktop
   crates keep their own, stricter script.
+- Licence gate (rule D2, #1253): everything tole ships, desktop GPUI stack
+  included, passes `deny.toml` (`cargo deny check licenses bans sources`): a
+  licence allowlist, `bans`, crates.io as the only source, no git
+  dependencies. A dependency under a licence outside the list is an OWNER
+  decision, never an agent's: do not widen `allow` or add an `exceptions` entry
+  to make CI green. Name the crate and the licence in the PR, and give each
+  non-permissive entry a comment (why, which crates). Advisories stay with
+  `cargo audit`.
 - Desktop crates are modular monoliths (owner rule D1; the crate cap is 50,000
   lines, the file cap 500): one small module per page or capability, shared
   pieces (text cleaning, badges, caps, strings, tokens) in their own reusable
