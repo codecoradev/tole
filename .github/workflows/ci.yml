@@ -62,6 +62,54 @@ jobs:
           cargo clippy -p tole-cli --no-default-features --features shell-tools --all-targets -- -D warnings
           cargo clippy -p tole-tui --no-default-features --all-targets -- -D warnings
 
+  # Rule M3 (#1254): every Cargo feature builds ALONE, with
+  # --no-default-features. A feature that silently relies on another one
+  # (a cfg gate on a sibling feature, a dependency listed under the wrong
+  # feature) fails here instead of in a downstream embedder's build. This is
+  # check only (the test runs of the two profiles above stay as they are) and
+  # its own parallel job per package, so it is not on the longest path (the
+  # Test shards and Cross-Compile). Warnings are errors: a dead item that
+  # shows up only in one profile is the usual sign of a wrong gate. The
+  # feature lists mirror [features] in crates/tole-core and crates/tole-cli;
+  # a new feature is added to the list in the same PR (the empty entry is the
+  # bare profile). tole-tui has no features.
+  features-alone:
+    name: Features alone (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: tole-core
+            features: "shell-tools mcp mcp-http"
+          - package: tole-cli
+            features: "shell-tools mcp mcp-http tui web-builtin replay"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-alone-${{ matrix.package }}
+      - name: cargo check, each feature alone and none
+        env:
+          PACKAGE: ${{ matrix.package }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          failed=""
+          for f in "" $FEATURES; do
+            echo "::group::cargo check -p $PACKAGE --no-default-features ${f:+--features $f}"
+            if ! cargo check -p "$PACKAGE" --no-default-features ${f:+--features "$f"}; then
+              failed="$failed ${f:-<none>}"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::$PACKAGE does not build with these features alone:$failed"
+            exit 1
+          fi
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
