@@ -159,13 +159,18 @@ def metadata(packages):
 
 
 class Wrapper(unittest.TestCase):
-    def check(self, stdout="", code=0, mode="kinds"):
+    def check(self, stdout="", code=0, mode="kinds", files=None, extra=()):
         with tempfile.TemporaryDirectory() as d:
             root = os.path.join(d, "ws")
             os.mkdir(root)
+            for rel, content in (files or {}).items():
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(content if isinstance(content, bytes) else content.encode())
             cargo = stub_cargo(d, stdout.replace("@ROOT@", root), code)
             env = dict(os.environ, CARGO=cargo)
-            done = subprocess.run(["bash", os.path.join(HERE, "arch-check.sh"), mode, root],
+            done = subprocess.run(["bash", os.path.join(HERE, "arch-check.sh"), mode, root, *extra],
                                   capture_output=True, text=True, env=env)
         return done.returncode, done.stdout + done.stderr
 
@@ -199,9 +204,223 @@ class Wrapper(unittest.TestCase):
         rc, _ = self.check(mode="bogus")
         self.assertEqual(rc, 2)
 
-    def test_all_runs_kinds(self):
-        rc, out = self.check(metadata([pkg("a", "core")]), mode="all")
+    def test_all_runs_kinds_and_size(self):
+        rc, out = self.check(metadata([pkg("a", "core")]), mode="all", files={**SMALL, LIST: "# empty\n"})
         self.assertEqual(rc, 0, out)
+        self.assertIn("kinds:", out)
+        self.assertIn("size:", out)
+
+LIST = "scripts/arch-size-allow.txt"
+SMALL = {"crates/a/src/lib.rs": "fn a() {}\n"}
+
+
+def lines(n):
+    return "".join(f"// {i}\n" for i in range(n))
+
+
+def size(files, crates, allow_text):
+    found = []
+    allow = arch.parse_allow(allow_text, report=lambda p, l, m: found.append((p, l, m)))
+    arch.check_size(files, crates, allow, report=lambda p, l, m: found.append((p, l, m)))
+    return found
+
+
+class SizeRules(unittest.TestCase):
+    def test_everything_within_the_caps_passes_with_an_empty_list(self):
+        self.assertEqual(size({"crates/a/src/lib.rs": 500}, {"a": 50000}, "# nothing listed\n"), [])
+
+    def test_a_new_file_over_the_cap_fails_with_the_file_and_the_numbers(self):
+        found = size({"crates/a/src/new.rs": 501}, {"a": 501}, "")
+        self.assertEqual(len(found), 1)
+        path, _, msg = found[0]
+        self.assertEqual(path, "crates/a/src/new.rs")
+        self.assertIn("501 lines", msg)
+        self.assertIn("500-line cap", msg)
+        self.assertIn("new entries are not added", msg)
+
+    def test_a_listed_file_that_grows_by_one_line_fails(self):
+        found = size({"crates/a/src/big.rs": 801}, {"a": 801}, "file crates/a/src/big.rs 800\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("grew past its entry (801 lines, entry 800)", found[0][2])
+        self.assertEqual(found[0][0], LIST)
+        self.assertEqual(found[0][1], 1)
+
+    def test_a_listed_file_that_shrank_has_a_stale_entry(self):
+        found = size({"crates/a/src/big.rs": 700}, {"a": 700}, "file crates/a/src/big.rs 800\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("lower it to 700", found[0][2])
+
+    def test_an_entry_left_behind_after_a_split_fails(self):
+        found = size({"crates/a/src/big.rs": 400}, {"a": 400}, "file crates/a/src/big.rs 800\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("remove this entry", found[0][2])
+        self.assertIn("within the 500-line cap", found[0][2])
+
+    def test_an_entry_for_a_file_that_is_gone_fails(self):
+        found = size({"crates/a/src/lib.rs": 10}, {"a": 10}, "file crates/a/src/gone.rs 800\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("not measured any more", found[0][2])
+
+    def test_an_entry_never_over_its_cap_is_refused(self):
+        # An entry is written only for a violation: a number within the cap cannot be a valid entry.
+        found = size({"crates/a/src/big.rs": 600}, {"a": 600}, "file crates/a/src/big.rs 400\n")
+        self.assertTrue(any("not over the 500-line cap" in m or "grew past" in m for _, _, m in found), found)
+
+    def test_the_crate_cap_has_the_same_rules(self):
+        self.assertIn("not in", size({}, {"a": 50001}, "")[0][2])
+        self.assertIn("grew past", size({}, {"a": 50002}, "crate a 50001\n")[0][2])
+        self.assertIn("lower it to 50001", size({}, {"a": 50001}, "crate a 60000\n")[0][2])
+        self.assertIn("remove this entry", size({}, {"a": 40000}, "crate a 60000\n")[0][2])
+        self.assertEqual(size({}, {"a": 60000}, "crate a 60000\n"), [])
+
+    def test_a_listed_violation_that_did_not_change_passes(self):
+        self.assertEqual(size({"crates/a/src/big.rs": 800}, {"a": 800}, "file crates/a/src/big.rs 800  # split later\n"), [])
+
+    def test_a_list_that_cannot_be_read_is_reported_not_taken_as_empty(self):
+        found = size({"crates/a/src/lib.rs": 10}, {"a": 10}, "oops\nfile x notanumber\nfile y 0\nfile z 9\nfile z 9\n")
+        msgs = " | ".join(m for _, _, m in found)
+        self.assertEqual(msgs.count("not understood"), 3, msgs)
+        self.assertIn("duplicate entry", msgs)
+
+    def test_the_committed_list_has_only_real_violations(self):
+        # AC3: every entry was over its cap when written, and the list is sorted (crates, then files).
+        path = os.path.join(HERE, "arch-size-allow.txt")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        found = []
+        allow = arch.parse_allow(text, report=lambda p, l, m: found.append((p, l, m)))
+        self.assertEqual(found, [])
+        self.assertTrue(allow, "the committed list is empty")
+        for (kind, name), (n, _) in allow.items():
+            cap = arch.MAX_FILE_LINES if kind == "file" else arch.MAX_CRATE_LINES
+            self.assertGreater(n, cap, f"{kind} {name}: entry {n} is within the cap")
+
+    def test_the_baseline_lists_only_violations_sorted(self):
+        text = arch.baseline_text({"b.rs": 600, "a.rs": 700, "c.rs": 500}, {"z": 50001, "y": 10})
+        entries = [l for l in text.splitlines() if not l.startswith("#")]
+        self.assertEqual(entries, ["crate z 50001", "file a.rs 700", "file b.rs 600"])
+
+
+def workspace(directory, files):
+    for rel, content in files.items():
+        path = os.path.join(directory, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content if isinstance(content, bytes) else content.encode())
+    return [{"name": "a", "manifest": "crates/a/Cargo.toml", "dir": os.path.join(directory, "crates/a"), "kind": "core", "deps": []}]
+
+
+class SizeMeasure(unittest.TestCase):
+    def test_lines_are_counted_like_wc_plus_an_unterminated_last_line(self):
+        self.assertEqual(arch.count_lines(b""), 0)
+        self.assertEqual(arch.count_lines(b"a\n"), 1)
+        self.assertEqual(arch.count_lines(b"a\nb"), 2)
+        self.assertEqual(arch.count_lines(b"\n\n"), 2)
+
+    def test_sources_tests_examples_benches_and_the_build_script_are_measured(self):
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {
+                "crates/a/src/lib.rs": lines(3), "crates/a/src/deep/x.rs": lines(4), "crates/a/src/notes.txt": lines(99),
+                "crates/a/tests/t.rs": lines(5), "crates/a/examples/e.rs": lines(6), "crates/a/benches/b.rs": lines(7),
+                "crates/a/build.rs": lines(8), "crates/a/other/skip.rs": lines(9),
+            })
+            files, crates = arch.measure(pk, d)
+        self.assertEqual(files, {"crates/a/src/lib.rs": 3, "crates/a/src/deep/x.rs": 4, "crates/a/tests/t.rs": 5,
+                                 "crates/a/examples/e.rs": 6, "crates/a/benches/b.rs": 7, "crates/a/build.rs": 8})
+        self.assertEqual(crates, {"a": 7})  # only src/ counts towards the crate cap
+
+    def test_a_crate_with_no_source_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {"crates/a/tests/t.rs": lines(1)})
+            with self.assertRaises(RuntimeError):
+                arch.measure(pk, d)
+
+    def test_a_file_that_is_not_utf8_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {"crates/a/src/lib.rs": b"fn a() {}\n\xff\xfe\n"})
+            with self.assertRaises(UnicodeDecodeError):
+                arch.measure(pk, d)
+
+    def test_a_dangling_symlink_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {"crates/a/src/lib.rs": lines(1)})
+            os.symlink(os.path.join(d, "nowhere.rs"), os.path.join(d, "crates/a/src/link.rs"))
+            with self.assertRaises(RuntimeError):
+                arch.measure(pk, d)
+
+    def test_an_unreadable_file_fails_closed(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {"crates/a/src/lib.rs": lines(1), "crates/a/src/secret.rs": lines(1)})
+            os.chmod(os.path.join(d, "crates/a/src/secret.rs"), 0)
+            with self.assertRaises(PermissionError):
+                arch.measure(pk, d)
+
+    def test_a_symlinked_directory_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as d:
+            pk = workspace(d, {"crates/a/src/lib.rs": lines(1), "elsewhere/big.rs": lines(900)})
+            os.symlink(os.path.join(d, "elsewhere"), os.path.join(d, "crates/a/src/linked"))
+            files, _ = arch.measure(pk, d)
+        self.assertEqual(files, {"crates/a/src/lib.rs": 1})
+
+
+class SizeWrapper(unittest.TestCase):
+    meta = metadata([pkg("a", "core")])
+
+    def run_size(self, files, extra=(), mode="size"):
+        return Wrapper().check(self.meta, mode=mode, files=files, extra=extra)
+
+    def test_a_new_501_line_file_exits_1_and_names_it(self):
+        rc, out = self.run_size({**SMALL, "crates/a/src/big.rs": lines(501), LIST: "# empty\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("crates/a/src/big.rs", out)
+        self.assertIn("501 lines", out)
+
+    def test_a_listed_file_that_grows_exits_1_and_a_split_leaves_a_stale_entry(self):
+        base = {**SMALL, "crates/a/src/big.rs": lines(601)}
+        rc, out = self.run_size({**base, LIST: "file crates/a/src/big.rs 600\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("grew past its entry", out)
+        rc, out = self.run_size({**SMALL, "crates/a/src/big.rs": lines(300), LIST: "file crates/a/src/big.rs 600\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("remove this entry", out)
+
+    def test_a_listed_violation_unchanged_passes(self):
+        rc, out = self.run_size({**SMALL, "crates/a/src/big.rs": lines(600), LIST: "file crates/a/src/big.rs 600\n"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("arch-check (size): ok", out)
+
+    def test_a_missing_list_fails_closed(self):
+        rc, out = self.run_size(SMALL)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NOT passed", out)
+
+    def test_a_non_utf8_source_fails_closed(self):
+        rc, out = self.run_size({"crates/a/src/lib.rs": b"\xff\xfe", LIST: "# empty\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn(": ok", out)
+
+    def test_init_writes_the_first_list_and_refuses_to_run_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "ws")
+            workspace(root, {**SMALL, "crates/a/src/big.rs": lines(777)})
+            os.makedirs(os.path.join(root, "scripts"))
+            env = dict(os.environ, CARGO=stub_cargo(d, self.meta.replace("@ROOT@", root)))
+            cmd = ["bash", os.path.join(HERE, "arch-check.sh"), "size", root, "--init"]
+            first = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            with open(os.path.join(root, LIST), encoding="utf-8") as f:
+                self.assertIn("file crates/a/src/big.rs 777", f.read())
+            again = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(again.returncode, 2, again.stdout + again.stderr)
+            self.assertIn("exists", again.stdout + again.stderr)
+            plain = subprocess.run(cmd[:-1], capture_output=True, text=True, env=env)
+            self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+
+    def test_init_is_for_the_size_mode_only(self):
+        rc, _ = self.run_size(SMALL, extra=("--init",), mode="kinds")
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

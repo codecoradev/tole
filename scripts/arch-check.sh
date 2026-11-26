@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Architecture guardrails of the CodeCora modular + thin-UI standard (#1249).
 #
-# Usage: scripts/arch-check.sh [kinds|all] [workspace-root]
+# Usage: scripts/arch-check.sh [kinds|size|all] [workspace-root] [--init]
 #   workspace-root defaults to the repository root (the self-test points it at
 #   fixture workspaces). Needs bash, cargo and Python 3.8+. Nothing is
 #   downloaded: `cargo metadata --no-deps --offline`.
@@ -26,6 +26,20 @@
 #             check is the crate level above it. The desktop crates keep their
 #             own stricter script, scripts/desktop-check.sh.
 #
+# size      (#1251, standard rule D1)
+#             - every .rs file of a crate's src/, tests/, examples/ and benches/
+#               and its build.rs has at most 500 lines, and the src/ of a crate
+#               at most 50,000 lines (the cap the desktop crates already have);
+#             - today's violations are in scripts/arch-size-allow.txt and that
+#               list can only go down: a file or crate over its cap and not
+#               listed fails; an entry that is smaller or larger than the
+#               measured size fails (stale, or grown past its entry); an entry
+#               within its cap fails (remove it);
+#             - `--init` writes the first list and refuses to run when it
+#               exists. No mode adds an entry: split the file instead.
+#             The desktop crates keep their own check, which this one does not
+#             weaken.
+#
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this
 # script exit 2 with a message. It never prints `ok` for a check that did not
@@ -38,16 +52,18 @@ set -uo pipefail
 mode="${1:-all}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${2:-$(cd "$here/.." && pwd)}"
+init=""
+if [ "${3:-}" = "--init" ]; then init="--init"; elif [ -n "${3:-}" ]; then echo "usage: $0 [kinds|size|all] [workspace-root] [--init]" >&2; exit 2; fi
 fails=0
 
 fail() { echo "error: $*"; fails=$((fails + 1)); }
 
-# lint <kinds>: run the Python rules; exit 2 unless they finished.
+# lint <kinds|size> [--init]: run the Python rules; exit 2 unless they finished.
 lint() {
   local out rc=0 err line
   command -v python3 > /dev/null 2>&1 || { echo "error: python3 is needed by the architecture guardrails and was not found"; exit 2; }
   err=$(mktemp)
-  out=$(python3 -I "$here/arch-lint.py" "$1" "$root" 2> "$err") || rc=$?
+  out=$(python3 -I "$here/arch-lint.py" "$1" "$root" ${2:+"$2"} 2> "$err") || rc=$?
   if [ "$rc" -gt 1 ] || { [ "$rc" = 1 ] && ! grep -q '^error: ' <<< "$out"; }; then
     echo "error: the architecture $1 check could not finish (exit $rc); the gate is NOT passed:"
     sed 's/^/  /' "$err"
@@ -63,10 +79,12 @@ lint() {
   done <<< "$out"
 }
 
+if [ -n "$init" ] && [ "$mode" != "size" ]; then echo "usage: --init is for the size mode only" >&2; exit 2; fi
 case "$mode" in
   kinds) lint kinds ;;
-  all) lint kinds ;;
-  *) echo "usage: $0 [kinds|all] [workspace-root]" >&2; exit 2 ;;
+  size) lint size "$init" ;;
+  all) lint kinds; lint size ;;
+  *) echo "usage: $0 [kinds|size|all] [workspace-root] [--init]" >&2; exit 2 ;;
 esac
 
 if [ "$fails" -gt 0 ]; then

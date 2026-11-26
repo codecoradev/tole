@@ -52,6 +52,10 @@ Every crate declares a kind in `[package.metadata.tole]` and `scripts/arch-check
 
 A UI toolkit package (`crossterm`, `ratatui`, `gpui*`, `zed*`) is a normal dependency of `ui`, `feature-ui` and `bin` crates only. Build and dev dependencies are not checked (test and build wiring). `tole-core` is the kernel crate: its engine-level modules (delegation, discussion, MCP, web, skills) are one crate by decision (#752) and are kept apart by the layering test, not by the matrix. The desktop crates keep their stricter script, `scripts/desktop-check.sh`. A new crate declares its kind in its first commit; the full vocabulary is core, engine, integration, os, feature, app, ffi, ui, feature-ui, bin and tool (`scripts/arch-lint.py`).
 
+### File and crate size (#1251)
+
+`scripts/arch-check.sh size` applies rule D1 of the same standard to every workspace crate: a `.rs` file (under `src/`, `tests/`, `examples/`, `benches/`, and `build.rs`) has at most 500 lines, and the `src/` of a crate at most 50,000 (the cap the desktop crates already have). Today's violations (138 files, and the `src/` of `tole-core` and `tole-cli`) are in `scripts/arch-size-allow.txt`, and that list **can only go down**: a file or crate over its cap and not listed fails the check; an entry smaller or larger than the measured size fails (stale, or grown past its entry); an entry within its cap fails (remove it); `--init` writes the first list once and refuses to run when it exists. There is no mode that adds an entry: split the file (one subsystem per pull request, pure moves, the #752 rules) and lower or remove its entry in the same PR. A file that cannot be measured (unreadable, not UTF-8, a link to nothing) or a crate with no source is exit 2, never a pass. The desktop crates keep `scripts/desktop-check.sh`, which this check does not weaken.
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |
