@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod export;
 pub mod host;
 pub mod index;
+pub mod interrupted;
 pub mod owner_mcp;
 pub mod runner;
 pub mod status;
