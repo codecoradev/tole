@@ -71,6 +71,10 @@ Rules M3 and L5 of the same standard, proved in CI (measured 2026-11-26 at the c
 
 Each Cargo feature also builds alone. The `Features alone` jobs of `ci.yml` run `cargo check --no-default-features` for `tole-core` (`shell-tools`, `mcp`, `mcp-http`) and `tole-cli` (`shell-tools`, `mcp`, `mcp-http`, `tui`, `web-builtin`, `replay`) with each feature alone and with none, with warnings as errors, in parallel with the longest path. A new feature goes into the matrix of that job in the same PR. A crate that must stay portable to a new target gets a check step for it in the workflow that owns it; a crate that becomes portable is moved in this table in the same PR.
 
+### Licence gate (#1253)
+
+Rule D2 of the same standard: everything tole ships passes `cargo deny check licenses bans sources`, configured in `deny.toml` and run by the `Licences, bans and sources` job of `.github/workflows/security.yml` with a pinned cargo-deny release binary (version and sha256 in the workflow; no third-party action). The policy covers every feature of every workspace member (the desktop's optional GPUI stack included) and every target. `licenses` holds the owner-approved allowlist; a licence outside it is a named per-crate `exceptions` entry with a comment (MPL-2.0 is weak copyleft and only for dependencies), so a new dependency under such a licence fails until the owner extends the list. `bans` rejects OpenSSL and aws-lc (tole's TLS is rustls with `ring`), `sources` allows only the crates.io index and no git dependency. Advisories and yanked crates stay with `cargo audit`. The npm dependencies of the future React views have their own allowlist (#1243); tole ships no model weights.
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |
