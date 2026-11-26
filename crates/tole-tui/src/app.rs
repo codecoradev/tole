@@ -5,6 +5,7 @@
 
 mod at;
 mod images;
+mod queue;
 
 use crate::{menu, App, Footer, Item, KeyAction, Keymap, Kind, Out, PickKind, Theme};
 
