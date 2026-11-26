@@ -71,3 +71,65 @@ fn a_settled_session_and_a_turn_parked_after_a_denial_take_a_prompt() {
     assert_eq!(refuse(&s), Ok(()), "parked after a denial (#476)");
     assert!(!core_refuses(&mut s), "the core settles it and runs");
 }
+
+/// Every register value, reached by legal steps: `refuse` and the core's own
+/// `run_turn` refusal agree on each, and the refusal names the register.
+#[test]
+fn refuse_agrees_with_the_core_for_every_register_value() {
+    use Pc::*;
+    // (case, steps after Idle, denial note last, refused, state named)
+    let cases: [(&str, &[Pc], bool, bool, &str); 8] = [
+        ("idle", &[], false, false, ""),
+        ("planning", &[Planning], false, true, "planning"),
+        ("planning, denial note last", &[Planning], true, false, ""),
+        ("tool_call", &[Planning, ToolCall], false, true, "tool_call"),
+        (
+            "awaiting_approval",
+            &[Planning, ToolCall, AwaitingApproval],
+            false,
+            true,
+            "awaiting_approval",
+        ),
+        (
+            "executing",
+            &[Planning, ToolCall, Executing],
+            false,
+            true,
+            "executing",
+        ),
+        (
+            "settling",
+            &[Planning, ToolCall, Executing, Settling],
+            false,
+            true,
+            "settling",
+        ),
+        ("final", &[Planning, Final], false, false, ""),
+    ];
+    for (name, steps, denial, refused, state) in cases {
+        let dir = TestDir::new("interrupted-table");
+        let mut s = JsonlStorage::create(&dir, "s", None).unwrap();
+        for (i, pc) in steps.iter().enumerate() {
+            if i == 0 {
+                commit_message(&mut s, json!({"role": "user", "text": "q"}), *pc);
+            } else {
+                let seq = s.state().seq;
+                s.commit(Commit::new().transition(StateTransition::from(seq, *pc)))
+                    .unwrap();
+            }
+        }
+        if denial {
+            let note = json!({"role": "user", "text": "[tole] denied", DENIAL_NOTE: true});
+            s.commit(Commit::new().entry(NewEntry::root(EntryType::new(EntryType::MESSAGE), note)))
+                .unwrap();
+        }
+        let ours = refuse(&s);
+        assert_eq!(ours.is_err(), refused, "{name}: refuse");
+        if refused {
+            let (code, body) = prompt_error(ours.unwrap_err());
+            assert_eq!(code, 409, "{name}");
+            assert_eq!(body["state"], state, "{name}");
+        }
+        assert_eq!(core_refuses(&mut s), refused, "{name}: the core");
+    }
+}
