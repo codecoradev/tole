@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use request::{read_request, ReadError, Request};
+use response::{respond, respond_unauthorized, respond_with};
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::{self, Conn, Listener};
@@ -72,6 +73,7 @@ mod models;
 pub mod past_sessions;
 mod pct;
 mod request;
+mod response;
 mod state_views;
 mod token;
 
@@ -403,53 +405,6 @@ fn hook_target(path: &str) -> Option<&str> {
     path.strip_prefix("/hooks/")
         .map(|r| r.split('?').next().unwrap_or(r))
 }
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        202 => "Accepted",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        507 => "Insufficient Storage",
-        _ => "Unknown",
-    }
-}
-
-fn respond(stream: &mut Conn, status: u16, payload: &serde_json::Value) {
-    respond_with(stream, status, payload, "");
-}
-
-/// The 401 of every refused request: one body whatever was wrong (no user
-/// or password verdict), and the Basic challenge when Basic is on.
-fn respond_unauthorized(stream: &mut Conn, auth: &tole_cli::auth::Authenticator) {
-    let extra = auth
-        .challenge()
-        .map(|c| format!("WWW-Authenticate: {c}\r\n"))
-        .unwrap_or_default();
-    respond_with(stream, 401, &json!({"error": "unauthorized"}), &extra);
-}
-
-/// `extra` is zero or more complete `Name: value\r\n` header lines.
-fn respond_with(stream: &mut Conn, status: u16, payload: &serde_json::Value, extra: &str) {
-    let body = payload.to_string();
-    let reason = reason_phrase(status);
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-    let _ = stream.flush();
-}
-
 /// Panic-safe connection-count guard: decrements on Drop (normal or
 /// unwind), so the counter never permanently inflates after a panicking
 /// handler.

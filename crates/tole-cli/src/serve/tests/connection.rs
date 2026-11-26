@@ -1,6 +1,7 @@
 //! Tests of the connection layer: the token, the status line and the read deadline.
 
 use crate::serve::request::DeadlineReader;
+use crate::serve::response::reason_phrase;
 use crate::serve::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
