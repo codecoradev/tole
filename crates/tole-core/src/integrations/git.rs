@@ -79,6 +79,7 @@
 //!   the owner's own choice and is not vetted; `GIT_CONFIG_NOSYSTEM=1` drops
 //!   `/etc/gitconfig` (safe.directory, credential helpers, user.*), so a
 //!   repository owned by another user can fail with "dubious ownership".
+#![allow(unsafe_code)] // SAFETY: close of inherited descriptors in the git child and a test fd check; each block states its invariant.
 
 use crate::subprocess::run_with_timeout;
 use crate::tool::{Risk, Tool};

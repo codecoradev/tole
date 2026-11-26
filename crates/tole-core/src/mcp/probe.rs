@@ -21,6 +21,7 @@
 //! A remote (HTTP) server has no local process to stop and goes through the
 //! shared reactor. On a platform without process groups only the server
 //! process itself is killed.
+#![allow(unsafe_code)] // SAFETY: killpg and pre_exec of a process group the probe owns; see the blocks.
 
 use super::*;
 

@@ -254,6 +254,7 @@ fn settle_writes(path: &Path) {
 /// without them) it falls back to scanning `/proc/*/fdinfo`, which is
 /// right except for a child caught mid-`fork`.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // SAFETY: test-only libc call on a path or descriptor the test owns.
 fn writers_gone(path: &Path) -> bool {
     use std::os::fd::AsRawFd;
     let Ok(f) = std::fs::File::open(path) else {
