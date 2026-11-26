@@ -1,12 +1,20 @@
 use super::*;
+use crate::event_loop::event_loop;
 use crate::host::unsupported;
-use crate::render::inline_spans;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::host_cmd::{attach_pasted, run_host_cmd};
+use crate::observer::ChanObserver;
+use crate::render::{inline_spans, styled, wrap};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier, Style};
-use std::time::Instant;
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tole_core::approval::Verdict;
+use tole_core::cancel::CancelToken;
 use tole_core::tool::Risk;
+use tole_core::turn::TurnObserver;
 
 fn key(c: KeyCode) -> KeyEvent {
     KeyEvent::new(c, KeyModifiers::NONE)
