@@ -3,15 +3,18 @@
 //!
 //! Opening a session folds its whole JSONL log into memory
 //! (`JsonlStorage::open`), and the first turn after a resume also scans the
-//! entries once (taint seeding, the denial check, the compaction view). This
-//! file builds long sessions through the REAL turn loop and JSONL writer (a
+//! entries once (taint seeding, the denial check). This file builds long sessions through the REAL turn loop and JSONL writer (a
 //! `MockProvider`, no network), then times:
 //!
 //! - `open`: the writable open (lock + replay + torn-tail check), the cost of
 //!   `tole resume` and of every `tole serve` session load;
 //! - `open_ro`: the read-only replay that listings and status use;
-//! - `first turn`: one text-only turn on the reopened session, i.e. everything
-//!   a resumed session does before its first provider request.
+//! - `first turn`: one text-only turn on the reopened session. It covers the
+//!   turn loop's own scans of the transcript (taint seeding, with a
+//!   `TaintTracker` set as real hosts do, and the denial check) and its durable
+//!   commits. It is one sample that includes an fdatasync, so a size
+//!   dependence under about 5 ms is not visible. The stop-gate scan and the
+//!   host's assemble work (config, tool roster, MCP) are not measured.
 //!
 //! The default run is small (a few seconds) and gates on a generous budget
 //! plus a linearity check, like `perf_threshold.rs`. The numbers that decide
@@ -27,8 +30,15 @@
 //! - `TOLE_REPLAY_REPS`: timed opens per size, the median is reported
 //!   (default 3).
 //! - `TOLE_REPLAY_DIR`: keep the fixtures there and reuse them on the next
-//!   run (building 100k entries takes minutes, and a second process gives a
-//!   clean `VmRSS` reading); without it they live in a `TestDir`.
+//!   run (building 100k entries takes minutes); without it they live in a
+//!   `TestDir`. The fixture name carries a generator version (`replay-v1-`),
+//!   so a change of the generator needs a new version, never a silent reuse.
+//!
+//! The `RSS` column is only valid for the first size measured in a process
+//! whose fixture was built by an EARLIER process (earlier builds and opens
+//! leave heap behind that a later open reuses). Run one profile and one size per
+//! process with `TOLE_REPLAY_DIR` set and the fixture already there; any other
+//! row prints `n/a`.
 //!
 //! The numbers are recorded in docs/perf.md ("Long-session replay").
 
@@ -43,6 +53,7 @@ use tole_core::cancel::CancelToken;
 use tole_core::image::ImageRef;
 use tole_core::mock::MockProvider;
 use tole_core::provider::ProviderOutput;
+use tole_core::skill_draft::TaintTracker;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn, run_turn_with_images, TurnOutcome};
@@ -134,6 +145,10 @@ impl Tool for BlobTool {
 
 fn registry() -> ToolRegistry {
     let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec![]));
+    // As a real host does (tool_roster, gate): without a tracker the turn
+    // loop's `seed_taint` returns at once and the first turn would not
+    // include it.
+    reg.set_taint_tracker(TaintTracker::default());
     reg.register(Box::new(BlobTool)).unwrap();
     reg
 }
@@ -150,16 +165,18 @@ fn image_refs(turn: u64) -> Vec<ImageRef> {
 }
 
 /// Builds `<dir>/<id>.jsonl` with at least `target` entries through the real
-/// turn loop; returns the path. An existing file is reused (see
-/// `TOLE_REPLAY_DIR`).
-fn build(dir: &Path, profile: Profile, target: usize) -> PathBuf {
-    let id = format!("replay-{}-{target}", profile.name());
+/// turn loop; returns the path and whether this call built it. An existing
+/// file is reused (see `TOLE_REPLAY_DIR`).
+fn build(dir: &Path, profile: Profile, target: usize) -> (PathBuf, bool) {
+    let id = format!("replay-v1-{}-{target}", profile.name());
     let path = dir.join(format!("{id}.jsonl"));
     if path.exists() {
-        return path;
+        return (path, false);
     }
     // Build under a temporary name and rename, so an interrupted build never
-    // leaves a short file that a later run would take for the fixture.
+    // leaves a short file that a later run would take for the fixture. (The
+    // header of the renamed file still carries the `-partial` id: harmless,
+    // the id is not checked against the file name.)
     let tmp_id = format!("{id}-partial");
     let tmp = dir.join(format!("{tmp_id}.jsonl"));
     let _ = std::fs::remove_file(&tmp);
@@ -218,7 +235,7 @@ fn build(dir: &Path, profile: Profile, target: usize) -> PathBuf {
     drop(s);
     std::fs::rename(&tmp, &path).unwrap();
     let _ = std::fs::remove_file(dir.join(format!("{tmp_id}.jsonl.lock")));
-    path
+    (path, true)
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -242,9 +259,9 @@ struct Measured {
     rss_delta_kib: Option<u64>,
 }
 
-fn measure(path: &Path, reps: usize) -> Measured {
+fn measure(path: &Path, reps: usize, rss_valid: bool) -> Measured {
     let bytes = std::fs::metadata(path).unwrap().len();
-    let rss_before = rss_kib();
+    let rss_before = rss_kib().filter(|_| rss_valid);
     let mut opens = Vec::new();
     let mut entries = 0;
     let mut rss_delta_kib = None;
@@ -272,7 +289,9 @@ fn measure(path: &Path, reps: usize) -> Measured {
     // Flush the copy first: the turn's durable commit does an fdatasync, which
     // would otherwise also write out every dirty page of the copy and be
     // timed as if it were replay cost.
-    std::fs::File::open(&copy_path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&copy_path)
         .and_then(|f| f.sync_all())
         .unwrap();
     let mut s = JsonlStorage::open(&copy_path).unwrap();
@@ -318,7 +337,10 @@ fn replay_of_long_sessions_stays_linear_and_under_budget() {
             other => panic!("TOLE_REPLAY_PROFILES: unknown profile {other}"),
         })
         .collect();
-    let reps: usize = list("TOLE_REPLAY_REPS", "3")[0].parse().unwrap();
+    let reps: usize = list("TOLE_REPLAY_REPS", "3")
+        .first()
+        .and_then(|s| s.parse().ok())
+        .expect("TOLE_REPLAY_REPS: a number >= 1");
     assert!(
         !sizes.is_empty() && !profiles.is_empty() && reps >= 1,
         "nothing to measure"
@@ -337,13 +359,18 @@ fn replay_of_long_sessions_stays_linear_and_under_budget() {
         "replay-measure: profile  entries   file MiB   open ms  open_ro ms  first turn ms  RSS MiB  (median of {reps}, {} build)",
         if cfg!(debug_assertions) { "debug" } else { "release" }
     );
+    let mut rss_valid = true;
     for profile in profiles {
         let mut rows: Vec<Measured> = Vec::new();
         for &size in &sizes {
             let t = Instant::now();
-            let path = build(&dir, profile, size);
+            let (path, did_build) = build(&dir, profile, size);
             let built = t.elapsed();
-            let m = measure(&path, reps);
+            // RSS is only meaningful for the first open of a process that
+            // built nothing (see the module doc).
+            rss_valid &= !did_build;
+            let m = measure(&path, reps, rss_valid);
+            rss_valid = false;
             eprintln!(
                 "replay-measure: {:<8} {:>7} {:>10.2} {:>9.1} {:>11.1} {:>14.1} {:>8}  (fixture {:.1}s{})",
                 profile.name(),

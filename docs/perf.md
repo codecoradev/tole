@@ -1,9 +1,9 @@
 # tole — Performance Record (E9)
 
-Threshold benchmarks, CI-enforced (`perf_threshold` test binary). These
-are **regression gates**, not microbenchmarks: generous budgets that
-fail when the harness itself regresses. Provider latency is excluded
-(MockProvider — no network); what is measured is the harness's own
+Threshold benchmarks, CI-enforced (`perf_threshold` and `perf_replay` test
+binaries). These are **regression gates**, not microbenchmarks: generous
+budgets that fail when the harness itself regresses. Provider latency is
+excluded (MockProvider — no network); what is measured is the harness's own
 durability tax.
 
 ## Budgets (2026-09-28, v0.3.0-era baseline)
@@ -38,12 +38,13 @@ observation: it exists to catch complexity regressions (an O(n²) fold of
 
 Opening a session folds its whole JSONL log into memory
 (`JsonlStorage::open`), and the first turn after a resume scans the entries
-once more (taint seeding, the denial check). The question of #1019 is whether that cost, which grows with the age of a session, needs a
-checkpoint entry. `crates/tole-core/tests/perf_replay.rs` measures it: it builds
-sessions through the real turn loop and JSONL writer (`MockProvider`, no
-network), then times the writable `open`, the read-only `open_ro` (listings,
-status) and the first text-only turn on the reopened session. The numbers
-below come from it.
+once more (taint seeding, the denial check). The question of #1019 is whether
+that cost, which grows with the age of a session, needs a checkpoint entry.
+`crates/tole-core/tests/perf_replay.rs` measures it: it builds sessions through
+the real turn loop and JSONL writer (`MockProvider`, no network), then times the
+writable `open`, the read-only `open_ro` (listings, status) and one text-only
+turn on the reopened session (`first turn`, run with a `TaintTracker` set, as
+real hosts do). The numbers below come from it.
 
 Fixtures (deterministic; the same file every run):
 
@@ -61,68 +62,85 @@ Machine: Intel Xeon @ 2.1 GHz, 4 cores (`nproc` 4), Linux 6.18 x86_64, rustc
 1.97.0, `cargo test --release` (opt-level 3, thin LTO). The files are in the
 page cache (a fixture is read right after it was written or used before), the
 disk is a virtual `/dev/vda`. Another build ran on the same machine during the
-runs (load average about 2), so the figures carry about +-30% noise; each
-`open` and `open_ro` cell is the range of six runs, each the median of 3 to 5
-opens (the `first turn` and `RSS` cells: three clean runs, one process per
-size). `RSS` is the `VmRSS` growth of a fresh process around one open, with the
-storage kept alive.
+runs (load average about 2), so the figures carry about +-30% noise. Each
+`open` and `open_ro` cell is the range of ten runs, each the median of 3 to 5
+opens. The `first turn` and `RSS` cells are three runs with one profile and one
+size per process and the fixture built by an earlier process (the only way the
+`RSS` column is valid: earlier builds and opens of the same process leave heap
+behind that a later open reuses, and the test prints `n/a` for such rows).
+`RSS` is the `VmRSS` growth of that process around one open, with the storage
+kept alive. `first turn` is a single sample per run and includes an fdatasync,
+so it has a floor of about 5 ms and a size dependence below that is not visible.
 
 | Profile | Entries | Log | open | open_ro | first turn | RSS |
 |---|---|---|---|---|---|---|
-| small | 1,014 | 0.5 MiB | 3.9-5.7 ms | 3.4-5.3 ms | 5-7 ms | 2-3 MiB |
-| small | 5,018 | 2.4 MiB | 20-32 ms | 18-30 ms | 6-8 ms | 10 MiB |
-| small | 20,020 | 9.6 MiB | 75-136 ms | 72-109 ms | 7-9 ms | 36-37 MiB |
-| small | 100,022 | 48.6 MiB | 368-525 ms | 367-556 ms | 7-13 ms | 179 MiB |
-| mixed | 1,014 | 2.8 MiB | 7.3-10.2 ms | 6.6-10.3 ms | 1-2 ms | 2 MiB |
-| mixed | 5,018 | 13.2 MiB | 34-53 ms | 36-50 ms | 1.5-2.6 ms | 10 MiB |
-| mixed | 20,020 | 51.1 MiB | 129-159 ms | 127-203 ms | 1.4-2.6 ms | 37-38 MiB |
-| mixed | 100,022 | 261.7 MiB | 662-859 ms | 632-778 ms | 2-3 ms | 198 MiB |
+| small | 1,014 | 0.5 MiB | 3.9-5.7 ms | 3.3-5.3 ms | 5.5-6.1 ms | 2 MiB |
+| small | 5,018 | 2.4 MiB | 19-32 ms | 17-30 ms | 5.6-6.2 ms | 10 MiB |
+| small | 20,020 | 9.6 MiB | 73-136 ms | 71-109 ms | 8.9-12.5 ms | 36-37 MiB |
+| small | 100,022 | 48.6 MiB | 368-525 ms | 367-556 ms | 18.9-19.6 ms | 179 MiB |
+| mixed | 1,014 | 2.8 MiB | 7.0-11.2 ms | 6.2-10.3 ms | 4.9-6.5 ms | 5 MiB |
+| mixed | 5,018 | 13.2 MiB | 34-53 ms | 33-50 ms | 5.7-6.2 ms | 20 MiB |
+| mixed | 20,020 | 51.1 MiB | 129-159 ms | 122-203 ms | 8.2-17.2 ms | 76 MiB |
+| mixed | 100,022 | 261.7 MiB | 662-859 ms | 632-778 ms | 19.6-20.5 ms | 381 MiB |
 
 Reading the table:
 
-- Replay is linear. From 5k to 100k entries (20 times) `open` grows 16 to 20
-  times. It costs about 4.5 to 5 us per entry for small entries and about 7.5
-  to 9.6 us per entry in `mixed`; at 100k `mixed` that is about 3 ns per byte of
-  log (roughly 350 MB/s of JSON parsed). A log line is parsed once into
-  `serde_json::Value`s; nothing in `open` is quadratic. `open_ro` costs the same
-  as `open` (the lock and the torn-tail check are not the cost).
-- The first turn after the reopen (a text-only turn on a copy of the log, the
-  copy flushed first) takes 1 to 13 ms and does not grow from 1,000 to 100,000 entries:
-  the scan of the transcript before the first provider call (taint seeding, the
-  denial check) is not visible next to the durable commits of the turn itself
-  (the difference between the two profiles is not explained, it is not size).
-  Replay is the only size-dependent part of a resume that was measured.
-- Memory is the first resource to grow: about 1.8 KiB per `small` entry (the
-  entry, its `Value` tree, the id index) and about 0.75 times the log size for
-  `mixed`, so 100k entries hold 180 to 200 MiB in the process.
-- The unoptimized build that CI runs is about 7 times slower (`small`: 1,014
-  entries 30 ms, 3,016 entries 83 ms, about 28 us per entry), which is the
-  default run of the test: it builds the two `small` sizes in about 4 s, asserts
-  `open` under 5,000 ms (about 60 times the observation) and, when the
+- Replay is linear. From 5k to 100k entries (20 times) the median `open` grows
+  19 to 20 times. It costs 3.7 to 6.8 us per entry for `small` entries and 6.4
+  to 11 us per entry for `mixed` (at 100k: 3.7 to 5.3 and 6.6 to 8.6 us; the
+  spread is mostly the +-30% noise, the small sizes carry the highest per-entry
+  figures), which is about 3 ns per byte of log at 100k `mixed` (roughly 350
+  MB/s of JSON parsed). A log line is parsed once into `serde_json::Value`s;
+  nothing in `open` is quadratic. `open_ro` costs the same as `open` (the lock
+  and the torn-tail check are not the cost).
+- The first turn (on a copy of the log, flushed first) sits on a floor of about
+  5 to 6 ms, its own durable commits, up to 5,000 entries. Above that a growth
+  shows: 8 to 17 ms at 20,000 entries and 19 to 20 ms at 100,000 (about 0.14 us
+  per entry over the floor), the same for both profiles. It appeared when the `TaintTracker` was
+  set (without one `seed_taint` returns at once and the column was flat), so it
+  is consistent with the scan of the transcript before the first provider call.
+  It is not broken down further. The stop-gate scan and the host's assemble
+  work (config, tool roster, MCP servers) are not part of this column.
+- Memory grows with the log: about 1.8 KiB per `small` entry (the entry, its
+  `Value` tree, the id index) and about 3.9 KiB per `mixed` entry, which is
+  about 1.5 times the size of the log file (it holds the strings and the
+  tree). 100,000 entries hold 180 MiB (`small`) to 380 MiB (`mixed`) in the
+  process.
+- The unoptimized build that CI runs is about 6 times slower (`small`: 1,014
+  entries 24 to 30 ms, 3,016 entries 71 to 83 ms, about 24 us per entry), which
+  is the default run of the test: it builds the two `small` sizes in about 4 s,
+  asserts `open` under 5,000 ms (60 times the observation) and, when the
   smaller open takes 20 ms or more, that the cost grows by at most 3 times the
   growth of the log in bytes. An O(n^2) replay fails it; machine noise does not.
 
-Run it yourself (the large sizes are opt-in; building 100k entries takes one to
-two minutes, so `TOLE_REPLAY_DIR` keeps the fixtures and reuses them, which also
-gives a second process a clean `RSS` reading):
+Run it yourself. The large sizes are opt-in. Building 100k entries takes one
+to two minutes per profile, so `TOLE_REPLAY_DIR` keeps the fixtures and reuses
+them (a fixture is trusted by its name, which carries a generator version).
+Build them once, then run one profile and one size per process for a valid
+`RSS` column:
 
 ```text
+export TOLE_REPLAY_DIR=/path/to/scratch
 TOLE_REPLAY_SIZES=1000,5000,20000,100000 TOLE_REPLAY_PROFILES=small,mixed \
-TOLE_REPLAY_DIR=/path/to/scratch \
-  cargo test -p tole-core --release --test perf_replay -- --nocapture
+  cargo test -p tole-core --release --test perf_replay -- --nocapture   # builds
+TOLE_REPLAY_SIZES=100000 TOLE_REPLAY_PROFILES=mixed \
+  cargo test -p tole-core --release --test perf_replay -- --nocapture   # measures
 ```
 
 **Recommendation (for the owner to confirm; no checkpoint is built here).**
 No checkpoint is needed at the sizes measured. A 20,000-entry session (about
-770 twelve-call turns) opens in about 0.1 to 0.15 s with 36 MiB of memory,
-and even 100,000 entries (a 262 MiB log with large tool outputs) open in under
-1 s, linearly, with nothing size-dependent after the open before the first
-provider call. That is within the 2 s budget of the first table, which was set
-for 50 entries and is met by 2,000 times as many. Where a session does grow without bound the limit is
-memory (about 2 KiB per entry), not time; a checkpoint that only saved the
-parse would not lower it, because the provider is still fed from the entries.
-Suggested trigger to revisit: logs over about 250,000 entries or 500 MiB, an
-open over 1 s on a supported host, or a reported slow resume; then write the
+770 twelve-call turns) opens in about 0.1 to 0.15 s with 36 to 76 MiB of
+memory, and 100,000 entries (a 262 MiB log with large tool outputs) open in
+under 1 s, linearly, with about 15 ms more before the first provider call. That
+is within the 2 s budget of the first table, which was set for 50 entries and
+is met by 2,000 times as many. If a session grows without bound the first
+limit is memory (about 2 to 4 KiB per entry, 380 MiB at 100k `mixed` entries),
+not time; a checkpoint that only saved the parse would not lower it, because
+the provider is still fed from the entries. Primary trigger to revisit: a
+measured `open` over 1 s on a supported host (on this machine about 125,000
+`mixed` or 220,000 `small` entries), or a reported slow resume. Secondary,
+for orientation: the memory of the process that holds the sessions (a
+`tole serve` with many long sessions). If either trigger is reached, write the
 design note #1019 describes (an append-only checkpoint entry that carries the
 folded state, with a verifier that refolds from the full log).
 
@@ -130,10 +148,11 @@ Not measured: a cold page cache or a slow disk (the first read of a large log
 adds its I/O time); macOS, ARM and Android hosts; sizes over 100,000 entries;
 real sessions' usage rows (one more line per provider step, the mock provider
 reports none; same parse path); compaction entries (they do not shorten the
-replay, entries are never dropped); the per-request cost of building and
-redacting the provider body from a long history (#908), which a real provider
-pays at every step and `MockProvider` does not; `tole serve` holding many long
-sessions at once; the `compact` and `fork` paths.
+replay, entries are never dropped); the stop-gate scan and the host's assemble
+work before a resumed turn; the per-request cost of building and redacting the
+provider body from a long history (#908), which a real provider pays at every
+step and `MockProvider` does not; `tole serve` holding many long sessions at
+once; the `compact` and `fork` paths.
 
 ## Secret redaction (#681, 2026-11-14)
 
