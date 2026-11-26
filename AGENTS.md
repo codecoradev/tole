@@ -115,7 +115,14 @@ scripts/desktop-render.sh <dir> # a desktop UI change: render the real window of
 ```
 
 CI enforces the first three, `scripts/arch-check.sh` and its self-test (steps of
-the `Check` job, so no new required check name; #1250). The desktop script runs in a separate `Desktop`
+the `Check` job, so no new required check name; #1250). The `Features alone` jobs of
+`ci.yml` (#1254) `cargo check` `tole-core` and `tole-cli` with each Cargo feature
+alone and with none (`--no-default-features [--features X]`, warnings as
+errors): when you add or rewire a feature in a `[features]` table, run the
+same locally and add it to the matrix of that job. The `Desktop` workflow also
+checks `tole-desktop-model` for `wasm32-unknown-unknown`
+(`rustup target add wasm32-unknown-unknown`); which crates are portable to
+which targets is in "Portable crates and targets" in docs/architecture.md. The desktop script runs in a separate `Desktop`
 workflow (`.github/workflows/desktop.yml`; not part of `ci.yml`, and not a
 required check unless the owner adds it to the branch protection: require only
 `Desktop model and guardrails`). The literals check is a heuristic: it
