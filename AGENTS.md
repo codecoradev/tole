@@ -27,6 +27,11 @@ continuity, infra facts.
   typed client `tole-client`. It never lists `tole-core`, `tole-tui` or
   `tole-cli` (the session host) among its own dependencies; `tole-core` is in
   its closure only through `tole-client`, `tole-tui` and `tole-cli` nowhere.
+  Renderer decision (owner, 2026-11-25, epic #1241): the views will become
+  React on GPUIX with this crate as the headless core. None of it is built
+  yet, so `ui` and the `gpui` feature stay until the M2 parity gate and M3
+  (#1247); this section and sections 3 and 6 change in the PRs that make them
+  stale.
 - `docs/` — architecture, PRD, epics (roadmap + tracking issues), threat
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live

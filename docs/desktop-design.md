@@ -1,7 +1,8 @@
 # tole-desktop: local and remote over the same serve API (design note, #949)
 
 **Status: DESIGN. The owner un-parked the desktop on 2026-11-20 and answered
-D1 to D4 and D6 (section 0); D5 and D7 to D11 are still open.** Step 7 of epic
+D1 to D4 and D6 (section 0); D5 and D7 to D11 are still open. On 2026-11-25
+the owner chose React on GPUIX as the renderer (section 0.1).** Step 7 of epic
 #941. In the [decision table](#4-decisions-open-for-the-owner) the
 "recommended default" column is a proposal, not a record, except where section
 0 says the owner decided otherwise.
@@ -52,6 +53,66 @@ config and profiles, trust approval of skills and connected tools (owner
 decision pending, #1034), the operating system's folder dialog. Each is a row
 of [faces.md](faces.md) (#1070), which also records the desktop and mobile
 faces and a file panel that reads the folder directly.
+
+## 0.1 Owner decision of 2026-11-25: the renderer (epic #1241)
+
+The desktop renderer becomes a **React front end on the stock `@gpuix/native`
+addon** (GPUI underneath: Metal, Direct3D, Vulkan), styled with Tailwind, with
+the Rust core kept. This supersedes **one element** of the 2026-11-10 decision
+("desktop UI = GPUI, native Rust only, no JavaScript runtime"). Everything else
+stands: GPUI is the toolkit, the desktop is a thin client of `tole serve` (D2),
+and D1, D3, D4 and D6 of section 0 are unchanged. Svelte was measured and
+rejected: it needs an owned 202-line bridge on Svelte internals. The audit, the
+measurements and the plan are in #1241 and #1240.
+
+**What stays and what is replaced** (develop @cb0bf63, about 49k of the 58.6k
+desktop lines and about 990 tests do not touch the toolkit):
+
+| Part | Fate |
+|---|---|
+| `tole-desktop-model`, `adapter`, `driver`, `backend`, `supervisor`, `app`, `tole-client` | stay, in Rust |
+| `tole-desktop/src/ui` (GPUI views, about 9.3k lines, 52 tests) and the render harness | replaced by React and GPUIX automation screenshots (M3, #1247) |
+
+**Target architecture.** `tole serve` talks over the Unix socket or named pipe
+to `tole-desktop-core` (Rust, headless: supervisor, drivers, backend, adapter,
+model), which exposes one plain-data view and a few commands as versioned JSON
+lines over stdio (schema committed and checked in CI, #1242) to `apps/desktop`
+(Bun, React, `@gpuix/react`, Tailwind), which renders the view, sends the
+user's intent and keeps only view-local state (hover, focus, scroll offset, an
+unsent draft). The front end holds no business state, no text cleaning, no
+strings and no colours of its own (standard U1, U2, U4, U9).
+
+**Tripwires, not a blank cheque.** M0 (#1240) re-checks what the first spike
+could not: no fork of GPUIX or Zed (G1), input method composition (G2), frame
+cost of a 2,000-row streaming transcript (G3), idle cost (G4), accessibility
+(G5), Tailwind coverage (G6), the pipe (G7) and effort (G8). If G1 or G2 fails,
+or a fork is needed, the epic stops at M0 and the Rust renderer carries on. The
+Rust renderer is not deleted before M3, which needs the M2 parity gate (the six
+built boards S2, S3, S5, S6, S7 and S8, same states, same keyboard order, same
+model tests) and the owner's OK.
+
+**Plan.** M0 gates (#1240); M1 headless core and protocol, app scaffold,
+Tailwind compiler (#1242, #1243, #1244); M2 parity views (#1245, #1246); M3
+retire the Rust renderer (#1247); M4 the new screens built directly in React
+(#1035, #1036, #1037); M5 packaging and release (#1248); M6 parked (web through
+GPUIX wasm, #529, and a Linux ARM64 addon). Work on #1031 to #1034 in the model
+and drivers continues: it serves either renderer.
+
+**Status (2026-11-25): none of this is built.** There is no `apps/desktop`, no
+protocol and no TypeScript in the repository. This section records the
+decision; the code and the rows of the threat model (a JavaScript runtime, the
+npm supply chain, model text rendered by `<markdown>`, a native addon) follow in
+the PRs of M1 to M5.
+
+**Still to confirm before M1** (the proposal is in brackets; these are not
+decided): a JavaScript runtime in the bundle, Bun, about 90 MB plus a 24 MB
+addon [accept]; the sidecar and JSON-lines protocol over a TypeScript client or
+a napi addon [sidecar]; caps for the TypeScript app, 500 lines per file and
+50,000 per package as for the Rust desktop crates [same caps]; no desktop
+support for Linux ARM64 and macOS Intel [accept]; the GPUIX pin and upgrade
+policy [exact pin, an upgrade is its own PR, never inside a feature PR]; where
+the app lives [`apps/desktop`, and the `tole-desktop` crate becomes the
+headless core].
 
 ## 1. One API, two transports
 
