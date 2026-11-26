@@ -123,7 +123,7 @@ approval gate on `run_command` and `job_start`, plus a best-effort blocklist
 that the threat model itself calls bypassable (`docs/threat-model.md:44`). The
 command sandbox is opt-in (`[sandbox.consumers] run_command` / `job_start`,
 default `off`); only when it is enabled, and the effective sessions directory is
-inside the workspace, is that directory bound read-only (#866, `main.rs:1209`,
+inside the workspace, is that directory bound read-only (#866, `main.rs:1208`,
 `sandbox/command.rs:285`). So the note does not claim a model cannot touch
 session files; it proposes that retention be an owner command, not a tool.
 

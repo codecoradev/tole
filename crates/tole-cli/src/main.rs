@@ -4,7 +4,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-// The binary probe backs the uteke memory loop and the cora MCP preset.
 use tole_cli::session::assemble::{default_prompt_for, resolve_workspace_root, review_section};
 use tole_cli::trust::expand_trust;
 
