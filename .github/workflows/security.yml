@@ -26,6 +26,39 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
+  # Licence gate (rule D2 of the architecture standard, #1253): every licence
+  # in the dependency graph is on the allowlist of deny.toml, no banned crate,
+  # crates.io is the only source. Advisories stay with `cargo audit` above.
+  # cargo-deny is a pinned release binary checked against its published
+  # sha256, not `cargo install` (slow) and not a third-party action (a new
+  # publisher in the supply chain). To bump: take the new tag, download the
+  # x86_64-unknown-linux-musl asset and its .sha256 file from the release page,
+  # and change both values together.
+  cargo-deny:
+    name: Licences, bans and sources
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.22.1"
+      CARGO_DENY_SHA256: "13f7e825e9cb811c2f8de63f29b0f45851dfb53004029f0f2501af524728364d"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cargo-deny (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          asset="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/cargo-deny.tgz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${asset}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/cargo-deny.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/cargo-deny"
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tgz" -C "$RUNNER_TEMP/cargo-deny" --strip-components=1 "${asset}/cargo-deny"
+          echo "$RUNNER_TEMP/cargo-deny" >> "$GITHUB_PATH"
+      # cargo-deny reads the resolved graph with `cargo metadata`, which needs
+      # every crate downloaded (no compile). The lockfile is authoritative.
+      - name: Download crates
+        run: cargo fetch --locked
+      - name: cargo deny check licenses bans sources
+        run: cargo-deny check --hide-inclusion-graph licenses bans sources
+
   trivy:
     name: Trivy FS Scan
     runs-on: ubuntu-latest
