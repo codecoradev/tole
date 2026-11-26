@@ -6,6 +6,7 @@ that script.
 
     arch-lint.py kinds <workspace-root>            enforced (#1250)
     arch-lint.py size <workspace-root> [--init]    enforced (#1251)
+    arch-lint.py unsafe <workspace-root>           enforced (#1252)
 
 Output: `error: path:line: message`, `warning: ...` or `info: ...` per finding.
 Exit 0 = no error, 1 = at least one `error:` line, 2 = the check itself could
@@ -24,9 +25,20 @@ that list can only go down: a file or crate over its cap and not in the list
 fails, an entry that no longer matches the measured size fails (grown or
 stale), an entry that is within its cap fails, and `--init` refuses to run when
 the list exists. There is no mode that adds an entry.
+
+unsafe (rule D4): `unsafe_code = "deny"` is set for the whole workspace
+(`[workspace.lints.rust]` in the root Cargo.toml, `[lints] workspace = true` in
+every crate), so the compiler rejects an `unsafe` block anywhere that has not
+opted in with `#[allow(unsafe_code)]` (or `#![allow(unsafe_code)]`). This mode
+keeps the opt-ins honest: every site has a `SAFETY:` comment on the attribute
+or within 3 lines of it, and the files that hold a site are exactly the files
+listed in AGENTS.md between the unsafe-opt-ins marker comments. Nothing is
+tolerated silently: a site, a list entry or a manifest that does not match is
+an error, and a list that cannot be read is a failed run (exit 2).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import traceback
@@ -63,6 +75,18 @@ MAX_FILE_LINES = 500
 MAX_CRATE_LINES = 50000
 SOURCE_DIRS = ("src", "tests", "examples", "benches")
 ALLOW_LIST = "scripts/arch-size-allow.txt"
+
+# Rule D4 (#1252): the opt-in list in AGENTS.md and what counts as a site.
+AGENTS_FILE = "AGENTS.md"
+UNSAFE_START = "<!-- unsafe-opt-ins:start -->"
+UNSAFE_END = "<!-- unsafe-opt-ins:end -->"
+SAFETY_WINDOW = 3  # lines above and below the attribute searched for `SAFETY:`
+_ATTRIBUTE = re.compile(r"#!?\[[^\]]*\]")
+_LINT_LIST = re.compile(r"\b(?:allow|expect)\s*\(([^()]*)\)")
+_UNSAFE_CODE = re.compile(r"(?<![\w:])unsafe_code\b")
+_LIST_ENTRY = re.compile(r"^\s*[-*]\s+`([^`]+)`")
+_WORKSPACE_LINT = re.compile(r'^\[workspace\.lints\.rust\][^\[]*?^\s*unsafe_code\s*=\s*"deny"', re.M | re.S)
+_CRATE_LINT = re.compile(r"^\[lints\][^\[]*?^\s*workspace\s*=\s*true\s*(?:#.*)?$", re.M | re.S)
 
 findings = []  # (severity, text)
 
@@ -212,6 +236,99 @@ def baseline_text(files, crates):
     return "\n".join(out) + "\n"
 
 
+# ---- unsafe rules (pure) ------------------------------------------------------
+
+
+def find_opt_ins(text):
+    """The `unsafe_code` opt-ins of one source file: [(line, has_safety)].
+
+    A site is an attribute (`#[allow(unsafe_code)]`, `#![allow(unsafe_code)]`,
+    the same with `expect`, or either inside `cfg_attr`) that names
+    `unsafe_code`; an attribute that spans lines counts once, at its first
+    line, and a line that is a `//` comment is never a site. `has_safety` is
+    true when `SAFETY:` appears on the attribute or within SAFETY_WINDOW lines
+    above or below it.
+    """
+    lines = text.split("\n")
+    sites = []
+    for match in _ATTRIBUTE.finditer(text):
+        first = text.count("\n", 0, match.start())
+        if lines[first].lstrip().startswith("//"):
+            continue
+        attribute = match.group(0)
+        if not any(_UNSAFE_CODE.search(group) for group in _LINT_LIST.findall(attribute)):
+            continue
+        last = first + attribute.count("\n")
+        window = lines[max(0, first - SAFETY_WINDOW):last + 1 + SAFETY_WINDOW]
+        sites.append((first + 1, any("SAFETY:" in line for line in window)))
+    return sites
+
+
+def parse_unsafe_list(text, report=error, path=AGENTS_FILE):
+    """The opt-in files listed in AGENTS.md: {file: line number}.
+
+    The list is the bullets between a line holding only UNSAFE_START and a line
+    holding only UNSAFE_END; each bullet starts with the file in backticks (text
+    after it is a description). Missing, repeated or misordered markers raise
+    (the list cannot be read); a line that is not a bullet, a bullet without a
+    path and a duplicate are reported.
+    """
+    lines = text.split("\n")
+    starts = [i for i, line in enumerate(lines) if line.strip() == UNSAFE_START]
+    ends = [i for i, line in enumerate(lines) if line.strip() == UNSAFE_END]
+    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+        raise RuntimeError(f"{path} must hold exactly one `{UNSAFE_START}` line followed by one `{UNSAFE_END}` line "
+                           f"(found {len(starts)} and {len(ends)}): the opt-in list cannot be read")
+    listed = {}
+    for index in range(starts[0] + 1, ends[0]):
+        raw = lines[index]
+        if not raw.strip():
+            continue
+        entry = _LIST_ENTRY.match(raw)
+        name = entry.group(1).strip() if entry else None
+        if not name or not name.startswith("crates/") or not name.endswith(".rs"):
+            report(path, index + 1, f"not understood: {raw.strip()!r} (a bullet that starts with the file in backticks, e.g. - `crates/x/src/y.rs`)")
+        elif name in listed:
+            report(path, index + 1, f"duplicate entry for {name}")
+        else:
+            listed[name] = index + 1
+    return listed
+
+
+def check_unsafe(sites, listed, report=error, list_path=AGENTS_FILE):
+    """Rule D4 over the opt-ins found in the code.
+
+    `sites`: {file: [(line, has_safety)]} from find_opt_ins; `listed`: {file:
+    line number} from parse_unsafe_list. Every site needs its SAFETY comment,
+    and the set of files must equal the list: a file with a site that is not
+    listed fails, and so does a listed file with no site (or that is gone).
+    """
+    for path in sorted(sites):
+        for line, has_safety in sites[path]:
+            if not has_safety:
+                report(path, line, f"unsafe_code opt-in without a `SAFETY:` comment (on the attribute or within {SAFETY_WINDOW} lines of it)")
+        if path not in listed:
+            report(path, sites[path][0][0],
+                   f"opts in to unsafe_code but is not in the opt-in list of {list_path}: list it there, or remove the opt-in")
+    for path, number in sorted(listed.items()):
+        if path not in sites:
+            report(list_path, number, f"{path}: listed as an unsafe opt-in but holds no #[allow(unsafe_code)] (or is gone): remove the entry")
+
+
+def check_lints(root_manifest, manifests, report=error):
+    """The lint wiring: the workspace denies `unsafe_code` and every crate inherits it.
+
+    `root_manifest`: text of the root Cargo.toml; `manifests`: {path: text} of
+    the crate manifests. Without this a crate that lost its `[lints]` table
+    would silently allow `unsafe` again.
+    """
+    if not _WORKSPACE_LINT.search(root_manifest):
+        report("Cargo.toml", 1, '[workspace.lints.rust] must set unsafe_code = "deny"')
+    for path, text in sorted(manifests.items()):
+        if not _CRATE_LINT.search(text):
+            report(path, 1, 'no `[lints]` table with `workspace = true`: the crate does not inherit unsafe_code = "deny"')
+
+
 # ---- cargo --------------------------------------------------------------------
 
 
@@ -303,6 +420,12 @@ def measure(packages, root):
     return files, crates
 
 
+def read_text(path):
+    """A file as UTF-8 text; unreadable or not UTF-8 raises (never a silent empty)."""
+    with open(path, "rb") as fh:
+        return fh.read().decode("utf-8")
+
+
 def _walk_error(err):
     raise RuntimeError(f"cannot read {err.filename}: {err.strerror}")
 
@@ -331,11 +454,35 @@ def run_size(root, init=False):
          f"their caps, all listed ({len(allow)} entries)")
 
 
+def run_unsafe(root):
+    packages = load_packages(root)
+    sites, manifests = {}, {}
+    for pkg in packages:
+        manifests[pkg["manifest"].replace(os.sep, "/")] = read_text(os.path.join(pkg["dir"], "Cargo.toml"))
+        for here, dirs, names in os.walk(pkg["dir"], followlinks=False, onerror=_walk_error):
+            dirs[:] = sorted(d for d in dirs if d != "target")
+            for name in sorted(names):
+                if not name.endswith(".rs"):
+                    continue
+                full = os.path.join(here, name)
+                found = find_opt_ins(read_text(full))
+                if found:
+                    sites[os.path.relpath(full, root).replace(os.sep, "/")] = found
+    agents_path = os.path.join(root, AGENTS_FILE)
+    if not os.path.isfile(agents_path):
+        raise RuntimeError(f"{AGENTS_FILE} is missing: it holds the list of unsafe opt-in files")
+    listed = parse_unsafe_list(read_text(agents_path))
+    check_lints(read_text(os.path.join(root, "Cargo.toml")), manifests)
+    check_unsafe(sites, listed)
+    info(f"unsafe: {sum(len(v) for v in sites.values())} opt-ins in {len(sites)} files across {len(packages)} crates; "
+         f"{len(listed)} files listed in {AGENTS_FILE}")
+
+
 # ---- main ---------------------------------------------------------------------
 
 
 def main(argv):
-    modes = {"kinds": run_kinds, "size": run_size}
+    modes = {"kinds": run_kinds, "size": run_size, "unsafe": run_unsafe}
     flags = argv[3:]
     if len(argv) < 3 or argv[1] not in modes or any(f != "--init" for f in flags) or (flags and argv[1] != "size"):
         print(__doc__, file=sys.stderr)
