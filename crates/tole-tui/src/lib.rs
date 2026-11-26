@@ -51,7 +51,7 @@ pub use input::{Input, Key, KeyPress, Mods};
 pub use keymap::{KeyAction, KeySpec, Keymap};
 pub use menu::{Item, PickKind};
 use render::{styled, wrap};
-pub(crate) use sanitize::{one_line, sanitize};
+pub(crate) use sanitize::{clip, one_line, sanitize};
 pub use theme::{parse_color, parse_spec, Role, Theme, BUILTIN as BUILTIN_THEMES};
 pub use transcript::{Kind, Out, Transcript};
 
@@ -77,14 +77,6 @@ pub fn tool_line(tool: &str, input: &Value) -> String {
         .map(|s| clip(&one_line(s.lines().next().unwrap_or("")), 60))
         .unwrap_or_default();
     format!("▸ {tool} {arg}").trim_end().to_string()
-}
-
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max).collect();
-    format!("{cut}…")
 }
 
 impl TurnObserver for ChanObserver {
