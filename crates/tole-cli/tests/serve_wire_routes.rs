@@ -30,6 +30,7 @@ fn read_routes_keep_their_shape() {
     // The state of a server nobody has used yet.
     let fresh = [
         ("health", "/health"),
+        ("info", "/info"),
         ("models", "/models"),
         ("sessions_empty", "/sessions"),
         ("sessions_index_empty", "/sessions/index"),
@@ -44,7 +45,14 @@ fn read_routes_keep_their_shape() {
     let none = Volatile::of(&serve, &[]);
     let mut seen = Vec::new();
     for (name, path) in fresh {
-        seen.push((name, none.apply(&get(&serve, path))));
+        let mut v = none.apply(&get(&serve, path));
+        if name == "info" && !cfg!(feature = "mcp") {
+            // The golden is recorded with the default features: add back the one this build lacks.
+            let features = v["features"].as_array_mut().unwrap();
+            features.push(json!("mcp"));
+            features.sort_by_key(|f| f.as_str().unwrap().to_string());
+        }
+        seen.push((name, v));
     }
 
     // One session that answered, one that waits for an approval.
@@ -108,8 +116,9 @@ fn read_routes_keep_their_shape() {
 fn refusals_keep_their_shape() {
     let serve = Serve::spawn(&spawn_mock(0));
     let id = new_session(&serve);
-    let asks: [(&str, &str, bool, Option<&str>); 6] = [
+    let asks: [(&str, &str, bool, Option<&str>); 7] = [
         ("GET", "/sessions", false, None),
+        ("GET", "/info", false, None),
         ("GET", "/health", false, None),
         ("GET", "/no/such/route", true, None),
         ("GET", "/sessions/nope/entries", true, None),

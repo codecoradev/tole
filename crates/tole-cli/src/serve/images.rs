@@ -1,32 +1,20 @@
 //! Image routes (#558): upload one image into a live session, read one back.
 
+use super::live_sessions::live;
 use super::State;
 use serde_json::json;
 use std::io::Write;
 use tole_cli::serve_support::transport::Conn;
-use tole_cli::session_host::lock_sessions;
 
 pub(super) fn image_error(e: tole_cli::serve_images::ImageApiError) -> (u16, serde_json::Value) {
     (e.status(), json!({"error": e.message()}))
 }
 
-/// The JSONL file of a live session, or the 404 answer.
-fn live_session_path(
-    state: &State,
-    id: &str,
-) -> Result<std::path::PathBuf, (u16, serde_json::Value)> {
-    let sessions = lock_sessions(&state.sessions);
-    sessions
-        .get(id)
-        .map(|st| st.path.clone())
-        .ok_or_else(|| (404, json!({"error": "unknown session"})))
-}
-
 /// `POST /sessions/{id}/images` (#558): store the raw body as an image of
 /// a live session; answers the reference (`id`, `mime`, `bytes`, `fnv1a64`).
 pub(super) fn upload_image(state: &State, id: &str, body: &[u8]) -> (u16, serde_json::Value) {
-    if let Err(resp) = live_session_path(state, id) {
-        return resp;
+    if let Err(unknown) = live(state, id) {
+        return unknown;
     }
     let Some(store) = state.uploads.as_ref() else {
         return (
@@ -47,7 +35,7 @@ pub(super) fn read_image(
     id: &str,
     hash: &str,
 ) -> Result<(String, Vec<u8>), (u16, serde_json::Value)> {
-    let path = live_session_path(state, id)?;
+    let path = live(state, id)?.path;
     tole_cli::serve_images::read_recorded_in_jail(&path, hash).map_err(image_error)
 }
 

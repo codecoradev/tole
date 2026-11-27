@@ -1,0 +1,29 @@
+{
+  "features": [
+    "approvals",
+    "compact",
+    "cron",
+    "delegation.approvals",
+    "detach",
+    "discussions",
+    "effort",
+    "entries",
+    "events.sse",
+    "fork",
+    "hooks",
+    "images",
+    "interrupt",
+    "mcp",
+    "missions",
+    "models",
+    "profiles",
+    "resume",
+    "session.name",
+    "sessions.index",
+    "skills",
+    "tools",
+    "tree"
+  ],
+  "protocolVersion": 1,
+  "version": "<VERSION>"
+}

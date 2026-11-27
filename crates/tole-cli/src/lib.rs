@@ -3,6 +3,7 @@
 //! jailed file tools — instead of test-local re-implementations that
 //! drift from production behavior (CodeCora scan 2026-09-18).
 // Test-only scratch directory shared with the integration tests (#781).
+pub mod acp_title;
 pub mod advisor_host;
 pub mod approvals;
 pub mod delegation;
