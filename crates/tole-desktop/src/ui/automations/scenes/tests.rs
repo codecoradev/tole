@@ -20,6 +20,7 @@ fn focus_after(window: &mut Offscreen<Gallery>, key: &'static str) -> Option<Aut
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn every_scene_is_drawn_and_none_is_blank() {
     let _one = lock();
     let dir = std::env::temp_dir().join(format!("tole-desktop-automations-{}", std::process::id()));
@@ -33,6 +34,7 @@ fn every_scene_is_drawn_and_none_is_blank() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn tab_walks_the_rows_and_their_switches_then_the_links_in_the_models_order() {
     let _one = lock();
     let mut window = open(scene_named("automations-page-history")).expect("open");
@@ -63,6 +65,7 @@ fn tab_walks_the_rows_and_their_switches_then_the_links_in_the_models_order() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn enter_on_a_row_picks_it() {
     let _one = lock();
     let mut window = open(scene_named("automations-page-table")).expect("open");
@@ -81,6 +84,7 @@ fn enter_on_a_row_picks_it() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn enter_on_a_switch_reports_that_row_and_nothing_else() {
     let _one = lock();
     let mut window = open(scene_named("automations-page-table")).expect("open");
@@ -101,6 +105,7 @@ fn enter_on_a_switch_reports_that_row_and_nothing_else() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn enter_on_the_link_of_a_run_that_stopped_to_ask_opens_that_request() {
     let _one = lock();
     let mut window = open(scene_named("automations-page-history")).expect("open");
@@ -120,6 +125,7 @@ fn enter_on_the_link_of_a_run_that_stopped_to_ask_opens_that_request() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "GPUI needs main thread (#1172)")]
 fn a_run_whose_request_is_not_known_has_no_link_to_reach() {
     let _one = lock();
     let mut window = open(scene_named("automations-page-history-partial")).expect("open");
