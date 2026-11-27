@@ -15,6 +15,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
+| Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features"}`: the binary version, the wire contract version and the feature names this server has, see [`GET /info`](#get-info). Behind the token, like every route but `/health` |
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
 | Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
@@ -155,7 +156,8 @@ The English wording is a pair of tables keyed by `kind` and `effect` (`tole_core
 - **Older rows.** The field is additive: a row queued without a summary has no `summary` key, and a summary missing the
   optional fields (`insideWorkspace`, `targetTruncated`, `preview`, `previewTruncated`) still loads with their defaults.
 - **The TUI prompt** is the summary's one-line sentence (what the call does and its effect), then ` :: ` and the tool's whole text character for character as before (`<tool> — <description> → <target>`), uncut; it does not show the preview lines or the flags; `job_start` reads `start job: ...` there and its summary says it STARTS A BACKGROUND JOB.
-- **Where it is not shown yet.** The stdio prompt, the ACP permission `title`, the delegated children's approvals
+- **ACP.** The `title` of a `session/request_permission` is the summary as one line (`<what it does> — <its effect>`, plus the tool's own text for a tool without a summary of its own): control and bidi characters are made visible, and the target is shown as the summary bounds it (at most 1000 characters, a longer one cut in the middle with the true omitted count and `see rawInput`). The tool's own text of an unknown-kind call is bounded the same way and, only when the whole title would pass 1500 characters, its tail is cut with a count; the effect sentence is never cut. Options, tool-call id and risk are unchanged.
+- **Where it is not shown yet.** The stdio prompt, the delegated children's approvals
   (`source: "delegation"`, which keep their own `display` and `text`) and the webhook events still use the older text
   and carry no `summary`; see `docs/faces.md`.
 
@@ -574,6 +576,28 @@ only for a change a client written against the previous number cannot handle, ne
 route or field. `version` is the `tole` binary's version. A client refuses a serve whose
 `protocol` it does not know. The fields are on both listeners.
 
+### `GET /info`
+
+Authenticated like every route but `/health` (a missing or wrong credential is `401`). It lets a
+client check the server it reached before it relies on a route or a field:
+
+```json
+{"version":"0.12.0","protocolVersion":1,"features":["approvals","compact","cron","delegation.approvals","detach","discussions","effort","entries","events.sse","fork","hooks","images","interrupt","mcp","missions","models","profiles","resume","session.name","sessions.index","skills","tools","tree"]}
+```
+
+- `version` is the `tole` binary's version, and `protocolVersion` the number `GET /health` reports
+  as `protocol` (`SERVE_PROTOCOL_VERSION`): a client that refuses a protocol it does not know may
+  use either route.
+- `features` is a sorted list of stable names, one per route group of this document (`entries`,
+  `events.sse`, `resume`, `images`, `approvals`, `delegation.approvals`, `fork`, `compact`,
+  `missions`, `models`, `sessions.index`, `profiles`, ...). A name is never renamed or removed
+  without a protocol bump; a newer server may list more, and a client ignores the ones it does
+  not know. Two names depend on the process: `mcp` (this binary can list connected MCP servers,
+  `GET /tools`) and `auth.basic` (the server also accepts HTTP Basic, `--auth basic`).
+- Nothing else is reported: no path, user name, key or configuration value.
+- A server older than the route answers `404 {"error": "not found"}`. `tole-client` has
+  `Client::info()` and `Info::has(name)`.
+
 ## Wire compatibility (#1024)
 
 The serve API is **additive-only**. Graphical clients (the desktop, Flutter, web), the chat
@@ -610,7 +634,7 @@ when the surface moves, so the change is made on purpose:
 | Check | Pins |
 |---|---|
 | `cargo test -p tole-cli --test client_routes` | the route table: every route `serve.rs` registers is listed, answered by a real serve, in this document and (unless allowlisted) in `tole-client` |
-| `cargo test -p tole-cli --test serve_wire_routes` | golden JSON of the read routes and of the refusals (`tests/golden/serve/routes/`) |
+| `cargo test -p tole-cli --test serve_wire_routes` | golden JSON of the read routes (`/info` included) and of the refusals (`tests/golden/serve/routes/`) |
 | `cargo test -p tole-cli --test serve_wire_entries` | golden transcripts, one per way a turn ends, with every entry kind; the session file's lines; one sample of each event frame (`tests/golden/serve/entries/`, `ledger/`, `events/`) |
 | `cargo test -p tole-core --test entry_wire` | the `Entry` serialization byte for byte, and the line the storage layer writes |
 | `scripts/client-schema.sh check` (CI job `Client schema`) | the JSON Schema of every request, response and event type of `tole-client` |
@@ -621,9 +645,10 @@ clocks, paths, the binary version, the size of the prompt) are replaced by place
 comparison; the `seq` numbers are replaced by their rank, so a new log line does not rewrite every
 file.
 
-There is no capability probe beyond `GET /health` (`protocol`, `version`) yet: a client that needs
-to know whether a route exists calls it and treats `404 {"error": "not found"}` as "this server is
-older".
+`GET /info` (above) is the capability probe: a client that needs to know whether a route group
+exists tests its name in `features`. A server older than `GET /info` answers `404 {"error": "not
+found"}` to it, and such a server is the one to treat as "older" (a client may still call a route
+it needs and read a `404` the same way).
 
 ## Shutdown on SIGTERM and SIGINT (#1014)
 

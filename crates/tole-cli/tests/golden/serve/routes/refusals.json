@@ -10,6 +10,14 @@
   {
     "authenticated": false,
     "body": {
+      "error": "unauthorized"
+    },
+    "request": "GET /info",
+    "status": 401
+  },
+  {
+    "authenticated": false,
+    "body": {
       "protocol": 1,
       "status": "ok",
       "version": "<VERSION>"
