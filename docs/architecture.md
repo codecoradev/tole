@@ -81,7 +81,7 @@ Rule D2 of the same standard: everything tole ships passes `cargo deny check lic
 
 ### Cora scope (#1249)
 
-`scripts/arch-check.sh cora` keeps the files of the scoped `index-breaking-change` entry of `.cora.yaml` binary-only: the parsed document (PyYAML) may name the rule only in that entry, and rustc's own dep-info after `cargo check --workspace --lib --bins --offline` must list each file for a bin target and for no workspace lib target. It runs as part of `all` in the `Check` job; the residual (feature-gated modules, cora's own matching) is in CONTRIBUTING, "Cora Workflow".
+`scripts/arch-check.sh cora` keeps the files of the scoped `index-breaking-change` entry of `.cora.yaml` binary-only: the parsed document (PyYAML) is held to whitelists (`ignore.files` and `review.exclude` only lock-file, target, docs and `crates/*/tests` globs, plain `ignore.rules` strings that are no pattern and no part of the rule), may name the rule only in that entry, and rustc's own dep-info after `cargo check --workspace --lib --bins --offline` must list each file for a bin target and for no workspace lib target. It runs as part of `all` in the `Check` job; it is a tripwire, not a proof, and the residuals (feature- and platform-gated modules, build-script output, cora's own matching) are in CONTRIBUTING, "Cora Workflow".
 
 ## 3. Module Responsibility
 

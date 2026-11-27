@@ -298,18 +298,30 @@ moves items out of them is not reported as a removal. Do not add a file the
 library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
 step; needs PyYAML, a missing one is exit 2) checks two things with ground
 truth, not text matching. First, the parsed `.cora.yaml` (PyYAML, duplicate
-keys refused): `index-breaking-change` may be silenced only by `ignore.rules`
-entries of the form `rule`/`files`/`reason` whose `files` are exact
-`crates/<name>/src/**/*.rs` paths; no plain `ignore.rules` string may contain
-`breaking`, and no other string, key or value anywhere in the document may name
-the rule (`index-breaking`, `breaking-change`, any case, `-` or `_`). Second,
-after `cargo check --workspace --lib --bins --offline`, rustc's own dep-info
-(the list of every source file it loaded, so `mod`, `#[path]`, `include!` and
-macros all count) must list each scoped file for a bin target and for no lib
-target of any workspace crate. A cargo or dep-info failure is exit 2, never a
-pass. Residual: it checks the default features the `Check` job builds (a
-`#[cfg(feature = ..)] mod serve;` in `lib.rs` is not seen) and what cora itself
-does with the entry cannot be verified without cora.
+keys, merge keys, custom tags and files over 1 MiB refused) is held to
+whitelists: `ignore` and `review` hold only known keys; `ignore.files` and
+`review.exclude` hold only lock-file, `target`, docs and `crates/*/tests`
+globs (so a glob over source files is refused, which would also drop them from
+the symbol index or the reviewed diff); a plain `ignore.rules` string (or the
+`rule` of another entry) holds no glob or regex character and is no part of the
+rule id or of the finding text ("Symbol `X` is being removed but has N
+caller(s)"); `index-breaking-change` itself is silenced only by an entry of the
+form `rule`/`files`/`reason` whose `files` are exact `crates/<name>/src/**/*.rs`
+paths, and no other string, key or value anywhere in the document may name it
+(`index-breaking`, `breaking-change`, any case, `-` or `_`). Second, after
+`cargo check --workspace --lib --bins --offline`, rustc's own dep-info (the list
+of every source file it loaded, compared as real paths, so `mod`, `#[path]`,
+`include!`, macros and symlinks all count) must list each scoped file for a bin
+target and for no lib target of any workspace crate; build scripts are skipped.
+A cargo or dep-info failure is exit 2, never a pass. This is a tripwire against
+the known ways to silence the rule, not a proof: cora was not run against these
+spellings, so what it does with a key or glob it was not tested on (anchoring,
+case, a key this script does not know) cannot be verified here. Residuals: it
+checks the default features and the host platform the `Check` job builds (a
+`#[cfg(feature = ..)] mod serve;` or a `#[cfg(windows)]` module in a lib is not
+seen), a `build.rs` or proc macro that generates library code from a scoped
+file is not seen, and an `include_str!`/`include_bytes!` of a scoped file in a
+lib is reported as if it were a module (fail closed).
 
 Exit-code reference:
 

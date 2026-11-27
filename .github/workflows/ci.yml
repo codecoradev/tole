@@ -24,10 +24,18 @@ jobs:
       - run: cargo check --workspace --all-targets
       # Architecture guardrails (#1249): crate kinds and the crate dependency
       # matrix (#1250), file and crate size against the allow-list that only
-      # shrinks (#1251), `unsafe` opt-ins (#1252) and the binary-only files of
-      # the scoped .cora.yaml silence (#1249: PyYAML and rustc's dep-info, after
-      # a no-op `cargo check`); the self-test proves the check fails closed. Part of this job so
-      # no required check name changes. Python 3 is preinstalled on the runner.
+      # shrinks (#1251), `unsafe` opt-ins (#1252) and the .cora.yaml silencing
+      # (#1249: whitelists over the parsed file, and rustc's dep-info after a
+      # `cargo check --workspace --lib --bins --offline` for the binary-only
+      # files); the self-test proves the check fails closed. Part of this job so
+      # no required check name changes. Python 3 is on the runner, PyYAML is
+      # not guaranteed there (and `python3 -I` ignores the user site), so the
+      # system package is installed explicitly; without it the cora check is
+      # exit 2, never a pass.
+      - name: Install PyYAML for the cora check
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
       - run: python3 scripts/test_arch_lint.py
       - run: scripts/arch-check.sh
 

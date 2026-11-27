@@ -4,7 +4,11 @@
 # Usage: scripts/arch-check.sh [kinds|size|unsafe|cora|all] [workspace-root] [--init]
 #   workspace-root defaults to the repository root (the self-test points it at
 #   fixture workspaces). Needs bash, cargo and Python 3.8+. Nothing is
-#   downloaded: `cargo metadata --no-deps --offline`.
+#   downloaded: kinds, size and unsafe use `cargo metadata --no-deps --offline`.
+#   The cora mode also needs PyYAML (apt: python3-yaml), the workspace's
+#   dependencies already fetched, and it COMPILES the workspace (`cargo check
+#   --workspace --lib --bins --offline`, a no-op after a build of the same
+#   profile).
 #
 # ENFORCED (a violation makes this script exit 1; CI runs it in the `Check`
 # job, so no new required check name exists):
@@ -57,13 +61,25 @@
 #             AGENTS.md list in the same change.
 #
 # cora      (#1249)
-#             - `index-breaking-change` is silenced in .cora.yaml only by a
-#               scoped `ignore.rules` entry listing exact crates/<name>/src/*.rs
-#               files; the parsed document (PyYAML) names the rule nowhere else;
+#             - the parsed .cora.yaml (PyYAML) is held to whitelists:
+#               `ignore.files` and `review.exclude` hold only lock-file, target,
+#               docs and crates/*/tests globs; `ignore` and `review` only known
+#               keys; a plain `ignore.rules` string is no glob or regex and no
+#               part of the rule id or the finding text;
+#             - `index-breaking-change` is silenced only by a scoped
+#               `ignore.rules` entry listing exact crates/<name>/src/**/*.rs
+#               files, and the parsed document names it nowhere else;
 #             - after `cargo check --workspace --lib --bins --offline`, rustc's
-#               own dep-info lists each file for a bin target and for no lib
-#               target of any workspace crate (mod, #[path], include!, macros).
-#               Needs PyYAML (python3-yaml); anything unprovable is exit 2.
+#               own dep-info (real paths) lists each file for a bin target and
+#               for no lib target of any workspace crate (mod, #[path],
+#               include!, macros); build scripts are skipped.
+#             A tripwire against the known ways to silence the rule, not a
+#             proof against every config semantic of cora (never run here).
+#             Residuals: default features and the host platform only (a
+#             `#[cfg(feature)]` or `#[cfg(windows)]` module in a lib is not
+#             seen), and code a build.rs or proc macro generates from a scoped
+#             file. Anything unprovable (no PyYAML, cargo or dep-info failing,
+#             a file over 1 MiB) is exit 2.
 #
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this
