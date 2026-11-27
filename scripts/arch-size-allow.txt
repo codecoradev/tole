@@ -19,8 +19,8 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 84115
-crate tole-core 64757
+crate tole-cli 84114
+crate tole-core 64747
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -35,7 +35,7 @@ file crates/tole-cli/src/delegation/approvals_owner_tests.rs 655
 file crates/tole-cli/src/delegation/approver_tests.rs 570
 file crates/tole-cli/src/delegation/decide_tests.rs 510
 file crates/tole-cli/src/delegation/delegate.rs 1336
-file crates/tole-cli/src/delegation/delegate_tests.rs 1753
+file crates/tole-cli/src/delegation/delegate_tests.rs 1752
 file crates/tole-cli/src/discuss/host.rs 1325
 file crates/tole-cli/src/discuss/host_tests.rs 1308
 file crates/tole-cli/src/discuss/tests.rs 1056
@@ -98,7 +98,7 @@ file crates/tole-client/src/sse.rs 540
 file crates/tole-client/src/types.rs 895
 file crates/tole-core/src/action_summary.rs 966
 file crates/tole-core/src/approval.rs 610
-file crates/tole-core/src/children/agents.rs 2326
+file crates/tole-core/src/children/agents.rs 2316
 file crates/tole-core/src/children/handoff.rs 659
 file crates/tole-core/src/children/memory.rs 682
 file crates/tole-core/src/children/sibling_watch.rs 675
