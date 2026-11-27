@@ -16,9 +16,10 @@ continuity, infra facts.
   `tui` feature).
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
-  `./target/release/tole`, never a PATH-resolved one. (A tole session's
-  `run_command` refuses a program written as a path, #1286: there use the
-  bare name, or run the build from a host shell.)
+  `./target/release/tole`, never a PATH-resolved one. (From inside a tole
+  session this is not possible: `run_command` refuses a program written as a
+  path, #1286, and the session guard refuses the tole binary under any name,
+  #684. Run the build from a host shell.)
 - `crates/tole-desktop-model` — the desktop's view state, reducers, design
   tokens and string table (#1028). Not published. No GUI toolkit and no tole
   dependency, so the compiler keeps the toolkit out of it.

@@ -256,11 +256,27 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
         if prog.contains('/') {
             // Path-qualified program escapes PATH-resolution auditing: always
             // refused. A teardown or recursive `rm` behind the path keeps the
-            // destructive text; any other program is told to use its bare name.
+            // destructive text; any other program is told to use its bare
+            // name, except the tole binary, which a session cannot run at all.
             let mut by_name = tokens.clone();
             by_name[0] = tokens[0].rsplit('/').next().unwrap_or_default().to_string();
             scan(&by_name, depth)?;
-            return Err(format!("refused \u{2014} the program is written as a path ({}); run_command resolves programs through PATH only, so use the bare name (`{}`).", tokens[0], by_name[0]));
+            let esc =
+                |s: &str| -> String { s.chars().take(120).flat_map(char::escape_debug).collect() };
+            let name = esc(&by_name[0]);
+            let tole = matches!(
+                name.strip_suffix(".exe").unwrap_or(&name),
+                "tole" | "tole-cli"
+            );
+            let why = if tole {
+                "a session may not run the tole binary at all (owner-only records are written by the owner from a terminal, issue #684), so there is no bare name to use".to_string()
+            } else {
+                format!("run_command resolves programs through PATH only, so use the bare name (`{name}`)")
+            };
+            return Err(format!(
+                "refused \u{2014} the program is written as a path ({}); {why}.",
+                esc(&tokens[0])
+            ));
         }
         if teardown_name(&prog) {
             return Err(REFUSE.to_string());
