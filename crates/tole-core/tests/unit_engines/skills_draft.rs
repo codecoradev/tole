@@ -1,4 +1,6 @@
-use super::*;
+use tole_core::secrets::SecretSet;
+use tole_core::skills::draft::*;
+use tole_core::skills::MAX_SKILL_CHARS;
 
 fn md(name: &str, desc: &str, body: &str) -> String {
     format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n")

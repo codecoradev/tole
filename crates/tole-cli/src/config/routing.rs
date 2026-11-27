@@ -394,7 +394,3 @@ pub fn explain(
         s(&route.reason)
     ))
 }
-
-#[cfg(test)]
-#[path = "routing_tests.rs"]
-mod tests;

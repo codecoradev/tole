@@ -275,7 +275,7 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
 - `crates/tole-cli/src/delegation/ledger_file.rs`: pid liveness probes (`kill 0`, macOS `proc_pidinfo`)
 - `crates/tole-cli/src/doctor.rs`: `flock` of the doctor lock file
 - `crates/tole-cli/src/plugin/cmd_tests.rs`: test; `mkfifo`
-- `crates/tole-cli/src/serve.rs`: termios echo guard of the token prompt
+- `crates/tole-cli/src/serve/token.rs`: termios echo guard of the token prompt
 - `crates/tole-cli/src/serve_support/shutdown.rs`: `sigaction` handler installation
 - `crates/tole-cli/src/serve_support/transport.rs`: serve socket (euid, `flock`, token descriptor)
 - `crates/tole-cli/src/session/assemble.rs`: test; `mkfifo`
