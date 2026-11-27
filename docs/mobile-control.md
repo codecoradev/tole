@@ -10,12 +10,13 @@ event stream ship with #524, image upload and read with #558; see the UI epic #5
 ## The surface uteke-mobile consumes
 
 All routes live under `tole serve` (bearer-token auth, or HTTP Basic with
-`--auth basic` (#742, "HTTP Basic auth" below), on everything except `/health`;
+`--auth basic` (#742, "HTTP Basic auth" below), on everything except `/health` and `/ready`;
 decisions revalidate per request; auth failures are rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
-| Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features"}`: the binary version, the wire contract version and the feature names this server has, see [`GET /info`](#get-info). Behind the token, like every route but `/health` |
+| Probe readiness (an orchestrator, a container `HEALTHCHECK`) | `GET /ready` (#1017) | `200 {"status":"ok","checks":{...}}` when serve can do its work, `503 {"status":"not ready",...}` when it cannot, see [`GET /ready`](#get-ready). No token, like `/health` |
+| Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features"}`: the binary version, the wire contract version and the feature names this server has, see [`GET /info`](#get-info). Behind the token, like every route but `/health` and `/ready` |
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
 | Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
@@ -536,7 +537,7 @@ curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
   on it (`connection refused`). A socket that answers is never taken over, so a second desktop
   window or a CLI client attaches to the running serve (`GET /health`, below) instead of
   starting another.
-- **The token is still required**, on every route but `/health`. The socket narrows who can
+- **The token is still required**, on every route but `/health` and `/ready`. The socket narrows who can
   reach serve; it does not replace the credential. The per-launch token reaches serve in one of
   two ways, never on the command line and never in the environment:
   - `--token-fd <n>`: read to the end from an inherited file descriptor (at most 4 KiB, then the
@@ -559,7 +560,7 @@ curl --unix-socket "$XDG_RUNTIME_DIR/tole/serve.sock" http://localhost/health
   one on a serve whose token is meant to separate the desktop from the user's other processes.
 - **Failed-auth limiter.** Every socket peer shares one bucket (a socket has no peer address):
   10 wrong tokens in 60 s answer `429` to everything else for the rest of the window, including
-  the right token. `GET /health` is exempt on the socket (it needs no token), so a client can
+  the right token. `GET /health` and `GET /ready` are exempt on the socket (they need no token), so a client can
   still see that serve is up. A same-user process holding a stale token can therefore lock the
   desktop out of the authenticated routes for the window. TCP is unchanged (per source IP,
   `/health` limited too).
@@ -577,9 +578,39 @@ only for a change a client written against the previous number cannot handle, ne
 route or field. `version` is the `tole` binary's version. A client refuses a serve whose
 `protocol` it does not know. The fields are on both listeners.
 
+### `GET /ready`
+
+No auth, on both listeners, like `/health`. `/health` is liveness (the process answers);
+`/ready` is readiness (it can do its work), the route for a container `HEALTHCHECK`
+(`scripts/container/healthcheck.sh` reads it) and for an orchestrator's readiness probe:
+
+```json
+{"status":"ok","checks":{"state":true,"cron":true,"webhook":true}}
+```
+
+`200` and `"status":"ok"` when every check holds, `503` and `"status":"not ready"` when one does
+not. A client decides by the status code. The checks, each `true` when it does not apply:
+
+- `state`: a file can be created and removed in the tole data directory, in the cron directory when
+  `--cron` is given or a webhook destination is configured, and in `--sessions-dir` when it is
+  given (a read-only volume, a full disk, a path that is not a directory). Without
+  `--sessions-dir` the sessions live in each session's workspace and are not probed.
+- `cron`: with `--cron`, this process's in-process ticker wrote its heartbeat (`ticker.json`, the file
+  `tole cron status` reads) within the last 180 s. It is `false` until the first pass, a few
+  milliseconds after the start, and after a ticker that stopped or cannot record.
+- `webhook`: every webhook sender thread of this serve (the outbound sender and the approval-event
+  sender, started only for a configured destination) is still running.
+
+The body carries one boolean per check and never a path, a setting or an error text: it says that a
+check failed, not why (the log and `tole doctor` do). Which checks apply is not told either (a
+check that does not apply is `true`). While serve drains after SIGTERM every route answers `503`,
+this one included. Each call writes and removes one small file per probed directory, so poll at
+the rate of a healthcheck (seconds), not in a loop. `tole-client` has no method for it: it is a probe
+for a process manager, and a client attaches with `health()` and `info()`.
+
 ### `GET /info`
 
-Authenticated like every route but `/health` (a missing or wrong credential is `401`). It lets a
+Authenticated like every route but `/health` and `/ready` (a missing or wrong credential is `401`). It lets a
 client check the server it reached before it relies on a route or a field:
 
 ```json
@@ -655,7 +686,7 @@ it needs and read a `404` the same way).
 
 `tole serve` (REST and `--transport mcp`) handles SIGTERM and SIGINT (Unix; on Windows Ctrl+C
 still ends the process at once). The handler only counts the signal; the rest runs on ordinary
-threads. From then on every new request is answered `503` (`GET /health` too, with
+threads. From then on every new request is answered `503` (`GET /health` and `GET /ready` too, with
 `Retry-After: 1`), event streams end once their turn has settled, the cron ticker and the
 webhook senders stop (a delivery attempt already in flight is finished, a cron run already
 started is not waited for and is recovered from the ledger at the next start, as after a
@@ -711,7 +742,7 @@ curl -u owner:"$PASSWORD" http://127.0.0.1:7801/sessions
   still make the server hash, once per request, up to the per-IP limit below.
 - **One check for every route.** The bearer token and Basic go through the same
   `Authenticator::check`, in the REST face (including the event stream, entries, images,
-  approvals, cron and the upload path), and in `--transport mcp`. Everything but `/health`
+  approvals, cron and the upload path), and in `--transport mcp`. Everything but `/health`, `/ready`
   and the webhook routes is behind it. Webhooks (`POST /hooks/<route>`) keep their own
   signature gate: a valid Basic header does not open one and a signature needs no Basic
   credential. With `--auth basic` a bearer token that is set (`--token-file`,

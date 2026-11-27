@@ -26,6 +26,19 @@
     "status": 200
   },
   {
+    "authenticated": false,
+    "body": {
+      "checks": {
+        "cron": true,
+        "state": true,
+        "webhook": true
+      },
+      "status": "ok"
+    },
+    "request": "GET /ready",
+    "status": 200
+  },
+  {
     "authenticated": true,
     "body": {
       "error": "not found"

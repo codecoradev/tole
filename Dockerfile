@@ -62,7 +62,8 @@ WORKDIR /workspace
 USER 10001:10001
 
 EXPOSE 7801
-# GET /health answers 200 without credentials; it answers 503 while serve drains.
+# GET /ready answers 200 without credentials when serve can do its work; 503 when it
+# cannot (a state directory that takes no write, a dead ticker or sender) and while it drains.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["/usr/local/bin/healthcheck.sh"]
 

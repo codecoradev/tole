@@ -1,0 +1,8 @@
+{
+  "checks": {
+    "cron": true,
+    "state": true,
+    "webhook": true
+  },
+  "status": "ok"
+}
