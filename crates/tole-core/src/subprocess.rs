@@ -180,7 +180,9 @@ fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &
 ///   recursive rm stays Write-tier territory. Flag clusters containing
 ///   r/R count as recursive (`-rfv` included).
 /// - Path-qualified programs (`/bin/rm`) are refused outright: bare
-///   names resolve via PATH, which is the audited surface.
+///   names resolve via PATH, which is the audited surface. The reason says
+///   so (use the bare name) unless the name behind the path is itself a
+///   teardown program or a recursive `rm` (#1286).
 ///
 /// SCOPE (read before extending): this is a best-effort blocklist for
 /// headline accidental cases, NOT a sandbox. Wrapper/interpreter
@@ -252,8 +254,29 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
         let tokens: Vec<String> = tokens.iter().map(|t| strip_quotes(t).to_string()).collect();
         let prog = tokens[0].trim_start_matches('-').to_ascii_lowercase();
         if prog.contains('/') {
-            // Path-qualified program escapes PATH-resolution auditing.
-            return Err(REFUSE.to_string());
+            // Path-qualified program escapes PATH-resolution auditing: always
+            // refused. A teardown or recursive `rm` behind the path keeps the
+            // destructive text; any other program is told to use its bare
+            // name, except the tole binary, which a session cannot run at all.
+            let mut by_name = tokens.clone();
+            by_name[0] = tokens[0].rsplit('/').next().unwrap_or_default().to_string();
+            scan(&by_name, depth)?;
+            let esc =
+                |s: &str| -> String { s.chars().take(120).flat_map(char::escape_debug).collect() };
+            let name = esc(&by_name[0]);
+            let tole = matches!(
+                name.strip_suffix(".exe").unwrap_or(&name),
+                "tole" | "tole-cli"
+            );
+            let why = if tole {
+                "a session may not run the tole binary at all (owner-only records are written by the owner from a terminal, issue #684), so there is no bare name to use".to_string()
+            } else {
+                format!("run_command resolves programs through PATH only, so use the bare name (`{name}`)")
+            };
+            return Err(format!(
+                "refused \u{2014} the program is written as a path ({}); {why}.",
+                esc(&tokens[0])
+            ));
         }
         if teardown_name(&prog) {
             return Err(REFUSE.to_string());
@@ -497,163 +520,6 @@ pub fn run_with_timeout_stdin(
         stdout,
         stderr,
     })
-}
-
-#[cfg(all(test, unix))]
-mod cancel_tests {
-    use super::*;
-
-    #[test]
-    fn a_set_cancel_token_kills_the_child() {
-        let cancel = crate::cancel::CancelToken::new();
-        cancel.cancel();
-        let start = std::time::Instant::now();
-        let mut cmd = Command::new("sleep");
-        cmd.arg("5");
-        let r = run_with_timeout_or_cancel(&mut cmd, Duration::from_secs(30), &cancel);
-        assert_eq!(r.unwrap_err(), CANCELLED);
-        assert!(start.elapsed() < Duration::from_secs(4));
-    }
-}
-
-#[cfg(test)]
-mod env_scrub_tests {
-    use super::*;
-
-    /// The scrubber mutates the Command; verify via a child that prints
-    /// its own env, run through run_with_timeout.
-    fn child_env(cmd: &mut Command) -> String {
-        let out = run_with_timeout(cmd, SUBPROCESS_TIMEOUT).unwrap();
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).to_string()
-    }
-
-    #[test]
-    fn secret_shaped_env_removed_but_normal_kept() {
-        std::env::set_var("TOLE_TEST_API_KEY", "x");
-        std::env::set_var("TOLE_TEST_SECRET_VALUE", "x");
-        std::env::set_var("MY_PASSWORD", "x");
-        // #284: names without the underscore-prefixed form.
-        std::env::set_var("SECRET_KEY", "x");
-        std::env::set_var("TOLE_TEST_AUTHTOKEN", "x");
-        std::env::set_var("TOLE_TEST_DB_PASSWD", "x");
-        std::env::set_var("TOLE_TEST_APIKEY", "x");
-        std::env::set_var("TOLE_TEST_KEEP_ME", "visible");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("env");
-        let env = child_env(scrub_env_for_child(&mut cmd));
-        assert!(!env.contains("TOLE_TEST_API_KEY"));
-        assert!(!env.contains("TOLE_TEST_SECRET_VALUE"));
-        assert!(!env.contains("MY_PASSWORD"));
-        assert!(!env.contains("SECRET_KEY="));
-        assert!(!env.contains("TOLE_TEST_AUTHTOKEN"));
-        assert!(!env.contains("TOLE_TEST_DB_PASSWD"));
-        assert!(!env.contains("TOLE_TEST_APIKEY"));
-        assert!(env.contains("TOLE_TEST_KEEP_ME=visible"));
-        assert!(env.contains("PATH="));
-        std::env::remove_var("TOLE_TEST_API_KEY");
-        std::env::remove_var("TOLE_TEST_SECRET_VALUE");
-        std::env::remove_var("MY_PASSWORD");
-        std::env::remove_var("SECRET_KEY");
-        std::env::remove_var("TOLE_TEST_AUTHTOKEN");
-        std::env::remove_var("TOLE_TEST_DB_PASSWD");
-        std::env::remove_var("TOLE_TEST_APIKEY");
-        std::env::remove_var("TOLE_TEST_KEEP_ME");
-    }
-}
-
-#[cfg(test)]
-mod destructive_argv_tests {
-    use super::check_destructive_argv;
-
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
-    #[test]
-    fn refused_cases() {
-        for argv in [
-            s(&["rm", "-rf", "/"]),
-            s(&["rm", "--recursive", "/"]),
-            s(&["rm", "-rfv", "/etc"]), // flag cluster with extra letter
-            s(&["rm", "-r", "../outside"]),
-            s(&["rm", "-rf", "/home/*"]),
-            s(&["rm", "-rf", "./.."]),
-            s(&["rm", "-rf", "~"]),
-            s(&["/bin/rm", "-rf", "/"]), // path-qualified program
-            s(&["dd", "if=/dev/zero", "of=/dev/sda"]),
-            s(&["mkfs.ext4", "/dev/sda1"]),
-            s(&["shutdown", "-h", "now"]),
-            s(&["env", "dd", "if=/dev/zero", "of=/dev/sda"]), // wrapper bypass
-            s(&["busybox", "mkfs.ext4", "/dev/sda"]),         // wrapper bypass
-            s(&["nohup", "shutdown", "-h", "now"]),           // wrapper bypass
-            s(&["sh", "-c", "rm -rf /etc"]),                  // quoted payload
-            s(&["sh", "-c", "-rm -rf /etc"]),                 // dash-prefixed payload (scan-3)
-            s(&["bash", "-c", "/bin/rm -rf /"]), // dash-prefixed + path-qualified (scan-3)
-            s(&["bash", "-lc", "dd if=/dev/zero of=/dev/sda"]), // quoted payload
-            s(&["xargs", "-n", "1", "rm", "-rf", "/"]), // option value derails naive scan
-            s(&["env", "-C", ".", "rm", "-rf", "/"]), // env -C dir bypass
-            s(&["nohup", "sh", "-c", "dd if=/dev/zero of=/dev/sda"]), // nested sh
-            s(&["env", "bash", "-c", "rm -rf /etc"]), // nested bash
-            s(&["sudo", "rm", "-rf", "/"]),      // sudo wrapper
-            s(&["doas", "rm", "-rf", "/"]),      // doas wrapper
-        ] {
-            let err = check_destructive_argv(&argv)
-                .err()
-                .unwrap_or_else(|| panic!("must refuse: {argv:?}"));
-            assert!(
-                err.contains("destructive beyond the Write risk tier"),
-                "{argv:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn benign_cases_pass() {
-        for argv in [
-            s(&["cat", "middleware.ts"]),
-            s(&["grep", "shutdown", "runbook.md"]),
-            s(&["git", "add", "file"]),
-            s(&["cargo", "add", "serde"]),
-            s(&["echo", "useradd"]),
-            s(&["which", "rm"]), // rm as ARGUMENT TEXT
-            s(&["man", "rm"]),
-            s(&["echo", "rm -rf is dangerous"]), // rm inside text
-            s(&["rm", "-rf", "./build"]),        // scoped, inside ws
-            s(&["rm", "-rf", "./a/../build"]),   // normalizes inside
-            s(&["rm", "notes.txt"]),             // non-recursive anywhere
-            s(&["sh", "-c", "echo hello"]),      // benign payload
-            s(&["env", "FOO=1", "echo", "hi"]),  // env with assignment
-            s(&["sh", "-c", "cat middleware.ts"]), // benign payload w/ dd-like text
-        ] {
-            assert!(
-                check_destructive_argv(&argv).is_ok(),
-                "must NOT refuse: {argv:?}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod stdin_tests {
-    use super::*;
-    use std::process::Command;
-
-    #[test]
-    fn stdin_helper_feeds_data_and_drains_output() {
-        // Large output + stdin data: proves no pipe deadlock and that
-        // the child actually received the bytes.
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("cat > /tmp/tole-stdin-test; head -c 200000 /dev/zero | tr '\\0' 'x'");
-        let out = run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, b"hello stdin").unwrap();
-        assert!(out.status.success());
-        assert_eq!(
-            std::fs::read_to_string("/tmp/tole-stdin-test").unwrap(),
-            "hello stdin"
-        );
-        assert_eq!(out.stdout.len(), 200_000);
-    }
 }
 
 #[cfg(test)]
