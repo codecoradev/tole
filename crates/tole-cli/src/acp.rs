@@ -21,8 +21,7 @@
 //! stderr. No new dependencies — the JSON-RPC framing is hand-rolled
 //! line-delimited JSON (serde_json only).
 //!
-//! The session machinery lives in [`tole_cli::session_host`] — one
-//! implementation shared with `tole serve`.
+//! The session machinery lives in [`tole_cli::session_host`], shared with `tole serve`.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -165,9 +164,8 @@ pub(crate) fn model_config_option(current: &str, models: &[String]) -> Option<Va
 }
 
 /// Build the `configOptions` entry for the approval selector: the per-session
-/// `--yes` equivalent, category `mode` (rendered next to the model picker).
-/// Session-scoped by design: consent resets with the process, unlike the
-/// model override.
+/// `--yes` equivalent, category `mode`. Session-scoped by design: consent
+/// resets with the process, unlike the model override.
 fn approval_config_option(auto_write: bool) -> Value {
     json!({
         "id": "approval",
@@ -370,10 +368,9 @@ fn wait_permission(
 // ---- Progress observer: tool cards + thought bubbles (issue #196) ----
 
 /// ACP `ToolKind` for a tole tool name (issue #196 phase 1): the spec's
-/// taxonomy drives host icons and progress rendering. Mapping falls out
-/// of the registry vocabulary; "other" stays the fallback for anything
-/// unmapped. Registry-gated tools only ever map when actually present —
-/// this is a pure name lookup, no registration assumption.
+/// taxonomy drives host icons and progress rendering. "other" is the fallback
+/// for anything unmapped; this is a pure name lookup, no registration
+/// assumption.
 fn tool_kind(tool: &str) -> &'static str {
     match tool {
         "read_file" | "tole_session_list" | "tole_session_status" => "read",

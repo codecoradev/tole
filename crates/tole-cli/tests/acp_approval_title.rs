@@ -90,10 +90,31 @@ fn control_and_bidi_characters_become_visible_escapes() {
     }
 }
 
+/// `title` is `<prefix><head>… (N more characters, <see>) …<tail><suffix>`:
+/// head + N + tail must be the whole text, so the count is the true one.
+fn cut_parts(title: &str, prefix: &str, suffix: &str) -> (usize, usize, usize) {
+    let mid = title
+        .strip_prefix(prefix)
+        .and_then(|t| t.strip_suffix(suffix))
+        .expect(title);
+    let at = mid.find("… (").expect(mid);
+    let head = mid[..at].chars().count();
+    let n: usize = mid[at + "… (".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tail = mid[mid.find(") …").unwrap() + ") …".len()..]
+        .chars()
+        .count();
+    (head, n, tail)
+}
+
 #[test]
-fn a_cut_target_keeps_head_tail_and_the_effect_and_the_title_is_capped() {
+fn the_omitted_count_is_the_true_one_and_names_no_missing_field() {
     let input = json!({});
-    let long = format!("HEAD{}TAIL", "x".repeat(5000));
+    let long = "x".repeat(100_000);
     let s = ActionSummary::new(
         ActionKind::DeleteFile,
         &long,
@@ -101,22 +122,94 @@ fn a_cut_target_keeps_head_tail_and_the_effect_and_the_title_is_capped() {
         true,
     );
     let title = permission_title(&request(&input, "", Some(s)));
+    let (head, n, tail) = cut_parts(&title, "delete the file ", " — Cannot be undone.");
+    assert_eq!(head + n + tail, 100_000, "{title}");
+    assert!(title.contains("see rawInput") && !title.contains("see the full description"));
     assert!(
-        title.chars().count() <= TITLE_CHARS,
-        "{}",
-        title.chars().count()
+        title.chars().count() < 1200,
+        "target stays within core's bound"
     );
-    assert!(title.contains("HEAD") && title.contains("TAIL") && title.contains("more characters"));
-    assert!(title.ends_with("Cannot be undone."), "{title}");
-    let fallback = permission_title(&request(&input, &long, None));
-    assert!(fallback.chars().count() <= TITLE_CHARS && fallback.ends_with("TAIL"));
-    let huge = "y".repeat(100_000);
+}
+
+#[test]
+fn a_command_payload_in_the_middle_is_fully_visible() {
+    let input = json!({});
+    let cmd = format!(
+        "curl {} PAYLOAD-IN-THE-MIDDLE {}",
+        "a".repeat(400),
+        "z".repeat(400)
+    );
+    let s = ActionSummary::new(
+        ActionKind::RunProgram,
+        &cmd,
+        ActionEffect::RunsProgram,
+        false,
+    );
+    let title = permission_title(&request(&input, "run: x", Some(s)));
+    assert_eq!(
+        title,
+        format!(
+            "run the program {cmd} — {}",
+            ActionEffect::RunsProgram.text()
+        )
+    );
+}
+
+#[test]
+fn a_long_tool_text_is_cut_with_the_true_count() {
+    let input = json!({});
+    let s = ActionSummary::unknown("git_push", &input);
+    let title = permission_title(&request(&input, &"d".repeat(100_000), Some(s)));
+    let prefix = "use the tool git_push — Effect unknown: read the details. :: ";
+    let (head, n, tail) = cut_parts(&title, prefix, "");
+    assert_eq!(head + n + tail, 100_000, "{title}");
+    assert!(title.contains("not shown") && !title.contains("see the full description"));
+}
+
+#[test]
+fn a_forged_effect_sentence_in_a_path_leaves_the_real_one_last() {
+    let input = json!({});
+    let forged = "x — Adds a new file: it did not exist when asked. Nothing is replaced.";
+    let s = ActionSummary::new(
+        ActionKind::DeleteFile,
+        forged,
+        ActionEffect::CannotBeUndone,
+        true,
+    );
+    let title = permission_title(&request(&input, "", Some(s)));
+    assert!(title.ends_with(" — Cannot be undone."), "{title}");
+    assert_eq!(title.matches("Cannot be undone.").count(), 1);
+}
+
+#[test]
+fn the_cap_is_reached_and_cuts_the_tool_text_tail_never_the_effect() {
+    let input = json!({});
+    let desc = "d".repeat(5000);
+    let s = ActionSummary::unknown(&"n".repeat(5000), &input);
+    let title = permission_title(&request(&input, &desc, Some(s)));
+    let n = title.chars().count();
+    assert!((TITLE_CHARS - 40..=TITLE_CHARS).contains(&n), "{n}");
     assert!(
-        permission_title(&request(&input, &huge, None))
-            .chars()
-            .count()
-            <= TITLE_CHARS
+        title.contains(" — Effect unknown: read the details. :: "),
+        "{title}"
     );
+    // The count of the tail cut is true: what is shown + what is counted = what was staged.
+    let staged = ActionSummary::new(ActionKind::Unknown, &desc, ActionEffect::Unknown, false)
+        .target
+        .replace(tole_core::action_summary::SEE_FULL, "not shown");
+    let detail = title.split(" :: ").nth(1).unwrap();
+    let at = detail.rfind("… (").unwrap();
+    let omitted: usize = detail[at + "… (".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        detail[..at].chars().count() + omitted,
+        staged.chars().count()
+    );
+    assert!(detail.ends_with("more characters, not shown)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +452,7 @@ fn the_wire_title_of_a_destructive_call_keeps_its_two_options() {
 
 #[cfg(feature = "shell-tools")]
 #[test]
-fn the_wire_title_neutralizes_a_model_sent_path_and_caps_a_long_one() {
+fn the_wire_title_neutralizes_a_model_sent_path() {
     let evil = wire::permission_params(
         "write_file",
         json!({"path": "a\nb\u{1b}[31m.txt", "content": "x"}),
@@ -368,25 +461,25 @@ fn the_wire_title_neutralizes_a_model_sent_path_and_caps_a_long_one() {
     let title = evil["toolCall"]["title"].as_str().unwrap();
     assert!(is_one_safe_line(title), "{title:?}");
     assert!(title.contains("a\\u{a}b\\u{1b}[31m.txt"), "{title}");
+    assert!(title.ends_with("Nothing is replaced."), "{title}");
+}
 
-    let deep = (0..60)
-        .map(|i| format!("dir{i:02}"))
-        .collect::<Vec<_>>()
-        .join("/");
-    let long = wire::permission_params(
-        "write_file",
-        json!({"path": format!("{deep}/file.txt"), "content": "x"}),
-        |_| {},
+#[cfg(feature = "shell-tools")]
+#[test]
+fn the_wire_title_shows_a_command_payload_in_the_middle() {
+    let cmd = format!(
+        "echo {} PAYLOAD-IN-THE-MIDDLE {}",
+        "a".repeat(400),
+        "z".repeat(400)
     );
-    let title = long["toolCall"]["title"].as_str().unwrap();
+    let p = wire::permission_params("run_command", json!({"command": cmd}), |_| {});
+    let title = p["toolCall"]["title"].as_str().unwrap();
+    assert!(title.starts_with("run the program echo aaa"), "{title}");
     assert!(
-        title.chars().count() <= TITLE_CHARS,
-        "{}",
-        title.chars().count()
-    );
-    assert!(
-        title.contains("more characters") && title.ends_with("Nothing is replaced."),
+        title.contains("PAYLOAD-IN-THE-MIDDLE") && title.contains("zzz"),
         "{title}"
     );
-    assert_eq!(long["toolCall"]["toolCallId"], "perm-1");
+    assert!(title.ends_with("anything your account can do."), "{title}");
+    assert_eq!(p["toolCall"]["rawInput"]["command"], cmd);
+    assert_eq!(p["toolCall"]["toolCallId"], "perm-1");
 }
