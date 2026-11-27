@@ -570,6 +570,15 @@ mod tests {
     use crate::status::SessionStatus;
 
     #[test]
+    fn a_settled_turn_maps_to_its_end() {
+        let stop = |t: &str| TurnEnd::Stopped(t.into());
+        assert_eq!(map(TurnOutcome::Detached), stop("turn detached"));
+        assert_eq!(map(TurnOutcome::Cancelled), TurnEnd::Cancelled);
+        let budget = map(TurnOutcome::BudgetExhausted);
+        assert_eq!(budget, stop("step budget exhausted"));
+    }
+
+    #[test]
     fn footer_carries_status_fields_and_effective_effort() {
         let st = SessionStatus {
             model: Some("m1".into()),
