@@ -85,9 +85,7 @@ wire! {
         pub resume: Option<String>,
     }
 
-    /// The answer to `POST /sessions`. A create sets `workspace`; a resume
-    /// sets `resumed` and `already_live` (and `busy` for a session that was
-    /// already live).
+    /// `POST /sessions`: a create sets `workspace`, a resume `resumed`, `already_live`, `busy`, `interrupted`.
     #[serde(rename_all = "camelCase")]
     pub struct SessionOpened {
         pub session_id: String,
@@ -99,6 +97,8 @@ wire! {
         pub already_live: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub busy: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub interrupted: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_mode: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

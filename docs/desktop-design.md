@@ -281,9 +281,13 @@ crash and restart, writer lock) that still holds.
 - **Crash or restart.** The sessions are in JSONL, so nothing durable is lost.
   After a restart the live map is empty: the desktop must `POST /sessions
   {"resume": id}` for each session it shows, and `GET /entries` returns `404`
-  until it does. A turn in flight when the process died is recoverable through
-  the existing crash-resume (see [daemon-design.md](daemon-design.md)); the
-  client treats it as a resumed session. A pending approval is in memory and is
+  until it does. A turn in flight when the process died is settled by the resume
+  itself (#1230): the answer says `"interrupted": true`, the turn is closed without
+  a model call or a tool run (an open tool call is marked failed, outcome UNKNOWN), and
+  the prompt that was cut off is **not** answered: show it as unanswered and let the
+  user resend it. Then the session takes prompts as usual. `tole resume <id>` at a terminal
+  is the other recovery and continues the turn by calling the model; a continue over
+  serve is not built (see [daemon-design.md](daemon-design.md)). A pending approval is in memory and is
   gone; the resumed turn asks again. Approvals expire to denied after 900 s
   (`EXPIRY_SECS`).
 - **Writer lock.** A session has one writer. If the user has the same session
