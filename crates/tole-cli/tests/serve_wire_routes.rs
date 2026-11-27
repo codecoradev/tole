@@ -45,7 +45,14 @@ fn read_routes_keep_their_shape() {
     let none = Volatile::of(&serve, &[]);
     let mut seen = Vec::new();
     for (name, path) in fresh {
-        seen.push((name, none.apply(&get(&serve, path))));
+        let mut v = none.apply(&get(&serve, path));
+        if name == "info" && !cfg!(feature = "mcp") {
+            // The golden is recorded with the default features: add back the one this build lacks.
+            let features = v["features"].as_array_mut().unwrap();
+            features.push(json!("mcp"));
+            features.sort_by_key(|f| f.as_str().unwrap().to_string());
+        }
+        seen.push((name, v));
     }
 
     // One session that answered, one that waits for an approval.
