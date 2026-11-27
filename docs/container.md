@@ -211,7 +211,7 @@ serve in a container (#1044)") and [desktop-design.md](desktop-design.md) 3.2 an
   adds a request-rate limit, which only slows a flood. Do this at the proxy; tole
   has nothing to restrict it by.
 - **`/health`, `/ready` and the webhook routes need no token.** `/health` tells anyone the exact tole version; `/ready` tells
-  anyone whether the state directory, the ticker and the sender work (three booleans, no path). Webhook routes keep
+  anyone whether serve works (`200` or `503`, no detail; the failing check only with the token). Webhook routes keep
   their own HMAC gate; a route configured `insecure_loopback` is refused by
   serve on a non-loopback bind, which `0.0.0.0` is.
 - **HTTP between the proxy and tole.** The traffic on the compose network is

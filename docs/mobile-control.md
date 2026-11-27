@@ -15,7 +15,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
-| Probe readiness (an orchestrator, a container `HEALTHCHECK`) | `GET /ready` (#1017) | `200 {"status":"ok","checks":{...}}` when serve can do its work, `503 {"status":"not ready",...}` when it cannot, see [`GET /ready`](#get-ready). No token, like `/health` |
+| Probe readiness (an orchestrator, a container `HEALTHCHECK`) | `GET /ready` (#1017) | `200 {"status":"ok"}` when serve can do its work, `503 {"status":"not ready"}` when it cannot (the `checks` only with a credential), see [`GET /ready`](#get-ready). No token needed, like `/health` |
 | Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features"}`: the binary version, the wire contract version and the feature names this server has, see [`GET /info`](#get-info). Behind the token, like every route but `/health` and `/ready` |
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
@@ -610,33 +610,46 @@ route or field. `version` is the `tole` binary's version. A client refuses a ser
 
 ### `GET /ready`
 
-No auth, on both listeners, like `/health`. `/health` is liveness (the process answers);
-`/ready` is readiness (it can do its work), the route for a container `HEALTHCHECK`
-(`scripts/container/healthcheck.sh` reads it) and for an orchestrator's readiness probe:
+No credential needed, on both listeners, like `/health`. `/health` is liveness (the process
+answers); `/ready` is readiness (it can do its work), the route for a container `HEALTHCHECK`
+(`scripts/container/healthcheck.sh` reads the status code) and for an orchestrator's readiness probe.
+Without a credential the answer is the status code and one word:
 
 ```json
-{"status":"ok","checks":{"state":true,"cron":true,"webhook":true}}
+{"status":"ok"}
 ```
 
 `200` and `"status":"ok"` when every check holds, `503` and `"status":"not ready"` when one does
-not. A client decides by the status code. The checks, each `true` when it does not apply:
+not. A caller that sends the token (or HTTP Basic) as for any route (a wrong one is `401`, as
+elsewhere) also gets which check failed, and nobody gets a path, a setting or an error text:
+
+```json
+{"status":"not ready","checks":{"state":false,"cron":true,"webhook":true}}
+```
+
+The checks, each `true` when it does not apply (so even `checks` does not say what is configured):
 
 - `state`: a file can be created and removed in the tole data directory, in the cron directory when
   `--cron` is given or a webhook destination is configured, and in `--sessions-dir` when it is
-  given (a read-only volume, a full disk, a path that is not a directory). Without
+  given (a read-only volume, a full disk, a path that is not a directory). A directory that does
+  not exist yet is probed at its nearest existing parent and is never created. Without
   `--sessions-dir` the sessions live in each session's workspace and are not probed.
 - `cron`: with `--cron`, this process's in-process ticker wrote its heartbeat (`ticker.json`, the file
   `tole cron status` reads) within the last 180 s. It is `false` until the first pass, a few
-  milliseconds after the start, and after a ticker that stopped or cannot record.
+  milliseconds after the start, and after a ticker that stopped or cannot record. The file is
+  shared: a standalone `tole cron tick` or a second serve on the same cron directory overwrites
+  it, and the check then flaps to `false` until this process's next pass (once a minute).
 - `webhook`: every webhook sender thread of this serve (the outbound sender and the approval-event
   sender, started only for a configured destination) is still running.
 
-The body carries one boolean per check and never a path, a setting or an error text: it says that a
-check failed, not why (the log and `tole doctor` do). Which checks apply is not told either (a
-check that does not apply is `true`). While serve drains after SIGTERM every route answers `503`,
-this one included. Each call writes and removes one small file per probed directory, so poll at
-the rate of a healthcheck (seconds), not in a loop. `tole-client` has no method for it: it is a probe
-for a process manager, and a client attaches with `health()` and `info()`.
+The state check is the only one that touches the disk, and its answer is reused for 5 seconds:
+callers that arrive together share one probe (one file created and removed per probed directory), so
+a flood of requests costs at most that every 5 seconds, however many connections it uses. A probe
+that takes longer than 2 seconds (a hung mount) counts as not ready and none is started again while
+it is stuck. A probe killed in mid-write can leave an empty `.ready-probe-*` file; a later probe skips
+a name that is taken, so a serve restarted as pid 1 in a container is not refused by it. While serve
+drains after SIGTERM every route answers `503`, this one included. `tole-client` has no method for it: it is
+a probe for a process manager, and a client attaches with `health()` and `info()`.
 
 ### `GET /info`
 

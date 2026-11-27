@@ -276,7 +276,9 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // local socket every peer shares one bucket, so the unauthenticated liveness
     // probe is exempt there: a client with a stale token must not be able to make
     // a running serve look dead to the one that attaches (TCP is unchanged).
-    let socket_probe = stream.is_local_socket() && req.method == "GET" && is_probe(&req.path);
+    let socket_probe = stream.is_local_socket()
+        && req.method == "GET"
+        && is_probe(&req.path, req.authorization.is_some());
     if limited && !socket_probe {
         respond(
             &mut stream,
@@ -297,7 +299,7 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
 
     // The one auth check (#742): every route below this line is behind it,
     // for a bearer token and for Basic alike.
-    let authorized = is_probe(&req.path)
+    let authorized = is_probe(&req.path, req.authorization.is_some())
         || req
             .verdict
             .unwrap_or_else(|| state.auth.check(req.authorization.as_deref()));
@@ -306,6 +308,15 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
             state.auth_failures.record_failure(ip);
         }
         respond_unauthorized(&mut stream, &state.auth);
+        return;
+    }
+
+    // `/ready` (#1017): the status for anyone, the checks only for a credential that passed.
+    if req.method == "GET" && req.path == "/ready" {
+        let (status, payload) = state
+            .ready
+            .answer(tole_cli::cron::now(), req.authorization.is_some());
+        respond(&mut stream, status, &payload);
         return;
     }
 
@@ -406,7 +417,6 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
-        ("GET", "/ready") => state.ready.answer(tole_cli::cron::now()),
         ("GET", "/info") => info::route(state),
         ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
