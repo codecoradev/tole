@@ -37,9 +37,9 @@ listed in AGENTS.md between the unsafe-opt-ins marker comments. Nothing is
 tolerated silently: a site, a list entry or a manifest that does not match is
 an error, and a list that cannot be read is a failed run (exit 2).
 
-cora: the parsed .cora.yaml (PyYAML) is held to whitelists. `ignore.files` and
-`review.exclude` hold only lock-file, target, docs or `crates/*/tests` globs;
-`ignore` and `review` hold only known keys; a plain `ignore.rules` string is
+cora: the parsed .cora.yaml (PyYAML) is held to whitelists. It has only known
+top-level keys, `ignore` and `review` only known keys, and `ignore.files` and
+`review.exclude` only lock-file, target, docs or `crates/*/tests` globs; a plain `ignore.rules` string is
 neither a pattern nor part of the rule id or the finding text; and
 `index-breaking-change` is silenced only by a scoped `ignore.rules` entry listing
 exact `crates/<name>/src/**/*.rs` files (no other string, key or value of the
@@ -108,9 +108,10 @@ CORA_RULE = "index-breaking-change"
 CORA_MESSAGE = "symbol `x` is being removed but has n caller(s)"  # the finding text, lower case
 CORA_WORDS = {"index", "breaking", "change", "symbol", "removed", "removing", "caller", "callers"}
 CORA_KEYS = {"ignore": {"files", "rules"}, "review": {"exclude", "max_chunk_chars", "fail_on_incomplete"}}
+CORA_TOP = {"llm", "focus", "rules", "ignore", "review", "rules_engine", "hook", "output"}
 CORA_MAX_BYTES = 1 << 20
 CORA_HINT = "read CONTRIBUTING.md, section 'Cora Workflow', before changing this entry"
-_CORA_FILE = re.compile(r"crates/[\w.-]+/src/(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.rs")
+_CORA_FILE = re.compile(r"crates/[\w-][\w.-]*/src/(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.rs")
 # the only globs that may leave the symbol index or the reviewed diff: tests, docs, lock files, target
 _CORA_GLOB = re.compile(r"(?:crates/(?:\*|[\w.-]+)/tests/|docs/|target/)[\w./*-]*|[\w*.-]*\.lock|CHANGELOG\.md")
 
@@ -406,7 +407,7 @@ def load_cora(raw, report=error):
 def check_cora_config(data, report=error, path=CORA_CONFIG):
     """Whitelist the parsed document and return the files of its scoped `index-breaking-change` entries.
 
-    `ignore` and `review` hold only known keys; `ignore.files` and `review.exclude` only lock-file,
+    The top level holds only the known keys; `ignore` and `review` hold only known keys; `ignore.files` and `review.exclude` only lock-file,
     target, docs or crates/*/tests globs; a plain `ignore.rules` string (or the `rule` of another
     entry) only text that is no pattern and no part of the rule id or finding text; the rule itself
     only a `- rule: <name>` entry whose `files:` are exact crates/<name>/src/**/*.rs paths. No other
@@ -421,6 +422,8 @@ def check_cora_config(data, report=error, path=CORA_CONFIG):
     if not isinstance(data, dict):
         bad("the document is not a mapping")
         return []
+    if not set(data) <= CORA_TOP:
+        bad(f"top-level key(s) {sorted(map(str, set(data) - CORA_TOP))} are not known (known: {sorted(CORA_TOP)})")
     files, scoped = [], set()
     for section, allowed in CORA_KEYS.items():
         block = data.get(section)
@@ -479,6 +482,8 @@ def check_cora_compiled(root, packages, files, report=error, path=CORA_CONFIG):
     out = run_cargo(["check", "--workspace", "--lib", "--bins", "--offline", "--message-format=json"], root)
     dirs, libs, bins = {os.path.realpath(p["dir"]) for p in packages}, set(), set()
     for line in out.splitlines():
+        if not line.startswith("{"):
+            continue  # a build script or proc macro printed it, cargo forwards it raw; a bad `{` line still raises
         msg = json.loads(line)
         if msg.get("reason") != "compiler-artifact" or "custom-build" in msg["target"]["kind"]:
             continue

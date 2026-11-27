@@ -299,13 +299,15 @@ library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
 step; needs PyYAML, a missing one is exit 2) checks two things with ground
 truth, not text matching. First, the parsed `.cora.yaml` (PyYAML, duplicate
 keys, merge keys, custom tags and files over 1 MiB refused) is held to
-whitelists: `ignore` and `review` hold only known keys; `ignore.files` and
+whitelists: the top level holds only the known keys (`llm`, `focus`, `rules`,
+`ignore`, `review`, `rules_engine`, `hook`, `output`), `ignore` and `review` hold only known keys; `ignore.files` and
 `review.exclude` hold only lock-file, `target`, docs and `crates/*/tests`
 globs (so a glob over source files is refused, which would also drop them from
 the symbol index or the reviewed diff); a plain `ignore.rules` string (or the
 `rule` of another entry) holds no glob or regex character and is no part of the
 rule id or of the finding text ("Symbol `X` is being removed but has N
-caller(s)"); `index-breaking-change` itself is silenced only by an entry of the
+caller(s)") and none of their words (index, breaking, change, symbol, removed,
+removing, caller, callers); `index-breaking-change` itself is silenced only by an entry of the
 form `rule`/`files`/`reason` whose `files` are exact `crates/<name>/src/**/*.rs`
 paths, and no other string, key or value anywhere in the document may name it
 (`index-breaking`, `breaking-change`, any case, `-` or `_`). Second, after
@@ -313,7 +315,11 @@ paths, and no other string, key or value anywhere in the document may name it
 of every source file it loaded, compared as real paths, so `mod`, `#[path]`,
 `include!`, macros and symlinks all count) must list each scoped file for a bin
 target and for no lib target of any workspace crate; build scripts are skipped.
-A cargo or dep-info failure is exit 2, never a pass. This is a tripwire against
+A cargo or dep-info failure is exit 2, never a pass (cargo stdout lines that do
+not start with `{`, such as a proc macro's `println!`, are skipped; a broken
+line that does is exit 2). The guard runs `python3 -I`, which ignores the user
+site: install PyYAML in the system or venv python (`apt install python3-yaml`),
+not with `pip install --user`. This is a tripwire against
 the known ways to silence the rule, not a proof: cora was not run against these
 spellings, so what it does with a key or glob it was not tested on (anchoring,
 case, a key this script does not know) cannot be verified here. Residuals: it

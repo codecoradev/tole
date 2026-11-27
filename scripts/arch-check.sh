@@ -61,8 +61,8 @@
 #             AGENTS.md list in the same change.
 #
 # cora      (#1249)
-#             - the parsed .cora.yaml (PyYAML) is held to whitelists:
-#               `ignore.files` and `review.exclude` hold only lock-file, target,
+#             - the parsed .cora.yaml (PyYAML) is held to whitelists: only
+#               the known top-level keys; `ignore.files` and `review.exclude` hold only lock-file, target,
 #               docs and crates/*/tests globs; `ignore` and `review` only known
 #               keys; a plain `ignore.rules` string is no glob or regex and no
 #               part of the rule id or the finding text;

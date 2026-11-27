@@ -29,13 +29,13 @@ jobs:
       # `cargo check --workspace --lib --bins --offline` for the binary-only
       # files); the self-test proves the check fails closed. Part of this job so
       # no required check name changes. Python 3 is on the runner, PyYAML is
-      # not guaranteed there (and `python3 -I` ignores the user site), so the
-      # system package is installed explicitly; without it the cora check is
-      # exit 2, never a pass.
+      # not guaranteed there, and `python3 -I` (what arch-check.sh runs)
+      # ignores the user site, so the check is for `python3 -I` itself: a
+      # runner that already has it never touches apt, otherwise the system
+      # package is installed. Without PyYAML the cora check is exit 2, never a
+      # pass.
       - name: Install PyYAML for the cora check
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-yaml
+        run: python3 -I -c 'import yaml' || { sudo apt-get update && sudo apt-get install -y python3-yaml; }
       - run: python3 scripts/test_arch_lint.py
       - run: scripts/arch-check.sh
 
