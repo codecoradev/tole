@@ -141,17 +141,28 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     false
 }
 
-/// Programs that treat a quoted argument as data (a pattern, a file name),
-/// never as shell text or a program to run. A separator inside such an
-/// argument is not a command boundary (#1287). `echo` and `printf` are not
-/// listed: their output can be piped into a shell.
-const INERT: [&str; 9] = [
-    "grep", "egrep", "fgrep", "rg", "ls", "cat", "head", "tail", "wc",
-];
+/// Programs whose arguments are data (a pattern, a file name): none has an
+/// option that runs a program, so a quoted separator is not a command
+/// boundary (#1287). Not listed: `echo` and `printf` (their output can be
+/// piped into a shell) and `rg` (`--pre`, `--pre-glob`, `--hostname-bin`,
+/// `-z` run programs). Off for text that [`redefines_a_command`].
+const INERT: [&str; 8] = ["grep", "egrep", "fgrep", "ls", "cat", "head", "tail", "wc"];
 const SEPARATORS: [char; 9] = [';', '&', '|', '(', ')', '`', '\n', '{', '}'];
 
 fn naive(s: &str) -> Vec<&str> {
     s.split(SEPARATORS).collect()
+}
+
+/// Text that may redefine a command name (`grep(){ eval "$@"; }`,
+/// `function ls { ..; }`, `alias`): the shell then runs the text under a
+/// name from [`INERT`]. Conservative: any `(` followed by `)` (blanks
+/// between), even inside quotes, and any `function` or `alias` word.
+fn redefines_a_command(s: &str) -> bool {
+    let sep = |c: char| c.is_whitespace() || SEPARATORS.contains(&c);
+    s.split(sep).any(|w| matches!(w, "function" | "alias"))
+        || s.split('(')
+            .skip(1)
+            .any(|r| r.trim_start().starts_with(')'))
 }
 
 fn inert(seg: &str) -> bool {
@@ -161,9 +172,10 @@ fn inert(seg: &str) -> bool {
 
 /// Split shell text at the separators the shell acts on, keeping quoted text
 /// whole. `None` when unsure: an unbalanced quote, or quoting this scan does
-/// not follow (comment, here-document, `$'..'`, command substitution inside
-/// double quotes, a backslash in single quotes, which fish treats as an
-/// escape). The caller then splits naively: refuse rather than guess.
+/// not follow (comment, here-document, `$'..'`, a command substitution or any
+/// `${` inside double quotes: bash 5.3 and ksh run `${ cmd; }` there, a
+/// backslash in single quotes, which fish treats as an escape). The caller
+/// then splits naively, which is the stricter reading.
 fn split_quoted(s: &str) -> Option<Vec<&str>> {
     let (mut parts, mut start) = (Vec::new(), 0);
     let mut it = s.char_indices().peekable();
@@ -183,7 +195,7 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
                     '"' => break,
                     '\\' => drop(it.next()),
                     '`' => return None,
-                    '$' if it.peek().is_some_and(|&(_, n)| n == '(') => return None,
+                    '$' if it.peek().is_some_and(|&(_, n)| matches!(n, '(' | '{')) => return None,
                     _ => {}
                 }
             },
@@ -205,10 +217,15 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
 /// checked like an argv. Text straight from a real argv (depth 1) is split
 /// quote-aware and a quoted separator only stays literal in the arguments of
 /// an [`INERT`] program; everything else, and any doubt, splits naively.
+/// Text that may redefine a command name is split naively too.
 /// Deeper text was cut on whitespace with its quotes still on, so it is
-/// always split naively.
+/// always split naively. That gate is close to redundant: such a word holds no
+/// blank, so an inert program never has an argument in it to protect, and a
+/// quoted word or a nested quote already falls to the naive cut. It stays as
+/// the cheap guarantee that nesting cannot loosen the scan.
 fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
-    let parts = (depth == 1).then(|| split_quoted(payload)).flatten();
+    let quote_aware = depth == 1 && !redefines_a_command(payload);
+    let parts = quote_aware.then(|| split_quoted(payload)).flatten();
     let segs = match parts {
         Some(parts) => parts
             .into_iter()

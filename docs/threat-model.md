@@ -1256,13 +1256,18 @@ them. Two layers close the direct routes; neither is a boundary.
   like and inside `sh -c` text. Any argument that names the marker below
   is refused too. The shell text is cut into commands at `; & | ( ) { }`
   and newlines; a separator inside quotes is literal only in the arguments
-  of a program that treats them as data (`grep`, `rg`, `ls`, `cat`, `head`,
-  `tail`, `wc`), so `grep -E "a|tole"` passes (#1287). For every other
-  program, and whenever the scan is unsure (unbalanced quote, comment,
-  here-document, `$'..'`, command substitution inside double quotes, a
-  backslash in single quotes), the old naive cut applies and a quoted word
-  `tole` still counts as a command: a false refusal is the price, a hidden
-  invocation is not. A human running `tole` from a terminal is not affected:
+  of a program none of whose options runs a program (`grep`, `egrep`,
+  `fgrep`, `ls`, `cat`, `head`, `tail`, `wc`), so `grep -E "a|tole"` passes
+  (#1287). `rg` is not on that list (`--pre`, `--pre-glob`,
+  `--hostname-bin` and `-z` run programs), nor are `echo` and `printf`.
+  For every other program, and whenever the scan is unsure (unbalanced
+  quote, comment, here-document, `$'..'`, a command substitution or any
+  `${` inside double quotes, a backslash in single quotes, text that
+  defines a function or an alias), the old naive cut applies and a quoted
+  word `tole` still counts as a command. This errs toward refusing and
+  is not a proof: it follows the shells it was checked against (dash,
+  bash 5.2 and 5.3, ksh93, mksh, zsh) and not every way a shell can run
+  text. A human running `tole` from a terminal is not affected:
   the check lives in the two tools, not in the CLI.
 - **A marker for what still runs.** Every process those two tools start
   carries `TOLE_UNDER_SESSION=1` (a child agent also has
@@ -1279,7 +1284,14 @@ them. Two layers close the direct routes; neither is a boundary.
 
 Residual, deliberately: a renamed or copied tole binary started with a
 cleared environment (`env -i`, a wrapper that drops variables) is
-indistinguishable from a program the owner runs; an interpreter
+indistinguishable from a program the owner runs. The highest-impact case
+is `env -i sh -c '/usr/local/bin/tole ...'`: it is allowed, because the
+wrappers (`env`, `nohup`, `sudo`, `timeout`, ...) are not followed into a
+shell's `-c` text, and `env -i` also clears the marker, so the second layer
+does not see it either. It reaches the owner-only records; only the Write
+approval of `run_command` and the sandbox bound it. Other routes the guard
+does not follow, all present before #1287: `eval`, `echo x | sh`,
+`x=tole; $x`, `xargs`, `find -exec`, `rg --pre`; an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
 into the data dir is not seen. A session with `run_command` has the

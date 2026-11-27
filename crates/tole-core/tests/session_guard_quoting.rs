@@ -36,7 +36,6 @@ fn a_quoted_pattern_that_mentions_tole_passes() {
     }
     for text in [
         "grep -E \"a|tole\" f",
-        "rg \"a|tole|b\" src",
         "grep 'a|tole' f && echo done",
         "ls \"$HOME/x\" | grep -i -E \"cora|tole|opencode\"",
         "cat \"a|tole\"",
@@ -107,6 +106,14 @@ fn a_substitution_around_a_quoted_pattern_is_refused() {
         "grep -f <(tole x) f",
         "grep `tole x` f",
         "grep \"${x:-$(tole x)}\" f",
+        // bash 5.3 and ksh93/mksh run a command in `${ cmd; }` and
+        // `${| cmd; }` inside double quotes.
+        "grep \"${ tole x; }\" f",
+        "grep \"${| tole x; }\" f",
+        "ls \"${ tole x; }\"",
+        "cat \"${\ntole x\n}\"",
+        "grep \"a|${ tole x;}\" f",
+        "grep \"${x}\" f ; tole x",
     ] {
         assert!(shell(text), "must refuse: {text:?}");
     }
@@ -143,6 +150,21 @@ fn quoting_tricks_cannot_hide_a_separator() {
         "cat <<<\"a\"; tole x; echo 'y'",
         "echo ${#x}; tole x",
         "echo a#b; tole x",
+        // The same tricks behind an inert program, where the quote-aware
+        // scan is in charge: each must still leave `tole x` a command.
+        "grep \\\" ; tole x ; echo \"",
+        "grep '\\' ; tole x",
+        "grep \"\\\"\" ; tole x",
+        "grep a} ; tole x",
+        "grep \"{\" ; tole x",
+        "grep \"a\" \\' ; tole x ; echo '",
+        "grep '' ; tole x",
+        "ls \"a\" '' ; tole x",
+        // Nested: the inner text is cut on whitespace with its quotes on.
+        "sh -c \"grep \\\"a;tole x\\\" f\"",
+        "sh -c 'grep \"a\" f; tole x'",
+        "sh -c 'sh -c \"grep a f; tole x\"'",
+        "sh -c 'sh -c \"grep \\\"a|b\\\" f | tole x\"'",
         // Unbalanced quotes: refuse rather than guess.
         "grep \"a|b f; tole x",
         "grep 'a|b f; tole x",
@@ -231,4 +253,40 @@ fn a_link_to_the_running_executable_is_still_refused_next_to_quotes() {
     // Mentioning the link in a quoted pattern is not running it.
     assert!(!run("grep -E \"a|./helper\" f"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redefined_command_name_is_not_inert() {
+    // `grep` and `ls` here run `eval`, so the quoted text is a program.
+    for text in [
+        "grep(){ eval \"$@\"; }; grep \"a;tole x\"",
+        "ls(){ eval \"$1\"; }; ls 'a;tole x'",
+        "grep () { eval \"$1\"; }\ngrep 'a;tole x'",
+        "grep ( ) { eval \"$1\"; }; grep 'a|tole x'",
+        "function grep { eval \"$1\"; }; grep 'a;tole x'",
+        "function ls() { eval \"$1\"; }; ls 'a;tole x'",
+        "cat(){ sh -c \"$1\"; }; cat \"a;tole x\"",
+        "alias grep=eval; grep 'a;tole x'",
+    ] {
+        assert!(shell(text), "must refuse: {text:?}");
+    }
+    // Only text that has the shape of a definition loses the quote-aware cut.
+    assert!(!shell("grep -E \"function|alias\" f"));
+    assert!(!shell("grep -E \"a|tole\" f"));
+}
+
+#[test]
+fn what_the_inert_list_does_not_cover_is_still_refused() {
+    // Residual, on purpose: a quoted separator in the arguments of any other
+    // program stays a boundary. `rg` is not listed: `--pre`, `--pre-glob`,
+    // `--hostname-bin` and `-z` run programs.
+    for text in [
+        "rg \"a|tole\" src",
+        "echo \"a|tole\"",
+        "git log --grep \"a|tole\"",
+        "\"grep\" \"a|tole\" f",
+        "/bin/grep \"a|tole\" f",
+    ] {
+        assert!(shell(text), "refused by design: {text:?}");
+    }
 }
