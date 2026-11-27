@@ -39,6 +39,7 @@ use tole_cli::serve_support::profiles::ProfileSource;
 use tole_cli::serve_support::ready::is_probe;
 use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::Conn;
+use tole_cli::session::problem::prompt_answer;
 use tole_cli::session_host::{lock_sessions, run_session_turn_with_end, SharedSessions};
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -988,11 +989,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                                     )
                                 },
                             );
-                            match (approval, r.text) {
-                                (Some(body), _) => (200, body),
-                                (None, Some(t)) => (200, json!({"stopReason": r.stop, "text": t})),
-                                (None, None) => (200, json!({"stopReason": r.stop})),
-                            }
+                            let p = r.problem.as_ref();
+                            let body = prompt_answer(approval, &r.stop, r.text, p);
+                            (200, body)
                         }
                         Err(e) => tole_cli::session::interrupted::prompt_error(e.message),
                     }

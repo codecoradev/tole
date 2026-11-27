@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tole_cli::approver::{InteractiveApprover, PromptFn};
+use tole_cli::session::problem::prompt_result;
 use tole_cli::session_host::{
-    lock_sessions, new_session_id, open_session, run_session_turn_with_images, validate_session_id,
+    lock_sessions, new_session_id, open_session, run_session_turn_detailed, validate_session_id,
     AdmitError, Sessions,
 };
 use tole_core::storage::Storage;
@@ -930,8 +931,7 @@ pub fn run_acp(
                     .map(|st| st.tool_ids.clone())
                     .unwrap_or_default();
                 std::thread::spawn(move || {
-                    // Phase 3 dedup flag, shared with the closure below —
-                    // the trait object cannot expose the field.
+                    // Phase 3 dedup flag, shared with the closure below.
                     let text_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let observer: Arc<dyn tole_core::turn::TurnObserver> = Arc::new(AcpObserver {
                         conn: conn.clone(),
@@ -940,18 +940,19 @@ pub fn run_acp(
                         current: Mutex::new(None),
                         text_streamed: Arc::clone(&text_streamed),
                     });
-                    match run_session_turn_with_images(
+                    match run_session_turn_detailed(
                         sessions,
                         &session_id_clone,
                         &prompt_text,
                         &prompt_images,
                         Some(Arc::clone(&observer)),
+                        None,
                     ) {
-                        Ok((stop, Some(text))) => {
-                            // Phase 3: when deltas already streamed the
-                            // answer, the full text was delivered live —
-                            // re-sending it would duplicate the message.
-                            if !text_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+                        Ok(r) => {
+                            // Phase 3: deltas already delivered the text
+                            // live; re-sending it would duplicate it.
+                            let streamed = text_streamed.load(std::sync::atomic::Ordering::SeqCst);
+                            if let Some(text) = r.text.filter(|_| !streamed) {
                                 conn.send_notification(
                                     "session/update",
                                     json!({
@@ -963,9 +964,8 @@ pub fn run_acp(
                                     }),
                                 );
                             }
-                            reply(&conn, id, json!({ "stopReason": stop }));
+                            reply(&conn, id, prompt_result(&r.stop, r.problem.as_ref()));
                         }
-                        Ok((stop, None)) => reply(&conn, id, json!({ "stopReason": stop })),
                         Err(e) => reply_error(&conn, id, &e),
                     }
                 });

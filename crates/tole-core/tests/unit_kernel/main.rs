@@ -6,6 +6,7 @@
 mod test_dir;
 
 mod approval;
+mod cancel;
 mod problem;
 mod provider_failover;
 mod tool_registry;

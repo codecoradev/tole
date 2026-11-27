@@ -55,6 +55,28 @@ the issue lands, and the test then fails until it is.
 | `todo_write` | yes | no | yes | yes | policy | The write half of `todo_read`; same reason. |
 <!-- parity:end -->
 
+## ACP and the TUI are local hosts
+
+Owner decision (2026-11-27): each difference of `tole acp` from `tole serve` in
+the table below is **policy**, not a gap to implement. `tole acp` is a local
+stdio host: an editor spawns it, it trusts that parent process (see "Identity
+and authentication" above), and the editor owns the plan, fork, history and
+compact controls of its own UI. By policy, remote authentication, remote
+clients and the capabilities a remote client needs (per-session plan mode,
+fork, tree, compact, name, missions, outbound webhooks) belong to `tole serve`,
+the desktop and the gateway, not to `tole acp`. An editor may be configured to
+start `tole acp` over `ssh`; that is the editor's setup, and it is neither
+tested nor documented here as a supported way to run it. The TUI is likewise a
+local, direct host: it runs the session in its own process and has no `serve`
+client inside it. Where ACP does reach a capability it is through
+`session/set_config_option` (the model picker and the per-session `approval`
+selector, `acp.rs`), through the `plan` `session/update` that carries the
+model's execution plan (the `update_plan` tool, `tool_roster.rs`) to the editor, or through the process flags of `tole acp`.
+By policy the capability itself lives in the shared assembly
+(`session::assemble`, `tool_roster`, `turn_runner`) and the session host, so a
+face added later is meant to reuse it instead of getting a second
+implementation.
+
 ## Capabilities the test cannot see in a tool list
 
 These are part of the same epic. They are not tools, so a person keeps them
@@ -67,10 +89,10 @@ true; the status column says where the work is.
 | Review guidance (named only when both review tools are present) | yes | yes (#945), and active when the owner has configured the cora review tools as an approved MCP server (#946); otherwise absent | n/a | no | one path in code |
 | Model routing for a new session (#586) | yes | yes (#945: routed once, at the session's first prompt, from the owner's `[router]` config; a session that already has a model, a resumed one included, is left alone; ACP and the MCP session tools share the path) | n/a | its own (cron routes by job) | one path |
 | MCP client servers (`--mcp-server`, the cora preset) | yes (flag, user or project config, and the cora preset when `cora` is on the PATH) | only the OWNER's list (`tole serve` / `tole acp` `--mcp-server` or the user config, read at start-up; a project-config `mcp_server` is refused at start-up; no PATH preset; never a request field), through the same plugin lock and sandbox rules, on `serve` (unattended) an `optional` sandbox counts as `required`, on `acp` (attended, like the CLI) it starts the server unsandboxed with a warning and a ledger fallback line; every tool `Write` through the approval gate; a refused server leaves one notice in the session log (#946) | no | no | policy (a trust boundary: the owner names the servers, a client never does; `tole mcp`, `POST /missions` and cron attach none) |
-| Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (`serve` only, #947; ACP keeps the process flag) | per process flag | per job (`read_only`) | one path for `serve` (a request can only turn it on) |
-| Fork, tree, compact, name a session | yes | yes (`serve` only, #947; ACP has none of these routes) | n/a | n/a | one path for `serve` |
-| Mission chaining with a budget | yes | yes (`serve` only, `POST /missions`, #947; a mission is its own session, one at a time, refused under `--plan-mode`) | n/a | n/a | one path for `serve` (the verify command, the budget ceilings and the workspace are owner configuration; a request may only lower a budget) |
-| The `turn_finished` outbound webhook event (#962; ids and a status word, opt-in per destination) | no | yes (`serve` only: the serve prompt route and the approval-resume thread; ACP and `tole mcp` have no webhook sink) | no | no (a cron run has `cron_run_finished`) | policy |
+| Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (`serve` only, #947). On ACP the `--plan-mode` flag of `tole acp` applies to every session it opens, and `session/set_config_option` accepts only `model` and `approval`, so an editor cannot switch it per session | per process flag | per job (`read_only`) | one path for `serve` (a request can only turn it on); policy for ACP (an editor that drives ACP has its own plan UI, and the execution plan the model writes with `update_plan` (a read-only tool, so it works under plan mode) reaches it as the standard `plan` `session/update`; the registry filter is the same shared code) |
+| Fork, tree, compact, name a session | yes | yes (`serve` only, #947: `POST /sessions/{id}/fork`, the tree, compact and name routes). `tole acp` has no method for them: it handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/set_config_option` and the `session/cancel` notification, and answers a request (a message with an id) for any other method with an error | n/a | n/a | one path for `serve`; policy for ACP (an editor that drives ACP has its own fork, history and compact UI; fork is `JsonlStorage::fork` in `tole-core`, called by the TUI (`session/tui.rs`) and by `serve` (`serve/session_routes.rs`); compact and name are `session_settings::request_compaction` and `set_name`, called by both too, so by policy nothing is derived twice; an editor can still reopen a session with `session/load`) |
+| Mission chaining with a budget | yes | yes (`serve` only, `POST /missions`, #947; a mission is its own session, one at a time, refused under `--plan-mode`; `tole acp` has no mission method) | n/a | n/a | one path for `serve`; policy for ACP (an editor drives its own turns, and a mission is a budgeted, headless chain that `serve` and the CLI host). On `serve` the verify command, the budget ceilings and the workspace are owner configuration; a request may only lower a budget |
+| The `turn_finished` outbound webhook event (#962; ids and a status word, opt-in per destination) | no | yes (`serve` only: the serve prompt route and the approval-resume thread; ACP, the TUI and `tole mcp` have no outbound webhook sink) | no | no (a cron run has `cron_run_finished`) | policy (a webhook is how a gateway learns that a turn of a remote `serve` session ended. `tole acp` is a local stdio host that an editor spawns and talks to directly: the editor already receives the turn's end as the `session/prompt` reply and does not need a callback. The event is built from the session host's typed turn end, so a sink on another face would only be a new destination, not new derivation) |
 | Every turn through `turn_runner` | yes (#944) | yes | n/a | yes | one path |
 | Tool roster built by `roster_for` and a `FacePolicy` (#943) | yes | yes | yes | yes | one path |
 | The approval gate (`gate::authorize`) | yes | yes | yes | yes | one path |
@@ -78,6 +100,7 @@ true; the status column says where the work is.
 | Sandbox profile for process tools | yes | yes | yes | yes | one path |
 | Helper tools for a discussion (#1039: `tole discuss start --tool <server>.<tool>`; the helpers are independent read-only children that may use the owner's named connected tools, each asked once per discussion in the owner's approvals queue) | yes | no (the start has no field and `serve` has no delegation host, so a start is never offered the allowance; a discussion the terminal started with tools can be listed, shown and stopped over serve, but resuming it while open is refused and the terminal's `tole discuss resume` continues it; a stop and a finished discussion need no host) | no (the model-facing `discuss` tool refuses a `tools` field) | no | policy (the allowance and the owner's approvals queue are owner-at-terminal actions, and only the CLI builds the host that starts helper children; a request, a model or a schedule never names a tool for a discussion) |
 | Graceful shutdown on SIGTERM and SIGINT (#1014: running turns detached through `detach_running_turns`, a bounded grace, exit 0 when drained) | no (a terminal turn ends with Ctrl+C as before) | yes, `serve` (REST) and the MCP-over-HTTP host share one drain (`serve_support::shutdown`); `tole acp` and `tole mcp` (stdio) end when their parent closes the pipe | n/a | no | policy (only the long-running daemons are stopped by a process manager with a signal; a mission is hosted by `serve` only, so only `serve` cancels one at shutdown) |
+| The typed problem of a stopped turn (#1023: `tole_core::problem`; `kind`, `subject`, `retryable` and a redacted, cut `detail`, no wording) | the host's stderr lines and the TUI's sentences are worded from it (`describe_problem`), nothing is sent | yes, the `problem` of the `POST /sessions/{id}/prompt` answer; ACP carries it in `result._meta.tole.problem`, as `stopReason` is a fixed enum | no (`tole_session_prompt` answers `stop_reason` and `text` only) | no (a cron run has its own outcome words) | policy (a graphical client or a gateway needs the machine-readable cause; the MCP session tool and cron are not such clients) |
 | Readiness probe, `GET /ready` (#1017: state directories writable, the cron ticker's beat under `--cron`, the webhook sender threads; one boolean per check) | no | yes (`serve` only: it answers for the REST process and its helper threads) | no (the MCP-over-HTTP host has no ticker, sender or session store of its own) | no | policy (a probe for the process manager of the long-running daemon; it reads the same heartbeat `tole cron status` shows, so no capability exists on `serve` alone because of it) |
 | Server probe, `GET /info` (#1024: binary version, wire contract version, feature names) | no | yes (`serve` only: it describes the REST wire of `tole serve`) | no (the MCP and ACP handshakes carry their own version and capabilities) | no | policy (a probe of one transport's contract; the names it lists are the route groups of `docs/mobile-control.md`, so no capability exists on `serve` alone because of it) |
 

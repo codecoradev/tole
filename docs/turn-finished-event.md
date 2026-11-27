@@ -148,7 +148,10 @@ Whether the turn's end also emits `turn_finished(approval_pending)` is a choice:
   approval. (**DECISION NEEDED**, D3: the alternative is to leave
   `ApprovalRequired` silent because the earlier event covers it.)
 
-**Which sessions.** **RECOMMENDATION** Only turns that run in a `tole serve`
+**Which sessions.** **DECIDED for ACP and the TUI (owner, 2026-11-27):** they
+are local hosts without an outbound webhook sink, by policy (see
+[faces.md](faces.md), "ACP and the TUI are local hosts"). The rest of this
+paragraph keeps its original wording. **RECOMMENDATION** Only turns that run in a `tole serve`
 session started or resumed through the serve routes. Cron agent runs already
 have `cron_run_finished`; ACP and the TUI have no outbound webhook sink, so this
 is a serve-only item and needs a row in the capability table of
