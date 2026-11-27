@@ -5,7 +5,9 @@ use super::State;
 use serde_json::json;
 use std::sync::Arc;
 use tole_cli::serve_support::profiles::{self, SessionProfile};
-use tole_cli::session_host::{lock_sessions, open_session_with, SessionOverrides, Sessions};
+use tole_cli::session_host::{
+    lock_sessions, open_session_with, SessionOverrides, SessionState, Sessions,
+};
 
 /// Open (or reopen, `loading`) a serve session and admit it to the live map.
 /// Shared by create and resume so both get the same approver, jail and
@@ -115,6 +117,12 @@ pub(super) fn sessions_keeping_pending(
     let mut sessions = Sessions::default();
     sessions.set_keep(Box::new(move |id| queue.has_pending(id)));
     sessions
+}
+
+/// A handle on live session `id`, or the `404` of an unknown one.
+pub(super) fn live(state: &State, id: &str) -> Result<SessionState, (u16, serde_json::Value)> {
+    let found = lock_sessions(&state.sessions).get(id).cloned();
+    found.ok_or_else(|| (404, json!({"error": "unknown session"})))
 }
 
 /// Look up a session's context window off the request path (#573): the

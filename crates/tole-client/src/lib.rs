@@ -113,7 +113,9 @@
 mod client;
 mod error;
 mod http;
+mod info;
 mod resume;
+mod route;
 #[cfg(test)]
 mod schema;
 mod sse;
@@ -124,10 +126,12 @@ mod types;
 #[cfg(unix)]
 mod unix;
 
-pub use client::{Client, IndexQuery, Route};
+pub use client::{Client, IndexQuery};
 pub use error::{Error, Result, MAX_ERROR_BODY, MAX_STATUS_MESSAGE};
 pub use http::ResponseBody;
+pub use info::Info;
 pub use resume::{ReconnectPolicy, ResumingStream, StreamItem};
+pub use route::Route;
 pub use sse::{Event, Frame, FrameReader, Ready, SseItem, SseParser};
 pub use tls::TlsTransport;
 pub use transport::{Connection, TcpTransport, Transport};

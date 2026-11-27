@@ -56,7 +56,7 @@ use approval_audit::write_approval_audit;
 use events::serve_events;
 use hooks::handle_hook;
 use images::{image_error, read_image, respond_image, upload_image};
-use live_sessions::{open_serve_session, resume_session, serve_storage_dir, warm_status};
+use live_sessions::{live, open_serve_session, resume_session, serve_storage_dir, warm_status};
 use request::{read_request, ReadError};
 use response::{respond, respond_unauthorized, respond_with};
 use session_routes::{compact_route, fork_route, name_route, tree_route, with_idle_session};
@@ -73,6 +73,7 @@ mod discussions;
 mod events;
 mod hooks;
 mod images;
+mod info;
 mod live_sessions;
 pub mod missions;
 mod models;
@@ -426,6 +427,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
+        ("GET", "/info") => info::route(state),
         ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);
@@ -924,12 +926,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                             return (500, json!({"error": m}))
                         }
                     };
-                    let path = {
-                        let sessions = lock_sessions(&state.sessions);
-                        sessions.get(id).map(|st| st.path.clone())
-                    };
-                    let Some(path) = path else {
-                        return (404, json!({"error": "unknown session"}));
+                    let path = match live(state, id) {
+                        Ok(st) => st.path,
+                        Err(unknown) => return unknown,
                     };
                     match tole_cli::protocol::entries_page(&path, id, after, limit) {
                         Ok(page) => (200, serde_json::to_value(&page).unwrap_or(json!(null))),
@@ -1046,12 +1045,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         return (400, json!({"error": "missing text"}));
                     };
                     let urgent = req.get("urgent").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let st = {
-                        let sessions = lock_sessions(&state.sessions);
-                        sessions.get(id).cloned()
-                    };
-                    let Some(st) = st else {
-                        return (404, json!({"error": "unknown session"}));
+                    let st = match live(state, id) {
+                        Ok(st) => st,
+                        Err(unknown) => return unknown,
                     };
                     match tole_cli::session_host::interrupt_session(&st, text, urgent) {
                         Ok(()) => {
@@ -1074,12 +1070,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 ("POST", id, Some("detach")) => {
                     // Detach (#217): stop waiting without aborting; the turn
                     // ends "detached". 409 when no turn is running.
-                    let st = {
-                        let sessions = lock_sessions(&state.sessions);
-                        sessions.get(id).cloned()
-                    };
-                    let Some(st) = st else {
-                        return (404, json!({"error": "unknown session"}));
+                    let st = match live(state, id) {
+                        Ok(st) => st,
+                        Err(unknown) => return unknown,
                     };
                     if tole_cli::session_host::detach_session(&st) {
                         eprintln!("tole: session/{id} detach requested (serve)");
