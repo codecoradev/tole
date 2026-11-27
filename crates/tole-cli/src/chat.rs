@@ -13,9 +13,7 @@ use tole_cli::tool_roster;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::turn::TurnOutcome;
 
-// ---------------------------------------------------------------------------
-// Chat (B1)
-// ---------------------------------------------------------------------------
+// ---- Chat (B1) ----
 
 /// The B1 REPL: one durable session, many turns. Every user line becomes a
 /// turn; mid-flight states (denial, provider failure) are resolved by

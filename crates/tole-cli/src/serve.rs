@@ -203,9 +203,7 @@ fn announce_turn(
 /// never speaks must not pin a thread forever (CodeCora scan
 /// 2026-09-28, thread-exhaustion DoS). Generous for real clients.
 const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
-// ---------------------------------------------------------------------------
-// Connection handling
-// ---------------------------------------------------------------------------
+// ---- Connection handling ----
 
 /// The route of a `/hooks/<route>` path.
 fn hook_target(path: &str) -> Option<&str> {
