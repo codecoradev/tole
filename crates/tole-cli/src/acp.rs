@@ -21,8 +21,7 @@
 //! stderr. No new dependencies — the JSON-RPC framing is hand-rolled
 //! line-delimited JSON (serde_json only).
 //!
-//! The session machinery lives in [`tole_cli::session_host`] — one
-//! implementation shared with `tole serve`.
+//! The session machinery lives in [`tole_cli::session_host`], shared with `tole serve`.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -51,9 +50,7 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
 /// building the provider.
 const MODEL_REGISTER: (&str, &str) = tole_cli::session_settings::MODEL;
 
-// ---------------------------------------------------------------------------
-// Model picker: ACP session config options (issue #176)
-// ---------------------------------------------------------------------------
+// ---- Model picker: ACP session config options (issue #176) ----
 
 /// Parse the `TOLE_MODELS` env into the advertised model list: comma
 /// separated, trimmed, empties dropped, duplicates collapsed, order kept.
@@ -72,13 +69,10 @@ pub(crate) fn parse_model_list(env_val: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Model-list resolution precedence (issue #195): a non-empty
-/// `TOLE_MODELS` wins AS-IS — deterministic, no network, the operator's
-/// explicit override/filter. Empty or unset falls to `probe` (the
-/// provider's `GET /models`); its result is used whatever it is,
-/// including empty (a successful probe is cached for the process
-/// lifetime by the caller; a failed one only for `PROBE_FAIL_TTL`, see
-/// `ProbeCache`).
+/// Model-list resolution precedence (issue #195): a non-empty `TOLE_MODELS`
+/// wins AS-IS (deterministic, no network, the operator's override). Empty or
+/// unset falls to `probe` (the provider's `GET /models`), used whatever it
+/// returns, empty included (the caller caches it, see `ProbeCache`).
 fn resolve_model_list(env_val: Option<&str>, probe: impl FnOnce() -> Vec<String>) -> Vec<String> {
     let from_env = parse_model_list(env_val);
     if !from_env.is_empty() {
@@ -147,12 +141,10 @@ fn advertised_models(current: &str, models: &[String]) -> Vec<String> {
 }
 
 /// Build the `configOptions` entry for the model picker, or `None` when
-/// there is nothing to advertise (no `TOLE_MODELS` configured).
-/// Wire shape per the ACP session-config-options spec: a `select`-kind
-/// option with `category: "model"` — Termul/Zed render it as the model
-/// dropdown. Select-only: boolean options additionally require the
-/// client's `session.configOptions.boolean` capability, which tole does
-/// not probe.
+/// there is nothing to advertise (no `TOLE_MODELS` configured). Wire shape
+/// per the ACP spec: a `select` option with `category: "model"`. Select-only:
+/// boolean options need the client's `session.configOptions.boolean`
+/// capability, which tole does not probe.
 pub(crate) fn model_config_option(current: &str, models: &[String]) -> Option<Value> {
     if models.is_empty() {
         return None;
@@ -171,11 +163,9 @@ pub(crate) fn model_config_option(current: &str, models: &[String]) -> Option<Va
     }))
 }
 
-/// Build the `configOptions` entry for the approval selector: the
-/// per-session `--yes` equivalent, category `mode` so hosts render it
-/// next to the model picker. Session-scoped by design — approval
-/// consent resets with the process, so it is NOT persisted like the
-/// model override.
+/// Build the `configOptions` entry for the approval selector: the per-session
+/// `--yes` equivalent, category `mode`. Session-scoped by design: consent
+/// resets with the process, unlike the model override.
 fn approval_config_option(auto_write: bool) -> Value {
     json!({
         "id": "approval",
@@ -228,24 +218,19 @@ fn session_model_override(
 }
 
 /// Per-session approval state, addressable by session id so
-/// `session/set_config_option` can act without touching the storage
-/// mutex (the reader thread must never block on a running turn). The
-/// auto-write handle is the same `Arc` the session's
-/// `InteractiveApprover` owns; the effective model mirrors what
-/// `session/new` computed (durable override or env default) and is
-/// updated by `set_model_option`, so every config-state reply renders
-/// the CURRENT selection (cora MAJOR, PR 2: an approval flip must not
-/// show a stale model). The pattern store stays bridge-owned
-/// (`AcpPrompt`) — grants land there.
+/// `session/set_config_option` can act without the storage mutex (the reader
+/// thread must never block on a running turn). The auto-write handle is the
+/// same `Arc` the session's `InteractiveApprover` owns; the effective model
+/// mirrors `session/new` and is updated by `set_model_option`, so every
+/// config-state reply shows the CURRENT selection (an approval flip must not
+/// show a stale model). The pattern store stays bridge-owned (`AcpPrompt`).
 #[derive(Clone)]
 struct SessionApprovalState {
     auto_write: Arc<Mutex<bool>>,
     current_model: Arc<Mutex<String>>,
 }
 
-// ---------------------------------------------------------------------------
-// Connection: outgoing lines + response routing
-// ---------------------------------------------------------------------------
+// ---- Connection: outgoing lines + response routing ----
 
 /// Shared connection state: outgoing JSON-RPC lines are pushed to the
 /// writer thread; responses to agent-initiated requests (permission) are
@@ -305,12 +290,10 @@ impl Conn {
     }
 
     /// Reader-side routing: a response line completes a pending agent
-    /// request. Client ERROR replies route too — an errored permission
-    /// must fail closed immediately, not hang for the full timeout
-    /// (CodeCora scan 2026-09-28). cora scan 2026-10-01 (#155): a reply
-    /// with the matching id but NEITHER field (malformed client) gets
-    /// the same immediate fail-closed treatment — otherwise the waiting
-    /// thread hangs for the full timeout on garbage input.
+    /// request. Client ERROR replies route too, and so does a reply with the
+    /// matching id but NEITHER field (malformed client; cora scan 2026-10-01,
+    /// #155): an errored permission must fail closed immediately, not hang
+    /// for the full timeout (CodeCora scan 2026-09-28).
     fn route_reply(&self, id: u64, msg: &Value) {
         if let Some(result) = msg.get("result").cloned() {
             self.route(id, result);
@@ -345,13 +328,11 @@ enum WaitOutcome {
     Timeout,
 }
 
-/// Wait for ONE pending permission reply in slices, re-checking the
-/// turn's cancellation token between slices (issue #178) — the wire
-/// request was sent once via [`Conn::open_request`]; only the WAIT is
-/// sliced, so a mid-wait `session/cancel` unwinds the approval within
-/// ~1 s instead of after the full window. Every unresolved exit
-/// abandons the pending entry (late client replies find no waiter and
-/// are ignored by `route`).
+/// Wait for ONE pending permission reply in slices, re-checking the turn's
+/// cancellation token between slices (issue #178): the request was sent once
+/// via [`Conn::open_request`], only the WAIT is sliced, so a mid-wait
+/// `session/cancel` unwinds within ~1 s. Every unresolved exit abandons the
+/// pending entry (late replies find no waiter and are ignored by `route`).
 fn wait_permission(
     conn: &Conn,
     req_id: u64,
@@ -384,15 +365,12 @@ fn wait_permission(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Progress observer: tool cards + thought bubbles (issue #196)
-// ---------------------------------------------------------------------------
+// ---- Progress observer: tool cards + thought bubbles (issue #196) ----
 
 /// ACP `ToolKind` for a tole tool name (issue #196 phase 1): the spec's
-/// taxonomy drives host icons and progress rendering. Mapping falls out
-/// of the registry vocabulary; "other" stays the fallback for anything
-/// unmapped. Registry-gated tools only ever map when actually present —
-/// this is a pure name lookup, no registration assumption.
+/// taxonomy drives host icons and progress rendering. "other" is the fallback
+/// for anything unmapped; this is a pure name lookup, no registration
+/// assumption.
 fn tool_kind(tool: &str) -> &'static str {
     match tool {
         "read_file" | "tole_session_list" | "tole_session_status" => "read",
@@ -511,9 +489,7 @@ impl tole_core::turn::TurnObserver for AcpObserver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Approval: the editor is the human
-// ---------------------------------------------------------------------------
+// ---- Approval: the editor is the human ----
 
 /// PromptFn bridge: renders a `session/request_permission` request to the
 /// ACP client and maps the chosen option back to a tole verdict.
@@ -594,12 +570,11 @@ impl PromptFn for AcpPrompt {
             *n += 1;
             format!("perm-{n}")
         };
-        // The timeline card is the observer's job (issue #196): announce
-        // + completion fire from the turn loop for EVERY execution. The
-        // permission request stays self-contained — hosts render the
-        // dialog from the embedded toolCall, now with the real kind.
-        // allow_always only for Write-tier calls: Destructive is never
-        // allowlistable, and ReadOnly never reaches the approver.
+        // The timeline card is the observer's job (issue #196): announce +
+        // completion fire from the turn loop for EVERY execution. The request
+        // stays self-contained (hosts render the dialog from the embedded
+        // toolCall). allow_always only for Write-tier calls: Destructive is
+        // never allowlistable, and ReadOnly never reaches the approver.
         let mut options =
             vec![json!({"kind": "allow_once", "name": "Allow", "optionId": option_allow})];
         if req.risk == Risk::Write {
@@ -613,7 +588,7 @@ impl PromptFn for AcpPrompt {
             "sessionId": self.session_id,
             "toolCall": {
                 "toolCallId": call_id,
-                "title": req.description,
+                "title": tole_cli::acp_title::permission_title(req),
                 "name": req.tool,
                 "kind": tool_kind(req.tool),
                 "rawInput": req.input,
@@ -632,9 +607,7 @@ impl PromptFn for AcpPrompt {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ACP server loop
-// ---------------------------------------------------------------------------
+// ---- ACP server loop ----
 
 /// Run the ACP agent over stdin/stdout. Blocks until the client closes
 /// stdin.
@@ -682,11 +655,9 @@ pub fn run_acp(
     let env_models_raw = std::env::var("TOLE_MODELS").ok();
     let probe_cfg = tole_cli::config_apply::provider_config();
     /// Bounded wait for the lazy /models probe (issues #257/#319). It runs
-    /// inline on the ACP reader thread (session/new, set_config_option), so
-    /// it is kept short: 5s covers a healthy gateway's `/models` (normally
-    /// well under 1s) while capping the reader stall; a failure is then
-    /// remembered for PROBE_FAIL_TTL, so a hung gateway costs at most one
-    /// 5s wait per 30s, not one per call.
+    /// inline on the ACP reader thread, so 5s (a healthy gateway answers well
+    /// under 1s) caps the stall; a failure is remembered for PROBE_FAIL_TTL,
+    /// so a hung gateway costs at most one 5s wait per 30s.
     const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let models_cache: Mutex<ProbeCache> = Mutex::new(ProbeCache::default());
@@ -772,18 +743,13 @@ pub fn run_acp(
                         "protocolVersion": ACP_PROTOCOL_VERSION,
                         "agentCapabilities": {
                             "loadSession": true,
-                            // #559: `image` content blocks are accepted
-                            // (spilled + referenced like a CLI `data:`
-                            // URL) whenever there is a spill dir. Audio and
-                            // embedded resources are not: they stay off.
-                            // ACP spec (agentclientprotocol.com, protocol/
-                            // initialization + protocol/content, checked
-                            // 2026-11-11): "image boolean default: false —
-                            // The prompt may include image content blocks";
-                            // an image block "Requires the image prompt
-                            // capability when included in prompts" and
-                            // carries `data` (base64, required), `mimeType`
-                            // (required) and an optional `uri`.
+                            // #559: `image` blocks are accepted (spilled and
+                            // referenced like a CLI `data:` URL) whenever
+                            // there is a spill dir; audio and embedded
+                            // resources stay off. ACP spec (checked
+                            // 2026-11-11): `image` defaults to false and an
+                            // image block needs `data` (base64), `mimeType`
+                            // and may carry a `uri`.
                             "promptCapabilities": {
                                 "image": tole_cli::turn_runner::inline_images_supported(),
                                 "audio": false,
@@ -820,13 +786,11 @@ pub fn run_acp(
                     reply_error(&conn, id, "session is busy running a turn");
                     continue;
                 }
-                // Shared approval handles: created here so the bridge
-                // (allow_always grants), the approver, and the
-                // set_config_option lookup all own the same stores.
-                // Seeded with the startup flag values. The cancel token
-                // (#178) is created HERE and shared three ways — the
-                // prompt bridge (permission wait), the session state
-                // (transport-side set), and the turn (checkpoint test).
+                // Shared approval handles: the bridge (allow_always grants),
+                // the approver and the set_config_option lookup own the same
+                // stores, seeded with the startup flags. The cancel token
+                // (#178) is shared three ways: the prompt bridge (permission
+                // wait), the session state (transport-side set) and the turn.
                 let patterns = Arc::new(Mutex::new(allow_patterns.to_vec()));
                 let session_auto_write = Arc::new(Mutex::new(auto_write));
                 let cancel = tole_core::cancel::CancelToken::new();
@@ -881,21 +845,18 @@ pub fn run_acp(
                         let models = model_list();
                         // Insert + busy re-check in ONE critical section:
                         // open_session is slow (canonicalize + a git
-                        // subprocess), and a prompt that set busy inside
-                        // that window must not be orphaned by the insert
-                        // swapping in a fresh, not-busy state (CodeCora
-                        // scan 2026-09-28).
+                        // subprocess), and a prompt that set busy meanwhile
+                        // must not be orphaned by the insert (CodeCora scan
+                        // 2026-09-28).
                         // Model picker state (issue #176): the durable
                         // register override wins, else the env default,
                         // else the first advertised entry. Read BEFORE
                         // the state moves into the session map.
                         let model_override = session_model_override(&state.storage);
                         // The registry's admission rule: refuse an id that
-                        // became busy while opening (an insert would orphan
-                        // that turn), replace an idle one in place, evict
-                        // for a new id at capacity. Prune the approval
-                        // state of every evicted session so the parallel
-                        // map cannot grow without bound (#299).
+                        // became busy while opening, replace an idle one in
+                        // place, evict for a new id at capacity. Prune the
+                        // approval state of every evicted session (#299).
                         match lock_sessions(&sessions).admit(session_id.clone(), state) {
                             Ok(evicted) => {
                                 let mut approvals = approval_states.lock().expect("approval map");
@@ -1020,13 +981,11 @@ pub fn run_acp(
                     env_model.as_deref(),
                 );
             }
-            // ACP baseline MUST (issue #178): stop the session's
-            // generating turn. A cancel BEFORE any prompt (or against an
-            // unknown session) is a no-op — the spec leaves that state
-            // unconstrained. A cancel while a permission request is
-            // pending also unwinds the wait below (fail closed to Deny,
-            // per spec) and the turn then settles as `cancelled`, not
-            // `refusal`.
+            // ACP baseline MUST (issue #178): stop the session's generating
+            // turn. A cancel BEFORE any prompt (or against an unknown
+            // session) is a no-op. A cancel while a permission request is
+            // pending also unwinds the wait (fail closed to Deny, per spec)
+            // and the turn settles as `cancelled`, not `refusal`.
             "session/cancel" => {
                 let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
                     continue; // notification: no id, nothing to answer
@@ -1046,19 +1005,15 @@ pub fn run_acp(
     Ok(())
 }
 
-/// `session/set_config_option` (issue #176): the client picked a new
-/// value for a config option. Two selects exist: `model` and
-/// `approval`.
+/// `session/set_config_option` (issue #176): the client picked a new value
+/// for `model` or `approval`.
 ///
-/// Asymmetry is deliberate. `model` needs the session's storage mutex
-/// (register write), so a running turn must refuse it — the reader loop
-/// would otherwise block on the lock the turn holds, the exact
-/// permission-routing deadlock class the CodeCora scan removed, for a
-/// change that only applies to the NEXT turn anyway (the provider is
-/// built once per turn). `approval` is an atomic flag flip on shared
-/// handles — no storage lock — so the spec's "at any point, even while
-/// generating" is honored: the very next approval check in the same
-/// turn sees it. Destructive tools are unaffected by either setting.
+/// Asymmetry is deliberate. `model` needs the session's storage mutex, so a
+/// running turn refuses it (the reader loop would block on the lock the turn
+/// holds: the permission-routing deadlock class the CodeCora scan removed),
+/// and it only applies to the NEXT turn anyway. `approval` is an atomic flag
+/// flip on shared handles, so it is honored even while generating: the very
+/// next approval check sees it. Destructive tools are unaffected by either.
 fn set_config_option(
     conn: &Conn,
     id: Option<Value>,
@@ -1228,17 +1183,14 @@ fn set_model_option(
 /// accepted for client convenience.
 ///
 /// - `text` blocks are joined into the user message;
-/// - `image` blocks (`data` = base64, `mimeType`) go through `resolve`, the
-///   same spill-and-reference path as a CLI `data:` URL — the declared MIME
-///   type is not trusted (the bytes are sniffed), the optional `uri` is
-///   never read (no client-named path reaches the filesystem), and one bad
-///   image refuses the whole prompt rather than silently dropping it;
-/// - every other block (audio, resource, resource_link, ...) is ignored, as
-///   the advertised `promptCapabilities` say.
+/// - `image` blocks go through `resolve`, the same spill-and-reference path
+///   as a CLI `data:` URL: the declared MIME type is not trusted (the bytes
+///   are sniffed), the `uri` is never read, and one bad image refuses the
+///   whole prompt rather than being dropped;
+/// - every other block is ignored, as `promptCapabilities` say.
 ///
-/// An empty prompt — no text and no image — is refused as "missing prompt"
-/// (cora scan 2026-10-01, #155 #4): a full agent turn never runs on nothing.
-/// An image-only prompt is a real prompt.
+/// An empty prompt (no text, no image) is refused as "missing prompt" (cora
+/// scan 2026-10-01, #155 #4); an image-only prompt is a real prompt.
 fn prompt_content(
     prompt: Option<&Value>,
     resolve: &dyn Fn(&str) -> Result<tole_core::image::ImageRef, String>,

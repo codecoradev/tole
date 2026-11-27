@@ -156,7 +156,8 @@ The English wording is a pair of tables keyed by `kind` and `effect` (`tole_core
 - **Older rows.** The field is additive: a row queued without a summary has no `summary` key, and a summary missing the
   optional fields (`insideWorkspace`, `targetTruncated`, `preview`, `previewTruncated`) still loads with their defaults.
 - **The TUI prompt** is the summary's one-line sentence (what the call does and its effect), then ` :: ` and the tool's whole text character for character as before (`<tool> — <description> → <target>`), uncut; it does not show the preview lines or the flags; `job_start` reads `start job: ...` there and its summary says it STARTS A BACKGROUND JOB.
-- **Where it is not shown yet.** The stdio prompt, the ACP permission `title`, the delegated children's approvals
+- **ACP.** The `title` of a `session/request_permission` is the summary as one line (`<what it does> — <its effect>`, plus the tool's own text for a tool without a summary of its own): control and bidi characters are made visible, and the target is shown as the summary bounds it (at most 1000 characters, a longer one cut in the middle with the true omitted count and `see rawInput`). The tool's own text of an unknown-kind call is bounded the same way and, only when the whole title would pass 1500 characters, its tail is cut with a count; the effect sentence is never cut. Options, tool-call id and risk are unchanged.
+- **Where it is not shown yet.** The stdio prompt, the delegated children's approvals
   (`source: "delegation"`, which keep their own `display` and `text`) and the webhook events still use the older text
   and carry no `summary`; see `docs/faces.md`.
 
