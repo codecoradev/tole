@@ -1312,7 +1312,9 @@ does not follow, all present before #1287: `eval`, `echo x | sh`,
 `x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, and, found in the #1302
 review and still allowed: `X+=1 tole x`, `X[0]=1 tole x`, a leading redirection
 (`>/dev/null tole x`, `2>&1 tole x`), `! tole x`, `coproc tole x`,
-`builtin tole x`, `env -S 'tole x'`, `$(echo tole) x`, and the `{` and `}` the
+`builtin tole x`, `env -S 'tole x'`, `$(echo tole) x`, a quoted or escaped KEY
+behind a wrapper with a separator inside the quotes (`env "X=a;c" tole x`,
+`env 'X'='a;c' tole x`; a plain key is refused), and the `{` and `}` the
 cut also splits inside a word; an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
