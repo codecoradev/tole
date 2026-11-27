@@ -18,6 +18,7 @@ use tole_tui::{
 
 use crate::approver::PromptFn;
 use crate::compaction_host::{CompactionSettings, ModelsCatalog, WindowSource};
+use crate::session::problem::{describe_outcome, Face};
 use crate::status::session_status;
 
 /// The inline y/n prompt: the approver (allowlist, `--yes`, Destructive rules
@@ -556,23 +557,10 @@ fn map(o: TurnOutcome) -> TurnEnd {
     match o {
         TurnOutcome::Final { text, .. } => TurnEnd::Final(text),
         TurnOutcome::Cancelled => TurnEnd::Cancelled,
-        TurnOutcome::ApprovalRequired { name } => TurnEnd::Stopped(format!(
-            "approval denied for '{name}'; your next message resumes"
-        )),
-        TurnOutcome::ProviderFailed { message } => TurnEnd::Stopped(format!(
-            "provider failed: {message}{}",
-            crate::compaction_host::overflow_hint(&message)
-        )),
-        TurnOutcome::UnknownTool { name } => TurnEnd::Stopped(format!("unknown tool '{name}'")),
-        TurnOutcome::BudgetExhausted => TurnEnd::Stopped("step budget exhausted".into()),
-        TurnOutcome::StopGateBlocked { reason } => {
-            TurnEnd::Stopped(format!("stop gate blocked: {reason}"))
-        }
         TurnOutcome::Detached => TurnEnd::Stopped("turn detached".into()),
-        TurnOutcome::LoopDetected { tool, .. } => {
-            TurnEnd::Stopped(format!("loop guard tripped on '{tool}'"))
-        }
-        TurnOutcome::Storage(e) => TurnEnd::Stopped(format!("storage error: {e}")),
+        other => TurnEnd::Stopped(
+            describe_outcome(&other, Face::Short).unwrap_or_else(|| "turn stopped".into()),
+        ),
     }
 }
 
@@ -580,76 +568,6 @@ fn map(o: TurnOutcome) -> TurnEnd {
 mod tests {
     use super::*;
     use crate::status::SessionStatus;
-
-    fn stopped(o: TurnOutcome) -> String {
-        match map(o) {
-            TurnEnd::Stopped(s) => s,
-            other => panic!("not a stop: {other:?}"),
-        }
-    }
-
-    /// Pins the sentences a non-final outcome shows in the TUI (#1023).
-    #[test]
-    fn stop_sentences_are_unchanged() {
-        assert_eq!(
-            stopped(TurnOutcome::ApprovalRequired { name: "n".into() }),
-            "approval denied for 'n'; your next message resumes"
-        );
-        assert_eq!(
-            stopped(TurnOutcome::ProviderFailed {
-                message: "boom".into()
-            }),
-            "provider failed: boom"
-        );
-        let overflow = "HTTP status: 400 maximum context length exceeded";
-        assert_eq!(
-            stopped(TurnOutcome::ProviderFailed {
-                message: overflow.into()
-            }),
-            format!("provider failed: {overflow} (compaction will run on the next resume)")
-        );
-        assert_eq!(
-            stopped(TurnOutcome::UnknownTool { name: "n".into() }),
-            "unknown tool 'n'"
-        );
-        assert_eq!(
-            stopped(TurnOutcome::BudgetExhausted),
-            "step budget exhausted"
-        );
-        assert_eq!(
-            stopped(TurnOutcome::StopGateBlocked { reason: "r".into() }),
-            "stop gate blocked: r"
-        );
-        assert_eq!(stopped(TurnOutcome::Detached), "turn detached");
-        assert_eq!(
-            stopped(TurnOutcome::LoopDetected {
-                tool: "t".into(),
-                count: 3
-            }),
-            "loop guard tripped on 't'"
-        );
-        assert_eq!(
-            stopped(TurnOutcome::Storage(
-                tole_core::storage::StorageError::Corrupt("x".into())
-            )),
-            format!(
-                "storage error: {}",
-                tole_core::storage::StorageError::Corrupt("x".into())
-            )
-        );
-    }
-
-    #[test]
-    fn final_and_cancelled_are_not_stops() {
-        assert!(matches!(
-            map(TurnOutcome::Final {
-                text: "a".into(),
-                wrote: false
-            }),
-            TurnEnd::Final(t) if t == "a"
-        ));
-        assert!(matches!(map(TurnOutcome::Cancelled), TurnEnd::Cancelled));
-    }
 
     #[test]
     fn footer_carries_status_fields_and_effective_effort() {

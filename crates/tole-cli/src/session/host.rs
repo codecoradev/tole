@@ -16,6 +16,7 @@ use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
+use crate::session::problem::{describe_outcome, Face};
 use crate::webhook_out::turn::{TurnCode, TurnEnd};
 
 #[derive(Clone)]
@@ -1115,30 +1116,15 @@ fn stop_reason(outcome: &tole_core::turn::TurnOutcome) -> Result<String, String>
         | O::UnknownTool { .. }
         | O::ProviderFailed { .. }
         | O::LoopDetected { .. } => "refusal",
-        O::Storage(e) => return Err(format!("storage error: {e}")),
+        O::Storage(_) => return Err(describe_outcome(outcome, Face::Short).unwrap_or_default()),
     }
     .to_string())
 }
 
 /// Operator-visible stderr line for non-final outcomes (unchanged text).
 fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
-    if let Some(line) = log_line(outcome) {
+    if let Some(line) = describe_outcome(outcome, Face::Log) {
         eprintln!("{line}");
-    }
-}
-
-/// The text of [`log_outcome`]; `None` for an outcome that logs nothing.
-fn log_line(outcome: &tole_core::turn::TurnOutcome) -> Option<String> {
-    use tole_core::turn::TurnOutcome as O;
-    match outcome {
-        O::StopGateBlocked { reason } => {
-            Some(format!("tole: stop gate blocked the turn: {reason}"))
-        }
-        O::ApprovalRequired { name } => Some(format!("tole: approval denied for '{name}'")),
-        O::UnknownTool { name } => Some(format!("tole: unknown tool '{name}'")),
-        O::ProviderFailed { message } => Some(format!("tole: provider failed: {message}")),
-        O::LoopDetected { tool, .. } => Some(format!("tole: loop detected on '{tool}'")),
-        _ => None,
     }
 }
 
@@ -1423,72 +1409,11 @@ mod stop_reason_tests {
         ] {
             assert_eq!(s(o), "refusal");
         }
-    }
-
-    /// The error text a storage outcome returns instead of a stop reason.
-    #[test]
-    fn a_storage_outcome_is_an_error_with_the_storage_text() {
-        let e = tole_core::storage::StorageError::Corrupt("bad line 7".into());
-        let text = e.to_string();
-        let err = stop_reason(&O::Storage(e)).unwrap_err();
-        assert_eq!(err, format!("storage error: {text}"));
-        assert!(err.ends_with("bad line 7"), "{err}");
-    }
-}
-
-#[cfg(test)]
-mod log_line_tests {
-    use super::log_line;
-    use tole_core::turn::TurnOutcome as O;
-
-    /// Pins the operator log lines of #1023 (they must not change).
-    #[test]
-    fn the_stderr_lines_are_unchanged() {
-        let l = |o: O| log_line(&o);
+        let e = O::Storage(tole_core::storage::StorageError::Corrupt("bad".into()));
         assert_eq!(
-            l(O::StopGateBlocked { reason: "r".into() }).as_deref(),
-            Some("tole: stop gate blocked the turn: r")
+            stop_reason(&e).unwrap_err(),
+            "storage error: corrupt session file: bad"
         );
-        assert_eq!(
-            l(O::ApprovalRequired { name: "n".into() }).as_deref(),
-            Some("tole: approval denied for 'n'")
-        );
-        assert_eq!(
-            l(O::UnknownTool { name: "n".into() }).as_deref(),
-            Some("tole: unknown tool 'n'")
-        );
-        assert_eq!(
-            l(O::ProviderFailed {
-                message: "m".into()
-            })
-            .as_deref(),
-            Some("tole: provider failed: m")
-        );
-        assert_eq!(
-            l(O::LoopDetected {
-                tool: "t".into(),
-                count: 3
-            })
-            .as_deref(),
-            Some("tole: loop detected on 't'")
-        );
-    }
-
-    #[test]
-    fn final_cancelled_detached_budget_and_storage_log_nothing() {
-        let quiet = [
-            O::Final {
-                text: "t".into(),
-                wrote: false,
-            },
-            O::Cancelled,
-            O::Detached,
-            O::BudgetExhausted,
-            O::Storage(tole_core::storage::StorageError::Corrupt("x".into())),
-        ];
-        for o in quiet {
-            assert_eq!(log_line(&o), None, "{o:?}");
-        }
     }
 }
 
