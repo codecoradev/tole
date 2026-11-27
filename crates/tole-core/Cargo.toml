@@ -112,5 +112,9 @@ name = "session_guard_quoting"
 required-features = ["shell-tools"]
 
 [[test]]
+name = "session_guard_assignment"
+required-features = ["shell-tools"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]

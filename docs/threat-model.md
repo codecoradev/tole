@@ -1262,7 +1262,20 @@ them. Two layers close the direct routes; neither is a boundary.
   `cd`, `pwd`), so `grep -E "a|tole"` passes (#1287). The program is the
   first word of the command, cut at space and tab as a shell does, with no
   assignment before it (a quoted value can hold a blank and a word that looks
-  like the program: `X='a;tole grep b' tole x` runs tole). `rg` is not on that list (`--pre`, `--pre-glob`,
+  like the program: `X='a;tole grep b' tole x` runs tole). A shell keeps NBSP,
+  CR, VT and FF inside a word; the guard reads the text with that cut and with
+  Rust's `split_whitespace` (which cuts there too) and refuses if either finds
+  tole, so it is never looser than the second cut alone (`env {<NBSP>X= tole x`,
+  since `{` is also cut). A leading assignment word, or one behind a wrapper
+  (`env`, `nohup`, `exec`, `then`, ...), that holds a quote or a backslash is
+  refused (#1302), at every depth: `X='a b' tole x`, `X=a\ b tole x`,
+  `X=$'a b' tole x`, `env X='a b;c' tole x`, and the same inside a nested
+  `sh -c` whose quotes are escaped (`sh -c "echo a; X=\"a b\" tole x"`).
+  This over-refuses: any leading assignment with a quote or backslash is
+  refused, harmless or not (`sh -c 'RUSTFLAGS="-D warnings" cargo test'`,
+  `CFLAGS='-O2 -g' make`, `cd x && FOO="$(date)" make`, `X='a b' ls`). A value
+  with a blank cannot be passed through a shell payload; `X=$(date) cmd`, `X=1
+  cmd` and `env` as an argv without a shell are unaffected. `rg` is not on that list (`--pre`, `--pre-glob`,
   `--hostname-bin` and `-z` run programs), nor are `echo` and `printf`.
   For every other program, and whenever the scan is unsure (unbalanced
   quote, comment, here-document, `$'..'`, a command substitution or any
@@ -1296,7 +1309,13 @@ shell's `-c` text, and `env -i` also clears the marker, so the second layer
 does not see it either. It reaches the owner-only records; only the Write
 approval of `run_command` and the sandbox bound it. Other routes the guard
 does not follow, all present before #1287: `eval`, `echo x | sh`,
-`x=tole; $x`, `xargs`, `find -exec`, `rg --pre`; an interpreter
+`x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, and, found in the #1302
+review and still allowed: `X+=1 tole x`, `X[0]=1 tole x`, a leading redirection
+(`>/dev/null tole x`, `2>&1 tole x`), `! tole x`, `coproc tole x`,
+`builtin tole x`, `env -S 'tole x'`, `$(echo tole) x`, a quoted or escaped KEY
+behind a wrapper with a separator inside the quotes (`env "X=a;c" tole x`,
+`env 'X'='a;c' tole x`; a plain key is refused), and the `{` and `}` the
+cut also splits inside a word; an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
 into the data dir is not seen. A session with `run_command` has the
