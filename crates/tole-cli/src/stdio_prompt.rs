@@ -33,7 +33,7 @@ fn input_preview(input: &serde_json::Value) -> String {
 }
 
 /// One printed value on one line: control, bidi and invisible characters
-/// become visible `\u{hex}` escapes (a newline too).
+/// (see [`sanitize`]) and a newline become visible `\u{hex}` escapes.
 fn one_line(text: &str) -> String {
     sanitize(text).replace('\n', "\\u{a}")
 }
@@ -58,16 +58,19 @@ pub fn render(req: &ToolRequest<'_>) -> String {
     )
 }
 
-/// Ask over `out` / `input`: EOF, a read error or anything but `y` / `yes`
-/// is Deny (fail closed).
+/// Ask over `out` / `input`: a prompt that could not be written (the human
+/// never saw it), EOF, a read error or anything but `y` / `yes` is Deny (fail
+/// closed).
 pub fn ask(req: &ToolRequest<'_>, input: &mut impl BufRead, out: &mut impl Write) -> Verdict {
-    // A failed prompt flush is not actionable.
-    // cora-ignore: qual-error-ignore
-    let _ = write!(out, "{}", render(req)).and_then(|()| out.flush());
+    if write!(out, "{}", render(req))
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        return Verdict::Deny;
+    }
     let mut line = String::new();
-    match input.read_line(&mut line) {
-        Ok(0) | Err(_) => return Verdict::Deny,
-        Ok(_) => {}
+    if matches!(input.read_line(&mut line), Ok(0) | Err(_)) {
+        return Verdict::Deny;
     }
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Verdict::Allow,

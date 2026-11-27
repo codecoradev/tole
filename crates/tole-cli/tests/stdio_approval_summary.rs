@@ -248,3 +248,129 @@ fn a_long_input_keeps_its_head_and_tail() {
     let short = render_of(Value::String(edge.clone()));
     assert!(short.contains(&format!("input: \"{edge}\"\n")), "{short}");
 }
+
+/// Characters the prompt must never print raw: the invisible fillers, the
+/// invisible math operators, the braille blank, the tag block, a combining
+/// grapheme joiner and variation selector 16.
+const HIDDEN: &[char] = &[
+    '\u{206a}',
+    '\u{206f}',
+    '\u{3164}',
+    '\u{ffa0}',
+    '\u{115f}',
+    '\u{1160}',
+    '\u{2800}',
+    '\u{e0041}',
+    '\u{e007f}',
+    '\u{34f}',
+    '\u{fe0f}',
+    '\u{ad}',
+    '\u{200b}',
+    '\u{feff}',
+];
+
+#[test]
+fn invisible_characters_are_escaped_in_every_printed_value() {
+    let run: String = HIDDEN.iter().collect();
+    let escaped: String = HIDDEN
+        .iter()
+        .map(|c| format!("\\u{{{:x}}}", *c as u32))
+        .collect();
+    // The input preview (JSON does not escape these), the tool name, the
+    // description and a hand-set summary target all print through one filter.
+    let input = json!({ "path": format!("a{run}b") });
+    let mut summary = ActionSummary::new(
+        ActionKind::DeleteFile,
+        "x",
+        ActionEffect::CannotBeUndone,
+        true,
+    );
+    summary.target = format!("c{run}d");
+    let tool = format!("t{run}");
+    let req = request(
+        &tool,
+        Risk::Destructive,
+        &input,
+        &format!("e{run}f"),
+        Some(summary),
+    );
+    let text = render(&req);
+    for c in HIDDEN {
+        assert!(
+            !text.contains(*c),
+            "U+{:x} printed raw: {text:?}",
+            *c as u32
+        );
+    }
+    for value in ["t", "a", "b", "c", "d", "e", "f"] {
+        assert!(
+            text.contains(&format!("{value}{escaped}"))
+                || text.contains(&format!("{escaped}{value}")),
+            "{value}: {text:?}"
+        );
+    }
+}
+
+/// A writer whose every write and flush fails (stdout closed, a full disk).
+struct Broken;
+
+impl std::io::Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("closed"))
+    }
+}
+
+/// A writer that takes the text but cannot flush it to the terminal.
+struct NoFlush;
+
+impl std::io::Write for NoFlush {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("closed"))
+    }
+}
+
+#[test]
+fn a_prompt_the_human_could_not_see_is_denied_even_if_stdin_says_y() {
+    let input = Value::Null;
+    let req = request("t", Risk::Write, &input, "d", None);
+    let y = || Cursor::new(b"y\n".to_vec());
+    assert_eq!(ask(&req, &mut y(), &mut Broken), Verdict::Deny);
+    assert_eq!(ask(&req, &mut y(), &mut NoFlush), Verdict::Deny);
+    assert_eq!(ask(&req, &mut y(), &mut Vec::new()), Verdict::Allow);
+}
+
+#[test]
+fn the_sentence_is_redacted_with_the_process_secrets() {
+    const SECRET: &str = "tole-stdio-secret-value-7731";
+    // A summary built outside the registry and set up before the secret was
+    // known: the prompt redacts it again.
+    let input = Value::Null;
+    let mut summary = ActionSummary::new(
+        ActionKind::RunProgram,
+        "x",
+        ActionEffect::RunsProgram,
+        false,
+    );
+    summary.target = format!("curl -H token={SECRET} https://example.test");
+    tole_core::secrets::set_process_secrets(
+        tole_core::secrets::process_secrets().with("TOLE_TEST_STDIO_Q", SECRET),
+    );
+    let text = render(&request(
+        "run_command",
+        Risk::Write,
+        &input,
+        "d",
+        Some(summary),
+    ));
+    assert!(
+        text.contains("does:  run the program curl -H token="),
+        "{text}"
+    );
+    assert!(!text.contains(SECRET), "{text}");
+}

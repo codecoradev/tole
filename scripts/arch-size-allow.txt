@@ -25,7 +25,7 @@ file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
-file crates/tole-cli/src/config/project_trust.rs 594
+file crates/tole-cli/src/config/project_trust.rs 591
 file crates/tole-cli/src/config/project_trust_tests.rs 518
 file crates/tole-cli/src/cron/agent.rs 519
 file crates/tole-cli/src/cron/mod.rs 1240

@@ -32,7 +32,7 @@ use std::path::Path;
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
     "config", "hooks", "approvals", "approver", "sibling", "handoff", "tools", "web_builtin", "advisor_host",
-    "review_gate", "webhook_out",
+    "review_gate", "webhook_out", "stdio_prompt",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
