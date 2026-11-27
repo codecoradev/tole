@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Hard cap on the file size `edit_file` will touch (bytes) — matches
 /// `read_file`'s cap so a readable file is always editable.
@@ -40,6 +40,19 @@ pub fn content_hash(content: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// The refusal text of a jail check (#1285), shared with `read_file`: an
+/// absolute path is told to be relative; `..` and a target that resolves
+/// outside `root` stay "escapes the jail". Both name the workspace.
+pub(super) fn refusal(tool: &str, root: &Path, rel: &str) -> String {
+    let w = root.display();
+    match Path::new(rel).components().next() {
+        Some(Component::RootDir | Component::Prefix(_)) => {
+            format!("{tool}: path must be relative to the workspace ({w}), not absolute: {rel}")
+        }
+        _ => format!("{tool}: path escapes the jail: {rel} (use a path inside the workspace {w}; --workspace <dir> widens it)"),
+    }
+}
+
 /// Resolve `rel` inside the jail. Shared shape with `WriteFileTool` /
 /// `ReadFileTool`: `rel` must be relative, no `..`, and the resolved
 /// target (through symlinks) must stay inside `root`.
@@ -50,12 +63,11 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
     // NOT `is_absolute()` yet `Path::join` lets both escape the base, and
     // a substring `..` check falsely rejects benign names containing "..".
     // Require every component to be a normal name.
-    use std::path::Component;
     let all_normal = rel_path
         .components()
         .all(|c| matches!(c, Component::Normal(_)));
     if !all_normal {
-        return Err(format!("{tool}: path escapes the jail: {rel}"));
+        return Err(refusal(tool, root, rel));
     }
     let target = root.join(rel_path);
     if !target.exists() {
@@ -68,7 +80,7 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|_| format!("{tool}: not found in jail: {rel}"))?;
     if canon_target != canon_root && !canon_target.starts_with(&canon_root) {
-        return Err(format!("{tool}: path escapes the jail: {rel}"));
+        return Err(refusal(tool, root, rel));
     }
     Ok(canon_target)
 }

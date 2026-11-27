@@ -148,7 +148,15 @@ impl Tool for WriteFileTool {
             return Err("write_file: missing 'content'".into());
         };
         let Some(target) = self.jailed(path) else {
-            return Err(format!("write_file: path escapes the jail: {path}"));
+            let why = if Path::new(path).has_root() {
+                "must be relative, not absolute"
+            } else {
+                "escapes the jail"
+            };
+            return Err(format!(
+                "write_file: path {why}: {path} (the workspace is {}; --workspace <dir> widens it)",
+                self.root.display()
+            ));
         };
         let bytes = content.len();
         self.write_jailed(&target, content)?;
