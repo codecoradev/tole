@@ -139,6 +139,7 @@ design, section 0) or a design rule, not a gap:
 | Change the allow list | the owner's config and `--allow` | An approval answers one call; the standing allow list is configuration. |
 | Create or edit a cron job | `tole cron create`, `tole cron edit` | A job carries a prompt, an allow list and, for a script job, a command run with the owner's authority. Stays local-only unless the owner decides otherwise (#1042). |
 | Choose a folder with the operating system's dialog | the desktop process | It is a window on the client's machine; the server only checks that a folder is inside its workspace. |
+| Create, list or revoke a device token (#1320) | `tole serve token add\|list\|revoke` at a terminal | Minting or revoking a credential is the owner's decision; a token holder, a model or a desktop must not widen its own scope or mint another. `add` and `revoke` refuse under an agent session (#684). The token store is `tole serve`'s own state, so no other face has a copy of it. |
 | Read the workspace folder from the client (a file panel) | the desktop process, on the same machine as the server | Serve has no file route on purpose. A client that reads the folder itself does not go through the file tools' jail or the approval gate for writes, so it is display only and never writes; mobile and a remote desktop cannot do it. |
 
 ## Adding or changing a face capability

@@ -15,6 +15,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Workspace files | `--workspace` dir (default cwd) | Readable AND writable by the model via tools |
 | Host env of child processes | inherited by spawned commands | See ENV-1 |
 | Subprocess execution authority | run_command / job_start / git / gh | The model chooses argv within argv-split + jail rules |
+| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600, never followed through a link, append-only (a revoke is a line), and an unreadable line makes the whole store unusable so a damaged revoke cannot revive a token. Writing the file is minting a credential, so `add` and `revoke` refuse under an agent session (#684, defense in depth, not a boundary: an interpreter that edits the file is not stopped, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
 
 ## Trust boundaries
 
@@ -523,9 +524,11 @@ denied (a stolen device cannot bank future approvals), every decision
 is audited on the session, and there is no push endpoint in tole — the
 phone pulls, so the attack surface tole exposes is exactly the
 authenticated REST face. Scoped device tokens (per-device, revocable,
-read-only vs approver roles) are the recognized follow-up; until then
-the deployment guidance is a dedicated OS user + minimal
-`--allow`/`--trust` on the serve process.
+read-only vs approver roles) are #1320: part 1 (the store and
+`tole serve token add|list|revoke`) exists but `tole serve` does not check
+them yet, so until part 2 enforces the scope the deployment guidance is
+unchanged: a dedicated OS user + minimal `--allow`/`--trust` on the serve
+process.
 
 ### Remote MCP servers (#530)
 
