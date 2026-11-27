@@ -60,7 +60,6 @@ file crates/tole-cli/src/session/host.rs 1828
 file crates/tole-cli/src/session/index.rs 503
 file crates/tole-cli/src/session/runner.rs 768
 file crates/tole-cli/src/session/tools.rs 525
-file crates/tole-cli/src/session/tui.rs 1180
 file crates/tole-cli/src/session/usage.rs 781
 file crates/tole-cli/src/skill/approve.rs 1274
 file crates/tole-cli/src/skill/curator.rs 736
