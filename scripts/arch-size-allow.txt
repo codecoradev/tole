@@ -1,3 +1,7 @@
+# 2026-11-26: a fourth owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 132 lines of module
+# glue (`//!` docs, imports, `mod` declarations, blank lines) that splitting serve.rs into 16 modules adds
+# (86109 -> 86241). serve.rs went from 3367 to 1112 lines and stays listed: what is left is the 685-line
+# `route` match and the code `tests/client_routes.rs` reads in that file, which pure moves cannot split.
 # 2026-11-26: a third owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 176 lines of module
 # glue (`//!` docs, imports, `mod` declarations, `cfg` gates) that splitting main.rs into 13 modules adds
 # (85933 -> 86109). main.rs went from 4999 to 2196 lines and stays listed: what is left is the `Command`
@@ -15,7 +19,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 84058
+crate tole-cli 84190
 crate tole-core 65135
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
@@ -45,7 +49,7 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 3367
+file crates/tole-cli/src/serve.rs 1112
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
