@@ -146,7 +146,7 @@ fn a_failure_after_the_post_may_have_been_sent_asks_for_the_status_and_one_befor
             reason: "r".into(),
         },
         Error::InvalidConfig("x".into()),
-        Error::HttpsUnsupported,
+        Error::Tls("x".into()),
         http(400),
         http(401),
         http(404),

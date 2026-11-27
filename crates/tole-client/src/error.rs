@@ -16,7 +16,7 @@ pub enum Error {
     /// `From<io::Error>` conversion.
     #[error("i/o error: {0}")]
     Io(std::io::Error),
-    /// The server url is not `http://host[:port]`.
+    /// The server url is not `http://host[:port]` or `https://host[:port]`.
     #[error("invalid server url: {0}")]
     InvalidUrl(String),
     /// Plain http to a host that policy does not allow: not loopback and not
@@ -37,11 +37,22 @@ pub enum Error {
     /// A setting the client cannot honor (a zero timeout). Not transient.
     #[error("invalid client setting: {0}")]
     InvalidConfig(String),
-    /// `https://` needs a TLS transport, which this crate does not have yet.
-    #[error("https is not supported yet: no TLS transport is built into tole-client")]
-    HttpsUnsupported,
+    /// The TLS handshake of an `https://` server failed, most often because
+    /// its certificate does not verify (unknown issuer, expired, not for this
+    /// host name). Nothing of the request, the token included, was sent, and
+    /// there is no way to carry on without verification. Not transient: the
+    /// same server answers the same way. The text is rustls's reason; it never
+    /// holds the token, but it can include names taken from the server's
+    /// certificate, so a UI must not render it unfiltered.
+    #[error("{0}")]
+    Tls(String),
     /// The server answered a non-2xx status. `message` is the server's
-    /// `{"error": ...}` text when it sent one.
+    /// `{"error": ...}` text when it sent one, else the start of the body as
+    /// text, cut to [`MAX_STATUS_MESSAGE`] bytes with a trailing `…` (a hostile
+    /// server must not make every error carry megabytes). `body` is the JSON
+    /// the server sent (`null` when it was not JSON, or longer than
+    /// [`MAX_ERROR_BODY`], 1 MiB: only that much of an error answer is read,
+    /// and a longer one is not parsed).
     #[error("server answered {status}: {message}")]
     Status {
         status: u16,
@@ -57,6 +68,49 @@ pub enum Error {
     /// The event stream could not be re-established.
     #[error("event stream lost: gave up after {0} failed reconnect attempts")]
     ReconnectExhausted(u32),
+}
+
+/// Most bytes of the body of a non-2xx answer the client reads and parses. A
+/// longer one is cut there and not parsed (`body` is `null`): a JSON array of
+/// ones is 2 bytes on the wire and 32 in memory (`serde_json::Value`), so the
+/// 64 MiB a success body may have would be gigabytes as an error body.
+pub const MAX_ERROR_BODY: usize = 1024 * 1024;
+
+/// The [`Error::Status`] of a non-2xx answer whose body (at most
+/// `MAX_ERROR_BODY + 1` bytes were read) is `raw`.
+pub(crate) fn status_error(status: u16, raw: &[u8]) -> Error {
+    let body = if raw.len() <= MAX_ERROR_BODY {
+        serde_json::from_slice(raw).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    Error::Status {
+        status,
+        message: status_message(&body, raw),
+        body,
+    }
+}
+
+/// Most bytes of a server's error text kept in `Error::Status::message`.
+pub const MAX_STATUS_MESSAGE: usize = 4096;
+
+/// The `message` of an [`Error::Status`]: the `error` string of the JSON body,
+/// else the raw body as text, cut at a character boundary to
+/// [`MAX_STATUS_MESSAGE`] bytes (plus `…` when cut).
+pub(crate) fn status_message(body: &Value, raw: &[u8]) -> String {
+    let text = match body.get("error").and_then(Value::as_str) {
+        Some(s) => std::borrow::Cow::Borrowed(s),
+        // Only the part that can be kept is decoded.
+        None => String::from_utf8_lossy(&raw[..raw.len().min(MAX_STATUS_MESSAGE + 4)]),
+    };
+    if text.len() <= MAX_STATUS_MESSAGE {
+        return text.into_owned();
+    }
+    let mut end = MAX_STATUS_MESSAGE;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 impl From<std::io::Error> for Error {
@@ -107,6 +161,28 @@ mod tests {
     use std::io::{Error as IoError, ErrorKind};
 
     #[test]
+    fn a_status_message_is_cut_and_the_body_stays_whole() {
+        let huge = "é".repeat(MAX_STATUS_MESSAGE);
+        // The error text of a JSON body.
+        let body = serde_json::json!({ "error": huge });
+        let m = status_message(&body, b"");
+        assert!(
+            m.len() <= MAX_STATUS_MESSAGE + '…'.len_utf8() && m.ends_with('…'),
+            "{}",
+            m.len()
+        );
+        assert!(m.starts_with("éé"));
+        // A raw (not JSON) body, longer than anything worth decoding.
+        let raw = vec![b'x'; 5 * 1024 * 1024];
+        let m = status_message(&Value::Null, &raw);
+        assert_eq!(m.len(), MAX_STATUS_MESSAGE + '…'.len_utf8());
+        // Short text is untouched, a cut never splits a character.
+        assert_eq!(status_message(&Value::Null, b"nope"), "nope");
+        let raw = "é".repeat(MAX_STATUS_MESSAGE);
+        assert!(status_message(&Value::Null, raw.as_bytes()).ends_with("é…"));
+    }
+
+    #[test]
     fn io_errors_are_classified_by_what_they_say_about_the_request() {
         let io = |k| Error::from(IoError::new(k, "x"));
         // A malformed peer and a bad setting are their own errors.
@@ -133,6 +209,7 @@ mod tests {
         assert!(!Error::Protocol("x".into()).is_transient());
         assert!(!Error::InvalidConfig("x".into()).is_transient());
         assert!(!Error::InsecureTransport("x".into()).is_transient());
+        assert!(!Error::Tls("x".into()).is_transient());
         let socket = Error::InsecureSocket {
             path: "/p".into(),
             reason: "r".into(),

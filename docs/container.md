@@ -303,9 +303,10 @@ provider, a build on arm64, the secret files with owner 10001 and mode `0400`.
   first bullet). A workflow change; it needs an independent security review.
 - **A CI job that builds the image** (without pushing), so a broken Dockerfile
   is caught before a release.
-- **The desktop's remote entry connects.** `tole-client` has no TLS yet
-  (`threat-model.md`, "Remote server entries"), so an `https://` entry cannot
-  connect. That is a change in `crates/tole-client`.
+- **The desktop's remote entry connects.** `tole-client` has an HTTPS transport
+  since #1071 (`threat-model.md`, "HTTPS to a remote serve"), so it can connect to
+  the proxy of this recipe. What is left is the desktop using it for a remote
+  entry (a credential store and the connection page).
 - **Acceptance criteria that need a running Docker host:** `docker compose up`
   with `/health` green, the timing of the stream through the proxy recorded,
   restart and upgrade with the data kept.

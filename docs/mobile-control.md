@@ -711,6 +711,9 @@ curl -u owner:"$PASSWORD" http://127.0.0.1:7801/sessions
   **refused** unless `--allow-insecure-basic` says TLS ends in front of this server (a
   container that must bind `0.0.0.0` behind its proxy, say). The static token does not have
   this refusal (unchanged).
+- **Reaching it from `tole-client`.** The Rust client connects to the proxy's `https://` address
+  (`Client::connect`, or `TlsTransport` to trust a private CA) and verifies its certificate; there is
+  no way to turn that off (#1071). It sends the bearer token only; Basic has no client yet.
 - **Credentials are never logged**: the server writes no request header anywhere, an error
   names the flag or file and never a value, and the secret set covers the hash. The password
   itself is never known to the server, only checked per request.
