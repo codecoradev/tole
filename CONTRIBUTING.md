@@ -296,20 +296,20 @@ known FP categories). The deterministic `index-breaking-change` check ("Symbol
 have a rule scoped to those two files in `ignore.rules`, so a refactor that
 moves items out of them is not reported as a removal. Do not add a file the
 library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
-step) reads that entry and fails when a listed file does not exist, is not
-reached from a bin target through `mod` declarations, or is reached from the
-library target (a `pub mod serve;` or `#[path]` include in `lib.rs` would let
-the silence hide real public API removals). What it checks: the rule name
-(any case, `-` or `_`) may appear nowhere in `.cora.yaml` except as the head
-of a scoped `- rule: index-breaking-change` entry; `ignore:` must be written
-exactly so; every `ignore.rules` item must be a plain `- "string"` (no `#` or
-backslash) or a `- rule:` entry, and every file a quoted exact path in a block
-`files:` list. Anything else is an error (exit 1); a `mod` it cannot resolve,
-`include!(`, `cfg_attr(..path..)` or a `#[path]` that is not on a `mod x;` in a
-file it walks is exit 2 (not proven). Keep the entry in the layout the file
-already uses. Not followed (residual): `include_str!`, macro-generated
-modules, another crate that `#[path]`-includes the file, and a name hidden
-from the text scan by a YAML escape or a folded line outside `ignore.rules`.
+step; needs PyYAML, a missing one is exit 2) checks two things with ground
+truth, not text matching. First, the parsed `.cora.yaml` (PyYAML, duplicate
+keys refused): `index-breaking-change` may be silenced only by `ignore.rules`
+entries of the form `rule`/`files`/`reason` whose `files` are exact
+`crates/<name>/src/**/*.rs` paths; no plain `ignore.rules` string may contain
+`breaking`, and no other string, key or value anywhere in the document may name
+the rule (`index-breaking`, `breaking-change`, any case, `-` or `_`). Second,
+after `cargo check --workspace --lib --bins --offline`, rustc's own dep-info
+(the list of every source file it loaded, so `mod`, `#[path]`, `include!` and
+macros all count) must list each scoped file for a bin target and for no lib
+target of any workspace crate. A cargo or dep-info failure is exit 2, never a
+pass. Residual: it checks the default features the `Check` job builds (a
+`#[cfg(feature = ..)] mod serve;` in `lib.rs` is not seen) and what cora itself
+does with the entry cannot be verified without cora.
 
 Exit-code reference:
 

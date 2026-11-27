@@ -57,14 +57,13 @@
 #             AGENTS.md list in the same change.
 #
 # cora      (#1249)
-#             - a .cora.yaml `ignore.rules` entry that silences
-#               `index-breaking-change` lists exact `crates/<name>/src/*.rs`
-#               files that exist, are reached from a bin target through `mod`
-#               declarations and are NOT reached from the crate's lib target
-#               (`pub mod serve;` in lib.rs would hide real API removals).
-#               Strict line parser: the rule name may appear nowhere else in
-#               .cora.yaml, an unknown form fails, an unresolvable `mod`,
-#               `include!(` or `cfg_attr` path in a walked file is exit 2.
+#             - `index-breaking-change` is silenced in .cora.yaml only by a
+#               scoped `ignore.rules` entry listing exact crates/<name>/src/*.rs
+#               files; the parsed document (PyYAML) names the rule nowhere else;
+#             - after `cargo check --workspace --lib --bins --offline`, rustc's
+#               own dep-info lists each file for a bin target and for no lib
+#               target of any workspace crate (mod, #[path], include!, macros).
+#               Needs PyYAML (python3-yaml); anything unprovable is exit 2.
 #
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this

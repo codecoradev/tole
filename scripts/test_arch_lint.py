@@ -8,7 +8,9 @@ last group drives the real shell wrapper with a stub `cargo` (CARGO=...), to
 prove the gate fails closed: a cargo failure, unreadable metadata or an empty
 workspace is exit 2, never a pass.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -639,245 +641,257 @@ class UnsafeWrapper(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
-CORA_OK = (
-    "ignore:\n  files:\n    - \"*.lock\"\n  rules:\n    - \"bug-todo\"\n"
-    "    # index-breaking-change in a comment is not a mention\n"
-    "    - rule: other-rule\n      files:\n        - \"x/**\"\n"
-    "    - rule: index-breaking-change\n      files:\n        - \"crates/a/src/main.rs\"\n"
-    "        - \"crates/a/src/serve.rs\"\n      reason: \"moved items (#669, #1249)\"\nreview:\n  exclude: []\n"
-)
+CORA_OK = """\
+ignore:
+  files:
+    - "*.lock"
+  rules:
+    - "bug-todo"
+    # index-breaking-change in a comment is not a mention
+    - rule: other-rule
+      files:
+        - "x/**"
+    - rule: index-breaking-change
+      files:
+        - "crates/a/src/main.rs"
+        - "crates/a/src/serve.rs"
+      reason: "moved items (#669, #1249)"
+review:
+  exclude: ["CHANGELOG.md"]
+"""
+SCOPED = ["crates/a/src/main.rs", "crates/a/src/serve.rs"]
 
 
-def cora_parse(text):
+def cora_cfg(text):
+    """(files, error messages) of a .cora.yaml text, through the real loader and checker."""
     found = []
-    entries = arch.parse_cora_scoped(text, report=lambda p, l, m: found.append((l, m)))
-    return entries, found
+    report = lambda p, l, m: found.append(m)
+    data = arch.load_cora(text if isinstance(text, bytes) else text.encode(), report=report)
+    return arch.check_cora_config(data, report=report), found
 
 
-class CoraParse(unittest.TestCase):
-    def test_a_scoped_entry_is_read_with_its_lines(self):
-        entries, found = cora_parse(CORA_OK)
-        self.assertEqual(found, [])
-        self.assertEqual([[f for _, f in files] for _, files in entries], [["crates/a/src/main.rs", "crates/a/src/serve.rs"]])
+class CoraConfig(unittest.TestCase):
+    def test_the_scoped_entry_is_read(self):
+        self.assertEqual(cora_cfg(CORA_OK), (SCOPED, []))
 
-    def test_no_ignore_section_silences_nothing(self):
-        self.assertEqual(cora_parse("review:\n  exclude: []\n"), ([], []))
+    def test_no_file_no_ignore_and_no_rules_silence_nothing(self):
+        for text in ("", "review: {}\n", "ignore:\n  files: []\n", "ignore:\n  rules: []\n"):
+            self.assertEqual(cora_cfg(text), ([], []), text)
 
-    def test_every_form_that_is_not_a_scoped_exact_entry_fails_closed(self):
-        files = "      files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n"
-        scoped = "    - rule: index-breaking-change\n"
-        bad = {
-            "bare string": (CORA_OK.replace("    - \"bug-todo\"\n", "    - \"index-breaking-change\"\n"), "named outside"),
-            "no files": (CORA_OK.replace(files, ""), "no readable `files:`"),
-            "flow list": (CORA_OK.replace(files, "      files: [\"crates/a/src/main.rs\"]\n"), "must be a block list"),
-            "glob": (CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs"), "not understood"),
-            "directory": (CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"), "not understood"),
-            "other key": (CORA_OK.replace("      reason:", "      paths: x\n      reason:"), "not understood"),
-            "odd indent": (CORA_OK.replace("        - \"crates/a/src/serve.rs\"", "          - \"crates/a/src/serve.rs\""), "not understood"),
-            "block scalar reason": (CORA_OK.replace("reason: \"moved items (#669, #1249)\"", "reason: |"), "plain double-quoted"),
-            "in ignore.files": (CORA_OK.replace("    - \"*.lock\"", "    - \"index-breaking-change\""), "named outside"),
-            "in a reason": (CORA_OK.replace("moved items", "index-breaking-change moved"), "named outside"),
-            "flow ignore": ("ignore: {rules: [\"index-breaking-change\"]}\n", "exactly `ignore:`"),
-            "ignore twice": (CORA_OK + CORA_OK, "appears twice"),
-            # finding 1: a quoted key hid the whole section; the name elsewhere was never seen
-            "double-quoted ignore key": (CORA_OK.replace("ignore:\n", "\"ignore\":\n", 1).replace("serve.rs", "lib.rs"), "exactly `ignore:`"),
-            "single-quoted ignore key": (CORA_OK.replace("ignore:\n", "'ignore':\n", 1), "exactly `ignore:`"),
-            "space before colon": (CORA_OK.replace("ignore:\n", "ignore :\n", 1), "exactly `ignore:`"),
-            "rules_engine disabled": (CORA_OK + "rules_engine:\n  disabled: [index-breaking-change]\n", "named outside"),
-            "unrelated key skip": (CORA_OK + "extra:\n  skip: index-breaking-change\n", "named outside"),
-            # finding 4: other spellings of the name
-            "upper case": (CORA_OK.replace("rule: index-breaking-change", "rule: Index-Breaking-Change"), "named outside"),
-            "underscores": (CORA_OK + "extra:\n  skip: index_breaking_change\n", "named outside"),
-            "plain string spelling": (CORA_OK.replace("\"bug-todo\"", "\"INDEX_BREAKING_CHANGE\""), "named outside"),
-            # finding 2: `#` inside quotes is not a comment; flow maps and glued strings are not plain items
-            "flow map": (CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change}"), "item not understood"),
-            "flow map with files": (CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change, files: [\"crates/a/src/lib.rs\"]}"), "item not understood"),
-            "hash in a string": (CORA_OK.replace("    - \"bug-todo\"", "    - \"#\" \"index-breaking-change\""), "item not understood"),
-            "unquoted item": (CORA_OK.replace("    - \"bug-todo\"", "    - index-breaking-change"), "item not understood"),
-            "single-quoted item": (CORA_OK.replace("    - \"bug-todo\"", "    - 'bug-todo'"), "item not understood"),
-            # finding 3: escapes decode to the name
-            "hex escape": (CORA_OK.replace("\"bug-todo\"", "\"index\\x2dbreaking-change\""), "item not understood"),
-            "unicode escape": (CORA_OK.replace("\"bug-todo\"", "\"index\\u002dbreaking-change\""), "item not understood"),
-            "escape in head": (CORA_OK.replace(scoped, "    - rule: \"index\\x2dbreaking-change\"\n"), "not understood"),
-        }
-        for name, (text, expect) in bad.items():
+    def test_other_yaml_spellings_of_the_same_entry_parse_to_it(self):
+        flow = '{ignore: {rules: ["bug-todo", {rule: index-breaking-change, files: [crates/a/src/main.rs, crates/a/src/serve.rs]}]}}'
+        anchor = 'ignore:\n  rules:\n    - rule: index-breaking-change\n      files: &f\n        - crates/a/src/main.rs\n        - crates/a/src/serve.rs\nx:\n  y: *f\n'
+        for name, text in {
+            "bom": b"\xef\xbb\xbf" + CORA_OK.encode(),
+            "quoted keys": CORA_OK.replace("ignore:", '"ignore":').replace("rules:", "'rules':"),
+            "deeper indent": "ignore:\n    rules:\n        - rule: index-breaking-change\n          files:\n              - crates/a/src/main.rs\n              - crates/a/src/serve.rs\n",
+            "flow root": flow,
+            "anchor and alias": anchor,
+            "escaped path": CORA_OK.replace('"crates/a/src/main.rs"', '"crates/a/src/ma\\x69n.rs"'),
+            "unquoted rule": CORA_OK.replace("rule: index-breaking-change", "rule: Index_Breaking_Change"),
+        }.items():
             with self.subTest(name):
-                found = cora_parse(text)[1]
-                self.assertTrue(any(expect in m for _, m in found), (name, found))
-                self.assertIn("Cora Workflow", found[0][1])
+                files, found = cora_cfg(text)
+                self.assertEqual(found, [], name)
+                self.assertEqual(files, SCOPED, name)
 
-    def test_comments_and_hashes_inside_quotes_are_read_like_yaml(self):
-        text = CORA_OK.replace("    - \"bug-todo\"", "    - \"a #b\" # index-breaking-change\n    # - rule: index-breaking-change")
-        entries, found = cora_parse(text.replace("a #b", "a b"))
-        self.assertEqual(found, [], found)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(arch.cora_code('    - "a #b" # c'), '    - "a #b"')
-        self.assertEqual(arch.cora_code("x: 'it''s # not' # c"), "x: 'it''s # not'")
-        self.assertEqual(arch.cora_code("a#b # c"), "a#b")
+    def test_every_hostile_layout_is_an_error(self):
+        entry = "    - rule: index-breaking-change\n"
+        bad = {
+            "escaped name": CORA_OK.replace('"bug-todo"', '"index\\x2dbreaking-change"'),
+            "unicode escaped name": CORA_OK.replace('"bug-todo"', '"index\\u002dbreaking-change"'),
+            "bare string": CORA_OK.replace('"bug-todo"', '"index-breaking-change"'),
+            "substring": CORA_OK.replace('"bug-todo"', '"index-breaking"'),
+            "breaking alone": CORA_OK.replace('"bug-todo"', '"Breaking"'),
+            "spelling": CORA_OK.replace('"bug-todo"', '" INDEX_BREAKING_CHANGE "'),
+            "unquoted item": CORA_OK.replace('"bug-todo"', "index-breaking-change"),
+            "flow map item": CORA_OK.replace('"bug-todo"', '{note: "#", rule: index-breaking-change}'),
+            "rules_engine": CORA_OK + "rules_engine:\n  disabled: [index-breaking-change]\n",
+            "as a key": CORA_OK + "extra:\n  index_breaking_change: off\n",
+            "as a nested value": CORA_OK + "extra:\n  - skip:\n      - [Index-Breaking-Change]\n",
+            "second unscoped entry": CORA_OK.replace("    - rule: other-rule", "    - rule: Index_Breaking_Change\n    - rule: other-rule"),
+            "second entry without files key": CORA_OK.replace('"bug-todo"', "{rule: index-breaking-change, reason: x}"),
+            "no files": CORA_OK.replace("      files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", ""),
+            "empty files": CORA_OK.replace("      files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", "      files: []\n"),
+            "files is a string": CORA_OK.replace("      files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", "      files: crates/a/src/main.rs\n"),
+            "glob": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs"),
+            "directory": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"),
+            "parent path": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/../lib.rs"),
+            "not a src file": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/tests/serve.rs"),
+            "other key": CORA_OK.replace("      reason:", "      paths: x\n      reason:"),
+            "item that is a list": CORA_OK.replace('"bug-todo"', "[a]"),
+            "item that is null": CORA_OK.replace('"bug-todo"', "~"),
+            "rules is a map": "ignore:\n  rules:\n    a: b\n",
+            "ignore is a list": "ignore: [a]\n",
+            "root is a list": "- ignore\n",
+            "duplicate ignore key": CORA_OK + "ignore:\n  files: []\n",
+            "duplicate rule key": CORA_OK.replace(entry, entry + "      rule: other\n"),
+            "duplicate files key": CORA_OK.replace("      reason:", "      files: [crates/a/src/lib.rs]\n      reason:"),
+            "duplicate via merge": "base: &b {k: 1}\nx:\n  <<: *b\n  k: 2\n",
+            "custom tag": CORA_OK + "x: !foo bar\n",
+            "python tag": CORA_OK + "x: !!python/object/apply:os.system [id]\n",
+            "not yaml": "ignore: [\n",
+        }
+        for name, text in bad.items():
+            with self.subTest(name):
+                found = cora_cfg(text)[1]
+                self.assertTrue(found, name)
+                self.assertIn("Cora Workflow", found[0], name)
 
     def test_the_committed_config_names_existing_src_files(self):
         root = os.path.dirname(HERE)
-        entries, found = cora_parse(arch.read_text(os.path.join(root, arch.CORA_CONFIG)))
+        files, found = cora_cfg(arch.read_text(os.path.join(root, arch.CORA_CONFIG)).encode())
         self.assertEqual(found, [])
-        self.assertTrue(entries, "the committed .cora.yaml has no scoped index-breaking-change entry")
-        for _, files in entries:
-            for _, rel in files:
-                self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
+        self.assertTrue(files, "the committed .cora.yaml has no scoped index-breaking-change entry")
+        for rel in files:
+            self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
+
+    def test_no_pyyaml_means_the_gate_is_not_passed(self):
+        saved = sys.modules.get("yaml")
+        sys.modules["yaml"] = None  # `import yaml` raises ImportError
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                arch.load_cora(b"ignore: {}\n")
+            with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+                with open(os.path.join(d, ".cora.yaml"), "w") as f:
+                    f.write(CORA_OK)
+                self.assertEqual(arch.main(["arch-lint.py", "cora", d]), 2)
+        finally:
+            if saved is None:
+                del sys.modules["yaml"]
+            else:
+                sys.modules["yaml"] = saved
+        self.assertIn("PyYAML", str(ctx.exception))
 
 
-LIB_TARGETS = [("lib", "crates/a/src/lib.rs"), ("bin", "crates/a/src/main.rs")]
-CORA_TREE = {
-    "crates/a/src/lib.rs": "pub mod shared;\n// pub mod serve;\n",
-    "crates/a/src/shared.rs": "pub mod inner;\n",
-    "crates/a/src/shared/inner.rs": "pub fn f() {}\n",
-    "crates/a/src/main.rs": "mod serve;\n#[cfg(test)]\n#[path = \"main_tests.rs\"]\nmod tests;\nfn main() {}\n",
-    "crates/a/src/main_tests.rs": "",
-    "crates/a/src/serve.rs": "mod cron;\n",
-    "crates/a/src/serve/cron.rs": "",
+CARGO = {
+    "Cargo.toml": '[workspace]\nmembers = ["crates/a", "crates/b"]\nresolver = "2"\n',
+    "crates/a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n',
+    "crates/b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n',
+    "crates/a/src/lib.rs": "pub fn f() {}\n",
+    "crates/a/src/main.rs": "mod serve;\nfn main() { serve::g(); }\n",
+    "crates/a/src/serve.rs": "pub fn g() {}\n",
+    "crates/b/src/lib.rs": "pub fn h() {}\n",
+    ".cora.yaml": CORA_OK,
 }
 
 
-def cora_scope(files, extra=None, targets=LIB_TARGETS, scoped=("crates/a/src/main.rs", "crates/a/src/serve.rs")):
-    found = []
+def cora_run(files, extra_env=None, cargo=None):
+    """Run `arch-check.sh cora` on a real tiny workspace (real `cargo check --offline`)."""
     with tempfile.TemporaryDirectory() as d:
-        workspace(d, {**CORA_TREE, **(extra or {})})
-        pkgs = [{"name": "a", "manifest": "crates/a/Cargo.toml", "targets": targets}]
-        arch.check_cora_scope([(1, [(2 + i, f) for i, f in enumerate(scoped)])], pkgs, d, report=lambda p, l, m: found.append((l, m)))
-    return found
+        root = os.path.join(d, "ws")
+        workspace_files = {**CARGO, **files}
+        for rel, content in workspace_files.items():
+            if content is not None:
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(content)
+        env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(d, "target"), **(extra_env or {}))
+        if cargo:
+            env["CARGO"] = cargo(d, root)
+        done = subprocess.run(["bash", os.path.join(HERE, "arch-check.sh"), "cora", root], capture_output=True, text=True, env=env)
+    return done.returncode, done.stdout + done.stderr
 
 
-class CoraScope(unittest.TestCase):
+class CoraCompiled(unittest.TestCase):
+    def fails_as_lib(self, files, name):
+        rc, out = cora_run(files)
+        self.assertEqual(rc, 1, (name, out))
+        self.assertIn("compiled into a library target", out, name)
+
     def test_binary_only_files_pass(self):
-        self.assertEqual(cora_scope(None), [])
-
-    def test_a_lib_that_declares_the_module_fails_whatever_the_spelling(self):
-        for name, lib in {
-            "pub mod": "pub mod serve;\n",
-            "private mod": "mod serve;\n",
-            "pub(crate) mod": "pub(crate) mod serve;\n",
-            "path attribute": "#[path = \"serve.rs\"]\npub mod srv;\n",
-            "attributes between": "#[path = \"serve.rs\"]\n#[cfg(unix)]\n// note\nmod srv;\n",
-            "path and mod on one line": "#[path = \"serve.rs\"] mod srv;\n",
-            "two mods on one line": "mod shared; mod serve;\n",
-            "path attribute in an inline module": "mod a { #[path=\"serve.rs\"] mod s; }\n",
-            "raw identifier": "mod r#serve;\n",
-            "main": "mod main;\n",
-            "through another module": "pub mod shared;\n",
-        }.items():
-            with self.subTest(name):
-                extra = {"crates/a/src/lib.rs": lib}
-                if name == "through another module":
-                    extra["crates/a/src/shared.rs"] = "#[path = \"serve.rs\"]\nmod s;\n"
-                found = cora_scope(None, extra)
-                self.assertTrue(found and all("reached from the library" in m for _, m in found), (name, found))
-
-    def test_a_nested_file_may_be_listed_and_a_lib_reaching_it_through_its_parent_fails(self):
-        nested = ("crates/a/src/serve/cron.rs",)
-        self.assertEqual(cora_scope(None, scoped=nested), [])
-        found = cora_scope(None, {"crates/a/src/lib.rs": "pub mod serve;\n"}, scoped=nested)
-        self.assertIn("reached from the library", found[0][1])
-
-    def test_a_file_loaded_by_path_owns_its_directory_for_nested_mods(self):
-        extra = {"crates/a/src/lib.rs": "#[path = \"other/m.rs\"]\nmod m;\n", "crates/a/src/other/m.rs": "mod serve;\n",
-                 "crates/a/src/other/serve.rs": ""}
-        found = cora_scope(None, extra, scoped=("crates/a/src/other/serve.rs",))
-        self.assertIn("reached from the library", found[0][1])
-
-    def test_what_the_lib_reaches_is_unknown_for_include_and_unresolved_path_forms(self):
-        for name, lib in {
-            "include": "include!(\"serve.rs\");\n",
-            "include with concat": "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n",
-            "cfg_attr path": "#[cfg_attr(all(), path = \"serve.rs\")] mod srv;\n",
-            "path that is not a literal": "#[path = concat!(\"a\", \"b\")]\nmod x;\n",
-            "path on an inline module": "#[path = \"shared.rs\"]\nmod a {}\n",
-            "path attribute with no mod": "#[path = \"shared.rs\"]\nfn f() {}\n",
-            "path attribute then an item then a mod": "#[path = \"main_tests.rs\"]\nfn f() {}\npub mod shared;\n",
-            "path split over two lines": "#[path =\n\"serve.rs\"]\nmod x;\n",
-        }.items():
-            with self.subTest(name):
-                with self.assertRaises(RuntimeError) as ctx:
-                    cora_scope(None, {"crates/a/src/lib.rs": lib})
-                self.assertIn("Cora Workflow", str(ctx.exception))
-
-    def test_include_str_and_comments_are_not_followed(self):
-        lib = "pub mod shared;\n// mod nowhere;\n/// #[path = \"x\"]\nconst D: &str = include_str!(\"shared.rs\");\n"
-        self.assertEqual(cora_scope(None, {"crates/a/src/lib.rs": lib}), [])
-
-    def test_a_missing_file_a_file_of_no_crate_and_an_orphan_fail(self):
-        self.assertIn("not a source file", cora_scope(None, scoped=("crates/a/src/gone.rs",))[0][1])
-        self.assertIn("not a source file", cora_scope(None, {"crates/b/src/x.rs": ""}, scoped=("crates/b/src/x.rs",))[0][1])
-        found = cora_scope(None, {"crates/a/src/orphan.rs": ""}, scoped=("crates/a/src/orphan.rs",))
-        self.assertIn("not reached from any bin", found[0][1])
-
-    def test_no_bin_target_means_not_proven(self):
-        found = cora_scope(None, targets=[("lib", "crates/a/src/lib.rs")])
-        self.assertEqual(len(found), 2, found)
-
-    def test_a_mod_that_cannot_be_resolved_raises(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            cora_scope(None, {"crates/a/src/lib.rs": "mod nowhere;\n"})
-        self.assertIn("Cora Workflow", str(ctx.exception))
-        with self.assertRaises(RuntimeError):  # both x.rs and x/mod.rs
-            cora_scope(None, {"crates/a/src/lib.rs": "mod x;\n", "crates/a/src/x.rs": "", "crates/a/src/x/mod.rs": ""})
-
-
-def cora_meta(targets):
-    body = json.loads(metadata([pkg("a", "core")]))
-    body["packages"][0]["targets"] = [{"kind": [k], "src_path": f"@ROOT@/{p}"} for k, p in targets]
-    return json.dumps(body)
-
-
-class CoraWrapper(unittest.TestCase):
-    def run_cora(self, files, mode="cora"):
-        return Wrapper().check(cora_meta(LIB_TARGETS), mode=mode, files={**SMALL, **CORA_TREE, **files})
-
-    def test_the_binary_only_scope_passes(self):
-        rc, out = self.run_cora({".cora.yaml": CORA_OK})
+        rc, out = cora_run({})
         self.assertEqual(rc, 0, out)
         self.assertIn("arch-check (cora): ok", out)
+        self.assertIn("2 scoped", out)
 
-    def test_a_lib_declaring_the_module_exits_1_and_names_the_config_line(self):
-        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "pub mod serve;\n"})
-        self.assertEqual(rc, 1, out)
-        self.assertIn("error: .cora.yaml:", out)
-        self.assertIn("crates/a/src/serve.rs is reached from the library", out)
-
-    def test_an_unparsable_entry_exits_1(self):
-        rc, out = self.run_cora({".cora.yaml": CORA_OK.replace("    - \"bug-todo\"", "    - \"index-breaking-change\"")})
-        self.assertEqual(rc, 1, out)
-        self.assertIn("Cora Workflow", out)
-
-    def test_an_unresolvable_mod_fails_closed_with_exit_2(self):
-        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "mod nowhere;\n"})
-        self.assertEqual(rc, 2, out)
-        self.assertIn("NOT passed", out)
-
-    def test_hostile_configs_exit_1_with_a_config_line(self):
-        for name, yaml in {
-            "quoted ignore key": CORA_OK.replace("ignore:\n", "\"ignore\":\n", 1).replace("serve.rs", "lib.rs"),
-            "rules_engine disabled": CORA_OK + "rules_engine:\n  disabled: [index-breaking-change]\n",
-            "flow map with #": CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change}"),
-            "escape": CORA_OK.replace("\"bug-todo\"", "\"index\\x2dbreaking-change\""),
-            "case": CORA_OK.replace("rule: index-breaking-change", "rule: Index_Breaking_Change"),
+    def test_every_way_a_lib_can_compile_a_scoped_file_fails(self):
+        a = "crates/a/src/lib.rs"
+        for name, files in {
+            "pub mod": {a: "pub mod serve;\n"},
+            "private mod": {a: "mod serve;\npub fn f() {}\n"},
+            "mod on two lines": {a: "pub mod\nserve;\n"},
+            "comment inside": {a: "mod /*c*/ serve;\n"},
+            "after a block comment": {a: "/* open\n// */ pub mod serve;\n"},
+            "include": {a: 'include!("serve.rs");\n'},
+            "path": {a: '#[path = "serve.rs"]\nmod srv;\n'},
+            "path on one line": {a: '#[path = "serve.rs"] mod srv;\n'},
+            "path on two lines": {a: '#[path =\n"serve.rs"]\nmod srv;\n'},
+            "cfg_attr path": {a: '#[cfg_attr(all(), path = "serve.rs")] mod srv;\n'},
+            "macro generated": {a: "macro_rules! m { () => { pub mod serve; }; }\nm!();\n"},
+            "raw identifier": {a: "mod r#serve;\n"},
+            "inline module with path": {a: 'mod w { #[path = "../serve.rs"] pub mod s; }\n', "crates/a/src/w/keep": ""},
+            "main as a module": {a: "mod main;\n", "crates/a/src/main.rs": '#[path = "serve.rs"]\nmod serve;\nfn main() { serve::g(); }\n'},
+            "another crate by path": {"crates/b/src/lib.rs": '#[path = "../../a/src/serve.rs"]\npub mod s;\n'},
+            "another crate by include": {"crates/b/src/lib.rs": 'include!("../../a/src/serve.rs");\n'},
         }.items():
             with self.subTest(name):
-                rc, out = self.run_cora({".cora.yaml": yaml})
-                self.assertEqual(rc, 1, out)
-                self.assertIn("error: .cora.yaml:", out)
+                self.fails_as_lib(files, name)
 
-    def test_same_line_declarations_exit_1_and_include_exits_2(self):
-        for lib in ("#[path = \"serve.rs\"] mod srv;\n", "mod shared; mod serve;\n", "mod r#serve;\n"):
-            rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": lib})
-            self.assertEqual(rc, 1, (lib, out))
-            self.assertIn("reached from the library", out)
-        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "include!(\"serve.rs\");\n"})
-        self.assertEqual(rc, 2, out)
-        self.assertIn("NOT passed", out)
+    def test_a_listed_file_must_exist_and_be_compiled_into_a_bin(self):
+        rc, out = cora_run({".cora.yaml": CORA_OK.replace("serve.rs", "gone.rs")})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("gone.rs: does not exist", out)
+        rc, out = cora_run({"crates/a/src/orphan.rs": "", ".cora.yaml": CORA_OK.replace("serve.rs", "orphan.rs")})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not compiled into any bin target", out)
+        rc, out = cora_run({"crates/a/src/main.rs": "fn main() {}\n"})  # serve.rs is no longer part of the bin
+        self.assertEqual(rc, 1, out)
+        self.assertIn("crates/a/src/serve.rs is not compiled into any bin", out)
 
-    def test_no_cora_config_silences_nothing(self):
-        rc, out = self.run_cora({})
-        self.assertEqual(rc, 0, out)
-        self.assertIn("nothing is silenced", out)
+    def test_a_nested_file_may_be_listed(self):
+        files = {"crates/a/src/main.rs": "mod serve;\nfn main() { serve::g(); }\n", "crates/a/src/serve.rs": "pub mod cron;\npub fn g() {}\n",
+                 "crates/a/src/serve/cron.rs": "", ".cora.yaml": CORA_OK.replace("main.rs", "serve/cron.rs")}
+        self.assertEqual(cora_run(files)[0], 0)
+        self.assertEqual(cora_run({**files, "crates/a/src/lib.rs": "pub mod serve;\n"})[0], 1)
+
+    def test_a_hostile_config_exits_1_without_needing_the_compiler(self):
+        for text in (CORA_OK.replace('"bug-todo"', '"index\\x2dbreaking-change"'), CORA_OK + "rules_engine: {disabled: [index-breaking-change]}\n",
+                     CORA_OK + "ignore:\n  rules: []\n", CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs")):
+            rc, out = cora_run({".cora.yaml": text})
+            self.assertEqual(rc, 1, out)
+            self.assertIn("error: ", out)
+        self.assertEqual(cora_run({".cora.yaml": None})[0], 0)  # no config: nothing is silenced
+
+    @staticmethod
+    def stub(artifacts, check_code=0, log=None):
+        """A cargo whose `check` prints `artifacts` (or fails) and logs its arguments; other calls reach the real one."""
+        def make(d, root):
+            path = os.path.join(d, "cargo")
+            real = os.environ.get("CARGO", "cargo")
+            body = f'#!/bin/sh\nif [ "$1" = check ]; then\necho "$@" >> "{d}/args.txt"\n'
+            body += f"[ {check_code} = 0 ] || {{ echo boom >&2; exit {check_code}; }}\ncat <<'J'\n{artifacts.replace('@ROOT@', root)}\nJ\nelse exec {real} \"$@\"; fi\n"
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+            return path
+        return make
+
+    ARTIFACT = lambda kind, name: json.dumps({"reason": "compiler-artifact", "manifest_path": "@ROOT@/crates/a/Cargo.toml",
+                                              "target": {"kind": [kind]}, "filenames": [f"@ROOT@/target/lib{name}.rmeta"]})
+
+    def test_what_cannot_be_proven_fails_closed_with_exit_2(self):
+        art, lib_d = CoraCompiled.ARTIFACT, {"target/a-1.d": "x.d: crates/a/src/lib.rs\n\ncrates/a/src/lib.rs:\n"}
+        for name, (files, cargo, expect) in {
+            "cargo check fails": ({}, self.stub("", 101), "`cargo check` failed"),
+            "no bin target at all": (lib_d, self.stub(art("lib", "a-1")), "no bin target"),
+            "dep-info file missing": ({}, self.stub(art("bin", "a-1")), "NOT passed"),
+            "dep-info lists nothing": ({"target/a-1.d": "garbage\n"}, self.stub(art("bin", "a-1")), "no source file listed"),
+        }.items():
+            with self.subTest(name):
+                rc, out = cora_run(files, cargo=cargo)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("NOT passed", out)
+                self.assertIn(expect, out)
+
+    def test_cargo_is_asked_for_the_workspace_libs_and_bins_offline(self):
+        with tempfile.TemporaryDirectory() as log_dir:
+            def make(d, root):
+                return CoraCompiled.stub("", 0)(log_dir, root)
+            cora_run({}, cargo=make)
+            with open(os.path.join(log_dir, "args.txt")) as f:
+                self.assertEqual(f.read().split(), ["check", "--workspace", "--lib", "--bins", "--offline", "--message-format=json"])
 
 
 class RepositoryList(unittest.TestCase):
