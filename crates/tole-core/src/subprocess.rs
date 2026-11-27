@@ -180,7 +180,9 @@ fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &
 ///   recursive rm stays Write-tier territory. Flag clusters containing
 ///   r/R count as recursive (`-rfv` included).
 /// - Path-qualified programs (`/bin/rm`) are refused outright: bare
-///   names resolve via PATH, which is the audited surface.
+///   names resolve via PATH, which is the audited surface. The reason says
+///   so (use the bare name) unless the name behind the path is itself a
+///   teardown program or a recursive `rm` (#1286).
 ///
 /// SCOPE (read before extending): this is a best-effort blocklist for
 /// headline accidental cases, NOT a sandbox. Wrapper/interpreter
@@ -252,8 +254,13 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
         let tokens: Vec<String> = tokens.iter().map(|t| strip_quotes(t).to_string()).collect();
         let prog = tokens[0].trim_start_matches('-').to_ascii_lowercase();
         if prog.contains('/') {
-            // Path-qualified program escapes PATH-resolution auditing.
-            return Err(REFUSE.to_string());
+            // Path-qualified program escapes PATH-resolution auditing: always
+            // refused. A teardown or recursive `rm` behind the path keeps the
+            // destructive text; any other program is told to use its bare name.
+            let mut by_name = tokens.clone();
+            by_name[0] = tokens[0].rsplit('/').next().unwrap_or_default().to_string();
+            scan(&by_name, depth)?;
+            return Err(format!("refused \u{2014} the program is written as a path ({}); run_command resolves programs through PATH only, so use the bare name (`{}`).", tokens[0], by_name[0]));
         }
         if teardown_name(&prog) {
             return Err(REFUSE.to_string());

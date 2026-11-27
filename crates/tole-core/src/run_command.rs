@@ -388,7 +388,7 @@ mod tests {
         let err = t
             .execute(json!({ "command": "/bin/echo hi" }))
             .expect_err("path-qualified program must be refused");
-        assert!(err.contains("destructive beyond the Write risk tier"));
+        assert!(err.contains("written as a path"), "{err}");
     }
 
     #[test]
