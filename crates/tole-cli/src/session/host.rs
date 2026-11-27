@@ -16,6 +16,7 @@ use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
+use crate::session::problem::{describe_outcome, Face};
 use crate::webhook_out::turn::{TurnCode, TurnEnd};
 
 #[derive(Clone)]
@@ -1115,21 +1116,15 @@ fn stop_reason(outcome: &tole_core::turn::TurnOutcome) -> Result<String, String>
         | O::UnknownTool { .. }
         | O::ProviderFailed { .. }
         | O::LoopDetected { .. } => "refusal",
-        O::Storage(e) => return Err(format!("storage error: {e}")),
+        O::Storage(_) => return Err(describe_outcome(outcome, Face::Short).unwrap_or_default()),
     }
     .to_string())
 }
 
 /// Operator-visible stderr line for non-final outcomes (unchanged text).
 fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
-    use tole_core::turn::TurnOutcome as O;
-    match outcome {
-        O::StopGateBlocked { reason } => eprintln!("tole: stop gate blocked the turn: {reason}"),
-        O::ApprovalRequired { name } => eprintln!("tole: approval denied for '{name}'"),
-        O::UnknownTool { name } => eprintln!("tole: unknown tool '{name}'"),
-        O::ProviderFailed { message } => eprintln!("tole: provider failed: {message}"),
-        O::LoopDetected { tool, .. } => eprintln!("tole: loop detected on '{tool}'"),
-        _ => {}
+    if let Some(line) = describe_outcome(outcome, Face::Log) {
+        eprintln!("{line}");
     }
 }
 
@@ -1414,6 +1409,11 @@ mod stop_reason_tests {
         ] {
             assert_eq!(s(o), "refusal");
         }
+        let e = O::Storage(tole_core::storage::StorageError::Corrupt("bad".into()));
+        assert_eq!(
+            stop_reason(&e).unwrap_err(),
+            "storage error: corrupt session file: bad"
+        );
     }
 }
 

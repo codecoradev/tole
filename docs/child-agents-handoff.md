@@ -66,6 +66,19 @@ Neither failure is closed silently. `Handoff::fix_prompt()` builds the prompt
 of the `fix` child that should follow: what failed, the evidence the child
 reported, and the artifact references to read.
 
+## Missing input (#1025)
+
+Every child mission, with a role or without one, ends with one sentence
+(`MISSING_INPUT_RULE`, appended by `compose_prompt`): if something the child
+needs is missing (a file, a credential, access, a decision), it says exactly
+what and stops, and does not mock, substitute or guess. It applies to a child
+started without `role` too, because `role` is optional and such a child gets
+no brief at all; it matters most for children nobody watches (missions, cron).
+The parent sees the child stop, with its reason in the log tail and summary
+that `agent_poll` returns. An `implement` or `fix` child that stops this way
+has no passing verification, so its handoff is not closed (see the verify
+gate); a structured "blocked" field is not part of the handoff yet.
+
 ## How it is wired
 
 - **Start**: `agent_start` takes an optional `role` and an optional

@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+use tole_core::problem::ProblemKind;
 use tole_core::turn::TurnOutcome;
 
 /// D3: a turn that stops on an approval emits `turn_finished(approval_pending)`.
@@ -94,7 +95,8 @@ impl TurnStatus {
     }
 }
 
-/// A fixed reason for `failed` or `blocked` (D6). Never a message.
+/// A fixed reason for `failed` or `blocked` (D6). Never a message. The
+/// webhook projection of [`ProblemKind`] (#1023): the words are the kind's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnCode {
     Provider,
@@ -107,16 +109,41 @@ pub enum TurnCode {
 }
 
 impl TurnCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TurnCode::Provider => "provider",
-            TurnCode::Storage => "storage",
-            TurnCode::Loop => "loop",
-            TurnCode::UnknownTool => "unknown_tool",
-            TurnCode::StopGate => "stop_gate",
-            TurnCode::Internal => "internal",
-            TurnCode::Approval => "approval",
+    /// The code of a problem kind. `None` for a kind with no code of its own
+    /// (`budget` is a status). A kind a newer tole-core adds (the enum is
+    /// `non_exhaustive`) reads as `internal` until it is placed here, so an
+    /// unknown cause never goes out as a made-up word; the test
+    /// `every_problem_kind_is_mapped_explicitly` fails until it is placed.
+    pub fn from_kind(kind: ProblemKind) -> Option<TurnCode> {
+        match kind {
+            ProblemKind::Provider => Some(TurnCode::Provider),
+            ProblemKind::Storage => Some(TurnCode::Storage),
+            ProblemKind::Loop => Some(TurnCode::Loop),
+            ProblemKind::UnknownTool => Some(TurnCode::UnknownTool),
+            ProblemKind::StopGate => Some(TurnCode::StopGate),
+            ProblemKind::Approval => Some(TurnCode::Approval),
+            ProblemKind::Internal => Some(TurnCode::Internal),
+            ProblemKind::BudgetExhausted => None,
+            _ => Some(TurnCode::Internal),
         }
+    }
+
+    /// The problem kind this code is.
+    pub fn kind(self) -> ProblemKind {
+        match self {
+            TurnCode::Provider => ProblemKind::Provider,
+            TurnCode::Storage => ProblemKind::Storage,
+            TurnCode::Loop => ProblemKind::Loop,
+            TurnCode::UnknownTool => ProblemKind::UnknownTool,
+            TurnCode::StopGate => ProblemKind::StopGate,
+            TurnCode::Internal => ProblemKind::Internal,
+            TurnCode::Approval => ProblemKind::Approval,
+        }
+    }
+
+    /// The wire word: the kind's, byte for byte (a published contract).
+    pub fn as_str(self) -> &'static str {
+        self.kind().as_str()
     }
 }
 
@@ -139,25 +166,32 @@ impl TurnEnd {
         TurnEnd { settle, ..self }
     }
 
-    /// The one mapping from a `TurnOutcome`. Exhaustive, no wildcard arm: a new
-    /// variant does not compile until it is placed here. `None` is a silent end
-    /// (D3 off). Nothing inside the outcome is read except its variant.
+    /// The one mapping from a `TurnOutcome` to a status. Exhaustive, no
+    /// wildcard arm: a new variant does not compile until it is placed here.
+    /// `None` is a silent end (D3 off). The code of a `failed` or `blocked`
+    /// end is the kind of the outcome (`problem_kind`, #1023); no payload
+    /// string is read or copied, and none reaches the end.
     pub fn from_outcome(outcome: &TurnOutcome, last_seq: u64) -> Option<TurnEnd> {
-        let (status, code) = match outcome {
-            TurnOutcome::Final { .. } => (TurnStatus::Completed, None),
-            TurnOutcome::ProviderFailed { .. } => (TurnStatus::Failed, Some(TurnCode::Provider)),
-            TurnOutcome::Storage(_) => (TurnStatus::Failed, Some(TurnCode::Storage)),
-            TurnOutcome::Cancelled => (TurnStatus::Cancelled, None),
-            TurnOutcome::Detached if FOLD_DETACHED_INTO_CANCELLED => (TurnStatus::Cancelled, None),
-            TurnOutcome::Detached => (TurnStatus::Detached, None),
-            TurnOutcome::BudgetExhausted => (TurnStatus::BudgetExhausted, None),
-            TurnOutcome::LoopDetected { .. } => (TurnStatus::Blocked, Some(TurnCode::Loop)),
-            TurnOutcome::UnknownTool { .. } => (TurnStatus::Blocked, Some(TurnCode::UnknownTool)),
-            TurnOutcome::StopGateBlocked { .. } => (TurnStatus::Blocked, Some(TurnCode::StopGate)),
+        let status = match outcome {
+            TurnOutcome::Final { .. } => TurnStatus::Completed,
+            TurnOutcome::ProviderFailed { .. } | TurnOutcome::Storage(_) => TurnStatus::Failed,
+            TurnOutcome::Cancelled => TurnStatus::Cancelled,
+            TurnOutcome::Detached if FOLD_DETACHED_INTO_CANCELLED => TurnStatus::Cancelled,
+            TurnOutcome::Detached => TurnStatus::Detached,
+            TurnOutcome::BudgetExhausted => TurnStatus::BudgetExhausted,
+            TurnOutcome::LoopDetected { .. }
+            | TurnOutcome::UnknownTool { .. }
+            | TurnOutcome::StopGateBlocked { .. } => TurnStatus::Blocked,
             TurnOutcome::ApprovalRequired { .. } if EMIT_APPROVAL_PENDING => {
-                (TurnStatus::ApprovalPending, None)
+                TurnStatus::ApprovalPending
             }
             TurnOutcome::ApprovalRequired { .. } => return None,
+        };
+        let code = match status {
+            TurnStatus::Failed | TurnStatus::Blocked => {
+                outcome.problem().and_then(|p| TurnCode::from_kind(p.kind))
+            }
+            _ => None,
         };
         Some(TurnEnd {
             status,
