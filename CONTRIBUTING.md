@@ -16,7 +16,7 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
   warnings` → `cargo test --workspace`. CI enforces the same set, plus
-  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252) and
+  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252; the files of the scoped `index-breaking-change` entry in `.cora.yaml` stay binary-only, #1249) and
   its self-test `python3 scripts/test_arch_lint.py`, which run as steps of the
   `Check` job; run the self-test when you touch `scripts/arch-*`. A change to
   `crates/tole-desktop` or `crates/tole-desktop-model` also runs
@@ -295,7 +295,39 @@ known FP categories). The deterministic `index-breaking-change` check ("Symbol
 `serve.rs` (not part of the library API, the compiler catches their callers)
 have a rule scoped to those two files in `ignore.rules`, so a refactor that
 moves items out of them is not reported as a removal. Do not add a file the
-library re-exports.
+library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
+step; needs PyYAML, a missing one is exit 2) checks two things with ground
+truth, not text matching. First, the parsed `.cora.yaml` (PyYAML, duplicate
+keys, merge keys, custom tags and files over 1 MiB refused) is held to
+whitelists: the top level holds only the known keys (`llm`, `focus`, `rules`,
+`ignore`, `review`, `rules_engine`, `hook`, `output`), `ignore` and `review` hold only known keys; `ignore.files` and
+`review.exclude` hold only lock-file, `target`, docs and `crates/*/tests`
+globs (so a glob over source files is refused, which would also drop them from
+the symbol index or the reviewed diff); a plain `ignore.rules` string (or the
+`rule` of another entry) holds no glob or regex character and is no part of the
+rule id or of the finding text ("Symbol `X` is being removed but has N
+caller(s)") and none of their words (index, breaking, change, symbol, removed,
+removing, caller, callers); `index-breaking-change` itself is silenced only by an entry of the
+form `rule`/`files`/`reason` whose `files` are exact `crates/<name>/src/**/*.rs`
+paths, and no other string, key or value anywhere in the document may name it
+(`index-breaking`, `breaking-change`, any case, `-` or `_`). Second, after
+`cargo check --workspace --lib --bins --offline`, rustc's own dep-info (the list
+of every source file it loaded, compared as real paths, so `mod`, `#[path]`,
+`include!`, macros and symlinks all count) must list each scoped file for a bin
+target and for no lib target of any workspace crate; build scripts are skipped.
+A cargo or dep-info failure is exit 2, never a pass (cargo stdout lines that do
+not start with `{`, such as a proc macro's `println!`, are skipped; a broken
+line that does is exit 2). The guard runs `python3 -I`, which ignores the user
+site: install PyYAML in the system or venv python (`apt install python3-yaml`),
+not with `pip install --user`. This is a tripwire against
+the known ways to silence the rule, not a proof: cora was not run against these
+spellings, so what it does with a key or glob it was not tested on (anchoring,
+case, a key this script does not know) cannot be verified here. Residuals: it
+checks the default features and the host platform the `Check` job builds (a
+`#[cfg(feature = ..)] mod serve;` or a `#[cfg(windows)]` module in a lib is not
+seen), a `build.rs` or proc macro that generates library code from a scoped
+file is not seen, and an `include_str!`/`include_bytes!` of a scoped file in a
+lib is reported as if it were a module (fail closed).
 
 Exit-code reference:
 
