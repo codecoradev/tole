@@ -71,8 +71,6 @@ file crates/tole-cli/src/webhook_out/approval_sender_tests.rs 859
 file crates/tole-cli/src/webhook_out/outbox_tests.rs 539
 file crates/tole-cli/src/webhook_out/send_tests.rs 667
 file crates/tole-cli/src/webhook_out/volatile_tests.rs 537
-file crates/tole-cli/tests/acp_approval.rs 651
-file crates/tole-cli/tests/acp_config_options.rs 734
 file crates/tole-cli/tests/client_contract.rs 812
 file crates/tole-cli/tests/config_apply.rs 741
 file crates/tole-cli/tests/config_sensitive.rs 1141

@@ -291,9 +291,9 @@ argv-validated subprocess tools, known-value redaction at the egress sinks — p
 known FP categories). The deterministic `index-breaking-change` check ("Symbol
 `X` is being removed but has N caller(s)") resolves Rust calls by bare name
 (#669): integration tests (`crates/*/tests/**`) are kept out of the symbol index
-(`ignore.files`), and the binary-only modules `crates/tole-cli/src/main.rs` and
-`serve.rs` (not part of the library API, the compiler catches their callers)
-have a rule scoped to those two files in `ignore.rules`, so a refactor that
+(`ignore.files`), and the binary-only modules `crates/tole-cli/src/main.rs`,
+`serve.rs` and `acp.rs` (not part of the library API, the compiler catches their
+callers) have a rule scoped to those three files in `ignore.rules`, so a refactor that
 moves items out of them is not reported as a removal. Do not add a file the
 library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
 step; needs PyYAML, a missing one is exit 2) checks two things with ground
