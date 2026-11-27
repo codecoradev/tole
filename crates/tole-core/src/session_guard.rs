@@ -2,8 +2,8 @@
 //!
 //! Records that mean "the owner did this" (`tole cron create`, `tole cron
 //! resume`, `plugin approve`, `skills approve`, `config trust`) are written
-//! by the official CLI, and any same-uid process a session starts could run
-//! it. Two layers, both defense in depth and not a boundary:
+//! by the official CLI, which any same-uid process a session starts could
+//! run. Two layers, both defense in depth and not a boundary:
 //!
 //! 1. [`check_session_argv`]: in EVERY session kind, `run_command` and
 //!    `job_start` refuse an argv whose program is the tole binary (by name,
@@ -14,17 +14,16 @@
 //!    tole that still gets started (a renamed copy of the binary) refuses
 //!    the owner-only subcommands (`child_env::under_session`).
 //!
-//! Residual (documented in `docs/threat-model.md`): a copied binary run
-//! with a cleared environment, or an interpreter writing the files
-//! directly, is not stopped here. Only a sandbox that cannot write the data
-//! dir closes that (#601).
+//! Residual (`docs/threat-model.md`): a copied binary run with a cleared
+//! environment, or an interpreter writing the files directly, is not stopped
+//! here. Only a sandbox that cannot write the data dir closes that (#601).
 
 use crate::child_env::UNDER_SESSION;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Wrapper programs and shell keywords that run another program: every
-/// later word is then checked as a possible program.
+/// Wrappers and shell keywords that run another program: every later word is
+/// checked as a possible program.
 const WRAPPERS: [&str; 17] = [
     "env", "nohup", "exec", "command", "time", "nice", "timeout", "setsid", "stdbuf", "sudo",
     "doas", "busybox", "then", "do", "else", "if", "while",
@@ -43,12 +42,7 @@ pub fn mark(cmd: &mut Command) -> &mut Command {
 /// Refuse an argv that runs the tole binary or manipulates the marker.
 /// `cwd` resolves relative program paths the way the spawn will.
 pub fn check_session_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
-    let strip = |a: &str| -> String {
-        a.chars()
-            .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
-            .collect()
-    };
-    if argv.iter().any(|a| strip(a).contains(UNDER_SESSION)) {
+    if argv.iter().any(|a| unquote(a).contains(UNDER_SESSION)) {
         return Err(ERR_MARKER.into());
     }
     let exe = std::env::current_exe()
@@ -74,19 +68,10 @@ fn base(w: &str) -> String {
     b.strip_suffix(".exe").unwrap_or(b).to_string()
 }
 
-fn named_tole(w: &str) -> bool {
-    matches!(base(w).as_str(), "tole" | "tole-cli")
-}
-
 /// Resolve a program word the way exec does (a path, or a `PATH` lookup).
 fn resolve(w: &str, cwd: &Path) -> Option<PathBuf> {
     let p = if w.contains('/') || w.contains('\\') {
-        let p = PathBuf::from(w);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
+        cwd.join(w) // an absolute `w` replaces `cwd`
     } else {
         std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join(w))
@@ -99,7 +84,8 @@ fn is_tole(w: &str, cwd: &Path, exe: Option<&Path>) -> bool {
     if w.is_empty() || w.starts_with('-') {
         return false;
     }
-    named_tole(w) || exe.is_some_and(|e| resolve(w, cwd).is_some_and(|r| r == e))
+    matches!(base(w).as_str(), "tole" | "tole-cli")
+        || exe.is_some_and(|e| resolve(w, cwd).is_some_and(|r| r == e))
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -108,26 +94,45 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
+/// A blank-cut word that ends in a quote or a backslash, or holds `$'` or a
+/// backslash in single quotes (fish): the value may hold a blank or separator,
+/// so the words after it are not the ones a shell sees (#1302).
+fn open_word(w: &str) -> bool {
+    let (mut q, mut esc) = (None, false);
+    for c in w.chars() {
+        match (q, c, esc) {
+            (_, _, true) => esc = false,
+            (Some('\''), '\\', _) => return true,
+            (_, '\\', _) => esc = true,
+            (Some(k), c, _) if c == k => q = None,
+            (None, '\'' | '"', _) => q = Some(c),
+            _ => {}
+        }
+    }
+    esc || q.is_some() || w.contains("$'")
+}
+
 fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
     if depth > 4 {
-        // Nested beyond any honest use: refuse rather than guess.
-        return true;
+        return true; // nested beyond any honest use: refuse, do not guess
     }
     let words: Vec<String> = argv.iter().map(|w| unquote(w)).collect();
-    let Some(i) = words.iter().position(|w| !is_assignment(w)) else {
-        return false;
-    };
+    let i = words.iter().position(|w| !is_assignment(w));
+    let open = |j: usize| is_assignment(&words[j]) && open_word(&argv[j]);
+    if (0..i.unwrap_or(words.len())).any(open) {
+        return true;
+    }
+    let Some(i) = i else { return false };
     let prog = &words[i];
     if is_tole(prog, cwd, exe) {
         return true;
     }
     let b = base(prog);
     if WRAPPERS.contains(&b.as_str()) {
-        // Any later word may be the wrapped program (`env -u X tole`,
-        // `timeout 5 tole`).
-        return words[i + 1..]
-            .iter()
-            .any(|w| !is_assignment(w) && is_tole(w, cwd, exe));
+        return (i + 1..words.len()).any(open)
+            || words[i + 1..]
+                .iter()
+                .any(|w| !is_assignment(w) && is_tole(w, cwd, exe));
     }
     if SHELLS.contains(&b.as_str()) {
         let mut rest = argv[i + 1..].iter();
@@ -141,15 +146,12 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     false
 }
 
-/// Programs whose arguments are data (a pattern, a file name): none has an
-/// option that runs a program, so a quoted separator is not a command
-/// boundary (#1287). Not listed: `echo` and `printf` (their output can be
-/// piped into a shell) and `rg` (`--pre`, `--pre-glob`, `--hostname-bin`,
-/// `-z` run programs).
+/// Programs whose arguments are data: none has an option that runs a program,
+/// so a quoted separator is no command boundary (#1287). Not listed: `echo`,
+/// `printf` (piped into a shell) and `rg` (`--pre`, `-z`... run programs).
 const INERT: [&str; 8] = ["grep", "egrep", "fgrep", "ls", "cat", "head", "tail", "wc"];
 /// The only commands allowed next to an inert program in a quote-aware cut:
-/// any other (`alias`, `function`, `eval`, a variable, a quoted spelling)
-/// might change what an [`INERT`] name means.
+/// any other (`alias`, `function`, `eval`...) might redefine an [`INERT`] name.
 const FILLER: [&str; 6] = ["echo", "true", "false", ":", "cd", "pwd"];
 const SEPARATORS: [char; 9] = [';', '&', '|', '(', ')', '`', '\n', '{', '}'];
 
@@ -162,18 +164,17 @@ fn blank_words(seg: &str) -> impl Iterator<Item = &str> {
     seg.split([' ', '\t']).filter(|w| !w.is_empty())
 }
 
-/// Inert only when the first word is an [`INERT`] program: a leading assignment
-/// may hold a quoted blank (`X='a;tole grep b' tole x` runs tole).
+/// Inert only when the first word is an [`INERT`] program (a leading assignment
+/// may hold a quoted blank: `X='a;tole grep b' tole x` runs tole).
 fn inert(seg: &str) -> bool {
     blank_words(seg).next().is_some_and(|w| INERT.contains(&w))
 }
 
 /// Split shell text at the separators the shell acts on, keeping quoted text
 /// whole. `None` when unsure: an unbalanced quote, or quoting this scan does
-/// not follow (comment, here-document, `$'..'`, a command substitution or any
-/// `${` inside double quotes: bash 5.3 and ksh run `${ cmd; }` there, a
-/// backslash in single quotes, which fish treats as an escape). The caller
-/// then splits naively, which is the stricter reading.
+/// not follow (comment, here-document, `$'..'`, a substitution or `${` in
+/// double quotes: bash 5.3 and ksh run `${ cmd; }` there, a backslash in
+/// single quotes: fish). The caller then splits naively, the stricter reading.
 fn split_quoted(s: &str) -> Option<Vec<&str>> {
     let (mut parts, mut start) = (Vec::new(), 0);
     let mut it = s.char_indices().peekable();
@@ -215,10 +216,8 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
 /// checked like an argv. Text straight from a real argv (depth 1) is split
 /// quote-aware, and a quoted separator stays literal only when every command
 /// is an [`INERT`] program or a [`FILLER`] (seen through the naive cut).
-/// Anything else, and any doubt, splits the whole text naively. Deeper text
-/// (cut on whitespace, quotes still on) always does: that gate is close to
-/// redundant, as such a word holds no blank, and stays so nesting cannot
-/// loosen the scan.
+/// Anything else, and any doubt, splits the whole text naively, as does
+/// deeper text (blank-cut words, quotes still on), so nesting cannot loosen it.
 fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
     let filler = |q: &str| blank_words(q).next().is_none_or(|f| FILLER.contains(&f));
     let parts = (depth == 1)
@@ -236,7 +235,7 @@ fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u3
         None => naive(payload),
     };
     segs.into_iter().any(|seg| {
-        let words: Vec<String> = seg.split_whitespace().map(String::from).collect();
+        let words: Vec<String> = blank_words(seg).map(String::from).collect();
         !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
     })
 }

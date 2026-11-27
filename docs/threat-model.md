@@ -1260,9 +1260,15 @@ them. Two layers close the direct routes; neither is a boundary.
   (`grep`, `egrep`, `fgrep`, `ls`, `cat`, `head`, `tail`, `wc`) or a filler
   that cannot change what those names mean (`echo`, `true`, `false`, `:`,
   `cd`, `pwd`), so `grep -E "a|tole"` passes (#1287). The program is the
-  first word of the command, cut at space and tab as a shell does, with no
-  assignment before it (a quoted value can hold a blank and a word that looks
-  like the program: `X='a;tole grep b' tole x` runs tole). `rg` is not on that list (`--pre`, `--pre-glob`,
+  first word of the command, cut at space and tab as a shell does (not at NBSP,
+  CR or VT), with no assignment before it (a quoted value can hold a blank and
+  a word that looks like the program: `X='a;tole grep b' tole x` runs tole).
+  A leading assignment, or one behind a wrapper, whose value ends inside a
+  quote or after a backslash, or holds `$'`, is refused (#1302): the cut would
+  read the rest of the value as the program (`X='a b' tole x`, `X=a\ b tole x`,
+  `X=$'a b' tole x`, `env X='a b;c' tole x`). It is refused even when it runs
+  nothing wrong (`X='a b' ls`, `X="$(date)" cmd`): write the value unquoted or
+  set it in a separate command. `rg` is not on that list (`--pre`, `--pre-glob`,
   `--hostname-bin` and `-z` run programs), nor are `echo` and `printf`.
   For every other program, and whenever the scan is unsure (unbalanced
   quote, comment, here-document, `$'..'`, a command substitution or any
