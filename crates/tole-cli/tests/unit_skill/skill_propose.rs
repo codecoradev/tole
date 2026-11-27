@@ -1,6 +1,16 @@
-use super::*;
+use serde_json::json;
+use serde_json::Value;
+use std::sync::Arc;
+use tole_cli::skill::propose::*;
+use tole_core::secrets::SecretSet;
+use tole_core::skill_draft::DraftStore;
+use tole_core::skill_draft::TaintTracker;
 use tole_core::skill_draft::{Band, DraftStatus};
+use tole_core::skill_index::SkillFilter;
+use tole_core::skill_index::SkillIndex;
 use tole_core::skill_index::{Candidate, SkillEntry};
+use tole_core::tool::Risk;
+use tole_core::tool::Tool;
 
 struct Fake {
     hit: Option<(&'static str, f32)>,

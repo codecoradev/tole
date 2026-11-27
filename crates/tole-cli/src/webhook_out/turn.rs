@@ -211,7 +211,3 @@ pub struct TurnSignal {
 
 /// The callback `tole serve` calls once per settled turn. It does no I/O.
 pub type TurnNotifier = Arc<dyn Fn(TurnSignal) + Send + Sync>;
-
-#[cfg(test)]
-#[path = "turn_tests.rs"]
-mod tests;

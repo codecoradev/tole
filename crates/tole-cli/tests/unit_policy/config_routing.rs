@@ -1,6 +1,8 @@
-use super::*;
-use crate::config::{layered, parse};
 use std::path::Path;
+use tole_cli::config::routing::*;
+use tole_cli::config::Config;
+use tole_cli::config::{layered, parse};
+use tole_core::router::Brief;
 use tole_core::router::{Source, TaskKind};
 use tole_core::tool::Risk;
 
@@ -199,8 +201,9 @@ fn doctor_shows_names_only() {
 
 #[test]
 fn config_check_shows_names_only() {
-    let text = crate::config::render_with(&cfg(USER), crate::config::USER_TAG, &Default::default())
-        .join("\n");
+    let text =
+        tole_cli::config::render_with(&cfg(USER), tole_cli::config::USER_TAG, &Default::default())
+            .join("\n");
     assert!(
         text.contains("router = on") && text.contains("\"short-cron\" -> \"light\""),
         "{text}"
@@ -304,7 +307,7 @@ fn routing_off_or_an_explicit_model_leaves_the_session_alone() {
     assert!(s.get_register(ROUTE.0, ROUTE.1).is_none() && model_of(&s).is_none());
     // A session that already has a model (an explicit choice) keeps it.
     let (mut s, _dir) = session("pinned");
-    crate::session_settings::write_model(&mut s, "owner-pick").unwrap();
+    tole_cli::session_settings::write_model(&mut s, "owner-pick").unwrap();
     assert_eq!(
         route_new_session(&mut s, &cfg(USER), &cron_brief(), &secrets).unwrap(),
         None

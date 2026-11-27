@@ -314,7 +314,3 @@ pub fn audit(
         }
     })
 }
-
-#[cfg(test)]
-#[path = "audit_tests.rs"]
-mod tests;
