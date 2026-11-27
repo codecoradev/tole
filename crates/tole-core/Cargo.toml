@@ -104,5 +104,13 @@ name = "command_sandbox_none"
 required-features = ["shell-tools"]
 
 [[test]]
+name = "session_guard"
+required-features = ["shell-tools"]
+
+[[test]]
+name = "session_guard_quoting"
+required-features = ["shell-tools"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]
