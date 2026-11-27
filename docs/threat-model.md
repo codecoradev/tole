@@ -1254,7 +1254,15 @@ them. Two layers close the direct routes; neither is a boundary.
   `tole-cli`, `.exe` forms), or by resolving to the running executable
   (links included), also behind `env`, `nohup`, `timeout`, `exec` and the
   like and inside `sh -c` text. Any argument that names the marker below
-  is refused too. A human running `tole` from a terminal is not affected:
+  is refused too. The shell text is cut into commands at `; & | ( ) { }`
+  and newlines; a separator inside quotes is literal only in the arguments
+  of a program that treats them as data (`grep`, `rg`, `ls`, `cat`, `head`,
+  `tail`, `wc`), so `grep -E "a|tole"` passes (#1287). For every other
+  program, and whenever the scan is unsure (unbalanced quote, comment,
+  here-document, `$'..'`, command substitution inside double quotes, a
+  backslash in single quotes), the old naive cut applies and a quoted word
+  `tole` still counts as a command: a false refusal is the price, a hidden
+  invocation is not. A human running `tole` from a terminal is not affected:
   the check lives in the two tools, not in the CLI.
 - **A marker for what still runs.** Every process those two tools start
   carries `TOLE_UNDER_SESSION=1` (a child agent also has

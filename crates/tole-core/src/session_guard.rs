@@ -141,13 +141,83 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     false
 }
 
-/// Shell text: each simple command (split on `; & | ( ) \` newline`) is
-/// checked like an argv.
+/// Programs that treat a quoted argument as data (a pattern, a file name),
+/// never as shell text or a program to run. A separator inside such an
+/// argument is not a command boundary (#1287). `echo` and `printf` are not
+/// listed: their output can be piped into a shell.
+const INERT: [&str; 9] = [
+    "grep", "egrep", "fgrep", "rg", "ls", "cat", "head", "tail", "wc",
+];
+const SEPARATORS: [char; 9] = [';', '&', '|', '(', ')', '`', '\n', '{', '}'];
+
+fn naive(s: &str) -> Vec<&str> {
+    s.split(SEPARATORS).collect()
+}
+
+fn inert(seg: &str) -> bool {
+    let mut words = seg.split_whitespace().skip_while(|w| is_assignment(w));
+    words.next().is_some_and(|w| INERT.contains(&w))
+}
+
+/// Split shell text at the separators the shell acts on, keeping quoted text
+/// whole. `None` when unsure: an unbalanced quote, or quoting this scan does
+/// not follow (comment, here-document, `$'..'`, command substitution inside
+/// double quotes, a backslash in single quotes, which fish treats as an
+/// escape). The caller then splits naively: refuse rather than guess.
+fn split_quoted(s: &str) -> Option<Vec<&str>> {
+    let (mut parts, mut start) = (Vec::new(), 0);
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|&(_, n)| n);
+        match c {
+            '\\' => drop(it.next()),
+            '\'' => loop {
+                match it.next()?.1 {
+                    '\'' => break,
+                    '\\' if matches!(it.peek(), Some(&(_, '\'' | '\\'))) => return None,
+                    _ => {}
+                }
+            },
+            '"' => loop {
+                match it.next()?.1 {
+                    '"' => break,
+                    '\\' => drop(it.next()),
+                    '`' => return None,
+                    '$' if it.peek().is_some_and(|&(_, n)| n == '(') => return None,
+                    _ => {}
+                }
+            },
+            '`' | '#' => return None,
+            '$' if next == Some('\'') => return None,
+            '<' if next == Some('<') => return None,
+            ';' | '&' | '|' | '(' | ')' | '\n' | '{' | '}' => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    Some(parts)
+}
+
+/// Shell text: each simple command (split on `; & | ( ) \` newline { }`) is
+/// checked like an argv. Text straight from a real argv (depth 1) is split
+/// quote-aware and a quoted separator only stays literal in the arguments of
+/// an [`INERT`] program; everything else, and any doubt, splits naively.
+/// Deeper text was cut on whitespace with its quotes still on, so it is
+/// always split naively.
 fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
-    payload
-        .split([';', '&', '|', '(', ')', '`', '\n', '{', '}'])
-        .any(|seg| {
-            let words: Vec<String> = seg.split_whitespace().map(String::from).collect();
-            !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
-        })
+    let parts = (depth == 1).then(|| split_quoted(payload)).flatten();
+    let segs = match parts {
+        Some(parts) => parts
+            .into_iter()
+            .flat_map(|p| if inert(p) { vec![p] } else { naive(p) })
+            .collect(),
+        None => naive(payload),
+    };
+    segs.into_iter().any(|seg| {
+        let words: Vec<String> = seg.split_whitespace().map(String::from).collect();
+        !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
+    })
 }
