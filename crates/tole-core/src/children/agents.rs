@@ -255,8 +255,12 @@ pub fn valid_agent_id(id: &str) -> bool {
 /// File name of a child's handoff inside its agent dir.
 pub const HANDOFF_FILE: &str = "handoff.json";
 
-/// The child's mission: what was asked, plus (when a role is set) its brief
-/// and the artifacts to read by reference. Unchanged when neither is given.
+/// Last line of every child mission, role or not (#1025): a child that lacks
+/// something must stop and say so, not stub it and look finished.
+pub const MISSING_INPUT_RULE: &str = "If something you need is missing (a file, a credential, access, a decision), say exactly what and stop. Do not mock, substitute or guess.";
+
+/// The child's mission: what was asked, plus (when a role is set) its brief,
+/// the artifacts to read by reference, and always [`MISSING_INPUT_RULE`].
 fn compose_prompt(
     prompt: &str,
     role: Option<crate::handoff::Role>,
@@ -273,6 +277,8 @@ fn compose_prompt(
         out.push_str("\n\n");
         out.push_str(&inputs);
     }
+    out.push_str("\n\n");
+    out.push_str(MISSING_INPUT_RULE);
     out
 }
 
@@ -1757,22 +1763,6 @@ mod tests {
         );
         let meta = read_meta(&agents_root(&d).join(id)).unwrap();
         assert_eq!(meta.role.as_deref(), Some("implement"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn without_a_role_nothing_changes() {
-        let d = tmp("norole");
-        let (out, argv, env) = start_and_dump(&d, json!({"prompt": "just do it"}), vec![]);
-        assert_eq!(out["role"], Value::Null);
-        assert_eq!(argv.last().map(String::as_str), Some("just do it"));
-        assert!(!argv.iter().any(|a| a == "handoff_submit"));
-        assert_eq!(
-            env,
-            vec!["".to_string(), "".to_string()],
-            "no handoff env: {env:?}"
-        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

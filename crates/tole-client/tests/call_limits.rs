@@ -107,6 +107,111 @@ fn drip_fed_headers_hit_the_deadline() {
 }
 
 #[test]
+fn a_huge_error_body_is_cut_in_the_message() {
+    // 3 MiB of text, and a JSON body whose `error` is 3 MiB: neither makes the
+    // message of the error longer than a few KiB.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let json = format!("{{\"error\":\"{big}\"}}");
+    for body in [big.clone(), json] {
+        let url = server(move |mut s| {
+            let head = format!(
+                "HTTP/1.1 500 Oops\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+        });
+        let err = Client::connect_tcp(&url, None, false)
+            .unwrap()
+            .health()
+            .unwrap_err();
+        let Error::Status {
+            status, message, ..
+        } = &err
+        else {
+            panic!("{err:?}")
+        };
+        assert_eq!(*status, 500);
+        assert_eq!(
+            message.len(),
+            tole_client::MAX_STATUS_MESSAGE + '…'.len_utf8()
+        );
+        assert!(message.ends_with('…'));
+        assert!(err.to_string().len() < 5000);
+    }
+}
+
+#[test]
+fn an_error_body_over_the_cap_is_not_parsed_and_a_success_body_keeps_its_limit() {
+    // 3 MiB of `1,`: 2 bytes each on the wire, a 32-byte `Value` each once
+    // parsed. As an error body it is cut at MAX_ERROR_BODY and never parsed.
+    let array = format!("[{}1]", "1,".repeat(3 * 512 * 1024));
+    let url = server(move |mut s| {
+        let head = format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\n\r\n",
+            array.len()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        // The client stops reading at the cap: the rest may meet a closed socket.
+        let _ = s.write_all(array.as_bytes());
+    });
+    let err = Client::connect_tcp(&url, None, false)
+        .unwrap()
+        .health()
+        .unwrap_err();
+    let Error::Status {
+        status,
+        message,
+        body,
+    } = &err
+    else {
+        panic!("{err:?}")
+    };
+    assert_eq!(*status, 502);
+    assert!(body.is_null(), "an over-cap error body is not parsed");
+    assert!(
+        message.starts_with("[1,1,1") && message.ends_with('…'),
+        "{}",
+        message.len()
+    );
+    assert!(err.is_transient(), "the status still classifies the error");
+    // A small error body is parsed as before.
+    let url = server(|mut s| {
+        let body = r#"{"error":"busy","n":1}"#;
+        let head = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body.as_bytes()).unwrap();
+    });
+    let err = Client::connect_tcp(&url, None, false)
+        .unwrap()
+        .health()
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Status { message, body, .. }
+        if message == "busy" && body["n"] == 1),
+        "{err:?}"
+    );
+    // A success body is not held to the error cap: 2 MiB is fine.
+    let url = server(|mut s| {
+        let body = format!(
+            r#"{{"status":"ok","version":"{}"}}"#,
+            "v".repeat(2 * 1024 * 1024)
+        );
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body.as_bytes()).unwrap();
+    });
+    let health = Client::connect_tcp(&url, None, false)
+        .unwrap()
+        .health()
+        .unwrap();
+    assert_eq!(health.version.map(|v| v.len()), Some(2 * 1024 * 1024));
+}
+
+#[test]
 fn unusable_settings_are_refused_up_front_and_a_huge_deadline_does_not_panic() {
     let c = Client::connect_tcp("http://127.0.0.1:1", None, false).unwrap();
     for refused in [

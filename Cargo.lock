@@ -7284,11 +7284,14 @@ name = "tole-client"
 version = "0.12.0"
 dependencies = [
  "libc",
+ "ring",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tole-core",
+ "webpki-roots",
 ]
 
 [[package]]

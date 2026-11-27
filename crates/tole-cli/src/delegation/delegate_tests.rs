@@ -2,6 +2,7 @@
 #![allow(unsafe_code)] // SAFETY: test-only libc calls (atexit, mkfifo) on paths the test owns.
 
 use super::*;
+use tole_core::agents::MISSING_INPUT_RULE;
 use tole_core::delegation::NodeStatus;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
@@ -429,7 +430,8 @@ fn a_profile_child_is_a_budgeted_mission_with_parent_intersect_profile_and_its_g
     assert_eq!(pair("--profile"), Some("coder"));
     assert_eq!(pair("--allow"), Some("write_file"));
     assert!(!argv.iter().any(|a| a == "run_command"), "{argv:?}");
-    assert_eq!(argv.last().map(String::as_str), Some("add the parser"));
+    assert_eq!(argv[argv.len() - 3], "add the parser", "the task is kept");
+    assert_eq!(argv.last().map(String::as_str), Some(MISSING_INPUT_RULE));
     let env = wait_for(&dir.join("env"));
     let node = out["node"].as_str().unwrap();
     assert!(env.contains("TOLE_AGENT_DEPTH=1\n"), "{env}");
@@ -610,11 +612,8 @@ fn the_machine_guard_queues_and_a_poll_starts_the_queued_child() {
         "{argv:?}"
     );
     assert!(!argv.iter().any(|a| a == "*"), "no forged allow: {argv:?}");
-    assert_eq!(
-        argv.last().map(String::as_str),
-        Some("b"),
-        "the recorded task"
-    );
+    assert_eq!(argv[argv.len() - 3], "b", "the recorded task");
+    assert_eq!(argv.last().map(String::as_str), Some(MISSING_INPUT_RULE));
     let _ = std::fs::remove_dir_all(&root);
 }
 
