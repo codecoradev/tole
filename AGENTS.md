@@ -289,7 +289,7 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
 - `crates/tole-cli/tests/serve_shutdown.rs`: test; signals, `flock`
 - `crates/tole-cli/tests/serve_socket.rs`: test; `geteuid`, `pipe`
 - `crates/tole-cli/tests/test_dir_helper.rs`: test; `pre_exec` to force a real fork
-- `crates/tole-cli/tests/tui_e2e.rs`: test; pty (`openpty`, `ioctl`)
+- `crates/tole-cli/tests/tui_e2e/pty.rs`: test; pty (`openpty`, `ioctl`)
 - `crates/tole-client/src/unix.rs`: local socket (euid, `poll`)
 - `crates/tole-core/src/children/agents.rs`: `flock` of the agents root lock
 - `crates/tole-core/src/delegation/report_tests.rs`: test; `mkfifo`
