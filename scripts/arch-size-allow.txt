@@ -21,7 +21,7 @@
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
 crate tole-cli 84114
 crate tole-core 64747
-file crates/tole-cli/src/acp.rs 1494
+file crates/tole-cli/src/acp.rs 1449
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
