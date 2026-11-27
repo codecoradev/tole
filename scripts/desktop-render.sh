@@ -80,6 +80,9 @@ done
   printf '[workspace]\nresolver = "2"\nmembers = ["crates/tole-desktop-model", "crates/tole-desktop", "crates/tole-client", "crates/tole-core"]\n\n'
   sed -n '/^\[workspace\.package\]/,/^$/p' "$root/Cargo.toml"
   sed -n '/^\[workspace\.dependencies\]/,/^$/p' "$root/Cargo.toml"
+  # The crates carry [lints] workspace = true; since #1252 the table lives in
+  # [workspace.lints.rust] at the root, so the trimmed manifest must carry it too.
+  sed -n '/^\[workspace\.lints/,/^$/p' "$root/Cargo.toml"
 } > "$work/Cargo.toml"
 # The committed lockfile keeps every existing version; cargo adds only what
 # test-support itself needs, in this copy.
