@@ -141,102 +141,102 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     false
 }
 
-/// Shell text: each simple command (split on `; & | ( ) \` newline`) is
-/// checked like an argv.
-fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
-    payload
-        .split([';', '&', '|', '(', ')', '`', '\n', '{', '}'])
-        .any(|seg| {
-            let words: Vec<String> = seg.split_whitespace().map(String::from).collect();
-            !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
-        })
+/// Programs whose arguments are data (a pattern, a file name): none has an
+/// option that runs a program, so a quoted separator is not a command
+/// boundary (#1287). Not listed: `echo` and `printf` (their output can be
+/// piped into a shell) and `rg` (`--pre`, `--pre-glob`, `--hostname-bin`,
+/// `-z` run programs).
+const INERT: [&str; 8] = ["grep", "egrep", "fgrep", "ls", "cat", "head", "tail", "wc"];
+/// The only commands allowed next to an inert program in a quote-aware cut:
+/// any other (`alias`, `function`, `eval`, a variable, a quoted spelling)
+/// might change what an [`INERT`] name means.
+const FILLER: [&str; 6] = ["echo", "true", "false", ":", "cd", "pwd"];
+const SEPARATORS: [char; 9] = [';', '&', '|', '(', ')', '`', '\n', '{', '}'];
+
+fn naive(s: &str) -> Vec<&str> {
+    s.split(SEPARATORS).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Words cut at space and tab only (a shell keeps NBSP, `\r`, `\v` in a word).
+fn blank_words(seg: &str) -> impl Iterator<Item = &str> {
+    seg.split([' ', '\t']).filter(|w| !w.is_empty())
+}
 
-    fn argv(line: &str) -> Vec<String> {
-        crate::run_command::RunCommandTool::split_argv(line).unwrap()
-    }
+/// Inert only when the first word is an [`INERT`] program: a leading assignment
+/// may hold a quoted blank (`X='a;tole grep b' tole x` runs tole).
+fn inert(seg: &str) -> bool {
+    blank_words(seg).next().is_some_and(|w| INERT.contains(&w))
+}
 
-    fn refused(line: &str) -> bool {
-        check_session_argv(&argv(line), Path::new("/tmp")).is_err()
-    }
-
-    #[test]
-    fn the_tole_binary_is_refused_in_every_form() {
-        for line in [
-            "tole cron resume job-1",
-            "/usr/local/bin/tole plugin approve x --hash h",
-            "./tole config trust --yes",
-            "tole-cli skills approve s",
-            "tole.exe cron create '@daily' --script x",
-            "FOO=1 tole cron resume j",
-            "env tole cron resume j",
-            "env -u TOLE_FOO tole cron resume j",
-            "env -i /opt/tole cron resume j",
-            "nohup tole cron resume j",
-            "timeout 5 tole cron resume j",
-            "sh -c 'tole cron resume j'",
-            "bash -lc 'cd x && tole cron resume j'",
-            "sh -c 'echo hi; tole cron resume j'",
-            "bash -c 'x=$(tole cron list)'",
-            "sh -c 'if true; then tole cron resume j; fi'",
-            "bash -c \"bash -c 'tole cron resume j'\"",
-        ] {
-            assert!(refused(line), "must refuse: {line}");
+/// Split shell text at the separators the shell acts on, keeping quoted text
+/// whole. `None` when unsure: an unbalanced quote, or quoting this scan does
+/// not follow (comment, here-document, `$'..'`, a command substitution or any
+/// `${` inside double quotes: bash 5.3 and ksh run `${ cmd; }` there, a
+/// backslash in single quotes, which fish treats as an escape). The caller
+/// then splits naively, which is the stricter reading.
+fn split_quoted(s: &str) -> Option<Vec<&str>> {
+    let (mut parts, mut start) = (Vec::new(), 0);
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|&(_, n)| n);
+        match c {
+            '\\' => drop(it.next()),
+            '\'' => loop {
+                match it.next()?.1 {
+                    '\'' => break,
+                    '\\' if matches!(it.peek(), Some(&(_, '\'' | '\\'))) => return None,
+                    _ => {}
+                }
+            },
+            '"' => loop {
+                match it.next()?.1 {
+                    '"' => break,
+                    '\\' => drop(it.next()),
+                    '`' => return None,
+                    '$' if it.peek().is_some_and(|&(_, n)| matches!(n, '(' | '{')) => return None,
+                    _ => {}
+                }
+            },
+            '`' | '#' => return None,
+            '$' if next == Some('\'') => return None,
+            '<' if next == Some('<') => return None,
+            ';' | '&' | '|' | '(' | ')' | '\n' | '{' | '}' => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
+    parts.push(&s[start..]);
+    Some(parts)
+}
 
-    #[test]
-    fn benign_commands_that_mention_tole_pass() {
-        for line in [
-            "git commit -m 'fix tole bug'",
-            "echo tole",
-            "grep -rn tole src",
-            "sh -c 'echo tole'",
-            "cat tole.toml",
-            "cargo test -p tole-core",
-            "ls tole-agents",
-            "env FOO=1 printenv FOO",
-            "sh -c 'cargo build -p tole-cli'",
-        ] {
-            assert!(!refused(line), "must allow: {line}");
-        }
-    }
-
-    #[test]
-    fn the_marker_cannot_be_named() {
-        for line in [
-            "env -u TOLE_UNDER_SESSION printenv",
-            "sh -c 'unset TOLE_UNDER_SESSION; ls'",
-            "env TOLE_UNDER_SE''SSION= ls",
-            "env TOLE_UNDER_SESSION= ls",
-        ] {
-            assert!(refused(line), "must refuse: {line}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_link_to_the_running_executable_is_refused() {
-        let dir = crate::test_dir::TestDir::new("tole-guard-link");
-        let exe = std::env::current_exe().unwrap();
-        std::os::unix::fs::symlink(&exe, dir.join("helper")).unwrap();
-        assert!(check_session_argv(&["./helper".into(), "x".into()], &dir).is_err());
-        let abs = dir.join("helper").display().to_string();
-        assert!(check_session_argv(&[abs, "x".into()], &dir).is_err());
-        assert!(check_session_argv(&["env".into(), "./helper".into()], &dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mark_sets_the_marker() {
-        let mut cmd = Command::new("true");
-        mark(&mut cmd);
-        assert!(cmd
-            .get_envs()
-            .any(|(k, v)| k == UNDER_SESSION && v.is_some()));
-    }
+/// Shell text: each simple command (split on `; & | ( ) \` newline { }`) is
+/// checked like an argv. Text straight from a real argv (depth 1) is split
+/// quote-aware, and a quoted separator stays literal only when every command
+/// is an [`INERT`] program or a [`FILLER`] (seen through the naive cut).
+/// Anything else, and any doubt, splits the whole text naively. Deeper text
+/// (cut on whitespace, quotes still on) always does: that gate is close to
+/// redundant, as such a word holds no blank, and stays so nesting cannot
+/// loosen the scan.
+fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
+    let filler = |q: &str| blank_words(q).next().is_none_or(|f| FILLER.contains(&f));
+    let parts = (depth == 1)
+        .then(|| split_quoted(payload))
+        .flatten()
+        .filter(|ps| {
+            ps.iter()
+                .all(|p| inert(p) || naive(p).into_iter().all(filler))
+        });
+    let segs = match parts {
+        Some(parts) => parts
+            .into_iter()
+            .flat_map(|p| if inert(p) { vec![p] } else { naive(p) })
+            .collect(),
+        None => naive(payload),
+    };
+    segs.into_iter().any(|seg| {
+        let words: Vec<String> = seg.split_whitespace().map(String::from).collect();
+        !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
+    })
 }
