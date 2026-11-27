@@ -74,7 +74,7 @@ ignore:
     #   policy is unit-tested there). The literal is the parser's own grammar,
     #   not a connection to an insecure endpoint.
     - "sec-hardcoded-url"
-    # - index-breaking-change, scoped to the two binary-only modules (the one
+    # - index-breaking-change, scoped to the three binary-only modules (the one
     #   rule in this list that names files, so it cannot hide a removal
     #   anywhere else, not even in other modules of the same crate).
     #   `mod serve;` is private to the `tole` bin target (src/main.rs);
@@ -84,7 +84,9 @@ ignore:
     #   resolves calls by bare name (#669), so when a refactor MOVES items out
     #   of these files it reports them as removed, with the callers being the
     #   new sibling modules of the same bin plus unrelated same-named symbols
-    #   of other crates (#1292: 45 errors on main.rs; the serve.rs split: 34).
+    #   of other crates (#1292: 45 errors on main.rs; the serve.rs split: 34; the
+    #   acp.rs split: 18, #1316; `mod acp;` is private to the bin, only the
+    #   `acp_title` helper module is in lib.rs and it is not listed here).
     #   A scoped rule, not `ignore.files` (the #1074 remedy for tests): that
     #   would also drop the two files from the review context and from the
     #   callers of the library items they use. Never add a file here that
@@ -93,6 +95,7 @@ ignore:
       files:
         - "crates/tole-cli/src/main.rs"
         - "crates/tole-cli/src/serve.rs"
+        - "crates/tole-cli/src/acp.rs"
       reason: "moved items of binary-only modules are not API removals (#669, #1249)"
 
 # #705 (cora 0.21): files removed from the REVIEWED DIFF. They are never sent
