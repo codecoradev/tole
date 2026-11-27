@@ -1,12 +1,14 @@
-use super::*;
 use std::path::Path;
+use tole_cli::config::discussion_roles::*;
+use tole_cli::config::Config;
+use tole_core::router::Tier;
 
 fn cfg(src: &str) -> Config {
-    crate::config::parse(src, Path::new("user.toml")).unwrap()
+    tole_cli::config::parse(src, Path::new("user.toml")).unwrap()
 }
 
 fn load_err(src: &str) -> String {
-    crate::config::parse(src, Path::new("user.toml"))
+    tole_cli::config::parse(src, Path::new("user.toml"))
         .unwrap_err()
         .to_string()
 }
@@ -99,13 +101,13 @@ fn a_project_config_can_neither_override_nor_widen_a_role() {
     let project = cfg("[profiles.scribe.models]\nlight = \"evil\"\n\
                        [router.tiers]\nlight = \"evil\"\n");
     let user = cfg("[router.tiers]\nlight = \"small-model\"\n");
-    let m = crate::config::layered(&project, &user);
+    let m = tole_cli::config::layered(&project, &user);
     let r = resolve(&m, Role::Scribe).unwrap();
     assert_eq!(
         (r.model.as_deref(), r.source),
         (Some("small-model"), "built-in, [router.tiers]")
     );
-    let m = crate::config::layered(&project, &Config::default());
+    let m = tole_cli::config::layered(&project, &Config::default());
     assert_eq!(resolve(&m, Role::Scribe).unwrap().model, None);
 }
 

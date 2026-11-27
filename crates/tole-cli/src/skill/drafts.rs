@@ -530,7 +530,3 @@ pub fn run(action: Option<DraftsAction>, store: &DraftStore) -> anyhow::Result<(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "drafts_tests.rs"]
-mod tests;

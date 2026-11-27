@@ -1,8 +1,9 @@
-use super::*;
-use crate::webhook_out::event::{turn_event_id, turn_finished, BuildError};
-use crate::webhook_out::Event;
 use serde_json::Value;
+use tole_cli::webhook_out::event::{turn_event_id, turn_finished, BuildError};
+use tole_cli::webhook_out::turn::*;
+use tole_cli::webhook_out::Event;
 use tole_core::storage::StorageError;
+use tole_core::turn::TurnOutcome;
 
 fn keep(s: &str) -> String {
     s.to_string()
@@ -316,7 +317,7 @@ fn a_bad_or_secret_shaped_id_is_refused_not_sent() {
 
 #[test]
 fn the_event_is_a_known_name_and_not_a_default() {
-    use crate::config::WebhookOutConfig;
+    use tole_cli::config::WebhookOutConfig;
     assert_eq!(Event::parse("turn_finished"), Some(Event::TurnFinished));
     assert!(Event::ALL.contains(&Event::TurnFinished) && Event::ALL.len() == 4);
     assert!(tole_core::webhook::valid_event("turn_finished"));
@@ -327,17 +328,17 @@ fn the_event_is_a_known_name_and_not_a_default() {
         ..WebhookOutConfig::default()
     };
     // An existing destination (no `events`) does not start receiving it.
-    let d = crate::webhook_out::load(&[("g".to_string(), cfg.clone())].into(), &env).unwrap();
+    let d = tole_cli::webhook_out::load(&[("g".to_string(), cfg.clone())].into(), &env).unwrap();
     assert!(!d.any_lists(&[Event::TurnFinished]));
     // Listing the cron event and approvals alone does not either.
     cfg.events = Some(vec![
         "cron_run_finished".into(),
         "approval_requested".into(),
     ]);
-    let d = crate::webhook_out::load(&[("g".to_string(), cfg.clone())].into(), &env).unwrap();
+    let d = tole_cli::webhook_out::load(&[("g".to_string(), cfg.clone())].into(), &env).unwrap();
     assert!(!d.any_lists(&[Event::TurnFinished]));
     cfg.events = Some(vec!["turn_finished".into()]);
-    let d = crate::webhook_out::load(&[("g".to_string(), cfg)].into(), &env).unwrap();
+    let d = tole_cli::webhook_out::load(&[("g".to_string(), cfg)].into(), &env).unwrap();
     assert!(d.any_lists(&[Event::TurnFinished]));
 }
 
@@ -359,7 +360,7 @@ fn a_turn_finished_body_has_a_pinned_signature() {
         text,
         r#"{"at":1795000000,"data":{"last_seq":14,"session_id":"s-1f2e3d","status":"completed"},"destination":"gateway","id":"turn:s-1f2e3d:357319c7c674b505:14:1","type":"turn_finished","v":1}"#
     );
-    let h = crate::webhook_out::sign::request_headers(
+    let h = tole_cli::webhook_out::sign::request_headers(
         b"tole-test-key-0123456789abcdef",
         1_795_000_000,
         &b.id,
