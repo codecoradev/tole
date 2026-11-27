@@ -174,14 +174,14 @@ answer (`end_turn`) and from a cancel or a detach.
 ```json
 {"stopReason": "refusal",
  "problem": {"kind": "provider", "subject": null, "retryable": true,
-             "detail": "http status: 429 Too Many Requests: slow down"}}
+             "detail": "http status: 429 Too Many Requests — slow down"}}
 ```
 
 | Field | Meaning |
 |---|---|
 | `kind` | `provider` (the provider failed after its retries), `storage`, `loop` (the loop guard tripped), `unknown_tool`, `stop_gate` (a turn-end gate denied the answer too often), `approval` (the turn stopped on a call that needs an approval), `internal`, `budget` (the step budget ran out). An open vocabulary: a client treats a kind it does not know as a generic problem. |
 | `subject` | What it is about: the tool of a `loop`, `unknown_tool` or `approval`; `null` otherwise. Always present. Redacted and at most 256 bytes. |
-| `retryable` | `true` when the same prompt may succeed again with nobody changing anything (a transient provider failure); `false` when a decision, a fix or another prompt is needed first. |
+| `retryable` | `true` for a provider failure (the provider failed after its retries, so the same prompt MAY succeed again with nobody changing anything: a rate limit, an outage; a permanent refusal such as a 400 is also `true` in this first cut, a client must not retry in a loop); `false` when a decision, a fix or another prompt is needed first. |
 | `detail` | Optional. The technical text for a "show details" disclosure (a provider message, a gate's output). **Redacted with the session's secrets** (the process secret set: environment secrets, the provider key, webhook and serve credentials, `web_fetch` header values) and THEN cut to 4096 bytes, so a cut never leaves part of a secret behind. Data, not wording: never parse it. |
 
 There is no wording in the answer: a client words a problem from `kind` and `subject`. Not covered
