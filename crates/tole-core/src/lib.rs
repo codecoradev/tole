@@ -129,6 +129,7 @@ pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
 pub mod paths;
+pub mod problem;
 pub mod process_guard;
 pub mod provider;
 // `provider/` holds the modules below; these re-exports keep the old top-level paths working.
