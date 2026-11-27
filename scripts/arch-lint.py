@@ -7,6 +7,7 @@ that script.
     arch-lint.py kinds <workspace-root>            enforced (#1250)
     arch-lint.py size <workspace-root> [--init]    enforced (#1251)
     arch-lint.py unsafe <workspace-root>           enforced (#1252)
+    arch-lint.py cora <workspace-root>             enforced (#1249)
 
 Output: `error: path:line: message`, `warning: ...` or `info: ...` per finding.
 Exit 0 = no error, 1 = at least one `error:` line, 2 = the check itself could
@@ -35,6 +36,11 @@ or within 3 lines of it, and the files that hold a site are exactly the files
 listed in AGENTS.md between the unsafe-opt-ins marker comments. Nothing is
 tolerated silently: a site, a list entry or a manifest that does not match is
 an error, and a list that cannot be read is a failed run (exit 2).
+
+cora: a .cora.yaml `ignore.rules` entry that silences `index-breaking-change`
+lists exact `crates/<name>/src/*.rs` files that exist, are reached from a bin
+target through `mod` declarations and are NOT reached from the crate's lib
+target. Strict line parser (no YAML library): an unknown form is an error.
 """
 import json
 import os
@@ -87,6 +93,16 @@ _UNSAFE_CODE = re.compile(r"(?<![\w:])unsafe_code\b")
 _LIST_ENTRY = re.compile(r"^\s*[-*]\s+`([^`]+)`")
 _WORKSPACE_LINT = re.compile(r'^\[workspace\.lints\.rust\][^\[]*?^\s*unsafe_code\s*=\s*"deny"', re.M | re.S)
 _CRATE_LINT = re.compile(r"^\[lints\][^\[]*?^\s*workspace\s*=\s*true\s*(?:#.*)?$", re.M | re.S)
+
+# Cora scope guard: the one rule that may be silenced, and only for binary-only files.
+CORA_CONFIG = ".cora.yaml"
+CORA_RULE = "index-breaking-change"
+CORA_HINT = "read CONTRIBUTING.md, section 'Cora Workflow', before changing this entry"
+_CORA_HEAD = re.compile(r"""^    - rule:\s*["']?([\w-]+)["']?$""")
+_CORA_KEY = re.compile(r"^      (\w+):(.*)$")
+_CORA_FILE = re.compile(r"""^        - "(crates/[\w.-]+/src/[\w./-]+\.rs)"$""")
+_MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+_PATH_ATTR = re.compile(r'^\s*#\[\s*path\s*=\s*"([^"]+)"\s*\]')
 
 findings = []  # (severity, text)
 
@@ -329,6 +345,117 @@ def check_lints(root_manifest, manifests, report=error):
             report(path, 1, 'no `[lints]` table with `workspace = true`: the crate does not inherit unsafe_code = "deny"')
 
 
+# ---- cora scope rules ---------------------------------------------------------
+
+
+def parse_cora_scoped(text, report=error, path=CORA_CONFIG):
+    """The `index-breaking-change` entries of `ignore.rules`: [(line, [(line, file)])].
+
+    Reads only the layout .cora.yaml uses today (`rules:` at indent 2, `- rule: X`
+    at 4, its keys at 6, `files:` items at 8, comments stripped). Every line of
+    the `ignore:` section that names the rule must be understood as such an entry
+    (a bare string, a flow list or a glob would silence it everywhere): else error.
+    """
+    lines = text.split("\n")
+    heads = [i for i, line in enumerate(lines) if re.match(r"ignore\s*:", line)]
+    if not heads:
+        return []
+    if len(heads) > 1 or lines[heads[0]].split("#", 1)[0].strip() != "ignore:":
+        report(path, heads[0] + 1, f"`ignore:` is not a plain block mapping: {CORA_HINT}")
+        return []
+    entries, mentions, in_rules, cur, files_mode = [], [], False, None, False
+    for i in range(heads[0] + 1, len(lines)):
+        raw = lines[i]
+        if raw[:1] not in ("", " ", "#", "\t"):
+            break  # next top-level key
+        body = raw.split("#", 1)[0].rstrip()
+        if not body.strip():
+            continue
+        if CORA_RULE in body:
+            mentions.append(i + 1)
+        indent = len(body) - len(body.lstrip(" "))
+        if indent <= 2:
+            in_rules, cur = body.strip() == "rules:", None
+        elif not in_rules:
+            continue
+        elif (head := _CORA_HEAD.match(body)):
+            cur, files_mode = {"rule": head.group(1), "line": i + 1, "files": []}, False
+            entries.append(cur)
+        elif indent == 4 and body.lstrip().startswith("- "):
+            cur = None  # a plain rule string; naming the scoped rule is caught below
+        elif cur is None:
+            report(path, i + 1, f"not understood in ignore.rules: {body.strip()!r}: {CORA_HINT}")
+        elif cur["rule"] != CORA_RULE:
+            continue  # the body of another rule's entry
+        elif (key := _CORA_KEY.match(body)) and key.group(1) in ("files", "reason"):
+            files_mode = key.group(1) == "files"
+            if files_mode and key.group(2).strip():
+                report(path, i + 1, f"`files:` must be a block list, one quoted path per line: {CORA_HINT}")
+        elif files_mode and (item := _CORA_FILE.match(body)):
+            cur["files"].append((i + 1, item.group(1)))
+        else:
+            report(path, i + 1, f"not understood in the {CORA_RULE} entry: {body.strip()!r} (only `reason:` and a `files:` list of exact crates/<name>/src/*.rs paths): {CORA_HINT}")
+    scoped = [e for e in entries if e["rule"] == CORA_RULE]
+    for number in sorted(set(mentions) - {e["line"] for e in scoped}):
+        report(path, number, f"{CORA_RULE} named in a form that is not a scoped `- rule:` entry with an exact `files:` list: {CORA_HINT}")
+    for entry in scoped:
+        if not entry["files"]:
+            report(path, entry["line"], f"{CORA_RULE} entry has no readable `files:` list (it would be unscoped): {CORA_HINT}")
+    return [(e["line"], e["files"]) for e in scoped]
+
+
+def reachable(root, rel, stop=()):
+    """Files reached from the crate root file `rel` through `mod x;` and `#[path]`.
+
+    A file in `stop` is recorded but not entered (it is already the answer).
+
+    Raises RuntimeError for a declaration that cannot be resolved (inline
+    modules that declare files, a missing file): the answer is then unknown.
+    """
+    seen, todo = set(), [rel]
+    while todo:
+        cur = todo.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur in stop and cur != rel:
+            continue
+        base = os.path.dirname(cur)
+        own = base if cur == rel or os.path.basename(cur) == "mod.rs" else os.path.join(base, os.path.basename(cur)[:-3])
+        path_attr = None
+        for number, line in enumerate(read_text(os.path.join(root, cur)).split("\n"), 1):
+            attr, decl = _PATH_ATTR.match(line), _MOD_DECL.match(line)
+            if attr:
+                path_attr = attr.group(1)
+            elif decl:
+                names = [os.path.join(base, path_attr)] if path_attr else [os.path.join(own, decl.group(1) + ".rs"), os.path.join(own, decl.group(1), "mod.rs")]
+                found = [os.path.normpath(n) for n in names if os.path.isfile(os.path.join(root, n))]
+                if len(found) != 1:
+                    raise RuntimeError(f"{cur}:{number}: `mod {decl.group(1)};` resolves to {len(found)} files, so what the library reaches is unknown: {CORA_HINT}")
+                todo.append(found[0].replace(os.sep, "/"))
+                path_attr = None
+            elif line.strip() and not line.lstrip().startswith(("#[", "//")):
+                path_attr = None
+    return seen
+
+
+def check_cora_scope(entries, packages, root, report=error, path=CORA_CONFIG):
+    """Each scoped file exists, is reached from a bin root of its crate and not from its lib root."""
+    stop = {rel for _, files in entries for _, rel in files}
+    for line, files in entries:
+        for number, rel in files:
+            owner = next((p for p in packages if rel.startswith(os.path.dirname(p["manifest"]) + "/src/")), None)
+            if not os.path.isfile(os.path.join(root, rel)) or owner is None:
+                report(path, number, f"{rel}: not a source file of a workspace crate: {CORA_HINT}")
+                continue
+            libs = [t for k, t in owner["targets"] if k in ("lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro")]
+            bins = [t for k, t in owner["targets"] if k == "bin"]
+            if any(rel in reachable(root, t, stop) for t in libs):
+                report(path, number, f"{rel} is reached from the library target of {owner['name']}: a silenced {CORA_RULE} would hide real public API removals; {CORA_HINT}")
+            elif not any(rel in reachable(root, t, stop) for t in bins):
+                report(path, number, f"{rel} is not reached from any bin target of {owner['name']} through mod declarations, so binary-only is not proven: {CORA_HINT}")
+
+
 # ---- cargo --------------------------------------------------------------------
 
 
@@ -360,6 +487,7 @@ def load_packages(root):
             "dir": os.path.dirname(pkg["manifest_path"]),
             "kind": tole.get("kind") if isinstance(tole, dict) else None,
             "deps": [{"name": d["name"], "kind": d.get("kind") or "normal"} for d in pkg.get("dependencies", [])],
+            "targets": [(k, os.path.relpath(t["src_path"], root).replace(os.sep, "/")) for t in pkg.get("targets", []) for k in t.get("kind", [])],
         })
     if not packages:
         raise RuntimeError("cargo metadata reported no workspace crate (is this a Cargo workspace root?)")
@@ -478,11 +606,21 @@ def run_unsafe(root):
          f"{len(listed)} files listed in {AGENTS_FILE}")
 
 
+def run_cora(root):
+    config = os.path.join(root, CORA_CONFIG)
+    if not os.path.isfile(config):
+        info(f"cora: no {CORA_CONFIG}, nothing is silenced")
+        return
+    entries = parse_cora_scoped(read_text(config))
+    check_cora_scope(entries, load_packages(root), root)
+    info(f"cora: {sum(len(f) for _, f in entries)} file(s) in {len(entries)} scoped {CORA_RULE} entr(ies) checked as binary-only")
+
+
 # ---- main ---------------------------------------------------------------------
 
 
 def main(argv):
-    modes = {"kinds": run_kinds, "size": run_size, "unsafe": run_unsafe}
+    modes = {"kinds": run_kinds, "size": run_size, "unsafe": run_unsafe, "cora": run_cora}
     flags = argv[3:]
     if len(argv) < 3 or argv[1] not in modes or any(f != "--init" for f in flags) or (flags and argv[1] != "size"):
         print(__doc__, file=sys.stderr)

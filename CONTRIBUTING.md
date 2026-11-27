@@ -16,7 +16,7 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
   warnings` → `cargo test --workspace`. CI enforces the same set, plus
-  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252) and
+  `scripts/arch-check.sh` (crate kinds and the crate dependency matrix, #1250; file and crate size against `scripts/arch-size-allow.txt`, #1251; `unsafe` opt-ins against the list in `AGENTS.md`, #1252; the files of the scoped `index-breaking-change` entry in `.cora.yaml` stay binary-only, #1249) and
   its self-test `python3 scripts/test_arch_lint.py`, which run as steps of the
   `Check` job; run the self-test when you touch `scripts/arch-*`. A change to
   `crates/tole-desktop` or `crates/tole-desktop-model` also runs
@@ -295,7 +295,14 @@ known FP categories). The deterministic `index-breaking-change` check ("Symbol
 `serve.rs` (not part of the library API, the compiler catches their callers)
 have a rule scoped to those two files in `ignore.rules`, so a refactor that
 moves items out of them is not reported as a removal. Do not add a file the
-library re-exports.
+library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
+step) reads that entry and fails when a listed file does not exist, is not
+reached from a bin target through `mod` declarations, or is reached from the
+library target (a `pub mod serve;` or `#[path]` include in `lib.rs` would let
+the silence hide real public API removals). It fails closed: an entry it cannot
+read, or a `mod` it cannot resolve, is a failure, never a skip. Keep the entry
+in the layout the file already uses (a block `files:` list of exact quoted
+`crates/<name>/src/*.rs` paths).
 
 Exit-code reference:
 

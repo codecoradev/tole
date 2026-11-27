@@ -210,6 +210,7 @@ class Wrapper(unittest.TestCase):
         self.assertIn("kinds:", out)
         self.assertIn("size:", out)
         self.assertIn("unsafe:", out)
+        self.assertIn("cora:", out)
 
 LIST = "scripts/arch-size-allow.txt"
 SMALL = {"crates/a/src/lib.rs": "fn a() {}\n"}
@@ -636,6 +637,156 @@ class UnsafeWrapper(unittest.TestCase):
     def test_init_is_for_the_size_mode_only(self):
         rc, _ = Wrapper().check(self.meta, mode="unsafe", files={**SMALL, **UNSAFE_OK}, extra=("--init",))
         self.assertEqual(rc, 2)
+
+
+CORA_OK = (
+    "ignore:\n  files:\n    - \"*.lock\"\n  rules:\n    - \"bug-todo\"\n"
+    "    # index-breaking-change in a comment is not a mention\n"
+    "    - rule: other-rule\n      files:\n        - \"x/**\"\n"
+    "    - rule: index-breaking-change\n      files:\n        - \"crates/a/src/main.rs\"\n"
+    "        - \"crates/a/src/serve.rs\"\n      reason: \"moved items\"\nreview:\n  exclude: []\n"
+)
+
+
+def cora_parse(text):
+    found = []
+    entries = arch.parse_cora_scoped(text, report=lambda p, l, m: found.append((l, m)))
+    return entries, found
+
+
+class CoraParse(unittest.TestCase):
+    def test_a_scoped_entry_is_read_with_its_lines(self):
+        entries, found = cora_parse(CORA_OK)
+        self.assertEqual(found, [])
+        self.assertEqual([[f for _, f in files] for _, files in entries], [["crates/a/src/main.rs", "crates/a/src/serve.rs"]])
+
+    def test_no_ignore_section_silences_nothing(self):
+        self.assertEqual(cora_parse("review:\n  exclude: []\n"), ([], []))
+
+    def test_every_form_that_is_not_a_scoped_exact_entry_fails_closed(self):
+        bad = {
+            "bare string": CORA_OK.replace("    - \"bug-todo\"\n", "    - \"index-breaking-change\"\n"),
+            "no files": CORA_OK.replace("files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", ""),
+            "flow list": CORA_OK.replace("files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", "files: [\"crates/a/src/main.rs\"]\n"),
+            "glob": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs"),
+            "directory": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"),
+            "other key": CORA_OK.replace("      reason:", "      paths: x\n      reason:"),
+            "odd indent": CORA_OK.replace("        - \"crates/a/src/serve.rs\"", "          - \"crates/a/src/serve.rs\""),
+            "in ignore.files": CORA_OK.replace("    - \"*.lock\"", "    - \"index-breaking-change\""),
+            "in a reason": CORA_OK.replace("moved items", "index-breaking-change moved"),
+            "flow ignore": "ignore: {rules: [\"index-breaking-change\"]}\n",
+            "ignore twice": CORA_OK + CORA_OK,
+        }
+        for name, text in bad.items():
+            with self.subTest(name):
+                self.assertTrue(cora_parse(text)[1], name)
+        self.assertIn("Cora Workflow", cora_parse(bad["glob"])[1][0][1])
+
+    def test_the_committed_config_names_existing_src_files(self):
+        root = os.path.dirname(HERE)
+        entries, found = cora_parse(arch.read_text(os.path.join(root, arch.CORA_CONFIG)))
+        self.assertEqual(found, [])
+        self.assertTrue(entries, "the committed .cora.yaml has no scoped index-breaking-change entry")
+        for _, files in entries:
+            for _, rel in files:
+                self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
+
+
+LIB_TARGETS = [("lib", "crates/a/src/lib.rs"), ("bin", "crates/a/src/main.rs")]
+CORA_TREE = {
+    "crates/a/src/lib.rs": "pub mod shared;\n// pub mod serve;\n",
+    "crates/a/src/shared.rs": "pub mod inner;\n",
+    "crates/a/src/shared/inner.rs": "pub fn f() {}\n",
+    "crates/a/src/main.rs": "mod serve;\n#[cfg(test)]\n#[path = \"main_tests.rs\"]\nmod tests;\nfn main() {}\n",
+    "crates/a/src/main_tests.rs": "",
+    "crates/a/src/serve.rs": "mod cron;\n",
+    "crates/a/src/serve/cron.rs": "",
+}
+
+
+def cora_scope(files, extra=None, targets=LIB_TARGETS, scoped=("crates/a/src/main.rs", "crates/a/src/serve.rs")):
+    found = []
+    with tempfile.TemporaryDirectory() as d:
+        workspace(d, {**CORA_TREE, **(extra or {})})
+        pkgs = [{"name": "a", "manifest": "crates/a/Cargo.toml", "targets": targets}]
+        arch.check_cora_scope([(1, [(2 + i, f) for i, f in enumerate(scoped)])], pkgs, d, report=lambda p, l, m: found.append((l, m)))
+    return found
+
+
+class CoraScope(unittest.TestCase):
+    def test_binary_only_files_pass(self):
+        self.assertEqual(cora_scope(None), [])
+
+    def test_a_lib_that_declares_the_module_fails_whatever_the_spelling(self):
+        for name, lib in {
+            "pub mod": "pub mod serve;\n",
+            "private mod": "mod serve;\n",
+            "pub(crate) mod": "pub(crate) mod serve;\n",
+            "path attribute": "#[path = \"serve.rs\"]\npub mod srv;\n",
+            "main": "mod main;\n",
+            "through another module": "pub mod shared;\n",
+        }.items():
+            with self.subTest(name):
+                extra = {"crates/a/src/lib.rs": lib}
+                if name == "through another module":
+                    extra["crates/a/src/shared.rs"] = "#[path = \"serve.rs\"]\nmod s;\n"
+                found = cora_scope(None, extra)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("reached from the library", found[0][1])
+
+    def test_a_missing_file_a_file_of_no_crate_and_an_orphan_fail(self):
+        self.assertIn("not a source file", cora_scope(None, scoped=("crates/a/src/gone.rs",))[0][1])
+        self.assertIn("not a source file", cora_scope(None, {"crates/b/src/x.rs": ""}, scoped=("crates/b/src/x.rs",))[0][1])
+        found = cora_scope(None, {"crates/a/src/orphan.rs": ""}, scoped=("crates/a/src/orphan.rs",))
+        self.assertIn("not reached from any bin", found[0][1])
+
+    def test_no_bin_target_means_not_proven(self):
+        found = cora_scope(None, targets=[("lib", "crates/a/src/lib.rs")])
+        self.assertEqual(len(found), 2, found)
+
+    def test_a_mod_that_cannot_be_resolved_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            cora_scope(None, {"crates/a/src/lib.rs": "mod nowhere;\n"})
+        self.assertIn("Cora Workflow", str(ctx.exception))
+        with self.assertRaises(RuntimeError):  # both x.rs and x/mod.rs
+            cora_scope(None, {"crates/a/src/lib.rs": "mod x;\n", "crates/a/src/x.rs": "", "crates/a/src/x/mod.rs": ""})
+
+
+def cora_meta(targets):
+    body = json.loads(metadata([pkg("a", "core")]))
+    body["packages"][0]["targets"] = [{"kind": [k], "src_path": f"@ROOT@/{p}"} for k, p in targets]
+    return json.dumps(body)
+
+
+class CoraWrapper(unittest.TestCase):
+    def run_cora(self, files, mode="cora"):
+        return Wrapper().check(cora_meta(LIB_TARGETS), mode=mode, files={**SMALL, **CORA_TREE, **files})
+
+    def test_the_binary_only_scope_passes(self):
+        rc, out = self.run_cora({".cora.yaml": CORA_OK})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("arch-check (cora): ok", out)
+
+    def test_a_lib_declaring_the_module_exits_1_and_names_the_config_line(self):
+        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "pub mod serve;\n"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("error: .cora.yaml:", out)
+        self.assertIn("crates/a/src/serve.rs is reached from the library", out)
+
+    def test_an_unparsable_entry_exits_1(self):
+        rc, out = self.run_cora({".cora.yaml": CORA_OK.replace("    - \"bug-todo\"", "    - \"index-breaking-change\"")})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("Cora Workflow", out)
+
+    def test_an_unresolvable_mod_fails_closed_with_exit_2(self):
+        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "mod nowhere;\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NOT passed", out)
+
+    def test_no_cora_config_silences_nothing(self):
+        rc, out = self.run_cora({})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("nothing is silenced", out)
 
 
 class RepositoryList(unittest.TestCase):
