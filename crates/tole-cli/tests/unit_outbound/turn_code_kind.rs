@@ -66,3 +66,18 @@ fn an_end_that_is_not_failed_or_blocked_has_no_code_even_with_a_problem() {
         assert_eq!(TurnEnd::from_outcome(&o, 1).unwrap().code, None, "{o:?}");
     }
 }
+
+/// The kinds that have no code of their own, on purpose.
+const NO_CODE: [ProblemKind; 1] = [ProblemKind::BudgetExhausted];
+
+#[test]
+fn every_problem_kind_is_mapped_explicitly() {
+    // A kind tole-core adds falls to `internal` in `from_kind`; this fails
+    // until the new kind is placed there (or listed in `NO_CODE`).
+    for kind in ProblemKind::ALL {
+        match TurnCode::from_kind(kind) {
+            Some(code) => assert_eq!(code.kind(), kind, "{kind:?} is not placed"),
+            None => assert!(NO_CODE.contains(&kind), "{kind:?} has no code"),
+        }
+    }
+}

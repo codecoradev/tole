@@ -91,36 +91,36 @@ fn every_other_outcome_maps_to_its_kind_subject_and_retryability() {
 
 #[test]
 fn the_wire_names_are_snake_case_and_equal_the_serde_names() {
-    let kinds = [
-        (ProblemKind::Provider, "provider"),
-        (ProblemKind::Storage, "storage"),
-        (ProblemKind::Loop, "loop"),
-        (ProblemKind::UnknownTool, "unknown_tool"),
-        (ProblemKind::StopGate, "stop_gate"),
-        (ProblemKind::Approval, "approval"),
-        (ProblemKind::Internal, "internal"),
-        (ProblemKind::BudgetExhausted, "budget"),
+    let words = [
+        "provider",
+        "storage",
+        "loop",
+        "unknown_tool",
+        "stop_gate",
+        "approval",
+        "internal",
+        "budget",
     ];
-    for (kind, word) in kinds {
+    for (kind, word) in ProblemKind::ALL.into_iter().zip(words) {
         assert_eq!(kind.as_str(), word);
         assert_eq!(serde_json::to_value(kind).unwrap(), json!(word));
     }
 }
 
 #[test]
-fn a_problem_serializes_without_its_empty_fields() {
-    let p = problem(&O::UnknownTool { name: "n".into() });
+fn the_kind_alone_and_the_whole_detail_are_available_without_the_cut() {
+    let long = "x".repeat(MAX_DETAIL_BYTES * 3);
+    let o = O::ProviderFailed {
+        message: long.clone(),
+    };
+    assert_eq!(o.problem_kind(), Some(ProblemKind::Provider));
     assert_eq!(
-        serde_json::to_value(&p).unwrap(),
-        json!({"kind": "unknown_tool", "subject": "n", "retryable": false})
+        o.problem_full().unwrap().detail.as_deref(),
+        Some(long.as_str())
     );
-    let p = problem(&O::ProviderFailed {
-        message: "m".into(),
-    });
-    assert_eq!(
-        serde_json::to_value(&p).unwrap(),
-        json!({"kind": "provider", "retryable": true, "detail": "m"})
-    );
+    assert!(o.problem().unwrap().detail.unwrap().len() <= MAX_DETAIL_BYTES);
+    assert_eq!(O::Cancelled.problem_kind(), None);
+    assert_eq!(O::Detached.problem_full(), None);
 }
 
 #[test]

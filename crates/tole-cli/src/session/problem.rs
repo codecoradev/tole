@@ -15,9 +15,11 @@ pub enum Face {
 }
 
 /// What `face` says about a settled turn; `None` when the outcome is not a
-/// problem (a final answer, a cancel, a detach) or the face stays silent.
+/// problem (a final answer, a cancel, a detach) or the face stays silent. It
+/// reads the whole detail (`problem_full`), not the cut one meant for a sink
+/// that leaves the process, so the printed text never shrinks.
 pub fn describe_outcome(outcome: &TurnOutcome, face: Face) -> Option<String> {
-    describe_problem(&outcome.problem()?, face)
+    describe_problem(&outcome.problem_full()?, face)
 }
 
 /// The sentence for `problem` on `face`; `None` when that face stays silent

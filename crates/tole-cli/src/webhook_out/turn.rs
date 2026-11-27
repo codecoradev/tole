@@ -110,9 +110,10 @@ pub enum TurnCode {
 
 impl TurnCode {
     /// The code of a problem kind. `None` for a kind with no code of its own
-    /// (`budget` is a status). A kind a newer tole-core adds reads as
-    /// `internal` until it is placed here, so an unknown cause never goes out
-    /// as a made-up word.
+    /// (`budget` is a status). A kind a newer tole-core adds (the enum is
+    /// `non_exhaustive`) reads as `internal` until it is placed here, so an
+    /// unknown cause never goes out as a made-up word; the test
+    /// `every_problem_kind_is_mapped_explicitly` fails until it is placed.
     pub fn from_kind(kind: ProblemKind) -> Option<TurnCode> {
         match kind {
             ProblemKind::Provider => Some(TurnCode::Provider),
@@ -168,8 +169,8 @@ impl TurnEnd {
     /// The one mapping from a `TurnOutcome` to a status. Exhaustive, no
     /// wildcard arm: a new variant does not compile until it is placed here.
     /// `None` is a silent end (D3 off). The code of a `failed` or `blocked`
-    /// end is the kind of the outcome's `problem()` (#1023); the payload
-    /// strings it carries are dropped and never reach the end.
+    /// end is the kind of the outcome (`problem_kind`, #1023); no payload
+    /// string is read or copied, and none reaches the end.
     pub fn from_outcome(outcome: &TurnOutcome, last_seq: u64) -> Option<TurnEnd> {
         let status = match outcome {
             TurnOutcome::Final { .. } => TurnStatus::Completed,

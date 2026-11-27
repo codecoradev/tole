@@ -86,3 +86,58 @@ fn a_final_a_cancel_and_a_detach_have_no_words() {
         assert_eq!(say(&o, Face::Short), None);
     }
 }
+
+/// A text of exactly `n` bytes.
+fn text(n: usize) -> String {
+    "a".repeat(n)
+}
+
+#[test]
+fn a_long_detail_is_printed_whole_on_both_faces() {
+    // Around and far past the 4096-byte cut of `TurnOutcome::problem`.
+    for n in [4095, 4096, 4097, 5000, 6000, 40_000] {
+        let t = text(n);
+        let provider = O::ProviderFailed { message: t.clone() };
+        let gate = O::StopGateBlocked { reason: t.clone() };
+        assert_eq!(
+            say(&provider, Face::Log).unwrap(),
+            format!("tole: provider failed: {t}")
+        );
+        assert_eq!(
+            say(&provider, Face::Short).unwrap(),
+            format!("provider failed: {t}")
+        );
+        assert_eq!(
+            say(&gate, Face::Log).unwrap(),
+            format!("tole: stop gate blocked the turn: {t}")
+        );
+        assert_eq!(
+            say(&gate, Face::Short).unwrap(),
+            format!("stop gate blocked: {t}")
+        );
+    }
+}
+
+#[test]
+fn a_long_storage_text_is_printed_whole_and_a_multibyte_one_is_not_split() {
+    // The storage text carries a 22-byte prefix; a cut would land inside it
+    // or the payload for these sizes.
+    for n in [4070, 4074, 4075, 5000] {
+        let e = StorageError::Corrupt(text(n));
+        let want = format!("storage error: {e}");
+        assert_eq!(say(&O::Storage(e), Face::Short).unwrap(), want);
+    }
+    // 3-byte characters straddling the 4096 boundary.
+    for n in [1364, 1365, 1366, 2000] {
+        let t = "\u{20ac}".repeat(n);
+        let o = O::ProviderFailed { message: t.clone() };
+        assert_eq!(
+            say(&o, Face::Short).unwrap(),
+            format!("provider failed: {t}")
+        );
+        assert_eq!(
+            say(&o, Face::Log).unwrap(),
+            format!("tole: provider failed: {t}")
+        );
+    }
+}
