@@ -12,7 +12,7 @@
 //! routes with their request and response type. Keys are sorted so the output
 //! does not depend on a serde_json feature another crate turns on.
 
-use crate::client::Route;
+use crate::route::Route;
 use crate::sse::payload::{ClosedData, ResyncData, TextData, ToolFinishedData, ToolStartedData};
 use crate::sse::Ready;
 use crate::types::*;
