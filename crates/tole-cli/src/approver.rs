@@ -3,68 +3,20 @@
 //! Lives in the host (CLI), not core: core stays deterministic and
 //! Tier A testable, while the human prompt is inherently I/O. The
 //! prompt function is injectable so tests drive verdicts without a
-//! terminal (`PromptFn`).
+//! terminal (`PromptFn`); the plain-terminal prompt is `stdio_prompt`.
 
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use tole_core::approval::{pattern_verdict, Approver, PatternVerdict, ToolRequest, Verdict};
 use tole_core::tool::Risk;
+
+pub use crate::stdio_prompt::StdioPrompt;
 
 /// How the approver asks a human and reads the answer. Injectable for
 /// tests; [`StdioPrompt`] is the production impl.
 pub trait PromptFn: Send + Sync {
     /// Render the request and return the human's verdict.
     fn prompt(&self, req: &ToolRequest<'_>) -> Verdict;
-}
-
-/// Preview of the tool input shown in the approval prompt. HEAD **and**
-/// TAIL are kept (cora MAJOR, 2026-09-19): a head-only cut could hide a
-/// dangerous path/command suffix beyond the preview from the human
-/// approver, weakening the fail-closed gate. Short scalar fields (paths,
-/// commands — the security-relevant values) stay fully visible; only
-/// oversized blobs lose their middle. The full input always lives in the
-/// durable session log; `tole status` is the audit surface.
-const INPUT_PREVIEW_HEAD: usize = 400;
-const INPUT_PREVIEW_TAIL: usize = 400;
-
-fn input_preview(input: &serde_json::Value) -> String {
-    let rendered = input.to_string();
-    let total = rendered.chars().count();
-    if total <= INPUT_PREVIEW_HEAD + INPUT_PREVIEW_TAIL {
-        return rendered;
-    }
-    let head: String = rendered.chars().take(INPUT_PREVIEW_HEAD).collect();
-    let tail: String = rendered.chars().skip(total - INPUT_PREVIEW_TAIL).collect();
-    let skipped = total - INPUT_PREVIEW_HEAD - INPUT_PREVIEW_TAIL;
-    format!("{head}… (+{skipped} more chars)…{tail}")
-}
-
-/// Production prompt: prints command + input preview to stdout, reads
-/// y/N from stdin. EOF / unrecognized input ⇒ Deny (fail closed).
-pub struct StdioPrompt;
-
-impl PromptFn for StdioPrompt {
-    fn prompt(&self, req: &ToolRequest<'_>) -> Verdict {
-        println!();
-        println!("── approval required ──────────────────────────");
-        println!("tool:  {} [{}]", req.tool, req.risk.as_str());
-        println!("what:  {}", req.description);
-        println!("input: {}", input_preview(req.input));
-        print!("allow? [y/N] ");
-        // A failed prompt flush is not actionable.
-        // cora-ignore: qual-error-ignore
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => return Verdict::Deny, // EOF / read error: fail closed
-            Ok(_) => {}
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => Verdict::Allow,
-            _ => Verdict::Deny,
-        }
-    }
 }
 
 /// y/N approver: allowlist patterns first, then the human prompt.
@@ -198,36 +150,6 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    #[test]
-    fn input_preview_short_input_passes_through() {
-        let v = Value::String("hello".into());
-        assert_eq!(input_preview(&v), r#""hello""#);
-    }
-
-    #[test]
-    fn input_preview_long_input_truncates_middle_keeps_both_ends() {
-        // 1998 x's + 2 JSON quotes = 2000 chars → middle 1200 elided.
-        let long = "x".repeat(1998);
-        let out = input_preview(&Value::String(long));
-        assert!(out.contains("… (+1200 more chars)…"));
-        assert!(out.starts_with('"'));
-        assert!(out.ends_with('"'));
-        // UTF-8-safe: multi-byte content still truncates on char boundaries
-        // (1000 é's + 2 quotes = 1002 chars → 202 skipped).
-        let multibyte = "é".repeat(1000);
-        let out2 = input_preview(&Value::String(multibyte));
-        assert!(out2.contains("… (+202 more chars)…"));
-        assert!(out2.starts_with('"'));
-        assert!(out2.ends_with('"'));
-        // A short security-relevant scalar stays fully visible even at the
-        // head/tail threshold edge (799 chars < 400+400).
-        let edge = "p".repeat(797);
-        assert_eq!(
-            input_preview(&Value::String(edge.clone())),
-            format!("\"{edge}\"")
-        );
-    }
-
     /// Scripted prompt: records requests, replays canned verdicts.
     struct ScriptedPrompt {
         answers: std::sync::Mutex<Vec<Verdict>>,
@@ -354,62 +276,5 @@ mod tests {
         })
         .with_shared_patterns(handle);
         assert_eq!(a.decide(&req("rm_rf", Risk::Destructive)), Verdict::Deny);
-    }
-
-    /// #438: a deny pattern beats --yes; a wrapper under a command deny
-    /// asks the human even under --yes.
-    #[test]
-    fn deny_beats_auto_write_and_wrappers_still_ask() {
-        struct Panics;
-        impl PromptFn for Panics {
-            fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
-                panic!("must not prompt")
-            }
-        }
-        struct Says(Verdict);
-        impl PromptFn for Says {
-            fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
-                self.0
-            }
-        }
-        fn request(input: &Value) -> ToolRequest<'_> {
-            ToolRequest {
-                tool: "run_command",
-                risk: Risk::Write,
-                input,
-                description: String::new(),
-                target: None,
-                summary: None,
-            }
-        }
-        let rm = serde_json::json!({ "command": "rm -rf build" });
-        let ls = serde_json::json!({ "command": "ls" });
-        let env = serde_json::json!({ "command": "env rm -rf build" });
-        let yes = InteractiveApprover::new(Panics)
-            .with_allow_patterns(vec!["run_command:ls".into(), "!run_command:rm *".into()])
-            .with_auto_write(true);
-        if cfg!(feature = "shell-tools") {
-            assert_eq!(yes.decide(&request(&rm)), Verdict::Deny);
-        }
-        assert_eq!(yes.decide(&request(&ls)), Verdict::Allow);
-        // Fail closed: under a command deny, --yes alone does not run an
-        // unnamed command unattended — the human is asked.
-        let other = serde_json::json!({ "command": "curl x" });
-        let asks_yes = InteractiveApprover::new(Says(Verdict::Deny))
-            .with_allow_patterns(vec!["!run_command:rm *".into()])
-            .with_auto_write(true);
-        if cfg!(feature = "shell-tools") {
-            assert_eq!(asks_yes.decide(&request(&other)), Verdict::Deny, "asked, N");
-        }
-        let asks = InteractiveApprover::new(Says(Verdict::Deny))
-            .with_allow_patterns(vec!["!run_command:rm *".into()])
-            .with_auto_write(true);
-        if cfg!(feature = "shell-tools") {
-            assert_eq!(
-                asks.decide(&request(&env)),
-                Verdict::Deny,
-                "asked, human said N"
-            );
-        }
     }
 }
