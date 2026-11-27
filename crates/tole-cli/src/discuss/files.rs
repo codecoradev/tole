@@ -220,7 +220,3 @@ fn read_checked(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(buf)
 }
-
-#[cfg(test)]
-#[path = "files_tests.rs"]
-mod tests;

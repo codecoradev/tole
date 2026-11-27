@@ -276,3 +276,62 @@ fn a_bad_request_is_refused_before_a_stream_opens() {
     let (code, _) = refused("/discussions/done-one/events", false);
     assert_eq!(code, 401);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_ledger_that_stays_unreadable_ends_the_stream_and_leaks_nothing() {
+    let (dir, ledger) = workspace();
+    // Open and not driven: a quiet stream that would stay silent.
+    let log = DiscussionLog::at(&ledger, "quiet-one").unwrap();
+    log.start(contract("quiet-one", "Which database?"), 1)
+        .unwrap();
+    // A readable ledger elsewhere, full of the secret, to point a link at.
+    let elsewhere = ledger.join("elsewhere");
+    finished(&elsewhere, "pick-db");
+    let env = [("PLANTED_API_KEY", SECRET)];
+    let serve = Serve::spawn_in_env(&discussion_mock(0), dir, true, &env);
+
+    let sse = open(&serve, "quiet-one", None);
+    sse.until(WITHIN, |f| f.event == "ready");
+    // The ledger is replaced by a symlink: every read of it is refused.
+    let file = ledger.join("quiet-one.jsonl");
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("pick-db.jsonl"), &file).unwrap();
+    let started = std::time::Instant::now();
+    let mut frames = Vec::new();
+    while let Some(f) = sse.next(Duration::from_secs(20)) {
+        frames.push(f);
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the stream stayed open: {frames:?}"
+    );
+    let wire = format!("{frames:?}");
+    for leak in [SECRET, RAW, "SQLite"] {
+        assert!(!wire.contains(leak), "{leak} reached the stream: {wire}");
+    }
+    assert!(frames.iter().all(|f| f.event == "ping"), "{frames:?}");
+    // The reconnect of a client gets the 500 of the first look.
+    let (code, _) = Sse::open(&serve, "/discussions/quiet-one/events", "", true)
+        .err()
+        .expect("a symlinked ledger opens no stream");
+    assert_eq!(code, 500);
+}
+
+#[test]
+fn a_closed_connection_frees_its_stream_slot_at_once() {
+    let (dir, ledger) = workspace();
+    let log = DiscussionLog::at(&ledger, "quiet-one").unwrap();
+    log.start(contract("quiet-one", "Which database?"), 1)
+        .unwrap();
+    let serve = Serve::spawn_in(&discussion_mock(0), dir, true);
+    // The cap is 8 streams. A quiet one writes nothing for 15 s, so only a
+    // look at the peer frees a slot sooner.
+    for _round in 0..3 {
+        let open: Vec<Sse> = (0..8).map(|_| open(&serve, "quiet-one", None)).collect();
+        for s in &open {
+            s.until(WITHIN, |f| f.event == "ready");
+            s.close();
+        }
+    }
+}

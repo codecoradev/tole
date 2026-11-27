@@ -511,6 +511,9 @@ where the discussion stands, and the client answers it with `GET /discussions/{i
 - **When it ends.** `closed` ends it (also for a discussion that was already closed when the stream opened). A server that
   shuts down ends it without `closed` and the client reconnects. A discussion that is open but not driven (`interrupted`)
   keeps the stream open, with heartbeats, until a resume or a stop; `POST /discussions/{id}/resume` shows as `state: running`.
+  A ledger that cannot be read for about 3 s in a row (deleted, garbled, replaced by a link) ends the stream without a frame;
+  the reconnect gets the `404` or `500` of the first look. A ledger replaced by another readable one is not detected. A peer that
+  closed its connection is noticed within about 150 ms and frees its slot.
 - **Limits.** Counted in the same 8 open streams as a session's (the 9th gets `429`), heartbeat and
   `TOLE_SERVE_HEARTBEAT_SECS` as in the [event stream](#event-stream-524). `401` without the token, `404` `no such
   discussion`, `400` for a bad id or `after`. A ledger that cannot be read is a `500` that names no path.

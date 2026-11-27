@@ -1,9 +1,18 @@
-use super::*;
+//! Background files of a discussion (#1038): names confined to the working folder, loaded
+//! by reference, redacted and verified on resume. (Moved from the unit tests of
+//! `src/discuss/files.rs`; it needs nothing private.)
+
+use std::path::Path;
+use tole_cli::discuss::files::*;
+use tole_core::discussion::MAX_BACKGROUND_EXCERPT_CHARS;
+use tole_core::secrets::SecretSet;
+
+mod common;
 
 const SECRET: &str = "bg-file-secret-0123456789";
 
-fn work(tag: &str) -> crate::test_dir::TestDir {
-    crate::test_dir::TestDir::new(&format!("tole-discuss-files-{tag}"))
+fn work(tag: &str) -> common::TestDir {
+    common::TestDir::new(&format!("tole-discuss-files-{tag}"))
 }
 
 fn names(v: &[&str]) -> Vec<String> {
