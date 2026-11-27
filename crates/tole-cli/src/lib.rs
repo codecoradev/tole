@@ -28,6 +28,7 @@ pub use delegation::machine_guard;
 pub use delegation::serve_delegation;
 pub mod approver;
 pub mod serve_support;
+pub mod stdio_prompt;
 // `serve_support/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
 pub use serve_support::auth;

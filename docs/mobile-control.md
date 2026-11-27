@@ -155,7 +155,8 @@ The English wording is a pair of tables keyed by `kind` and `effect` (`tole_core
 - **Older rows.** The field is additive: a row queued without a summary has no `summary` key, and a summary missing the
   optional fields (`insideWorkspace`, `targetTruncated`, `preview`, `previewTruncated`) still loads with their defaults.
 - **The TUI prompt** is the summary's one-line sentence (what the call does and its effect), then ` :: ` and the tool's whole text character for character as before (`<tool> — <description> → <target>`), uncut; it does not show the preview lines or the flags; `job_start` reads `start job: ...` there and its summary says it STARTS A BACKGROUND JOB.
-- **Where it is not shown yet.** The stdio prompt, the ACP permission `title`, the delegated children's approvals
+- **The stdio prompt** (the plain-terminal CLI paths) prints the sentence on a `does:` line between `tool:` and `what:`, which still holds the tool's whole text; every printed value is neutralized to one line; a request without a summary has no `does:` line.
+- **Where it is not shown yet.** The ACP permission `title`, the delegated children's approvals
   (`source: "delegation"`, which keep their own `display` and `text`) and the webhook events still use the older text
   and carry no `summary`; see `docs/faces.md`.
 

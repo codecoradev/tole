@@ -312,3 +312,60 @@ fn trust_workspace_guard_follows_symlinks_to_the_real_target() {
     }
     assert!(!ws.join(".git/hooks/pre-commit").exists());
 }
+
+/// #438: a deny pattern beats --yes; a wrapper under a command deny
+/// asks the human even under --yes.
+#[test]
+fn deny_beats_auto_write_and_wrappers_still_ask() {
+    struct Panics;
+    impl PromptFn for Panics {
+        fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
+            panic!("must not prompt")
+        }
+    }
+    struct Says(Verdict);
+    impl PromptFn for Says {
+        fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
+            self.0
+        }
+    }
+    fn request(input: &Value) -> ToolRequest<'_> {
+        ToolRequest {
+            tool: "run_command",
+            risk: Risk::Write,
+            input,
+            description: String::new(),
+            target: None,
+            summary: None,
+        }
+    }
+    let rm = serde_json::json!({ "command": "rm -rf build" });
+    let ls = serde_json::json!({ "command": "ls" });
+    let env = serde_json::json!({ "command": "env rm -rf build" });
+    let yes = InteractiveApprover::new(Panics)
+        .with_allow_patterns(vec!["run_command:ls".into(), "!run_command:rm *".into()])
+        .with_auto_write(true);
+    if cfg!(feature = "shell-tools") {
+        assert_eq!(yes.decide(&request(&rm)), Verdict::Deny);
+    }
+    assert_eq!(yes.decide(&request(&ls)), Verdict::Allow);
+    // Fail closed: under a command deny, --yes alone does not run an
+    // unnamed command unattended — the human is asked.
+    let other = serde_json::json!({ "command": "curl x" });
+    let asks_yes = InteractiveApprover::new(Says(Verdict::Deny))
+        .with_allow_patterns(vec!["!run_command:rm *".into()])
+        .with_auto_write(true);
+    if cfg!(feature = "shell-tools") {
+        assert_eq!(asks_yes.decide(&request(&other)), Verdict::Deny, "asked, N");
+    }
+    let asks = InteractiveApprover::new(Says(Verdict::Deny))
+        .with_allow_patterns(vec!["!run_command:rm *".into()])
+        .with_auto_write(true);
+    if cfg!(feature = "shell-tools") {
+        assert_eq!(
+            asks.decide(&request(&env)),
+            Verdict::Deny,
+            "asked, human said N"
+        );
+    }
+}
