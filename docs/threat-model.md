@@ -1312,7 +1312,8 @@ does not follow, all present before #1287: `eval`, `echo x | sh`,
 `x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, and, found in the #1302
 review and still allowed: `X+=1 tole x`, `X[0]=1 tole x`, a leading redirection
 (`>/dev/null tole x`, `2>&1 tole x`), `! tole x`, `coproc tole x`,
-`builtin tole x`, `env -S 'tole x'`, `$(echo tole) x`, a quoted or escaped KEY
+`builtin command tole x` (`builtin tole x` alone runs nothing: `builtin` only
+runs builtins), `env -S 'tole x'` (as an argv), `$(echo tole) x`, a quoted or escaped KEY
 behind a wrapper with a separator inside the quotes (`env "X=a;c" tole x`,
 `env 'X'='a;c' tole x`; a plain key is refused), and the `{` and `}` the
 cut also splits inside a word; an interpreter
@@ -1322,6 +1323,31 @@ into the data dir is not seen. A session with `run_command` has the
 owner's file permissions. These are defense in depth against the plain
 route (the official CLI, the file tools). The real boundary is a sandbox
 that cannot write the data dir (#601).
+
+**Differential test (#1307).** `crates/tole-core/tests/session_guard_differential.rs`
+(unix, `shell-tools`) runs a corpus of command lines through `sh -c` (and `bash
+-c`, `dash -c` when they exist; a missing shell is skipped) against a FAKE `tole`
+that only writes a marker file, and through `check_session_argv`. The real
+binary never runs: the fake and `sudo` / `doas` shims sit first on a cleared
+`PATH`, and the test is skipped when a real `tole` is in a system directory.
+It guarantees, within its corpus: a line that a shell runs as `tole` and the
+guard allows is a failure unless it is listed in `KNOWN_RESIDUAL` (the routes
+above, as exact texts, plus one named class of generated lines), and the list
+can only shrink: an entry the guard now refuses, or that no shell runs any
+more, fails the test and has to be deleted. The corpus is the hand-written
+tables of the earlier guard tests (#1287, #1298, #1302) and a fixed-seed
+generator (assignments, wrappers, separators, quotes, nested `sh -c` to depth 2,
+seven spellings of the program word). It does not cover: zsh, ksh, fish or
+busybox; inputs outside that grammar (here-documents, aliases and functions
+beyond the hand cases, `eval` strings built at run time, a wrapper in front of a
+nested shell, beyond the exact entries); what a shell does with an environment
+other than the test's; and a copy or a link of the binary, which the guard tests
+of #684 cover. `TOLE_GUARD_DIFF_REPORT=1` prints every disagreement
+as a worklist instead of failing. Found by it, not in the list above and still
+allowed: a nested shell whose payload is written unquoted with backslash-escaped
+blanks (`sh -c echo\ a\;\ tole\ x`, `sh -c \(\ tole\ x\ \)`); the guard cuts
+words at the escaped blank and a shell does not. The same text split as an argv
+is refused.
 
 ### Delegation approvals (#714)
 
