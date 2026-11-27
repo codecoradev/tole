@@ -7,3 +7,4 @@ mod test_dir;
 mod config_discussion_roles;
 mod config_routing;
 mod delegation_audit;
+mod provider_chain;
