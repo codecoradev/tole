@@ -1255,15 +1255,17 @@ them. Two layers close the direct routes; neither is a boundary.
   (links included), also behind `env`, `nohup`, `timeout`, `exec` and the
   like and inside `sh -c` text. Any argument that names the marker below
   is refused too. The shell text is cut into commands at `; & | ( ) { }`
-  and newlines; a separator inside quotes is literal only in the arguments
-  of a program none of whose options runs a program (`grep`, `egrep`,
-  `fgrep`, `ls`, `cat`, `head`, `tail`, `wc`), so `grep -E "a|tole"` passes
-  (#1287). `rg` is not on that list (`--pre`, `--pre-glob`,
+  and newlines; a separator inside quotes is literal only when every
+  command of the text is a program none of whose options runs a program
+  (`grep`, `egrep`, `fgrep`, `ls`, `cat`, `head`, `tail`, `wc`) or a filler
+  that cannot change what those names mean (`echo`, `true`, `false`, `:`,
+  `cd`, `pwd`), so `grep -E "a|tole"` passes (#1287). `rg` is not on that list (`--pre`, `--pre-glob`,
   `--hostname-bin` and `-z` run programs), nor are `echo` and `printf`.
   For every other program, and whenever the scan is unsure (unbalanced
   quote, comment, here-document, `$'..'`, a command substitution or any
-  `${` inside double quotes, a backslash in single quotes, text that
-  defines a function or an alias), the old naive cut applies and a quoted
+  `${` inside double quotes, a backslash in single quotes, any other
+  command in the text, such as `alias`, `function` or `eval`, which could
+  redefine an inert name), the old naive cut applies and a quoted
   word `tole` still counts as a command. This errs toward refusing and
   is not a proof: it follows the shells it was checked against (dash,
   bash 5.2 and 5.3, ksh93, mksh, zsh) and not every way a shell can run

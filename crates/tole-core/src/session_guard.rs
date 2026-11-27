@@ -145,24 +145,16 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
 /// option that runs a program, so a quoted separator is not a command
 /// boundary (#1287). Not listed: `echo` and `printf` (their output can be
 /// piped into a shell) and `rg` (`--pre`, `--pre-glob`, `--hostname-bin`,
-/// `-z` run programs). Off for text that [`redefines_a_command`].
+/// `-z` run programs).
 const INERT: [&str; 8] = ["grep", "egrep", "fgrep", "ls", "cat", "head", "tail", "wc"];
+/// The only commands allowed next to an inert program in a quote-aware cut:
+/// any other (`alias`, `function`, `eval`, a variable, a quoted spelling)
+/// might change what an [`INERT`] name means.
+const FILLER: [&str; 6] = ["echo", "true", "false", ":", "cd", "pwd"];
 const SEPARATORS: [char; 9] = [';', '&', '|', '(', ')', '`', '\n', '{', '}'];
 
 fn naive(s: &str) -> Vec<&str> {
     s.split(SEPARATORS).collect()
-}
-
-/// Text that may redefine a command name (`grep(){ eval "$@"; }`,
-/// `function ls { ..; }`, `alias`): the shell then runs the text under a
-/// name from [`INERT`]. Conservative: any `(` followed by `)` (blanks
-/// between), even inside quotes, and any `function` or `alias` word.
-fn redefines_a_command(s: &str) -> bool {
-    let sep = |c: char| c.is_whitespace() || SEPARATORS.contains(&c);
-    s.split(sep).any(|w| matches!(w, "function" | "alias"))
-        || s.split('(')
-            .skip(1)
-            .any(|r| r.trim_start().starts_with(')'))
 }
 
 fn inert(seg: &str) -> bool {
@@ -215,17 +207,25 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
 
 /// Shell text: each simple command (split on `; & | ( ) \` newline { }`) is
 /// checked like an argv. Text straight from a real argv (depth 1) is split
-/// quote-aware and a quoted separator only stays literal in the arguments of
-/// an [`INERT`] program; everything else, and any doubt, splits naively.
-/// Text that may redefine a command name is split naively too.
-/// Deeper text was cut on whitespace with its quotes still on, so it is
-/// always split naively. That gate is close to redundant: such a word holds no
-/// blank, so an inert program never has an argument in it to protect, and a
-/// quoted word or a nested quote already falls to the naive cut. It stays as
-/// the cheap guarantee that nesting cannot loosen the scan.
+/// quote-aware, and a quoted separator stays literal only when every command
+/// is an [`INERT`] program or a [`FILLER`] (seen through the naive cut).
+/// Anything else, and any doubt, splits the whole text naively. Deeper text
+/// (cut on whitespace, quotes still on) always does: that gate is close to
+/// redundant, as such a word holds no blank, and stays so nesting cannot
+/// loosen the scan.
 fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
-    let quote_aware = depth == 1 && !redefines_a_command(payload);
-    let parts = quote_aware.then(|| split_quoted(payload)).flatten();
+    let filler = |q: &str| {
+        q.split_whitespace()
+            .next()
+            .is_none_or(|f| FILLER.contains(&f))
+    };
+    let parts = (depth == 1)
+        .then(|| split_quoted(payload))
+        .flatten()
+        .filter(|ps| {
+            ps.iter()
+                .all(|p| inert(p) || naive(p).into_iter().all(filler))
+        });
     let segs = match parts {
         Some(parts) => parts
             .into_iter()

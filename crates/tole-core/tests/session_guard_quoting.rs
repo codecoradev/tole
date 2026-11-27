@@ -257,7 +257,9 @@ fn a_link_to_the_running_executable_is_still_refused_next_to_quotes() {
 
 #[test]
 fn a_redefined_command_name_is_not_inert() {
-    // `grep` and `ls` here run `eval`, so the quoted text is a program.
+    // `grep` and `ls` here run `eval`, so the quoted text is a program. The
+    // quote-aware cut applies only when every command is inert or a filler,
+    // whatever the spelling of the definition.
     for text in [
         "grep(){ eval \"$@\"; }; grep \"a;tole x\"",
         "ls(){ eval \"$1\"; }; ls 'a;tole x'",
@@ -267,12 +269,33 @@ fn a_redefined_command_name_is_not_inert() {
         "function ls() { eval \"$1\"; }; ls 'a;tole x'",
         "cat(){ sh -c \"$1\"; }; cat \"a;tole x\"",
         "alias grep=eval; grep 'a;tole x'",
+        "\\alias grep=eval\ngrep \"a;tole x\"",
+        "\"alias\" grep=eval\ngrep \"a;tole x\"",
+        "'alias' grep=eval\ngrep \"a;tole x\"",
+        "al\"\"ias grep=eval\ngrep \"a;tole x\"",
+        "al\\\nias grep=eval\ngrep \"a;tole x\"",
+        "x=alias\n$x grep=eval\ngrep \"a;tole x\"",
+        "eval \"alias grep=eval\"\ngrep \"a;tole x\"",
+        "shopt -s expand_aliases\n\\alias grep=eval\ngrep \"a;tole x\"",
+        "grep \"a|b\" ; \\alias ls=eval\nls \"a;tole x\"",
+        "grep(\\\n){ eval \"$@\"; }; grep \"a;tole x\"",
+        "grep( \\\n ){ eval \"$@\"; }; grep \"a;tole x\"",
+        "fun\\\nction grep { eval \"$@\"; }; grep \"a;tole x\"",
     ] {
         assert!(shell(text), "must refuse: {text:?}");
     }
-    // Only text that has the shape of a definition loses the quote-aware cut.
-    assert!(!shell("grep -E \"function|alias\" f"));
-    assert!(!shell("grep -E \"a|tole\" f"));
+    // Inert programs and fillers together keep the quote-aware cut.
+    for text in [
+        "grep -E \"function|alias\" f",
+        "grep -E \"a|tole\" f",
+        "grep \"a|tole\" f; echo ok",
+        "cd src && grep -rn \"a;tole\" . ; pwd",
+        "echo start\ngrep \"a|tole\" f | wc -l && true",
+        "ls \"a|tole\" || false",
+        ": ; cat \"a;tole\"",
+    ] {
+        assert!(!shell(text), "must allow: {text:?}");
+    }
 }
 
 #[test]
