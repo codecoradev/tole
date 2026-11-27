@@ -30,7 +30,6 @@ fn a_quoted_pattern_that_mentions_tole_passes() {
         "sh -c \"grep -E 'a|tole' file\"",
         "bash -c 'cat x | grep -E \"a;tole|b&tole\"'",
         "bash -lc 'grep -rn \"(tole)\" src && echo done'",
-        "sh -c 'FOO=1 grep -E \"a|tole\" f'",
     ] {
         assert!(!line(line_), "must allow: {line_}");
     }
@@ -311,5 +310,22 @@ fn what_the_inert_list_does_not_cover_is_still_refused() {
         "/bin/grep \"a|tole\" f",
     ] {
         assert!(shell(text), "refused by design: {text:?}");
+    }
+}
+
+/// A leading assignment keeps a part from being inert: its quoted value can hold
+/// a blank and a word that looks like the program, and the scan reads words, not
+/// quotes (review of #1298). Each of these runs tole in a shell.
+#[test]
+fn an_assignment_prefix_is_never_inert() {
+    for text in [
+        "X='a;tole grep b' tole cron resume j",
+        "A='1 ls 2|tole' tole x",
+        "X=\"a;tole grep\" tole x",
+        "FOO=1 grep -E \"a|tole\" f",
+        // Rust cuts words at NBSP, a shell does not: no blank here for the shell.
+        "X='a;tole'\u{a0}grep tole",
+    ] {
+        assert!(shell(text), "must refuse: {text:?}");
     }
 }

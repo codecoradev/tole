@@ -157,9 +157,15 @@ fn naive(s: &str) -> Vec<&str> {
     s.split(SEPARATORS).collect()
 }
 
+/// Words cut at space and tab only (a shell keeps NBSP, `\r`, `\v` in a word).
+fn blank_words(seg: &str) -> impl Iterator<Item = &str> {
+    seg.split([' ', '\t']).filter(|w| !w.is_empty())
+}
+
+/// Inert only when the first word is an [`INERT`] program: a leading assignment
+/// may hold a quoted blank (`X='a;tole grep b' tole x` runs tole).
 fn inert(seg: &str) -> bool {
-    let mut words = seg.split_whitespace().skip_while(|w| is_assignment(w));
-    words.next().is_some_and(|w| INERT.contains(&w))
+    blank_words(seg).next().is_some_and(|w| INERT.contains(&w))
 }
 
 /// Split shell text at the separators the shell acts on, keeping quoted text
@@ -214,11 +220,7 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
 /// redundant, as such a word holds no blank, and stays so nesting cannot
 /// loosen the scan.
 fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
-    let filler = |q: &str| {
-        q.split_whitespace()
-            .next()
-            .is_none_or(|f| FILLER.contains(&f))
-    };
+    let filler = |q: &str| blank_words(q).next().is_none_or(|f| FILLER.contains(&f));
     let parts = (depth == 1)
         .then(|| split_quoted(payload))
         .flatten()
