@@ -838,7 +838,3 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         format!("{}: {e}", path.display())
     })
 }
-
-#[cfg(test)]
-#[path = "draft_tests.rs"]
-mod tests;

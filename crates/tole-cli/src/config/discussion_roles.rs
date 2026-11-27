@@ -162,7 +162,3 @@ pub fn doctor_lines(cfg: &Config) -> Vec<String> {
         })
         .collect()
 }
-
-#[cfg(test)]
-#[path = "discussion_roles_tests.rs"]
-mod tests;

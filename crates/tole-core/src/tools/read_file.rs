@@ -11,9 +11,10 @@
 //! A regular file with more than one hard link is withheld by `read_file`
 //! (Unix only, #703): it may be a sensitive file under another name.
 
+use super::file_tools::refusal;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Hard cap on file size (bytes) — a runaway read (e.g. pointing at a
 /// dataset) must not blow up the durable log / provider context.
@@ -70,12 +71,11 @@ impl ReadFileTool {
         // are NOT is_absolute() yet escape via join; a substring ".." both
         // misses them and rejects benign names. Require all-normal
         // components.
-        use std::path::Component;
         let all_normal = rel_path
             .components()
             .all(|c| matches!(c, Component::Normal(_)));
         if !all_normal {
-            return Err(format!("read_file: path escapes the jail: {rel}"));
+            return Err(refusal("read_file", &self.root, rel));
         }
         let target = self.root.join(rel_path);
         if !target.exists() {
@@ -89,7 +89,7 @@ impl ReadFileTool {
             .canonicalize()
             .map_err(|_| format!("read_file: not found in jail: {rel}"))?;
         if canon_target != canon_root && !canon_target.starts_with(&canon_root) {
-            return Err(format!("read_file: path escapes the jail: {rel}"));
+            return Err(refusal("read_file", &self.root, rel));
         }
         Ok(canon_target)
     }

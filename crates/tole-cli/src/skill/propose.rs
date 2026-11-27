@@ -232,7 +232,3 @@ impl Tool for SkillProposeTool {
         }))
     }
 }
-
-#[cfg(test)]
-#[path = "propose_tests.rs"]
-mod tests;

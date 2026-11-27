@@ -16,7 +16,10 @@ continuity, infra facts.
   `tui` feature).
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
-  `./target/release/tole`, never a PATH-resolved one.
+  `./target/release/tole`, never a PATH-resolved one. (From inside a tole
+  session this is not possible: `run_command` refuses a program written as a
+  path, #1286, and the session guard refuses the tole binary under any name,
+  #684. Run the build from a host shell.)
 - `crates/tole-desktop-model` — the desktop's view state, reducers, design
   tokens and string table (#1028). Not published. No GUI toolkit and no tole
   dependency, so the compiler keeps the toolkit out of it.
@@ -107,7 +110,7 @@ continuity, infra facts.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250), the size guard (#1251) and the unsafe opt-in list (#1252); exits 1 on a crate without a kind, a dependency that points upward, a UI toolkit below a ui or bin crate, a file over 500 lines or a crate src/ over 50,000 that is not in scripts/arch-size-allow.txt, an allow-list entry that no longer matches, an unsafe_code opt-in without a SAFETY comment or not in the AGENTS.md list, or a crate without the workspace lints
+scripts/arch-check.sh         # crate kinds and the crate dependency matrix (#1250), the size guard (#1251), the unsafe opt-in list (#1252) and the .cora.yaml silencing (#1249: whitelists over the file parsed with PyYAML, and the binary-only scope of the index-breaking-change entry proven with rustc's dep-info after a `cargo check`); exits 1 on a crate without a kind, a dependency that points upward, a UI toolkit below a ui or bin crate, a file over 500 lines or a crate src/ over 50,000 that is not in scripts/arch-size-allow.txt, an allow-list entry that no longer matches, an unsafe_code opt-in without a SAFETY comment or not in the AGENTS.md list, a crate without the workspace lints, or an `ignore.files` / `review.exclude` glob, an `ignore.rules` string or a key of .cora.yaml outside the whitelists, or the rule named outside its scoped entry, or a scoped file that does not exist, is not compiled into a bin target or is compiled into a lib target of any workspace crate (exit 2 when PyYAML, cargo or the dep-info is missing)
 # only when you add or update a dependency (Cargo.toml / Cargo.lock; #1253): licence gate, needs the pinned cargo-deny (version in security.yml)
 cargo deny check licenses bans sources   # exits 1 on a licence outside deny.toml, a banned crate or a non-crates.io source
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
