@@ -37,12 +37,18 @@ listed in AGENTS.md between the unsafe-opt-ins marker comments. Nothing is
 tolerated silently: a site, a list entry or a manifest that does not match is
 an error, and a list that cannot be read is a failed run (exit 2).
 
-cora: `index-breaking-change` may be silenced in .cora.yaml only by a scoped
-`ignore.rules` entry listing exact `crates/<name>/src/*.rs` files (the parsed
-document, via PyYAML: no other string, key or value may name the rule). Those
-files must be compiled into a bin target and into no lib target of any workspace
-crate; the proof is rustc's own dep-info after `cargo check --workspace --lib
---bins --offline`, so `mod`, `#[path]`, `include!` and macros are all covered.
+cora: the parsed .cora.yaml (PyYAML) is held to whitelists. `ignore.files` and
+`review.exclude` hold only lock-file, target, docs or `crates/*/tests` globs;
+`ignore` and `review` hold only known keys; a plain `ignore.rules` string is
+neither a pattern nor part of the rule id or the finding text; and
+`index-breaking-change` is silenced only by a scoped `ignore.rules` entry listing
+exact `crates/<name>/src/**/*.rs` files (no other string, key or value of the
+document may name it). Those files must be compiled into a bin target and into no
+lib target of any workspace crate; the proof is rustc's own dep-info after
+`cargo check --workspace --lib --bins --offline`, so `mod`, `#[path]`, `include!`
+and macros are covered. It is a tripwire against the known ways to silence the
+rule, not a proof against every config semantic of cora (never run here), and
+it sees the default features of one platform only (CONTRIBUTING, "Cora Workflow").
 """
 import json
 import os
@@ -96,11 +102,17 @@ _LIST_ENTRY = re.compile(r"^\s*[-*]\s+`([^`]+)`")
 _WORKSPACE_LINT = re.compile(r'^\[workspace\.lints\.rust\][^\[]*?^\s*unsafe_code\s*=\s*"deny"', re.M | re.S)
 _CRATE_LINT = re.compile(r"^\[lints\][^\[]*?^\s*workspace\s*=\s*true\s*(?:#.*)?$", re.M | re.S)
 
-# Cora scope guard: the one rule that may be silenced, and only for binary-only files.
+# Cora scope guard: whitelists for the keys that can silence a finding.
 CORA_CONFIG = ".cora.yaml"
 CORA_RULE = "index-breaking-change"
+CORA_MESSAGE = "symbol `x` is being removed but has n caller(s)"  # the finding text, lower case
+CORA_WORDS = {"index", "breaking", "change", "symbol", "removed", "removing", "caller", "callers"}
+CORA_KEYS = {"ignore": {"files", "rules"}, "review": {"exclude", "max_chunk_chars", "fail_on_incomplete"}}
+CORA_MAX_BYTES = 1 << 20
 CORA_HINT = "read CONTRIBUTING.md, section 'Cora Workflow', before changing this entry"
-_CORA_FILE = re.compile(r"^crates/[\w.-]+/src/(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.rs$")
+_CORA_FILE = re.compile(r"crates/[\w.-]+/src/(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.rs")
+# the only globs that may leave the symbol index or the reviewed diff: tests, docs, lock files, target
+_CORA_GLOB = re.compile(r"(?:crates/(?:\*|[\w.-]+)/tests/|docs/|target/)[\w./*-]*|[\w*.-]*\.lock|CHANGELOG\.md")
 
 findings = []  # (severity, text)
 
@@ -350,71 +362,111 @@ def cora_norm(text):
     return str(text).strip().lower().replace("_", "-")
 
 
+def cora_plain(text):
+    """True for a plain `ignore.rules` string that cannot be a pattern for the rule: no glob or
+    regex character, no part of the rule id or of the finding text, none of their words."""
+    norm = cora_norm(text)
+    return (isinstance(text, str) and not set(text) & set("*?[](){}.|^$+\\")
+            and not any(norm in known for known in (CORA_RULE, CORA_MESSAGE))
+            and not set(re.findall(r"[a-z]+", norm)) & CORA_WORDS)
+
+
 def load_cora(raw, report=error):
-    """The parsed .cora.yaml (PyYAML, duplicate keys refused). No PyYAML: RuntimeError (exit 2)."""
+    """The parsed .cora.yaml (PyYAML, duplicate keys refused). No PyYAML, a file over 1 MiB or
+    nesting too deep for the parser: RuntimeError (exit 2)."""
     try:
         import yaml
     except ImportError:
         raise RuntimeError("PyYAML is needed to read .cora.yaml (apt: python3-yaml) and was not found: the cora check cannot run")
+    if len(raw) > CORA_MAX_BYTES:
+        raise RuntimeError(f"{CORA_CONFIG} is over {CORA_MAX_BYTES} bytes: not parsed")
 
     class Strict(yaml.SafeLoader):
         pass
 
     def mapping(loader, node, deep=False):
         keys = [loader.construct_object(key, deep=True) for key, _ in node.value]
-        if any(keys.count(key) > 1 for key in keys):
+        try:
+            duplicate = len(set(keys)) != len(keys)
+        except TypeError:
+            raise yaml.YAMLError("a mapping key cannot be hashed")
+        if duplicate:
             raise yaml.YAMLError("a mapping has a duplicate key")
         return yaml.SafeLoader.construct_mapping(loader, node, deep)
 
     Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
     try:
         return yaml.load(raw, Strict)
+    except RecursionError:
+        raise RuntimeError(f"{CORA_CONFIG} is nested too deeply to parse")
     except yaml.YAMLError as err:
         report(CORA_CONFIG, 1, f"not understood as YAML (duplicate keys, merge keys and custom tags are refused): {err}; {CORA_HINT}")
 
 
 def check_cora_config(data, report=error, path=CORA_CONFIG):
-    """The files of the scoped `index-breaking-change` entries of `ignore.rules`, from the parsed document.
+    """Whitelist the parsed document and return the files of its scoped `index-breaking-change` entries.
 
-    The rule may be silenced only by `- rule: <name>` entries with a `files:` list of exact
-    crates/<name>/src/**/*.rs paths; no other string, key or value of the whole document may
-    name it (`index-breaking`, `breaking-change`, any case, `-` or `_`), and no plain
-    `ignore.rules` string may contain `breaking`.
+    `ignore` and `review` hold only known keys; `ignore.files` and `review.exclude` only lock-file,
+    target, docs or crates/*/tests globs; a plain `ignore.rules` string (or the `rule` of another
+    entry) only text that is no pattern and no part of the rule id or finding text; the rule itself
+    only a `- rule: <name>` entry whose `files:` are exact crates/<name>/src/**/*.rs paths. No other
+    string, key or value of the document may name it (`index-breaking`, `breaking-change`, any case,
+    `-` or `_`). The input is not changed.
     """
-    ignore = data.get("ignore") if isinstance(data, dict) else None
-    rules = ignore.get("rules") if isinstance(ignore, dict) else None
-    if data is not None and not isinstance(data, dict) or ignore is not None and not isinstance(ignore, dict) or rules is not None and not isinstance(rules, list):
-        report(path, 1, f"the document, `ignore` or `ignore.rules` has an unexpected type: {CORA_HINT}")
+    def bad(msg):
+        report(path, 1, f"{msg}: {CORA_HINT}")
+
+    if data is None:
         return []
-    files = []
-    for i, item in enumerate(rules or []):
-        name = item.get("rule") if isinstance(item, dict) else item
-        if not (isinstance(item, str) or isinstance(item, dict) and set(item) <= {"rule", "files", "reason"} and isinstance(name, str)):
-            report(path, 1, f"ignore.rules[{i}] is not a string or a rule/files/reason entry: {CORA_HINT}")
-        elif isinstance(item, dict) and cora_norm(name) == CORA_RULE:
-            listed = item.get("files")
-            if not (isinstance(listed, list) and listed and all(isinstance(f, str) and _CORA_FILE.match(f) for f in listed)):
-                report(path, 1, f"ignore.rules[{i}]: {CORA_RULE} needs a non-empty `files:` list of exact crates/<name>/src/*.rs paths: {CORA_HINT}")
-            else:
-                files += listed
-            item["rule"] = None  # the one place the name may stand
-        elif "breaking" in cora_norm(name):
-            report(path, 1, f"ignore.rules[{i}] mentions `breaking`: a global or unreadable silence of {CORA_RULE}: {CORA_HINT}")
-    stack = [data]
+    if not isinstance(data, dict):
+        bad("the document is not a mapping")
+        return []
+    files, scoped = [], set()
+    for section, allowed in CORA_KEYS.items():
+        block = data.get(section)
+        if block is None:
+            continue
+        if not isinstance(block, dict) or not set(block) <= allowed:
+            bad(f"`{section}` must be a mapping with only the keys {sorted(allowed)}")
+            continue
+        for key in ("files", "exclude"):
+            globs = block.get(key, [])
+            for glob in globs if isinstance(globs, list) else [globs]:
+                if not (isinstance(glob, str) and _CORA_GLOB.fullmatch(glob) and ".." not in glob.split("/")):
+                    bad(f"{section}.{key}: {glob!r} is not a lock file, target, docs or crates/*/tests glob; anything else can hide source from the index or the review")
+        rules = block.get("rules", []) if section == "ignore" else []
+        if not isinstance(rules, list):
+            bad("ignore.rules is not a list")
+            rules = []
+        for i, item in enumerate(rules):
+            name = item.get("rule") if isinstance(item, dict) else item
+            entry = isinstance(item, dict) and set(item) <= {"rule", "files", "reason"}
+            if entry and isinstance(name, str) and cora_norm(name) == CORA_RULE:
+                listed = item.get("files")
+                if isinstance(listed, list) and listed and all(isinstance(f, str) and _CORA_FILE.fullmatch(f) for f in listed):
+                    files += listed
+                    scoped.add(id(item))
+                else:
+                    bad(f"ignore.rules[{i}]: {CORA_RULE} needs a non-empty `files:` list of exact crates/<name>/src/**/*.rs paths")
+            elif not (isinstance(item, str) or entry) or not cora_plain(name):
+                bad(f"ignore.rules[{i}] is not a plain rule string or a rule/files/reason entry, or could match {CORA_RULE} (glob or regex character, part of its id or message)")
+    seen, stack = set(), [data]
     while stack:
         node = stack.pop()
-        if isinstance(node, dict):
-            stack += list(node) + list(node.values())
-        elif isinstance(node, (list, tuple, set)):
-            stack += list(node)
+        if isinstance(node, (dict, list, tuple, set)):
+            if id(node) not in seen:  # aliases and cycles are walked once
+                seen.add(id(node))
+                stack += list(node)
+                if isinstance(node, dict):
+                    stack += [v for k, v in node.items() if not (k == "rule" and id(node) in scoped)]
         elif node is not None and any(w in cora_norm(node) for w in ("index-breaking", "breaking-change")):
-            report(path, 1, f"{str(node)[:60]!r} names {CORA_RULE} outside a scoped ignore.rules entry: {CORA_HINT}")
+            bad(f"{str(node)[:60]!r} names {CORA_RULE} outside a scoped ignore.rules entry")
     return sorted(set(files))
 
 
 def dep_info(root, path):
-    """The source files rustc loaded for one target, from its makefile-style dep-info (`file:` lines)."""
-    found = {os.path.normpath(os.path.join(root, line[:-1].replace("\\ ", " "))) for line in read_text(path).splitlines() if line.endswith(":")}
+    """The real paths of the source files rustc loaded for one target, from its makefile-style dep-info (`file:` lines)."""
+    found = {os.path.realpath(os.path.join(root, line[:-1].replace("\\ ", " "))) for line in read_text(path).splitlines() if line.endswith(":")}
     if not found:
         raise RuntimeError(f"{path}: no source file listed")
     return found
@@ -422,12 +474,15 @@ def dep_info(root, path):
 
 def check_cora_compiled(root, packages, files, report=error, path=CORA_CONFIG):
     """cargo check the workspace, then ask the compiler's own dep-info: no lib target of any
-    workspace crate may have loaded a scoped file, and a bin target must have."""
+    workspace crate may have loaded a scoped file, and a bin target must have. Paths are compared
+    as real paths (a symlinked root or file cannot hide an `include!`); build scripts are skipped."""
     out = run_cargo(["check", "--workspace", "--lib", "--bins", "--offline", "--message-format=json"], root)
-    dirs, libs, bins = {p["dir"] for p in packages}, set(), set()
+    dirs, libs, bins = {os.path.realpath(p["dir"]) for p in packages}, set(), set()
     for line in out.splitlines():
         msg = json.loads(line)
-        if msg.get("reason") == "compiler-artifact" and os.path.dirname(msg["manifest_path"]) in dirs:
+        if msg.get("reason") != "compiler-artifact" or "custom-build" in msg["target"]["kind"]:
+            continue
+        if os.path.realpath(os.path.dirname(msg["manifest_path"])) in dirs:
             first = msg["filenames"][0]
             name = os.path.splitext(os.path.basename(first))[0]
             used = dep_info(root, os.path.join(os.path.dirname(first), (name[3:] if name.startswith("lib") else name) + ".d"))
@@ -435,7 +490,7 @@ def check_cora_compiled(root, packages, files, report=error, path=CORA_CONFIG):
     if not bins:
         raise RuntimeError("cargo reported no bin target of the workspace: binary-only cannot be proven")
     for rel in files:
-        full = os.path.normpath(os.path.join(root, rel))
+        full = os.path.realpath(os.path.join(root, rel))
         if not os.path.isfile(full):
             report(path, 1, f"{rel}: does not exist: {CORA_HINT}")
         elif full in libs:

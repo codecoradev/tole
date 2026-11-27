@@ -718,6 +718,9 @@ class CoraConfig(unittest.TestCase):
             "directory": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"),
             "parent path": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/../lib.rs"),
             "not a src file": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/tests/serve.rs"),
+            "outside crates/": CORA_OK.replace("crates/a/src/serve.rs", "vendor/a/src/serve.rs"),
+            "crates/ not at the start": CORA_OK.replace("crates/a/src/serve.rs", "x/crates/a/src/serve.rs"),
+            "trailing newline": CORA_OK.replace('serve.rs"', 'serve.rs\\n"'),
             "other key": CORA_OK.replace("      reason:", "      paths: x\n      reason:"),
             "item that is a list": CORA_OK.replace('"bug-todo"', "[a]"),
             "item that is null": CORA_OK.replace('"bug-todo"', "~"),
@@ -737,6 +740,69 @@ class CoraConfig(unittest.TestCase):
                 found = cora_cfg(text)[1]
                 self.assertTrue(found, name)
                 self.assertIn("Cora Workflow", found[0], name)
+
+    def test_ignore_files_and_review_exclude_are_whitelists(self):
+        def with_glob(glob):
+            return {"ignore.files": CORA_OK.replace('    - "*.lock"\n', f'    - "*.lock"\n    - "{glob}"\n'),
+                    "review.exclude": CORA_OK.replace('exclude: ["CHANGELOG.md"]', f'exclude: ["CHANGELOG.md", "{glob}"]')}
+        for glob in ("crates/*/tests/**", "crates/tole-core/tests/**", "crates/*/tests/**/*.rs", "docs/**", "docs/*.md", "target/", "target/**",
+                     "*.lock", "Cargo.lock", "CHANGELOG.md"):
+            for where, text in with_glob(glob).items():
+                with self.subTest(where=where, ok=glob):
+                    self.assertEqual(cora_cfg(text), (SCOPED, []))
+        for glob in ("crates/tole-core/src/**", "*.rs", "crates/**", "**/src/**", "**", "*", "", "src/**", "crates/tole-cli/src/lib.rs", "crates/*/src/**",
+                     "crates/*/tests", "docs/../crates/**", "crates/*/tests/../src/**", "target/../src/**", "{crates,docs}/**", "docs/**\\n"):
+            for where, text in with_glob(glob).items():
+                with self.subTest(where=where, bad=glob):
+                    found = cora_cfg(text)[1]
+                    self.assertTrue(found)
+                    self.assertIn("Cora Workflow", found[0])
+        for name, text in {"files is a string": CORA_OK.replace('  files:\n    - "*.lock"', '  files: "*.rs"'),
+                           "exclude is a map": CORA_OK.replace('exclude: ["CHANGELOG.md"]', "exclude: {a: b}"),
+                           "files is null": CORA_OK.replace('  files:\n    - "*.lock"', "  files: ~")}.items():
+            with self.subTest(name):
+                self.assertTrue(cora_cfg(text)[1])
+
+    def test_unknown_ignore_and_review_keys_are_refused(self):
+        for text in (CORA_OK.replace("  files:\n    - \"*.lock\"", "  paths: [crates/**]\n  files: []"),
+                     CORA_OK.replace("review:\n", "review:\n  skip: [crates/**]\n"), CORA_OK.replace("review:\n  exclude: [\"CHANGELOG.md\"]", "review: [a]"),
+                     CORA_OK.replace("ignore:\n", "ignore:\n  rule_ids: [x]\n")):
+            self.assertTrue(cora_cfg(text)[1], text)
+        self.assertEqual(cora_cfg(CORA_OK.replace("review:\n", "review:\n  max_chunk_chars: 1\n  fail_on_incomplete: true\n")), (SCOPED, []))
+
+    def test_a_plain_rule_string_may_not_be_a_pattern_or_part_of_the_rule(self):
+        def with_rule(name):
+            return CORA_OK.replace('    - "bug-todo"\n', f'    - "bug-todo"\n    - {json.dumps(name)}\n')
+        def with_other_entry(name):
+            return CORA_OK.replace("    - rule: other-rule", f"    - rule: {json.dumps(name)}\n    - rule: other-rule")
+        for name in ("Hardcoded password or secret", "Command injection via exec/system with dynamic input", "qual-clone", "sec-hardcoded-url", "other_rule"):
+            with self.subTest(ok=name):
+                self.assertEqual(cora_cfg(with_rule(name)), (SCOPED, []))
+        for name in ("Symbol", "is being removed", "removed", "caller(s)", "Symbol `x` is being removed", "index-", "-change", "index_b", "e", "Index Change",
+                     "Breaking change", "callers", "index-*", ".*", "*", "?", "[i]ndex-breaking-change", "index|x", "^index", "x$", "(a)", "a+", "a\\b", "", " "):
+            for make in (with_rule, with_other_entry):
+                with self.subTest(bad=name, make=make.__name__):
+                    self.assertTrue(cora_cfg(make(name))[1])
+
+    def test_the_input_is_not_changed(self):
+        import copy
+        data = arch.load_cora(CORA_OK.encode())
+        before = copy.deepcopy(data)
+        arch.check_cora_config(data)
+        self.assertEqual(data, before)
+
+    def test_aliases_cycles_and_hostile_files_do_not_hang_or_blow_up(self):
+        bomb = "a: &a [x, x, x, x, x, x, x, x, x, x]\n" + "".join(
+            f"{chr(98 + i)}: &{chr(98 + i)} [{', '.join('*' + chr(97 + i) for _ in range(10))}]\n" for i in range(12))
+        self.assertEqual(cora_cfg(CORA_OK + bomb), (SCOPED, []))
+        self.assertEqual(cora_cfg(CORA_OK + "loop: &l [*l]\n"), (SCOPED, []))
+        self.assertTrue(cora_cfg(CORA_OK + "? [a]\n: 1\n")[1])  # an unhashable key
+        with self.assertRaises(RuntimeError) as big:
+            arch.load_cora(b"#" * ((1 << 20) + 1))
+        self.assertIn("bytes", str(big.exception))
+        with self.assertRaises(RuntimeError) as deep:
+            arch.load_cora(b"[" * 100000)
+        self.assertIn("too deeply", str(deep.exception))
 
     def test_the_committed_config_names_existing_src_files(self):
         root = os.path.dirname(HERE)
@@ -776,8 +842,13 @@ CARGO = {
 }
 
 
-def cora_run(files, extra_env=None, cargo=None):
-    """Run `arch-check.sh cora` on a real tiny workspace (real `cargo check --offline`)."""
+class Link(str):
+    """A workspace file that is a symbolic link to this (relative) target."""
+
+
+def cora_run(files, extra_env=None, cargo=None, via_link=False):
+    """Run `arch-check.sh cora` on a real tiny workspace (real `cargo check --offline`);
+    `via_link` hands the script a symbolic link to the workspace root."""
     with tempfile.TemporaryDirectory() as d:
         root = os.path.join(d, "ws")
         workspace_files = {**CARGO, **files}
@@ -785,8 +856,14 @@ def cora_run(files, extra_env=None, cargo=None):
             if content is not None:
                 path = os.path.join(root, rel)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as f:
-                    f.write(content)
+                if isinstance(content, Link):
+                    os.symlink(content, path)
+                else:
+                    with open(path, "w") as f:
+                        f.write(content)
+        if via_link:
+            os.symlink(root, os.path.join(d, "link"))
+            root = os.path.join(d, "link")
         env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(d, "target"), **(extra_env or {}))
         if cargo:
             env["CARGO"] = cargo(d, root)
@@ -828,6 +905,25 @@ class CoraCompiled(unittest.TestCase):
         }.items():
             with self.subTest(name):
                 self.fails_as_lib(files, name)
+
+    def test_a_proc_macro_and_a_cdylib_lib_count_as_libs(self):
+        take = '#[path = "../../a/src/serve.rs"]\nmod s;\n'
+        for name, kind in {"proc-macro": "proc-macro = true", "cdylib": 'crate-type = ["cdylib"]'}.items():
+            with self.subTest(name):
+                self.fails_as_lib({"crates/b/Cargo.toml": CARGO["crates/b/Cargo.toml"] + f"[lib]\n{kind}\n", "crates/b/src/lib.rs": take}, name)
+
+    def test_a_symlink_cannot_hide_a_scoped_file_from_the_comparison(self):
+        by_manifest_dir = 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve.rs"));\n'
+        self.assertEqual(cora_run({}, via_link=True)[0], 0)
+        rc, out = cora_run({"crates/a/src/lib.rs": by_manifest_dir}, via_link=True)  # rustc lists the real path, the script got the link
+        self.assertEqual((rc, "compiled into a library target" in out), (1, True), out)
+        self.fails_as_lib({"crates/a/src/alias.rs": Link("serve.rs"), "crates/a/src/lib.rs": "mod alias;\n"}, "alias of a scoped file")
+        self.fails_as_lib({"crates/b/src/other.rs": Link("../../a/src/serve.rs"), "crates/b/src/lib.rs": "mod other;\n"}, "link into another crate")
+
+    def test_a_crate_with_a_build_script_is_not_a_failure(self):
+        rc, out = cora_run({"crates/a/build.rs": "fn main() {}\n", "crates/b/build.rs": "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("arch-check (cora): ok", out)
 
     def test_a_listed_file_must_exist_and_be_compiled_into_a_bin(self):
         rc, out = cora_run({".cora.yaml": CORA_OK.replace("serve.rs", "gone.rs")})
