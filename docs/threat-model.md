@@ -1259,7 +1259,10 @@ them. Two layers close the direct routes; neither is a boundary.
   command of the text is a program none of whose options runs a program
   (`grep`, `egrep`, `fgrep`, `ls`, `cat`, `head`, `tail`, `wc`) or a filler
   that cannot change what those names mean (`echo`, `true`, `false`, `:`,
-  `cd`, `pwd`), so `grep -E "a|tole"` passes (#1287). `rg` is not on that list (`--pre`, `--pre-glob`,
+  `cd`, `pwd`), so `grep -E "a|tole"` passes (#1287). The program is the
+  first word of the command, cut at space and tab as a shell does, with no
+  assignment before it (a quoted value can hold a blank and a word that looks
+  like the program: `X='a;tole grep b' tole x` runs tole). `rg` is not on that list (`--pre`, `--pre-glob`,
   `--hostname-bin` and `-z` run programs), nor are `echo` and `printf`.
   For every other program, and whenever the scan is unsure (unbalanced
   quote, comment, here-document, `$'..'`, a command substitution or any
