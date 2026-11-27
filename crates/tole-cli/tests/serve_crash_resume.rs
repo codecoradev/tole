@@ -20,9 +20,10 @@
 //! What is pinned, and where the answer is not "it just works":
 //! - A turn killed while the provider is answering leaves its user message
 //!   durable and no settle. `tole resume <id>` finishes that turn in the same
-//!   session; over serve nothing does yet (#1230): a prompt answers a defined
-//!   409 `{"error": "interrupted turn", "state": "planning"}` (step 1). One test
-//!   pins it, one states what #1230 asks for (accepted, or that 409).
+//!   session; over serve a resume settles it itself (#1230): the answer says
+//!   `"interrupted": true`, the prompt that was cut off is not answered, and the
+//!   next prompt is accepted. Two tests pin it, with a second resume and a
+//!   resume during a running turn.
 //! - A parked approval is in memory and is gone after a kill (documented in
 //!   `docs/desktop-design.md`, "Crash or restart"); the session resumes, the
 //!   write has not run, the model asks again, and one allow settles one write.
@@ -92,7 +93,8 @@ fn api_entries(serve: &Serve, id: &str) -> Vec<Value> {
     page["entries"].as_array().unwrap().clone()
 }
 
-fn resume_over_serve(serve: &Serve, id: &str, ctx: &str) {
+/// `POST /sessions {"resume"}` on a session the server does not host: the answer.
+fn resume_over_serve(serve: &Serve, id: &str, ctx: &str) -> Value {
     let (code, body) = serve.http(
         "POST",
         "/sessions",
@@ -100,6 +102,7 @@ fn resume_over_serve(serve: &Serve, id: &str, ctx: &str) {
     );
     assert_eq!(code, 200, "{ctx}: {body}");
     assert_eq!(body["resumed"], true, "{ctx}: {body}");
+    body
 }
 
 /// `tole resume <id>` on the serve's sessions directory: the documented
@@ -117,10 +120,9 @@ fn wait_for_the_log_to_hold(serve: &Serve, id: &str, needle: &str) {
     });
 }
 
-/// A serve killed while its provider holds a prompt, and a new serve over the
-/// same workspace that has resumed the session. `(first, second, id)`: keep
-/// `first` alive, its drop removes the workspace.
-fn killed_mid_turn_then_resumed(base: &str, marker: &str) -> (Serve, Serve, String) {
+/// A serve killed while its provider holds a prompt: `(serve, id)`; the
+/// serve's drop removes the workspace.
+fn killed_mid_turn(base: &str, marker: &str) -> (Serve, String) {
     let mut serve = Serve::spawn(base);
     let id = new_session(&serve);
     let stream = send_prompt(serve.port, &id, marker);
@@ -129,9 +131,7 @@ fn killed_mid_turn_then_resumed(base: &str, marker: &str) -> (Serve, Serve, Stri
     wait_for_the_log_to_hold(&serve, &id, marker);
     serve.kill();
     drop(stream);
-    let second = Serve::spawn_in(base, serve.dir.clone(), false);
-    resume_over_serve(&second, &id, marker);
-    (serve, second, id)
+    (serve, id)
 }
 
 /// Kill a serve at a random point of a turn, again and again: the log always
@@ -202,7 +202,8 @@ fn a_serve_killed_at_a_random_point_in_a_turn_leaves_a_session_that_resumes() {
         // 3. A new serve opens the session, shows exactly what the file holds,
         // and takes a new prompt: one more user message, one more answer.
         let second = Serve::spawn_in(&base, serve.dir.clone(), false);
-        resume_over_serve(&second, &id, &ctx);
+        let opened = resume_over_serve(&second, &id, &ctx);
+        assert!(opened.get("interrupted").is_none(), "{ctx}: {opened}");
         assert_eq!(
             api_seqs(&api_entries(&second, &id)),
             entry_seqs(&now),
@@ -228,55 +229,91 @@ fn a_serve_killed_at_a_random_point_in_a_turn_leaves_a_session_that_resumes() {
     );
 }
 
-/// What #1230 step 1 pins: a session killed with its user message durable and
-/// no settle refuses a prompt with a defined 409 (never a 500) that names the
-/// state, and writes nothing. Recovering the session over serve is step 2.
+/// #1230: a resume settles the turn a kill cut off (no model call, no tool
+/// run, append only) and says so; the interrupted prompt is not answered; a
+/// second resume is a no-op; the next prompt is accepted and answered.
 #[test]
-fn a_session_killed_mid_turn_answers_a_defined_409_to_a_prompt_over_serve() {
+fn a_resume_settles_a_killed_turn_and_the_next_prompt_is_accepted() {
     let base = spawn_mock(1500);
-    let (first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-pinned");
-    let (log, _) = read_log(&first, &id, "pinned");
-    assert_eq!(
-        user_messages_with(&log, "marker-pinned"),
-        1,
-        "the message is durable"
-    );
-    assert_eq!(last_pc(&log).as_deref(), Some("planning"), "no settle");
+    let (first, id) = killed_mid_turn(&base, "slow marker-pinned");
+    let (log, _) = read_log(&first, &id, "killed");
+    assert_eq!(user_messages_with(&log, "marker-pinned"), 1);
+    assert_eq!(last_pc(&log).as_deref(), Some("planning"), "no settle yet");
+    let was = log.len();
 
-    let before = api_seqs(&api_entries(&second, &id));
-    let (code, body) = second.http(
-        "POST",
-        &format!("/sessions/{id}/prompt"),
-        Some(&json!({"text": "next question"}).to_string()),
-    );
-    assert_eq!(code, 409, "{body}");
+    let second = Serve::spawn_in(&base, first.dir.clone(), false);
+    let opened = resume_over_serve(&second, &id, "killed");
+    assert_eq!(opened["interrupted"], true, "{opened}");
+    let (log, _) = read_log(&second, &id, "settled");
     assert_eq!(
-        body,
-        json!({"error": "interrupted turn", "state": "planning"})
+        last_pc(&log).as_deref(),
+        Some("final"),
+        "the turn is settled"
     );
+    assert_eq!(answers(&log), 0, "the interrupted prompt is not answered");
+    assert_eq!(user_messages_with(&log, "marker-pinned"), 1);
+    assert!(log.len() > was, "the settle is appended");
+    let seqs = api_seqs(&api_entries(&second, &id));
+
+    // A second resume finds the session live and settled: nothing to do.
+    let (code, again) = second.http(
+        "POST",
+        "/sessions",
+        Some(&json!({"resume": id}).to_string()),
+    );
+    assert_eq!(
+        (code, &again["alreadyLive"]),
+        (200, &json!(true)),
+        "{again}"
+    );
+    assert!(again.get("interrupted").is_none(), "{again}");
     assert_eq!(
         api_seqs(&api_entries(&second, &id)),
-        before,
-        "a refused prompt writes nothing"
+        seqs,
+        "nothing written"
     );
-}
 
-/// What #1230 asks for: after a resume, a prompt on a session that was killed
-/// mid-turn is accepted, or refused with a defined 409, never a 500. Step 1
-/// gives the 409; once the recovery of step 2 exists this answers 200.
-#[test]
-fn a_session_killed_mid_turn_takes_a_prompt_or_a_defined_409_after_a_resume() {
-    let base = spawn_mock(1500);
-    let (_first, second, id) = killed_mid_turn_then_resumed(&base, "slow marker-wanted");
     let (code, body) = second.http(
         "POST",
         &format!("/sessions/{id}/prompt"),
         Some(&json!({"text": "next question"}).to_string()),
     );
-    assert!(code == 200 || code == 409, "{code}: {body}");
-    if code == 409 {
-        assert_eq!(body["error"], "interrupted turn", "{body}");
-    }
+    assert_eq!(
+        (code, &body["stopReason"]),
+        (200, &json!("end_turn")),
+        "{body}"
+    );
+    let (log, _) = read_log(&second, &id, "next");
+    assert_eq!(user_messages_with(&log, "next question"), 1);
+    assert_eq!(answers(&log), 1, "only the new prompt is answered");
+}
+
+/// A resume while a turn is running answers as before (`busy`) and settles
+/// nothing: the turn finishes and is answered once.
+#[test]
+fn a_resume_during_a_running_turn_settles_nothing() {
+    let base = spawn_mock(1500);
+    let serve = Serve::spawn(&base);
+    let id = new_session(&serve);
+    let _stream = send_prompt(serve.port, &id, "slow marker-running");
+    wait_for_the_log_to_hold(&serve, &id, "marker-running");
+    let (code, body) = serve.http(
+        "POST",
+        "/sessions",
+        Some(&json!({"resume": id}).to_string()),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (&body["alreadyLive"], &body["busy"]),
+        (&json!(true), &json!(true))
+    );
+    assert!(body.get("interrupted").is_none(), "{body}");
+    common::wait_until(common::WAIT, "the turn to be answered", || {
+        answers(&read_log(&serve, &id, "running").0) == 1
+    });
+    let (log, _) = read_log(&serve, &id, "running");
+    assert_eq!(last_pc(&log).as_deref(), Some("final"));
+    assert!(!log.iter().any(|e| e["payload"]["error"] == "interrupted"));
 }
 
 /// A kill while a turn is parked at an approval: the queue row is gone (it is
@@ -316,7 +353,11 @@ fn a_kill_at_a_parked_approval_loses_the_row_but_never_settles_the_write_twice()
         listed(&second).is_empty(),
         "the queue is in memory: it is empty after a kill"
     );
-    resume_over_serve(&second, &id, "approval");
+    let opened = resume_over_serve(&second, &id, "approval");
+    assert!(
+        opened.get("interrupted").is_none(),
+        "parked is not cut off: {opened}"
+    );
     assert!(
         listed(&second).is_empty(),
         "a resume does not bring the row back"
