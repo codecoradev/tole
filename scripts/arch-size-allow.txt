@@ -19,8 +19,8 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 86185
-crate tole-core 66692
+crate tole-cli 84134
+crate tole-core 64831
 file crates/tole-cli/src/acp.rs 1494
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -64,7 +64,7 @@ file crates/tole-cli/src/session/tui.rs 1183
 file crates/tole-cli/src/session/usage.rs 781
 file crates/tole-cli/src/skill/approve.rs 1274
 file crates/tole-cli/src/skill/curator.rs 736
-file crates/tole-cli/src/skill/drafts.rs 536
+file crates/tole-cli/src/skill/drafts.rs 532
 file crates/tole-cli/src/skill/fetch.rs 517
 file crates/tole-cli/src/skill/recall.rs 823
 file crates/tole-cli/src/tool_roster.rs 1389
@@ -97,7 +97,7 @@ file crates/tole-client/src/http.rs 807
 file crates/tole-client/src/sse.rs 540
 file crates/tole-client/src/types.rs 895
 file crates/tole-core/src/action_summary.rs 966
-file crates/tole-core/src/approval.rs 991
+file crates/tole-core/src/approval.rs 610
 file crates/tole-core/src/children/agents.rs 2326
 file crates/tole-core/src/children/handoff.rs 659
 file crates/tole-core/src/children/memory.rs 682
@@ -125,7 +125,6 @@ file crates/tole-core/src/mcp.rs 1700
 file crates/tole-core/src/mcp_server.rs 898
 file crates/tole-core/src/plugin_lock.rs 1095
 file crates/tole-core/src/plugin_lock_tests.rs 933
-file crates/tole-core/src/provider/failover.rs 567
 file crates/tole-core/src/provider/openai.rs 3053
 file crates/tole-core/src/provider/replay.rs 631
 file crates/tole-core/src/run_command.rs 652
@@ -137,14 +136,13 @@ file crates/tole-core/src/secrets/mod.rs 1384
 file crates/tole-core/src/session/storage.rs 1729
 file crates/tole-core/src/skills/approval.rs 1289
 file crates/tole-core/src/skills/curator.rs 705
-file crates/tole-core/src/skills/draft.rs 844
+file crates/tole-core/src/skills/draft.rs 840
 file crates/tole-core/src/skills/index.rs 1605
 file crates/tole-core/src/skills/mod.rs 658
 file crates/tole-core/src/subprocess.rs 633
 file crates/tole-core/src/systemone.rs 681
 file crates/tole-core/src/tool.rs 610
 file crates/tole-core/src/tools/read_file.rs 789
-file crates/tole-core/src/turn/compaction.rs 668
 file crates/tole-core/src/turn/mod.rs 1326
 file crates/tole-core/src/web.rs 2348
 file crates/tole-core/tests/action_summary.rs 684

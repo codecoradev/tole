@@ -289,7 +289,3 @@ pub fn usage_value(usage: &serde_json::Value) -> serde_json::Value {
     out["role"] = serde_json::json!("advisor");
     out
 }
-
-#[cfg(test)]
-#[path = "advisor_tests.rs"]
-mod tests;

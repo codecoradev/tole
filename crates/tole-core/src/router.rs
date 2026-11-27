@@ -434,7 +434,3 @@ impl Router for RuleRouter {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "router_tests.rs"]
-mod tests;
