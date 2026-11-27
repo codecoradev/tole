@@ -94,22 +94,10 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
-/// A blank-cut word that ends in a quote or a backslash, or holds `$'` or a
-/// backslash in single quotes (fish): the value may hold a blank or separator,
-/// so the words after it are not the ones a shell sees (#1302).
-fn open_word(w: &str) -> bool {
-    let (mut q, mut esc) = (None, false);
-    for c in w.chars() {
-        match (q, c, esc) {
-            (_, _, true) => esc = false,
-            (Some('\''), '\\', _) => return true,
-            (_, '\\', _) => esc = true,
-            (Some(k), c, _) if c == k => q = None,
-            (None, '\'' | '"', _) => q = Some(c),
-            _ => {}
-        }
-    }
-    esc || q.is_some() || w.contains("$'")
+/// A word with a quote or backslash: an assignment value may then hold a blank
+/// or a separator, and the cut no longer finds the program (#1302).
+fn quoted(w: &str) -> bool {
+    w.contains(['\\', '\'', '"'])
 }
 
 fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
@@ -118,8 +106,7 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     }
     let words: Vec<String> = argv.iter().map(|w| unquote(w)).collect();
     let i = words.iter().position(|w| !is_assignment(w));
-    let open = |j: usize| is_assignment(&words[j]) && open_word(&argv[j]);
-    if (0..i.unwrap_or(words.len())).any(open) {
+    if argv[..i.unwrap_or(argv.len())].iter().any(|w| quoted(w)) {
         return true;
     }
     let Some(i) = i else { return false };
@@ -129,7 +116,7 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     }
     let b = base(prog);
     if WRAPPERS.contains(&b.as_str()) {
-        return (i + 1..words.len()).any(open)
+        return argv[i + 1..].iter().any(|w| is_assignment(w) && quoted(w))
             || words[i + 1..]
                 .iter()
                 .any(|w| !is_assignment(w) && is_tole(w, cwd, exe));
@@ -234,8 +221,14 @@ fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u3
             .collect(),
         None => naive(payload),
     };
+    // Both cuts, so a word glued by NBSP, CR, VT or FF is never read looser
+    // than the shell-faithful cut alone would (`env {<NBSP>X= tole x`).
     segs.into_iter().any(|seg| {
-        let words: Vec<String> = blank_words(seg).map(String::from).collect();
-        !words.is_empty() && invokes_tole(&words, cwd, exe, depth)
+        let cuts = [
+            blank_words(seg).map(String::from).collect::<Vec<_>>(),
+            seg.split_whitespace().map(String::from).collect(),
+        ];
+        cuts.iter()
+            .any(|w| !w.is_empty() && invokes_tole(w, cwd, exe, depth))
     })
 }

@@ -1,8 +1,9 @@
 //! #1302: a leading assignment whose quoted (or escaped) value holds a blank
 //! hid the program from the guard's word cut (`X='a b' tole x` read `b'` as the
-//! program). Every input here runs tole in bash. The guard refuses when a
-//! leading assignment ends inside a quote, so each is refused, as `sh -c` text
-//! and wrapped.
+//! program). Every input here runs tole in bash. The guard refuses any leading
+//! assignment word that holds a quote or a backslash, at every depth, and cuts
+//! words at space and tab as the shell does without ever reading looser than
+//! `split_whitespace` (which also cuts at NBSP, CR, VT and FF).
 
 use std::path::Path;
 use tole_core::session_guard::check_session_argv;
@@ -96,8 +97,6 @@ fn an_assignment_that_runs_nothing_is_still_allowed() {
         "X=1 grep a f",
         "X=a Y=b ls",
         "FOO=1 grep \"a|b\" f",
-        "X='a' ls",
-        "X=\"ab\" cat f",
         "grep -E \"a|tole\" f",
         "echo \"a|b\"",
         "if grep -q \"a|b\" f; then echo ok; fi",
@@ -119,7 +118,66 @@ fn a_leading_assignment_with_a_quoted_blank_is_refused_even_when_harmless() {
         "X=a\\ b",
         "X='a b'",
         "X=\"$(date)\" cmd",
+        "X='a' ls",
+        "RUSTFLAGS=\"-D warnings\" cargo test",
+        "cd x && CFLAGS='-O2 -g' make",
+        "cd x && FOO=\"$(date)\" make",
+        "env CFLAGS='-O2' make",
     ] {
         assert!(shell(text), "refused by design: {text:?}");
+    }
+}
+
+/// `text` as the argument of one more `sh -c`, single-quoted the way a shell reads it.
+fn wrap(text: &str) -> String {
+    format!("sh -c '{}'", text.replace('\'', r"'\''"))
+}
+
+#[test]
+fn the_assignment_cannot_hide_behind_a_separator_in_nested_text() {
+    // The outer payload is cut at `;` `&` `|` and newline inside the inner
+    // quotes, so the inner layer's `\"` has to show as a quote.
+    for inner in [
+        r#"echo a; X="a b" tole x"#,
+        r#"true;X="a b" tole x"#,
+        r"echo a; X=a\ b tole x",
+        r#"echo a & X="a b" tole x"#,
+        r#"true && X="a b" tole x"#,
+        r#"echo a | X="a b" tole x"#,
+        "echo a\nX=\"a b\" tole x",
+        "echo a; X='a b' tole x",
+        "echo a; X=$'a b' tole x",
+        "echo a; env X='a b' tole x",
+    ] {
+        let one = wrap(inner);
+        let two = wrap(&one);
+        let three = wrap(&two);
+        for text in [one, two, three] {
+            assert!(shell(&text), "must refuse: {text:?}");
+        }
+    }
+    // The reviewer's spelling, with the inner quotes escaped by hand.
+    for text in [
+        r#"sh -c "echo a; X=\"a b\" tole x""#,
+        r#"sh -c "true;X=\"a b\" tole x""#,
+        r#"sh -c "echo a; X=a\\ b tole x""#,
+    ] {
+        assert!(shell(text), "must refuse: {text:?}");
+    }
+}
+
+#[test]
+fn a_glued_blank_never_reads_looser_than_split_whitespace() {
+    // `{` and `}` are cut as separators, so `{<NBSP>X=` is a word to the shell
+    // that the shell-faithful cut cannot take for an assignment; the other cut
+    // does. Refused before #1302, and must stay so.
+    for text in [
+        "env {\u{a0}X= tole x",
+        "env a{\u{a0}b=c tole x",
+        "env a}\rb=c tole x",
+        "env a{\u{b}b=c tole x",
+        "env a{\u{c}b=c tole x",
+    ] {
+        assert!(shell(text), "must refuse: {text:?}");
     }
 }
