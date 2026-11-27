@@ -73,6 +73,7 @@ mod discussions;
 mod events;
 mod hooks;
 mod images;
+mod info;
 mod live_sessions;
 pub mod missions;
 mod models;
@@ -426,6 +427,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
+        ("GET", "/info") => info::route(state),
         ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);

@@ -166,7 +166,7 @@ unless the status column says otherwise.
 | Session list of past sessions (name, folder, last activity) | `GET /sessions/index?limit&cursor` | exists (#572); `GET /sessions` still lists only sessions live in the server process |
 | Model list, set model, set thinking level | `GET /models`, `POST /sessions/{id}/model`, `POST /sessions/{id}/effort` | exists (#574) |
 | Remove or archive a session | none | not planned in any issue read for this note |
-| Server version or capability probe | `GET /health` | `/health` returns `protocol` and `version` next to `status` (#1043) |
+| Server version or capability probe | `GET /health`, `GET /info` | `/health` returns `protocol` and `version` next to `status` (#1043); `/info` (authenticated) adds the feature names (#1024) |
 | Push notification of a pending approval | none | by design (threat model: "no push endpoint in tole"); webhook delivery (#911) exists for the gateway |
 
 I checked the route table by reading the `route` function and the `handle_conn`

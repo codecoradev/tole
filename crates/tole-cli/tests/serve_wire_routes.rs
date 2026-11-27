@@ -30,6 +30,7 @@ fn read_routes_keep_their_shape() {
     // The state of a server nobody has used yet.
     let fresh = [
         ("health", "/health"),
+        ("info", "/info"),
         ("models", "/models"),
         ("sessions_empty", "/sessions"),
         ("sessions_index_empty", "/sessions/index"),
@@ -108,8 +109,9 @@ fn read_routes_keep_their_shape() {
 fn refusals_keep_their_shape() {
     let serve = Serve::spawn(&spawn_mock(0));
     let id = new_session(&serve);
-    let asks: [(&str, &str, bool, Option<&str>); 6] = [
+    let asks: [(&str, &str, bool, Option<&str>); 7] = [
         ("GET", "/sessions", false, None),
+        ("GET", "/info", false, None),
         ("GET", "/health", false, None),
         ("GET", "/no/such/route", true, None),
         ("GET", "/sessions/nope/entries", true, None),

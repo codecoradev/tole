@@ -400,6 +400,16 @@
       "required": ["id","mime","bytes","fnv1a64"],
       "type": "object"
     },
+    "Info": {
+      "description": "`GET /info`: the server's version, the version of the wire contract and the\nnames of what it has. A server older than the route answers `404`, which\n[`Client::info`](crate::Client::info) returns as an error: such a server has\nnone of the features that were added after it. Keys this client does not\nknow are ignored.",
+      "properties": {
+        "features": {"description":"Sorted, stable feature names (`entries`, `events.sse`, `missions`, ...).","items":{"type":"string"},"type":"array"},
+        "protocolVersion": {"description":"The version of the serve wire contract, the same number `GET /health`\nreports as `protocol`.","format":"uint32","minimum":0,"type":"integer"},
+        "version": {"description":"The `tole` binary's version.","type":"string"}
+      },
+      "required": ["version","protocolVersion","features"],
+      "type": "object"
+    },
     "InterruptReply": {
       "description": "The answer to `POST /sessions/{id}/interrupt` (`202`): queued, and\ndelivered at the turn's next safe point.",
       "properties": {
@@ -832,6 +842,7 @@
         "ForkReply": {"$ref":"#/$defs/ForkReply"},
         "Health": {"$ref":"#/$defs/Health"},
         "ImageUploaded": {"$ref":"#/$defs/ImageUploaded"},
+        "Info": {"$ref":"#/$defs/Info"},
         "InterruptReply": {"$ref":"#/$defs/InterruptReply"},
         "Mission": {"$ref":"#/$defs/Mission"},
         "MissionCancelled": {"$ref":"#/$defs/MissionCancelled"},
@@ -849,7 +860,7 @@
         "SkillsState": {"$ref":"#/$defs/SkillsState"},
         "ToolsState": {"$ref":"#/$defs/ToolsState"}
       },
-      "required": ["ApprovalList","CancelReply","CompactReply","CronJobState","CronJobs","CronRuns","DecisionReply","DetachReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EffortReply","EntriesPage","ForkReply","Health","ImageUploaded","InterruptReply","Mission","MissionCancelled","MissionStarted","ModelReply","Models","NameReply","Profiles","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus","SessionTree","SkillsState","ToolsState"],
+      "required": ["ApprovalList","CancelReply","CompactReply","CronJobState","CronJobs","CronRuns","DecisionReply","DetachReply","Discussion","DiscussionEstimate","DiscussionList","DiscussionResumed","DiscussionStarted","DiscussionStopped","EffortReply","EntriesPage","ForkReply","Health","ImageUploaded","Info","InterruptReply","Mission","MissionCancelled","MissionStarted","ModelReply","Models","NameReply","Profiles","PromptReply","SessionIndex","SessionList","SessionOpened","SessionStatus","SessionTree","SkillsState","ToolsState"],
       "type": "object"
     }
   },
@@ -864,6 +875,15 @@
       "rawBody": null,
       "request": null,
       "response": "Health",
+      "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/info",
+      "query": [],
+      "rawBody": null,
+      "request": null,
+      "response": "Info",
       "stream": null
     },
     {

@@ -75,6 +75,7 @@ const IMAGE_BYTES: &str = "image";
 fn route_types(r: Route) -> (Option<&'static str>, &'static str, &'static [&'static str]) {
     match r {
         Route::Health => (None, "Health", &[]),
+        Route::Info => (None, "Info", &[]),
         Route::Sessions => (None, "SessionList", &[]),
         Route::SessionIndex => (None, "SessionIndex", &["limit", "cursor"]),
         Route::CreateSession => (Some("NewSession"), "SessionOpened", &[]),
@@ -142,6 +143,7 @@ pub(crate) fn generate() -> Value {
     ]);
     let responses = group(vec![
         ("Health", g.subschema_for::<Health>()),
+        ("Info", g.subschema_for::<crate::Info>()),
         ("SessionList", g.subschema_for::<SessionList>()),
         ("SessionIndex", g.subschema_for::<SessionIndex>()),
         ("SessionOpened", g.subschema_for::<SessionOpened>()),

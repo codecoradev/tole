@@ -7,6 +7,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Health,
+    Info,
     Sessions,
     SessionIndex,
     CreateSession,
@@ -47,8 +48,9 @@ pub enum Route {
 }
 
 impl Route {
-    pub const ALL: [Route; 38] = [
+    pub const ALL: [Route; 39] = [
         Route::Health,
+        Route::Info,
         Route::Sessions,
         Route::SessionIndex,
         Route::CreateSession,
@@ -119,6 +121,7 @@ impl Route {
     pub fn template(self) -> &'static str {
         match self {
             Route::Health => "/health",
+            Route::Info => "/info",
             Route::Sessions => "/sessions",
             Route::SessionIndex => "/sessions/index",
             Route::CreateSession => "/sessions",

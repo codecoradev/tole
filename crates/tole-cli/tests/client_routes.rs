@@ -33,6 +33,7 @@ use serve_harness::{spawn_mock, Serve};
 /// hash, `{name}` a webhook route name.
 const SERVE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/health"),
+    ("GET", "/info"),
     ("GET", "/models"),
     ("GET", "/sessions"),
     ("GET", "/sessions/index"),

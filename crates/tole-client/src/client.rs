@@ -2,6 +2,7 @@
 
 use crate::error::{status_error, Error, Result, MAX_ERROR_BODY};
 use crate::http::{self, Request, ResponseBody};
+use crate::info::Info;
 use crate::resume::{ReconnectPolicy, ResumingStream};
 use crate::route::Route;
 use crate::sse::FrameReader;
@@ -243,6 +244,11 @@ impl Client {
 
     pub fn health(&self) -> Result<Health> {
         self.call(Route::Health, None, "", None)
+    }
+
+    /// `GET /info` (#1024): the server's version, wire version and features.
+    pub fn info(&self) -> Result<Info> {
+        self.call(Route::Info, None, "", None)
     }
 
     /// Sessions live in this serve.
