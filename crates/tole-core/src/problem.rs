@@ -11,6 +11,7 @@ use std::borrow::Cow;
 
 use serde::Serialize;
 
+use crate::secrets::SecretSet;
 use crate::turn::TurnOutcome;
 
 /// The longest `detail`, in bytes (cut on a character boundary, ending in an
@@ -75,12 +76,16 @@ impl ProblemKind {
     }
 }
 
+/// The longest `subject` on the wire, in bytes: a tool name the model chose.
+pub const MAX_SUBJECT_BYTES: usize = 256;
+
 /// A settled turn that did not finish with an answer.
 ///
-/// Deliberately not `Serialize`: its `detail` is unredacted. The serializable
-/// form, with the detail redacted at the egress, arrives with the serve and
-/// ACP `problem` field (#1023, part 2).
+/// Deliberately not `Serialize`: its `detail` is unredacted. The form that
+/// leaves the process is [`WireProblem`] (see [`TurnOutcome::problem_redacted`]).
+/// `#[non_exhaustive]`: a field can be added without a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Problem {
     pub kind: ProblemKind,
     /// What it is about: the tool of a loop, an unknown tool or an approval.
@@ -97,14 +102,49 @@ pub struct Problem {
     pub detail: Option<String>,
 }
 
+/// A [`Problem`] fit to leave the process (the `problem` of the `tole serve`
+/// prompt answer and of the ACP reply, #1023): `subject` and `detail` are
+/// redacted with the session's secrets, THEN cut, so a cut never leaves part
+/// of a secret behind. Built only by [`TurnOutcome::problem_redacted`]; no
+/// wording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct WireProblem {
+    pub kind: ProblemKind,
+    pub subject: Option<String>,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl Problem {
+    fn redacted(&self, secrets: &SecretSet) -> WireProblem {
+        let cut = |t: &String, max| bounded(&secrets.redact(t), max);
+        WireProblem {
+            kind: self.kind,
+            subject: self.subject.as_ref().map(|t| cut(t, MAX_SUBJECT_BYTES)),
+            retryable: self.retryable,
+            detail: self.detail.as_ref().map(|t| cut(t, MAX_DETAIL_BYTES)),
+        }
+    }
+}
+
 impl TurnOutcome {
     /// The problem a settled turn ended with, its detail cut to
     /// [`MAX_DETAIL_BYTES`]: `None` for a final answer, a cancel and a detach.
     /// The shape for anything that leaves the process.
     pub fn problem(&self) -> Option<Problem> {
         let mut p = self.problem_full()?;
-        p.detail = p.detail.map(|d| bounded(&d));
+        p.detail = p.detail.map(|d| bounded(&d, MAX_DETAIL_BYTES));
         Some(p)
+    }
+
+    /// The problem as it may leave the process, for the `tole serve` and ACP
+    /// `problem` field (#1023): `subject` and `detail` redacted with `secrets`
+    /// (#677), THEN cut to [`MAX_SUBJECT_BYTES`] and [`MAX_DETAIL_BYTES`] (from
+    /// the whole detail, never from an already cut one).
+    pub fn problem_redacted(&self, secrets: &SecretSet) -> Option<WireProblem> {
+        Some(self.problem_full()?.redacted(secrets))
     }
 
     /// [`TurnOutcome::problem`] with the detail whole, for an in-process face
@@ -162,13 +202,13 @@ impl TurnOutcome {
 /// Kind, subject, retryable and detail of a problem, borrowed from the outcome.
 type Parts<'a> = (ProblemKind, Option<&'a str>, bool, Option<Cow<'a, str>>);
 
-/// `text` cut to [`MAX_DETAIL_BYTES`] on a character boundary.
-fn bounded(text: &str) -> String {
+/// `text` cut to `max` bytes on a character boundary.
+fn bounded(text: &str, max: usize) -> String {
     const ELLIPSIS: &str = "\u{2026}";
-    if text.len() <= MAX_DETAIL_BYTES {
+    if text.len() <= max {
         return text.to_string();
     }
-    let mut end = MAX_DETAIL_BYTES - ELLIPSIS.len();
+    let mut end = max - ELLIPSIS.len();
     while !text.is_char_boundary(end) {
         end -= 1;
     }

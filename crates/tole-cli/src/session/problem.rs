@@ -2,7 +2,7 @@
 //! host and the TUI turn a kind, a subject and a detail into a sentence.
 //! tole-core ships the typed problem only; the wording is a face's job.
 
-use tole_core::problem::{Problem, ProblemKind};
+use tole_core::problem::{Problem, ProblemKind, WireProblem};
 use tole_core::turn::TurnOutcome;
 
 /// Where a sentence is shown. The same problem reads differently on each.
@@ -55,4 +55,42 @@ pub fn describe_problem(problem: &Problem, face: Face) -> Option<String> {
             _ => format!("turn stopped ({})", problem.kind.as_str()),
         }),
     }
+}
+
+/// The problem of a settled turn as it leaves the process (#1023): `subject`
+/// and `detail` redacted with the egress secret set, then cut. `None` for a
+/// final answer, a cancel and a detach.
+pub fn wire(outcome: &TurnOutcome) -> Option<WireProblem> {
+    outcome.problem_redacted(&crate::approvals::egress_secrets())
+}
+
+/// The `tole serve` prompt answer (`POST /sessions/{id}/prompt`): the queued
+/// approval's body when the turn waits for one, else `stopReason` and the text.
+/// `problem` is added next to those fields; nothing else changes.
+pub fn prompt_answer(
+    approval: Option<serde_json::Value>,
+    stop: &str,
+    text: Option<String>,
+    problem: Option<&WireProblem>,
+) -> serde_json::Value {
+    let mut body = match (approval, text) {
+        (Some(body), _) => body,
+        (None, Some(t)) => serde_json::json!({"stopReason": stop, "text": t}),
+        (None, None) => serde_json::json!({"stopReason": stop}),
+    };
+    if let Some(p) = problem {
+        body["problem"] = serde_json::json!(p);
+    }
+    body
+}
+
+/// The ACP `session/prompt` result. `stopReason` is the fixed ACP enum and
+/// stays as is; the problem rides in `_meta.tole.problem`, the extension point
+/// the ACP schema reserves on every type.
+pub fn prompt_result(stop: &str, problem: Option<&WireProblem>) -> serde_json::Value {
+    let mut out = serde_json::json!({ "stopReason": stop });
+    if let Some(p) = problem {
+        out["_meta"] = serde_json::json!({"tole": {"problem": p}});
+    }
+    out
 }

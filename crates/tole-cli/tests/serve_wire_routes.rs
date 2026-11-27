@@ -146,6 +146,43 @@ fn refusals_keep_their_shape() {
     check("routes/refusals", &vol.apply(&json!(seen)));
 }
 
+/// #1023: the prompt answers that settle a non-final turn carry a `problem`
+/// next to `stopReason` (which keeps its value), and a final answer does not.
+#[test]
+fn prompt_answers_keep_their_shape() {
+    let serve = Serve::spawn(&spawn_mock(0));
+    let mut sessions = Vec::new();
+    let mut seen = Vec::new();
+    for (name, text) in [
+        ("prompt_final", "hello"),
+        ("prompt_approval_required", "TOOL_MISSION write it"),
+        ("prompt_provider_failed", "PROVIDER_FAIL go"),
+        ("prompt_unknown_tool", "UNKNOWN_TOOL go"),
+        ("prompt_loop", "LOOP_TOOL go"),
+    ] {
+        let id = new_session(&serve);
+        let body = json!({"text": text}).to_string();
+        let (code, answer) = serve.http("POST", &format!("/sessions/{id}/prompt"), Some(&body));
+        assert_eq!(code, 200, "{answer}");
+        sessions.push(id);
+        seen.push((name, answer));
+    }
+    let approval = seen[1].1["approval"]["id"].as_str().unwrap().to_string();
+    let mut ids: Vec<(&str, &'static str)> = vec![(&approval, "<APPROVAL>")];
+    ids.extend(
+        sessions
+            .iter()
+            .map(|s| s.as_str())
+            .zip(["<S1>", "<S2>", "<S3>", "<S4>", "<S5>"]),
+    );
+    let vol = Volatile::of(&serve, &ids);
+    let answers: serde_json::Map<String, Value> = seen
+        .into_iter()
+        .map(|(name, answer)| (name.to_string(), answer))
+        .collect();
+    check("routes/prompt_answers", &vol.apply(&Value::Object(answers)));
+}
+
 const CONFIG: &str = r#"
 [profiles.reviewer]
 system_prompt_file = "reviewer.md"

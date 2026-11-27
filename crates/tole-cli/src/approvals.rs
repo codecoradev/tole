@@ -568,7 +568,7 @@ pub fn redact_description(description: &str) -> String {
     egress_secrets().redact(description).into_owned()
 }
 
-fn egress_secrets() -> tole_core::secrets::SecretSet {
+pub fn egress_secrets() -> tole_core::secrets::SecretSet {
     let mut set = tole_core::secrets::process_secrets();
     for (name, value) in tole_core::web::header_secrets(&|k| std::env::var(k).ok()) {
         set = set.with(&name, &value);

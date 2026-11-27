@@ -22,7 +22,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status, and a `summary` (below); expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict. Only the first decision counts: the same verdict again answers `200` with `"resuming":false` and audits and resumes nothing; the opposite verdict, or any decision on an entry that already expired, answers `409` with the current `status`. An allow for a session this server no longer hosts (evicted from the 256-session live map, or the server restarted) with no cron run parked on it answers `409` with `"resuming":false` and an `error` saying the decision is recorded but nothing was resumed (reopen with `POST /sessions {"resume":"<id>"}` and send a new prompt); it never answers `202`. A session with a pending approval is never evicted, and eviction takes the least recently used idle session |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
-| Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | `approval` is the `GET /approvals` row (summary included) (`description` is sanitized to one line but not length-capped, as there) of the entry THIS turn queued for this session, found by a queue snapshot taken before the turn; its `id` is what `POST /approvals/{id}/decision` takes. If that entry expired or was decided before the lookup, `approval` is omitted: use `GET /approvals?session=<id>`. A stop that queued nothing (a pre-tool hook denial, a blocked stop gate, an unknown tool, a provider failure, a loop) stays `refusal`; ACP and the MCP session tool keep their own vocabulary (`refusal`) |
+| Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | `approval` is the `GET /approvals` row (summary included) (`description` is sanitized to one line but not length-capped, as there) of the entry THIS turn queued for this session, found by a queue snapshot taken before the turn; its `id` is what `POST /approvals/{id}/decision` takes. If that entry expired or was decided before the lookup, `approval` is omitted: use `GET /approvals?session=<id>`. A stop that queued nothing (a pre-tool hook denial, a blocked stop gate, an unknown tool, a provider failure, a loop) stays `refusal` (its `problem` says which, see [Problem of a stopped turn](#problem-of-a-stopped-turn-1023)); ACP and the MCP session tool keep their own vocabulary (`refusal`) |
 | Prompt on an interrupted turn | `POST /sessions/{id}/prompt` answers `409 {"error":"interrupted turn","state":"planning"}` (#1230) | The session's log ends in a turn that never settled, because the server died while the turn was in flight (a kill, a crash, an OOM kill): the user message is durable, the answer is not. `state` is the register (`planning` after a model call was cut off; `tool_call`, `awaiting_approval`, `executing` or `settling` for a cut-off tool step). `POST /sessions {"resume":"<id>"}` still answers `200`, but a prompt is refused until the turn is settled, and nothing is written for the refused prompt. It is a defined state, not a server error: do not retry it. Until serve can settle the turn itself (the next step of #1230), run `tole resume <id>` on the same sessions directory, then resume the session over serve and prompt again. A turn parked at an approval or after a denial is not this state: the next prompt is accepted. The `409` of a running turn keeps its own body (`session is busy running a turn` on `POST /sessions/{id}/prompt`, no `state`) |
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
@@ -161,6 +161,36 @@ The English wording is a pair of tables keyed by `kind` and `effect` (`tole_core
 - **Where it is not shown yet.** The delegated children's approvals
   (`source: "delegation"`, which keep their own `display` and `text`) and the webhook events still use the older text
   and carry no `summary`; see `docs/faces.md`.
+
+## Problem of a stopped turn (#1023)
+
+`POST /sessions/{id}/prompt` answers a turn that did not end with an answer with a `problem` object
+next to the fields it always had. A client tells "the provider failed" from "a loop was detected" by
+`problem.kind`, without parsing English. `stopReason`, `text` and `approval` keep their values and
+meaning (an approval stop is still `approval_required`, every other stop still `refusal`,
+`max_tokens`, `cancelled` or `detached` as before); `problem` is added, and is absent from a final
+answer (`end_turn`) and from a cancel or a detach.
+
+```json
+{"stopReason": "refusal",
+ "problem": {"kind": "provider", "subject": null, "retryable": true,
+             "detail": "http status: 429 Too Many Requests — slow down"}}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `provider` (the provider failed after its retries), `storage`, `loop` (the loop guard tripped), `unknown_tool`, `stop_gate` (a turn-end gate denied the answer too often), `approval` (the turn stopped on a call that needs an approval), `internal`, `budget` (the step budget ran out). An open vocabulary: a client treats a kind it does not know as a generic problem. |
+| `subject` | What it is about: the tool of a `loop`, `unknown_tool` or `approval`; `null` otherwise. Always present. Redacted and at most 256 bytes. |
+| `retryable` | `true` for a provider failure (the provider failed after its retries, so the same prompt MAY succeed again with nobody changing anything: a rate limit, an outage; a permanent refusal such as a 400 is also `true` in this first cut, a client must not retry in a loop); `false` when a decision, a fix or another prompt is needed first. |
+| `detail` | Optional. The technical text for a "show details" disclosure (a provider message, a gate's output). **Redacted with the session's secrets** (the process secret set: environment secrets, the provider key, webhook and serve credentials, `web_fetch` header values) and THEN cut to 4096 bytes, so a cut never leaves part of a secret behind. Data, not wording: never parse it. |
+
+There is no wording in the answer: a client words a problem from `kind` and `subject`. Not covered
+yet: a turn that fails with a storage error still answers `500 {"error": "<text>"}` without a
+`problem`, the answer of the approval-resume thread (`202`, no turn outcome is reported there) and
+the event stream (no frame carries the outcome of a turn). The ACP face carries the same object in
+`result._meta.tole.problem`; `stopReason` there stays in the fixed ACP vocabulary
+(`end_turn`, `max_tokens`, `refusal`, `cancelled`), and the `_meta` key is the extension point the
+ACP schema reserves on every type.
 
 ## Status JSON fields
 
