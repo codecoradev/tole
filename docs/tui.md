@@ -453,5 +453,5 @@ Wide characters wrap by character count, not cell width.
   in raw mode.
 - `cargo build -p tole-cli --no-default-features` builds without the TUI.
 - Tests: unit tests for the editor, transcript, footer and approval state
-  machines; `crates/tole-cli/tests/tui_e2e.rs` drives the real binary through
+  machines; `crates/tole-cli/tests/tui_e2e/` drives the real binary through
   a pty against a scripted mock provider.
