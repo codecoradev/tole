@@ -30,8 +30,8 @@ test prints its seed). The helpers are in `crates/tole-cli/tests/crash_loop/`.
 
 | Cut off in | `tole resume <id>` | `tole serve` | `tole mission --resume <id>` |
 |---|---|---|---|
-| The model call (`planning`) | finishes the turn once, same session | `POST /sessions {"resume"}` works; a prompt answers `409 interrupted turn` until `tole resume` has run (#1230) | **exit 1, `status: error`**, nothing written; run `tole resume` first |
-| A tool effect (`executing`) | see "Replay" below | the same 409 (the rule is on the register, not the step) | as above |
+| The model call (`planning`) | finishes the turn once, same session | `POST /sessions {"resume"}` settles the turn without a model call and answers `"interrupted": true`; the cut-off prompt is not answered, the next prompt is accepted (#1230) | **exit 1, `status: error`**, nothing written; run `tole resume` first |
+| A tool effect (`executing`) | see "Replay" below | the same settle: the open call is failed, outcome UNKNOWN, never re-run | as above |
 | An approval pending in serve's queue | the write never ran; nothing to resume | the queue is in memory and is gone; resume, and the model asks again: one new row | (a mission started over serve) the session is parked; `tole mission --resume` continues it directly |
 | Settled | `nothing to resume` (exit 1) | a new prompt works | continues the mission |
 

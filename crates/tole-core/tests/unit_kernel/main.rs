@@ -10,4 +10,5 @@ mod cancel;
 mod problem;
 mod provider_failover;
 mod tool_registry;
+mod transcript;
 mod turn_compaction;

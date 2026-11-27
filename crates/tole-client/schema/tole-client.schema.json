@@ -636,10 +636,11 @@
       "type": "object"
     },
     "SessionOpened": {
-      "description": "The answer to `POST /sessions`. A create sets `workspace`; a resume\nsets `resumed` and `already_live` (and `busy` for a session that was\nalready live).",
+      "description": "`POST /sessions`: a create sets `workspace`, a resume `resumed`, `already_live`, `busy`, `interrupted`.",
       "properties": {
         "alreadyLive": {"type":["boolean","null"]},
         "busy": {"type":["boolean","null"]},
+        "interrupted": {"type":["boolean","null"]},
         "planMode": {"type":["boolean","null"]},
         "profile": {"type":["string","null"]},
         "resumed": {"type":["boolean","null"]},

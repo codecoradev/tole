@@ -133,3 +133,14 @@ fn refuse_agrees_with_the_core_for_every_register_value() {
         assert_eq!(core_refuses(&mut s), refused, "{name}: the core");
     }
 }
+
+#[test]
+fn only_busy_and_interrupted_are_a_409() {
+    let body = json!({"error": "interrupted turn", "state": "tool_call"});
+    assert_eq!(
+        prompt_error("interrupted turn: tool_call".into()),
+        (409, body)
+    );
+    assert_eq!(prompt_error("session is busy: x".into()).0, 409);
+    assert_eq!(prompt_error("boom".into()), (500, json!({"error": "boom"})));
+}
