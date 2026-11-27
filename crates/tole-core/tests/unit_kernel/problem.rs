@@ -1,7 +1,8 @@
 //! The one mapping from a settled turn to a typed problem (#1023).
 
 use serde_json::json;
-use tole_core::problem::{Problem, ProblemKind, MAX_DETAIL_BYTES};
+use tole_core::problem::{Problem, ProblemKind, MAX_DETAIL_BYTES, MAX_SUBJECT_BYTES};
+use tole_core::secrets::SecretSet;
 use tole_core::storage::StorageError;
 use tole_core::turn::TurnOutcome as O;
 
@@ -143,4 +144,70 @@ fn a_detail_up_to_the_cap_is_kept_and_a_longer_one_is_cut_on_a_char_boundary() {
         .chars()
         .all(|c| c == '\u{20ac}'));
     assert!(cut.len() > MAX_DETAIL_BYTES - 8);
+}
+
+const KEY: &str = "sk-live-0123456789abcdefXYZ";
+
+fn secrets() -> SecretSet {
+    SecretSet::collect(Vec::new(), [("PROVIDER_KEY".to_string(), KEY.to_string())])
+}
+
+#[test]
+fn the_wire_form_redacts_the_detail_and_the_subject_with_the_session_secrets() {
+    let o = O::ProviderFailed {
+        message: format!("401 from the provider: bad key {KEY}"),
+    };
+    let w = o.problem_redacted(&secrets()).expect("problem");
+    let detail = w.detail.expect("detail");
+    assert!(!detail.contains(KEY), "{detail}");
+    assert!(detail.contains("\u{ab}PROVIDER_KEY\u{bb}"), "{detail}");
+
+    let o = O::UnknownTool {
+        name: format!("tool_{KEY}"),
+    };
+    let subject = o
+        .problem_redacted(&secrets())
+        .and_then(|w| w.subject)
+        .expect("subject");
+    assert!(!subject.contains(KEY), "{subject}");
+}
+
+#[test]
+fn a_secret_that_straddles_the_cut_is_redacted_before_it_is_cut() {
+    // The secret starts 20 bytes before the cap: cutting first would leave
+    // its head behind, which no redaction could match any more.
+    let message = format!(
+        "{} {KEY} {}",
+        "a".repeat(MAX_DETAIL_BYTES - 21),
+        "b".repeat(50)
+    );
+    let o = O::ProviderFailed { message };
+    let w = o.problem_redacted(&secrets()).expect("problem");
+    let detail = w.detail.expect("detail");
+    assert!(!detail.contains(&KEY[..8]), "a head of the secret is left");
+    assert!(detail.len() <= MAX_DETAIL_BYTES);
+}
+
+#[test]
+fn the_wire_form_is_cut_and_has_the_documented_json_shape() {
+    let long = O::UnknownTool {
+        name: "n".repeat(MAX_SUBJECT_BYTES * 2),
+    };
+    let w = long.problem_redacted(&secrets()).expect("problem");
+    assert_eq!(w.subject.as_deref().map(str::len), Some(MAX_SUBJECT_BYTES));
+
+    let o = O::ProviderFailed {
+        message: "overloaded".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(o.problem_redacted(&secrets())).unwrap(),
+        json!({"kind": "provider", "subject": null, "retryable": true, "detail": "overloaded"})
+    );
+    let o = O::ApprovalRequired {
+        name: "write".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(o.problem_redacted(&secrets())).unwrap(),
+        json!({"kind": "approval", "subject": "write", "retryable": false})
+    );
 }

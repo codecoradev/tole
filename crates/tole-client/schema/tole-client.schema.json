@@ -543,6 +543,17 @@
       "required": ["id","folder","lastActivity","entries","turns","live","busy"],
       "type": "object"
     },
+    "Problem": {
+      "description": "Why a turn stopped without an answer: the `problem` next to `stopReason` in\nthe `POST /sessions/{id}/prompt` answer. It carries no wording; a client\nwords it from `kind` and `subject`. `kind` is a string, not a closed set:\na newer server may send a kind this client does not know, which then reads\nas a problem of an unknown kind.",
+      "properties": {
+        "detail": {"description":"The technical text for a \"show details\" disclosure: redacted with the\nsession's secrets and cut by the server.","type":["string","null"]},
+        "kind": {"description":"`provider`, `storage`, `loop`, `unknown_tool`, `stop_gate`, `approval`,\n`internal` or `budget` today.","type":"string"},
+        "retryable": {"description":"A plain retry of the same turn may succeed (a transient provider failure).","type":"boolean"},
+        "subject": {"description":"What it is about: the tool of a loop, an unknown tool or an approval.","type":["string","null"]}
+      },
+      "required": ["kind","retryable"],
+      "type": "object"
+    },
     "Profile": {
       "description": "One helper of `GET /profiles`. A profile that cannot be loaded is a row\nwith only `name` and `error`. `persona` is the first line of the persona\nfile (absent when it has none); `models` has the tiers the profile sets\nand its `default` tier name; `may_use` is the profile's own allow list\nand `session_allow` what a session opened with it gets on this server.",
       "properties": {
@@ -567,9 +578,10 @@
       "type": "object"
     },
     "PromptReply": {
-      "description": "The answer to a prompt, once the turn stopped. `stop_reason` is\n`approval_required` when a Write waits for a decision: `approval` is\nthen the queue row (absent when it was decided or expired meanwhile).",
+      "description": "The answer to a prompt, once the turn stopped. `stop_reason` is\n`approval_required` when a Write waits: `approval` is then the queue row\n(absent once decided or expired); `problem` says why a turn did not end.",
       "properties": {
         "approval": {"anyOf":[{"$ref":"#/$defs/Approval"},{"type":"null"}]},
+        "problem": {"anyOf":[{"$ref":"#/$defs/Problem"},{"type":"null"}]},
         "stopReason": {"type":"string"},
         "text": {"type":["string","null"]}
       },

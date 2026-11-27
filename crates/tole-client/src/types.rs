@@ -1,11 +1,9 @@
 //! Request and response types of the serve routes a graphical client uses.
-//!
 //! Field names are the wire names: serve is not uniform (`stopReason` and
 //! `sessionId` are camelCase, `plan_mode` and `usage_report` are snake_case),
-//! and each rename below mirrors what the server emits. Every type both
-//! serializes and deserializes, so the contract test can prove a response is
-//! decoded without loss (re-serialized JSON equals the server's JSON), and the
-//! committed JSON Schema is derived from these types (`schema/`, #1068).
+//! and each rename mirrors what the server emits. Every type serializes and
+//! deserializes, so the contract test proves a response decodes without loss,
+//! and the committed JSON Schema is derived from these types (`schema/`, #1068).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -116,8 +114,8 @@ wire! {
     }
 
     /// The answer to a prompt, once the turn stopped. `stop_reason` is
-    /// `approval_required` when a Write waits for a decision: `approval` is
-    /// then the queue row (absent when it was decided or expired meanwhile).
+    /// `approval_required` when a Write waits: `approval` is then the queue row
+    /// (absent once decided or expired); `problem` says why a turn did not end.
     #[serde(rename_all = "camelCase")]
     pub struct PromptReply {
         pub stop_reason: String,
@@ -125,6 +123,8 @@ wire! {
         pub text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub approval: Option<Approval>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub problem: Option<crate::Problem>,
     }
 
     /// `POST /sessions/{id}/cancel`.
