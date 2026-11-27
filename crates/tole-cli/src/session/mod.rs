@@ -12,6 +12,7 @@ pub mod host;
 pub mod index;
 pub mod interrupted;
 pub mod owner_mcp;
+pub mod problem;
 pub mod runner;
 pub mod status;
 pub mod tools;

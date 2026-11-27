@@ -18,6 +18,7 @@ use tole_tui::{
 
 use crate::approver::PromptFn;
 use crate::compaction_host::{CompactionSettings, ModelsCatalog, WindowSource};
+use crate::session::problem::{describe_outcome, Face};
 use crate::status::session_status;
 
 /// The inline y/n prompt: the approver (allowlist, `--yes`, Destructive rules
@@ -556,23 +557,10 @@ fn map(o: TurnOutcome) -> TurnEnd {
     match o {
         TurnOutcome::Final { text, .. } => TurnEnd::Final(text),
         TurnOutcome::Cancelled => TurnEnd::Cancelled,
-        TurnOutcome::ApprovalRequired { name } => TurnEnd::Stopped(format!(
-            "approval denied for '{name}'; your next message resumes"
-        )),
-        TurnOutcome::ProviderFailed { message } => TurnEnd::Stopped(format!(
-            "provider failed: {message}{}",
-            crate::compaction_host::overflow_hint(&message)
-        )),
-        TurnOutcome::UnknownTool { name } => TurnEnd::Stopped(format!("unknown tool '{name}'")),
-        TurnOutcome::BudgetExhausted => TurnEnd::Stopped("step budget exhausted".into()),
-        TurnOutcome::StopGateBlocked { reason } => {
-            TurnEnd::Stopped(format!("stop gate blocked: {reason}"))
-        }
         TurnOutcome::Detached => TurnEnd::Stopped("turn detached".into()),
-        TurnOutcome::LoopDetected { tool, .. } => {
-            TurnEnd::Stopped(format!("loop guard tripped on '{tool}'"))
-        }
-        TurnOutcome::Storage(e) => TurnEnd::Stopped(format!("storage error: {e}")),
+        other => TurnEnd::Stopped(
+            describe_outcome(&other, Face::Short).unwrap_or_else(|| "turn stopped".into()),
+        ),
     }
 }
 
@@ -580,6 +568,15 @@ fn map(o: TurnOutcome) -> TurnEnd {
 mod tests {
     use super::*;
     use crate::status::SessionStatus;
+
+    #[test]
+    fn a_settled_turn_maps_to_its_end() {
+        let stop = |t: &str| TurnEnd::Stopped(t.into());
+        assert_eq!(map(TurnOutcome::Detached), stop("turn detached"));
+        assert_eq!(map(TurnOutcome::Cancelled), TurnEnd::Cancelled);
+        let budget = map(TurnOutcome::BudgetExhausted);
+        assert_eq!(budget, stop("step budget exhausted"));
+    }
 
     #[test]
     fn footer_carries_status_fields_and_effective_effort() {
