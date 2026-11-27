@@ -40,7 +40,8 @@ an error, and a list that cannot be read is a failed run (exit 2).
 cora: a .cora.yaml `ignore.rules` entry that silences `index-breaking-change`
 lists exact `crates/<name>/src/*.rs` files that exist, are reached from a bin
 target through `mod` declarations and are NOT reached from the crate's lib
-target. Strict line parser (no YAML library): an unknown form is an error.
+target. Strict line parser (no YAML library): the rule name may appear nowhere else
+in the file, and an unknown form is an error.
 """
 import json
 import os
@@ -98,11 +99,13 @@ _CRATE_LINT = re.compile(r"^\[lints\][^\[]*?^\s*workspace\s*=\s*true\s*(?:#.*)?$
 CORA_CONFIG = ".cora.yaml"
 CORA_RULE = "index-breaking-change"
 CORA_HINT = "read CONTRIBUTING.md, section 'Cora Workflow', before changing this entry"
-_CORA_HEAD = re.compile(r"""^    - rule:\s*["']?([\w-]+)["']?$""")
-_CORA_KEY = re.compile(r"^      (\w+):(.*)$")
+_CORA_HEAD = re.compile(r"""^    - rule: ?(?:"([\w-]+)"|([\w-]+))$""")
+_CORA_PLAIN = re.compile(r'^    - "[^"\\#]*"$')
+_CORA_KEY = re.compile(r"^      (files|reason):(.*)$")
 _CORA_FILE = re.compile(r"""^        - "(crates/[\w.-]+/src/[\w./-]+\.rs)"$""")
-_MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
-_PATH_ATTR = re.compile(r'^\s*#\[\s*path\s*=\s*"([^"]+)"\s*\]')
+_CORA_IGNORE_KEY = re.compile(r"""^["']?ignore["']?\s*:""")
+_RS_TOKEN = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]|\bmod\s+(?:r#)?(\w+)\s*;')
+_RS_UNKNOWN = re.compile(r"\binclude!\s*[(\[{]|cfg_attr\s*\([^\]]*\bpath\b")
 
 findings = []  # (severity, text)
 
@@ -348,56 +351,79 @@ def check_lints(root_manifest, manifests, report=error):
 # ---- cora scope rules ---------------------------------------------------------
 
 
+def cora_code(line):
+    """A .cora.yaml line without its comment (a `#` outside quotes, at the start or after a space)."""
+    quote, i = None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+        i += 1
+    return line.rstrip()
+
+
 def parse_cora_scoped(text, report=error, path=CORA_CONFIG):
     """The `index-breaking-change` entries of `ignore.rules`: [(line, [(line, file)])].
 
-    Reads only the layout .cora.yaml uses today (`rules:` at indent 2, `- rule: X`
-    at 4, its keys at 6, `files:` items at 8, comments stripped). Every line of
-    the `ignore:` section that names the rule must be understood as such an entry
-    (a bare string, a flow list or a glob would silence it everywhere): else error.
+    Reads only the layout .cora.yaml uses today (`ignore:` at column 0, `rules:` at
+    indent 2, `- rule: X` or `- "plain string"` at 4, `files:`/`reason:` at 6, `files:`
+    items at 8). The rule name must not appear anywhere in the file (any case, `-` or
+    `_`) except as the head of such a scoped entry, and every `ignore.rules` item must
+    be one of the forms above: else error (a flow map, escape or other YAML spelling
+    would otherwise silence it everywhere).
     """
-    lines = text.split("\n")
-    heads = [i for i, line in enumerate(lines) if re.match(r"ignore\s*:", line)]
-    if not heads:
-        return []
-    if len(heads) > 1 or lines[heads[0]].split("#", 1)[0].strip() != "ignore:":
-        report(path, heads[0] + 1, f"`ignore:` is not a plain block mapping: {CORA_HINT}")
-        return []
-    entries, mentions, in_rules, cur, files_mode = [], [], False, None, False
-    for i in range(heads[0] + 1, len(lines)):
-        raw = lines[i]
-        if raw[:1] not in ("", " ", "#", "\t"):
+    lines = [cora_code(raw) for raw in text.split("\n")]
+    heads, entries, in_rules, cur, files_mode = [], [], False, None, False
+    for i, body in enumerate(lines):
+        if _CORA_IGNORE_KEY.match(body):
+            heads.append(i)
+            if body != "ignore:":
+                report(path, i + 1, f"the `ignore` key must be written exactly `ignore:`: {CORA_HINT}")
+    if len(heads) > 1:
+        report(path, heads[1] + 1, f"`ignore:` appears twice: {CORA_HINT}")
+    for i in range(heads[0] + 1 if heads else len(lines), len(lines)):
+        body = lines[i]
+        if body[:1] not in ("", " ", "\t"):
             break  # next top-level key
-        body = raw.split("#", 1)[0].rstrip()
+        indent = len(body) - len(body.lstrip(" "))
         if not body.strip():
             continue
-        if CORA_RULE in body:
-            mentions.append(i + 1)
-        indent = len(body) - len(body.lstrip(" "))
-        if indent <= 2:
-            in_rules, cur = body.strip() == "rules:", None
+        if indent == 2:
+            in_rules, cur = body == "  rules:", None
         elif not in_rules:
             continue
-        elif (head := _CORA_HEAD.match(body)):
-            cur, files_mode = {"rule": head.group(1), "line": i + 1, "files": []}, False
-            entries.append(cur)
-        elif indent == 4 and body.lstrip().startswith("- "):
-            cur = None  # a plain rule string; naming the scoped rule is caught below
+        elif indent == 4:
+            head = _CORA_HEAD.match(body)
+            cur, files_mode = None, False
+            if head:
+                cur = {"rule": head.group(1) or head.group(2), "line": i + 1, "files": []}
+                entries.append(cur)
+            elif not _CORA_PLAIN.match(body):
+                report(path, i + 1, f"ignore.rules item not understood (only `- \"plain string\"` or `- rule: id`): {body.strip()!r}: {CORA_HINT}")
         elif cur is None:
             report(path, i + 1, f"not understood in ignore.rules: {body.strip()!r}: {CORA_HINT}")
         elif cur["rule"] != CORA_RULE:
             continue  # the body of another rule's entry
-        elif (key := _CORA_KEY.match(body)) and key.group(1) in ("files", "reason"):
-            files_mode = key.group(1) == "files"
-            if files_mode and key.group(2).strip():
-                report(path, i + 1, f"`files:` must be a block list, one quoted path per line: {CORA_HINT}")
-        elif files_mode and (item := _CORA_FILE.match(body)):
+        elif indent == 6 and (key := _CORA_KEY.match(body)):
+            files_mode, value = key.group(1) == "files", key.group(2).strip()
+            if (files_mode and value) or (not files_mode and not re.fullmatch(r'"[^"\\]*"', value)):
+                report(path, i + 1, f"`{key.group(1)}:` must be a block list or one plain double-quoted string: {CORA_HINT}")
+        elif indent == 8 and files_mode and (item := _CORA_FILE.match(body)):
             cur["files"].append((i + 1, item.group(1)))
         else:
             report(path, i + 1, f"not understood in the {CORA_RULE} entry: {body.strip()!r} (only `reason:` and a `files:` list of exact crates/<name>/src/*.rs paths): {CORA_HINT}")
     scoped = [e for e in entries if e["rule"] == CORA_RULE]
-    for number in sorted(set(mentions) - {e["line"] for e in scoped}):
-        report(path, number, f"{CORA_RULE} named in a form that is not a scoped `- rule:` entry with an exact `files:` list: {CORA_HINT}")
+    known = {e["line"] for e in scoped}
+    for number, body in enumerate(lines, 1):
+        if CORA_RULE in body.lower().replace("_", "-") and number not in known:
+            report(path, number, f"{CORA_RULE} named outside a scoped `- rule: {CORA_RULE}` entry of ignore.rules (it would be silenced or disabled unscoped): {CORA_HINT}")
     for entry in scoped:
         if not entry["files"]:
             report(path, entry["line"], f"{CORA_RULE} entry has no readable `files:` list (it would be unscoped): {CORA_HINT}")
@@ -408,34 +434,42 @@ def reachable(root, rel, stop=()):
     """Files reached from the crate root file `rel` through `mod x;` and `#[path]`.
 
     A file in `stop` is recorded but not entered (it is already the answer).
-
-    Raises RuntimeError for a declaration that cannot be resolved (inline
-    modules that declare files, a missing file): the answer is then unknown.
+    Raises RuntimeError when the answer is unknown: a `mod` that does not resolve
+    to exactly one file, a `#[path]` not on a `mod x;`, `include!(` or `cfg_attr(..path..)`.
+    `include_str!`, macro-generated modules and other crates are not followed.
     """
-    seen, todo = set(), [rel]
+    seen, todo = set(), [(rel, True)]
     while todo:
-        cur = todo.pop()
+        cur, mod_rs = todo.pop()
         if cur in seen:
             continue
         seen.add(cur)
         if cur in stop and cur != rel:
             continue
+        text = read_text(os.path.join(root, cur))
+        if _RS_UNKNOWN.search(text):
+            raise RuntimeError(f"{cur}: `include!(` or a cfg_attr path, so what the library reaches is unknown: {CORA_HINT}")
         base = os.path.dirname(cur)
-        own = base if cur == rel or os.path.basename(cur) == "mod.rs" else os.path.join(base, os.path.basename(cur)[:-3])
-        path_attr = None
-        for number, line in enumerate(read_text(os.path.join(root, cur)).split("\n"), 1):
-            attr, decl = _PATH_ATTR.match(line), _MOD_DECL.match(line)
-            if attr:
-                path_attr = attr.group(1)
-            elif decl:
-                names = [os.path.join(base, path_attr)] if path_attr else [os.path.join(own, decl.group(1) + ".rs"), os.path.join(own, decl.group(1), "mod.rs")]
+        own = base if mod_rs or os.path.basename(cur) == "mod.rs" else os.path.join(base, os.path.basename(cur)[:-3])
+        pending, used, attrs = None, 0, 0
+        for number, line in enumerate(text.split("\n"), 1):
+            code = line.strip()
+            for m in _RS_TOKEN.finditer("" if code.startswith("//") else line):
+                if m.group(1):
+                    pending = m.group(1)
+                    continue
+                names = [os.path.join(base, pending)] if pending else [os.path.join(own, m.group(2) + ".rs"), os.path.join(own, m.group(2), "mod.rs")]
                 found = [os.path.normpath(n) for n in names if os.path.isfile(os.path.join(root, n))]
                 if len(found) != 1:
-                    raise RuntimeError(f"{cur}:{number}: `mod {decl.group(1)};` resolves to {len(found)} files, so what the library reaches is unknown: {CORA_HINT}")
-                todo.append(found[0].replace(os.sep, "/"))
-                path_attr = None
-            elif line.strip() and not line.lstrip().startswith(("#[", "//")):
-                path_attr = None
+                    raise RuntimeError(f"{cur}:{number}: `mod {m.group(2)};` resolves to {len(found)} files, so what the library reaches is unknown: {CORA_HINT}")
+                todo.append((found[0].replace(os.sep, "/"), bool(pending)))
+                used, pending = used + bool(pending), None
+            if code and not code.startswith("//"):
+                attrs += len(re.findall(r"#\s*\[\s*path\b", code))
+                if not (code.startswith("#[") and code.endswith("]")):
+                    pending = None
+        if used != attrs:
+            raise RuntimeError(f"{cur}: a `#[path]` that is not directly on a `mod x;` ({attrs} attributes, {used} used), so what the library reaches is unknown: {CORA_HINT}")
     return seen
 
 
@@ -452,7 +486,7 @@ def check_cora_scope(entries, packages, root, report=error, path=CORA_CONFIG):
             bins = [t for k, t in owner["targets"] if k == "bin"]
             if any(rel in reachable(root, t, stop) for t in libs):
                 report(path, number, f"{rel} is reached from the library target of {owner['name']}: a silenced {CORA_RULE} would hide real public API removals; {CORA_HINT}")
-            elif not any(rel in reachable(root, t, stop) for t in bins):
+            elif not any(rel in reachable(root, t) for t in bins):
                 report(path, number, f"{rel} is not reached from any bin target of {owner['name']} through mod declarations, so binary-only is not proven: {CORA_HINT}")
 
 

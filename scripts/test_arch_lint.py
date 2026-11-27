@@ -644,7 +644,7 @@ CORA_OK = (
     "    # index-breaking-change in a comment is not a mention\n"
     "    - rule: other-rule\n      files:\n        - \"x/**\"\n"
     "    - rule: index-breaking-change\n      files:\n        - \"crates/a/src/main.rs\"\n"
-    "        - \"crates/a/src/serve.rs\"\n      reason: \"moved items\"\nreview:\n  exclude: []\n"
+    "        - \"crates/a/src/serve.rs\"\n      reason: \"moved items (#669, #1249)\"\nreview:\n  exclude: []\n"
 )
 
 
@@ -664,23 +664,56 @@ class CoraParse(unittest.TestCase):
         self.assertEqual(cora_parse("review:\n  exclude: []\n"), ([], []))
 
     def test_every_form_that_is_not_a_scoped_exact_entry_fails_closed(self):
+        files = "      files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n"
+        scoped = "    - rule: index-breaking-change\n"
         bad = {
-            "bare string": CORA_OK.replace("    - \"bug-todo\"\n", "    - \"index-breaking-change\"\n"),
-            "no files": CORA_OK.replace("files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", ""),
-            "flow list": CORA_OK.replace("files:\n        - \"crates/a/src/main.rs\"\n        - \"crates/a/src/serve.rs\"\n", "files: [\"crates/a/src/main.rs\"]\n"),
-            "glob": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs"),
-            "directory": CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"),
-            "other key": CORA_OK.replace("      reason:", "      paths: x\n      reason:"),
-            "odd indent": CORA_OK.replace("        - \"crates/a/src/serve.rs\"", "          - \"crates/a/src/serve.rs\""),
-            "in ignore.files": CORA_OK.replace("    - \"*.lock\"", "    - \"index-breaking-change\""),
-            "in a reason": CORA_OK.replace("moved items", "index-breaking-change moved"),
-            "flow ignore": "ignore: {rules: [\"index-breaking-change\"]}\n",
-            "ignore twice": CORA_OK + CORA_OK,
+            "bare string": (CORA_OK.replace("    - \"bug-todo\"\n", "    - \"index-breaking-change\"\n"), "named outside"),
+            "no files": (CORA_OK.replace(files, ""), "no readable `files:`"),
+            "flow list": (CORA_OK.replace(files, "      files: [\"crates/a/src/main.rs\"]\n"), "must be a block list"),
+            "glob": (CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/*.rs"), "not understood"),
+            "directory": (CORA_OK.replace("crates/a/src/serve.rs", "crates/a/src/"), "not understood"),
+            "other key": (CORA_OK.replace("      reason:", "      paths: x\n      reason:"), "not understood"),
+            "odd indent": (CORA_OK.replace("        - \"crates/a/src/serve.rs\"", "          - \"crates/a/src/serve.rs\""), "not understood"),
+            "block scalar reason": (CORA_OK.replace("reason: \"moved items (#669, #1249)\"", "reason: |"), "plain double-quoted"),
+            "in ignore.files": (CORA_OK.replace("    - \"*.lock\"", "    - \"index-breaking-change\""), "named outside"),
+            "in a reason": (CORA_OK.replace("moved items", "index-breaking-change moved"), "named outside"),
+            "flow ignore": ("ignore: {rules: [\"index-breaking-change\"]}\n", "exactly `ignore:`"),
+            "ignore twice": (CORA_OK + CORA_OK, "appears twice"),
+            # finding 1: a quoted key hid the whole section; the name elsewhere was never seen
+            "double-quoted ignore key": (CORA_OK.replace("ignore:\n", "\"ignore\":\n", 1).replace("serve.rs", "lib.rs"), "exactly `ignore:`"),
+            "single-quoted ignore key": (CORA_OK.replace("ignore:\n", "'ignore':\n", 1), "exactly `ignore:`"),
+            "space before colon": (CORA_OK.replace("ignore:\n", "ignore :\n", 1), "exactly `ignore:`"),
+            "rules_engine disabled": (CORA_OK + "rules_engine:\n  disabled: [index-breaking-change]\n", "named outside"),
+            "unrelated key skip": (CORA_OK + "extra:\n  skip: index-breaking-change\n", "named outside"),
+            # finding 4: other spellings of the name
+            "upper case": (CORA_OK.replace("rule: index-breaking-change", "rule: Index-Breaking-Change"), "named outside"),
+            "underscores": (CORA_OK + "extra:\n  skip: index_breaking_change\n", "named outside"),
+            "plain string spelling": (CORA_OK.replace("\"bug-todo\"", "\"INDEX_BREAKING_CHANGE\""), "named outside"),
+            # finding 2: `#` inside quotes is not a comment; flow maps and glued strings are not plain items
+            "flow map": (CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change}"), "item not understood"),
+            "flow map with files": (CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change, files: [\"crates/a/src/lib.rs\"]}"), "item not understood"),
+            "hash in a string": (CORA_OK.replace("    - \"bug-todo\"", "    - \"#\" \"index-breaking-change\""), "item not understood"),
+            "unquoted item": (CORA_OK.replace("    - \"bug-todo\"", "    - index-breaking-change"), "item not understood"),
+            "single-quoted item": (CORA_OK.replace("    - \"bug-todo\"", "    - 'bug-todo'"), "item not understood"),
+            # finding 3: escapes decode to the name
+            "hex escape": (CORA_OK.replace("\"bug-todo\"", "\"index\\x2dbreaking-change\""), "item not understood"),
+            "unicode escape": (CORA_OK.replace("\"bug-todo\"", "\"index\\u002dbreaking-change\""), "item not understood"),
+            "escape in head": (CORA_OK.replace(scoped, "    - rule: \"index\\x2dbreaking-change\"\n"), "not understood"),
         }
-        for name, text in bad.items():
+        for name, (text, expect) in bad.items():
             with self.subTest(name):
-                self.assertTrue(cora_parse(text)[1], name)
-        self.assertIn("Cora Workflow", cora_parse(bad["glob"])[1][0][1])
+                found = cora_parse(text)[1]
+                self.assertTrue(any(expect in m for _, m in found), (name, found))
+                self.assertIn("Cora Workflow", found[0][1])
+
+    def test_comments_and_hashes_inside_quotes_are_read_like_yaml(self):
+        text = CORA_OK.replace("    - \"bug-todo\"", "    - \"a #b\" # index-breaking-change\n    # - rule: index-breaking-change")
+        entries, found = cora_parse(text.replace("a #b", "a b"))
+        self.assertEqual(found, [], found)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(arch.cora_code('    - "a #b" # c'), '    - "a #b"')
+        self.assertEqual(arch.cora_code("x: 'it''s # not' # c"), "x: 'it''s # not'")
+        self.assertEqual(arch.cora_code("a#b # c"), "a#b")
 
     def test_the_committed_config_names_existing_src_files(self):
         root = os.path.dirname(HERE)
@@ -723,6 +756,11 @@ class CoraScope(unittest.TestCase):
             "private mod": "mod serve;\n",
             "pub(crate) mod": "pub(crate) mod serve;\n",
             "path attribute": "#[path = \"serve.rs\"]\npub mod srv;\n",
+            "attributes between": "#[path = \"serve.rs\"]\n#[cfg(unix)]\n// note\nmod srv;\n",
+            "path and mod on one line": "#[path = \"serve.rs\"] mod srv;\n",
+            "two mods on one line": "mod shared; mod serve;\n",
+            "path attribute in an inline module": "mod a { #[path=\"serve.rs\"] mod s; }\n",
+            "raw identifier": "mod r#serve;\n",
             "main": "mod main;\n",
             "through another module": "pub mod shared;\n",
         }.items():
@@ -731,8 +769,39 @@ class CoraScope(unittest.TestCase):
                 if name == "through another module":
                     extra["crates/a/src/shared.rs"] = "#[path = \"serve.rs\"]\nmod s;\n"
                 found = cora_scope(None, extra)
-                self.assertEqual(len(found), 1, found)
-                self.assertIn("reached from the library", found[0][1])
+                self.assertTrue(found and all("reached from the library" in m for _, m in found), (name, found))
+
+    def test_a_nested_file_may_be_listed_and_a_lib_reaching_it_through_its_parent_fails(self):
+        nested = ("crates/a/src/serve/cron.rs",)
+        self.assertEqual(cora_scope(None, scoped=nested), [])
+        found = cora_scope(None, {"crates/a/src/lib.rs": "pub mod serve;\n"}, scoped=nested)
+        self.assertIn("reached from the library", found[0][1])
+
+    def test_a_file_loaded_by_path_owns_its_directory_for_nested_mods(self):
+        extra = {"crates/a/src/lib.rs": "#[path = \"other/m.rs\"]\nmod m;\n", "crates/a/src/other/m.rs": "mod serve;\n",
+                 "crates/a/src/other/serve.rs": ""}
+        found = cora_scope(None, extra, scoped=("crates/a/src/other/serve.rs",))
+        self.assertIn("reached from the library", found[0][1])
+
+    def test_what_the_lib_reaches_is_unknown_for_include_and_unresolved_path_forms(self):
+        for name, lib in {
+            "include": "include!(\"serve.rs\");\n",
+            "include with concat": "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n",
+            "cfg_attr path": "#[cfg_attr(all(), path = \"serve.rs\")] mod srv;\n",
+            "path that is not a literal": "#[path = concat!(\"a\", \"b\")]\nmod x;\n",
+            "path on an inline module": "#[path = \"shared.rs\"]\nmod a {}\n",
+            "path attribute with no mod": "#[path = \"shared.rs\"]\nfn f() {}\n",
+            "path attribute then an item then a mod": "#[path = \"main_tests.rs\"]\nfn f() {}\npub mod shared;\n",
+            "path split over two lines": "#[path =\n\"serve.rs\"]\nmod x;\n",
+        }.items():
+            with self.subTest(name):
+                with self.assertRaises(RuntimeError) as ctx:
+                    cora_scope(None, {"crates/a/src/lib.rs": lib})
+                self.assertIn("Cora Workflow", str(ctx.exception))
+
+    def test_include_str_and_comments_are_not_followed(self):
+        lib = "pub mod shared;\n// mod nowhere;\n/// #[path = \"x\"]\nconst D: &str = include_str!(\"shared.rs\");\n"
+        self.assertEqual(cora_scope(None, {"crates/a/src/lib.rs": lib}), [])
 
     def test_a_missing_file_a_file_of_no_crate_and_an_orphan_fail(self):
         self.assertIn("not a source file", cora_scope(None, scoped=("crates/a/src/gone.rs",))[0][1])
@@ -780,6 +849,28 @@ class CoraWrapper(unittest.TestCase):
 
     def test_an_unresolvable_mod_fails_closed_with_exit_2(self):
         rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "mod nowhere;\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NOT passed", out)
+
+    def test_hostile_configs_exit_1_with_a_config_line(self):
+        for name, yaml in {
+            "quoted ignore key": CORA_OK.replace("ignore:\n", "\"ignore\":\n", 1).replace("serve.rs", "lib.rs"),
+            "rules_engine disabled": CORA_OK + "rules_engine:\n  disabled: [index-breaking-change]\n",
+            "flow map with #": CORA_OK.replace("    - \"bug-todo\"", "    - {note: \"#\", rule: index-breaking-change}"),
+            "escape": CORA_OK.replace("\"bug-todo\"", "\"index\\x2dbreaking-change\""),
+            "case": CORA_OK.replace("rule: index-breaking-change", "rule: Index_Breaking_Change"),
+        }.items():
+            with self.subTest(name):
+                rc, out = self.run_cora({".cora.yaml": yaml})
+                self.assertEqual(rc, 1, out)
+                self.assertIn("error: .cora.yaml:", out)
+
+    def test_same_line_declarations_exit_1_and_include_exits_2(self):
+        for lib in ("#[path = \"serve.rs\"] mod srv;\n", "mod shared; mod serve;\n", "mod r#serve;\n"):
+            rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": lib})
+            self.assertEqual(rc, 1, (lib, out))
+            self.assertIn("reached from the library", out)
+        rc, out = self.run_cora({".cora.yaml": CORA_OK, "crates/a/src/lib.rs": "include!(\"serve.rs\");\n"})
         self.assertEqual(rc, 2, out)
         self.assertIn("NOT passed", out)
 

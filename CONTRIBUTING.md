@@ -299,10 +299,17 @@ library re-exports: `scripts/arch-check.sh cora` (part of `all`, a CI `Check`
 step) reads that entry and fails when a listed file does not exist, is not
 reached from a bin target through `mod` declarations, or is reached from the
 library target (a `pub mod serve;` or `#[path]` include in `lib.rs` would let
-the silence hide real public API removals). It fails closed: an entry it cannot
-read, or a `mod` it cannot resolve, is a failure, never a skip. Keep the entry
-in the layout the file already uses (a block `files:` list of exact quoted
-`crates/<name>/src/*.rs` paths).
+the silence hide real public API removals). What it checks: the rule name
+(any case, `-` or `_`) may appear nowhere in `.cora.yaml` except as the head
+of a scoped `- rule: index-breaking-change` entry; `ignore:` must be written
+exactly so; every `ignore.rules` item must be a plain `- "string"` (no `#` or
+backslash) or a `- rule:` entry, and every file a quoted exact path in a block
+`files:` list. Anything else is an error (exit 1); a `mod` it cannot resolve,
+`include!(`, `cfg_attr(..path..)` or a `#[path]` that is not on a `mod x;` in a
+file it walks is exit 2 (not proven). Keep the entry in the layout the file
+already uses. Not followed (residual): `include_str!`, macro-generated
+modules, another crate that `#[path]`-includes the file, and a name hidden
+from the text scan by a YAML escape or a folded line outside `ignore.rules`.
 
 Exit-code reference:
 

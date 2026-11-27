@@ -24,7 +24,9 @@ jobs:
       - run: cargo check --workspace --all-targets
       # Architecture guardrails (#1249): crate kinds and the crate dependency
       # matrix (#1250), file and crate size against the allow-list that only
-      # shrinks (#1251); the self-test proves the check fails closed. Part of this job so
+      # shrinks (#1251), `unsafe` opt-ins (#1252) and the binary-only files of
+      # the scoped .cora.yaml silence (#1249); the self-test proves the check
+      # fails closed. Part of this job so
       # no required check name changes. Python 3 is preinstalled on the runner.
       - run: python3 scripts/test_arch_lint.py
       - run: scripts/arch-check.sh

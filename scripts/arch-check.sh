@@ -62,8 +62,9 @@
 #               files that exist, are reached from a bin target through `mod`
 #               declarations and are NOT reached from the crate's lib target
 #               (`pub mod serve;` in lib.rs would hide real API removals).
-#               Entries are read by a strict line parser: what it does not
-#               understand fails, an unresolvable `mod` is exit 2.
+#               Strict line parser: the rule name may appear nowhere else in
+#               .cora.yaml, an unknown form fails, an unresolvable `mod`,
+#               `include!(` or `cfg_attr` path in a walked file is exit 2.
 #
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this

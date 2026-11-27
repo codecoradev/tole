@@ -79,6 +79,10 @@ Rule D2 of the same standard: everything tole ships passes `cargo deny check lic
 
 `unsafe_code = "deny"` is set once for the whole workspace (`[workspace.lints.rust]` in the root `Cargo.toml`, inherited by every crate with `[lints] workspace = true`), so an `unsafe` block, fn, impl or attribute (`#[no_mangle]`) is a compile error wherever a module has not opted in (rule D4 of the same standard). An opt-in is one `#[allow(unsafe_code)]` on a named module or function that wraps the FFI (libc: `getpwuid_r`, `prctl`, `flock`, `kill`, `openat`, sysctl probes, the desktop supervisor), with a `// SAFETY:` comment; test helpers (`mkfifo`, `pre_exec`, `setuid` in a fixture) opt in on the test function or module. The files that hold an opt-in are listed in `AGENTS.md` section 6, and `scripts/arch-check.sh unsafe` (part of `all`, run in CI) keeps the list equal to the code: a file with an opt-in that is not listed, a listed file without one, a site without a `SAFETY:` comment on it or within 3 lines, and a crate without `[lints] workspace = true` all exit 1. `tole-tui` and `tole-desktop-model` have no opt-in, and `tole-core` built with `--no-default-features` keeps the same rule for embedders. A change in the opt-in list is a review signal: it is the whole `unsafe` surface of the repository.
 
+### Cora scope (#1249)
+
+`scripts/arch-check.sh cora` keeps the files of the scoped `index-breaking-change` entry of `.cora.yaml` binary-only (reached from a bin target through `mod` declarations, never from the library target); it reads the entry with a strict parser, fails closed on any form it does not understand, and runs as part of `all` in the `Check` job (what it does not follow: CONTRIBUTING, "Cora Workflow").
+
 ## 3. Module Responsibility
 
 | Module | File | Responsibility |
