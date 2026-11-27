@@ -150,6 +150,8 @@ pub(super) fn serve_storage_dir(state: &State, cwd: &str) -> std::path::PathBuf 
 /// - an already-live session is returned as is (200, `alreadyLive`): nothing
 ///   is reopened or replaced, so a busy turn is never disturbed, and a client
 ///   that reconnects mid-turn gets its id back plus the `busy` flag;
+/// - a log that ends in a turn a crash cut off is settled first (#1230: no
+///   model call, no tool run) and the answer says `"interrupted": true`;
 /// - no such file in that directory is a 404;
 /// - another process holding the session's writer lock is a 409.
 ///
@@ -183,10 +185,17 @@ pub(super) fn resume_session(
                 }
             }
             let busy = *st.busy.lock().expect("busy lock");
-            return (
-                200,
-                json!({"sessionId": id, "resumed": false, "alreadyLive": true, "busy": busy}),
-            );
+            drop(sessions);
+            let mut out =
+                json!({"sessionId": id, "resumed": false, "alreadyLive": true, "busy": busy});
+            // Idle and live can still hold a cut-off turn (a failed provider
+            // call): never settled while a turn runs or an approval waits.
+            if !busy && !state.approvals.has_pending(id) {
+                if let Err(resp) = settle(state, id, &mut out) {
+                    return resp;
+                }
+            }
+            return (200, out);
         }
     }
     let file = serve_storage_dir(state, cwd).join(format!("{id}.jsonl"));
@@ -248,8 +257,27 @@ pub(super) fn resume_session(
             if let Some(p) = &profile {
                 out["profile"] = json!(p.name);
             }
+            if let Err(resp) = settle(state, id, &mut out) {
+                return resp;
+            }
             (200, out)
         }
         Err(resp) => resp,
     }
+}
+
+/// Settle the cut-off turn of live session `id` (#1230); `out` says so.
+fn settle(
+    state: &State,
+    id: &str,
+    out: &mut serde_json::Value,
+) -> Result<(), (u16, serde_json::Value)> {
+    let done = tole_cli::session::interrupted::settle(&state.sessions, id).map_err(|e| {
+        let error = format!("cut-off turn not settled: {e}");
+        (500, json!({ "error": error }))
+    })?;
+    if done {
+        out["interrupted"] = json!(true);
+    }
+    Ok(())
 }
