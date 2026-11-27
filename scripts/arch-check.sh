@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Architecture guardrails of the CodeCora modular + thin-UI standard (#1249).
 #
-# Usage: scripts/arch-check.sh [kinds|size|unsafe|all] [workspace-root] [--init]
+# Usage: scripts/arch-check.sh [kinds|size|unsafe|cora|all] [workspace-root] [--init]
 #   workspace-root defaults to the repository root (the self-test points it at
 #   fixture workspaces). Needs bash, cargo and Python 3.8+. Nothing is
-#   downloaded: `cargo metadata --no-deps --offline`.
+#   downloaded: kinds, size and unsafe use `cargo metadata --no-deps --offline`.
+#   The cora mode also needs PyYAML (apt: python3-yaml), the workspace's
+#   dependencies already fetched, and it COMPILES the workspace (`cargo check
+#   --workspace --lib --bins --offline`, a no-op after a build of the same
+#   profile).
 #
 # ENFORCED (a violation makes this script exit 1; CI runs it in the `Check`
 # job, so no new required check name exists):
@@ -56,6 +60,27 @@
 #             module or function that wraps the FFI, and add the file to the
 #             AGENTS.md list in the same change.
 #
+# cora      (#1249)
+#             - the parsed .cora.yaml (PyYAML) is held to whitelists: only
+#               the known top-level keys; `ignore.files` and `review.exclude` hold only lock-file, target,
+#               docs and crates/*/tests globs; `ignore` and `review` only known
+#               keys; a plain `ignore.rules` string is no glob or regex and no
+#               part of the rule id or the finding text;
+#             - `index-breaking-change` is silenced only by a scoped
+#               `ignore.rules` entry listing exact crates/<name>/src/**/*.rs
+#               files, and the parsed document names it nowhere else;
+#             - after `cargo check --workspace --lib --bins --offline`, rustc's
+#               own dep-info (real paths) lists each file for a bin target and
+#               for no lib target of any workspace crate (mod, #[path],
+#               include!, macros); build scripts are skipped.
+#             A tripwire against the known ways to silence the rule, not a
+#             proof against every config semantic of cora (never run here).
+#             Residuals: default features and the host platform only (a
+#             `#[cfg(feature)]` or `#[cfg(windows)]` module in a lib is not
+#             seen), and code a build.rs or proc macro generates from a scoped
+#             file. Anything unprovable (no PyYAML, cargo or dep-info failing,
+#             a file over 1 MiB) is exit 2.
+#
 # FAIL CLOSED: anything that stops a check from finishing (python3 or cargo
 # missing, cargo failing, bad metadata, an exception in the helper) makes this
 # script exit 2 with a message. It never prints `ok` for a check that did not
@@ -69,12 +94,12 @@ mode="${1:-all}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${2:-$(cd "$here/.." && pwd)}"
 init=""
-if [ "${3:-}" = "--init" ]; then init="--init"; elif [ -n "${3:-}" ]; then echo "usage: $0 [kinds|size|unsafe|all] [workspace-root] [--init]" >&2; exit 2; fi
+if [ "${3:-}" = "--init" ]; then init="--init"; elif [ -n "${3:-}" ]; then echo "usage: $0 [kinds|size|unsafe|cora|all] [workspace-root] [--init]" >&2; exit 2; fi
 fails=0
 
 fail() { echo "error: $*"; fails=$((fails + 1)); }
 
-# lint <kinds|size|unsafe> [--init]: run the Python rules; exit 2 unless they finished.
+# lint <kinds|size|unsafe|cora> [--init]: run the Python rules; exit 2 unless they finished.
 lint() {
   local out rc=0 err line
   command -v python3 > /dev/null 2>&1 || { echo "error: python3 is needed by the architecture guardrails and was not found"; exit 2; }
@@ -100,8 +125,9 @@ case "$mode" in
   kinds) lint kinds ;;
   size) lint size "$init" ;;
   unsafe) lint unsafe ;;
-  all) lint kinds; lint size; lint unsafe ;;
-  *) echo "usage: $0 [kinds|size|unsafe|all] [workspace-root] [--init]" >&2; exit 2 ;;
+  cora) lint cora ;;
+  all) lint kinds; lint size; lint unsafe; lint cora ;;
+  *) echo "usage: $0 [kinds|size|unsafe|cora|all] [workspace-root] [--init]" >&2; exit 2 ;;
 esac
 
 if [ "$fails" -gt 0 ]; then
