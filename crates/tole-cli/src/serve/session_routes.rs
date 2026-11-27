@@ -1,9 +1,9 @@
 //! Session routes that write a log register the TUI writes too (#947): fork, tree,
 //! compact and name, and the idle-session guard they and the model routes share.
 
+use super::live_sessions::live;
 use super::State;
 use serde_json::json;
-use tole_cli::session_host::lock_sessions;
 use tole_core::storage::Storage;
 
 /// `POST /sessions/{id}/fork {"at"?: <seq>}` (#947): fork the session at a
@@ -32,12 +32,9 @@ pub(super) fn fork_route(state: &State, id: &str, body: &str) -> (u16, serde_jso
             None => return (400, json!({"error": "at must be an entry seq (integer)"})),
         },
     };
-    let st = {
-        let sessions = lock_sessions(&state.sessions);
-        sessions.get(id).cloned()
-    };
-    let Some(st) = st else {
-        return (404, json!({"error": "unknown session"}));
+    let st = match live(state, id) {
+        Ok(st) => st,
+        Err(unknown) => return unknown,
     };
     if *st.busy.lock().expect("busy lock") {
         return (409, json!({"error": "session is busy: a turn is running"}));
@@ -88,12 +85,9 @@ pub(super) fn fork_route(state: &State, id: &str, body: &str) -> (u16, serde_jso
 /// so it works while a turn runs. Rows are depth-first, `depth` relative
 /// to the root. 404 for an unknown session.
 pub(super) fn tree_route(state: &State, id: &str) -> (u16, serde_json::Value) {
-    let path = {
-        let sessions = lock_sessions(&state.sessions);
-        sessions.get(id).map(|st| st.path.clone())
-    };
-    let Some(path) = path else {
-        return (404, json!({"error": "unknown session"}));
+    let path = match live(state, id) {
+        Ok(st) => st.path,
+        Err(unknown) => return unknown,
     };
     let Some(dir) = path.parent() else {
         return (500, json!({"error": "session file has no directory"}));
@@ -125,13 +119,7 @@ pub(super) fn with_idle_session(
     id: &str,
     write: impl FnOnce(&mut tole_core::storage::JsonlStorage) -> Result<(), (u16, String)>,
 ) -> Result<(), (u16, serde_json::Value)> {
-    let st = {
-        let sessions = lock_sessions(&state.sessions);
-        sessions.get(id).cloned()
-    };
-    let Some(st) = st else {
-        return Err((404, json!({"error": "unknown session"})));
-    };
+    let st = live(state, id)?;
     let busy = || (409, json!({"error": "session is busy: a turn is running"}));
     if *st.busy.lock().expect("busy lock") {
         return Err(busy());
