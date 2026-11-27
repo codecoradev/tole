@@ -823,9 +823,8 @@ pub fn sessions_dir_for(cwd: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// One prompt = one full tole turn. Returns `(stop_reason, final_text)`;
-/// the transport decides how to deliver them (ACP: notification chunk +
-/// response; serve: the HTTP response body).
+/// One prompt = one full tole turn. Returns `(stop_reason, final_text)`; the
+/// transport delivers them (ACP: chunk + response; serve: the HTTP body).
 pub fn run_session_turn(
     sessions: SharedSessions,
     session_id: &str,
@@ -865,12 +864,13 @@ pub struct TurnResult {
     /// The typed end of the turn for the `turn_finished` webhook (#962): every
     /// payload string dropped. `None` when the end is not announced.
     pub turn_end: Option<TurnEnd>,
+    /// The typed problem of a non-final outcome, redacted for the wire.
+    pub problem: Option<tole_core::problem::WireProblem>,
 }
 
-/// A turn that returned an error. `message` is what the HTTP face reports.
-/// `end` is `Some` only when the turn had started (the session was claimed):
-/// a busy session or an unknown id never produce one, so nothing is announced.
-/// It carries no text; `message` must never be copied into an event.
+/// A turn that returned an error; `message` is what the HTTP face reports.
+/// `end` is `Some` only once the session was claimed (a busy session or an
+/// unknown id announce nothing) and carries no text: never copy `message` in.
 #[derive(Debug)]
 pub struct TurnError {
     pub message: String,
@@ -896,11 +896,10 @@ fn last_seq(storage: &dyn Storage) -> u64 {
     storage.entries().last().map_or(0, |e| e.seq)
 }
 
-/// [`run_session_turn_with_images`] plus the approval tool of an
-/// approval stop. Only the serve prompt route reads the extra fields; it
-/// passes its approval queue so the snapshot is taken AFTER the busy claim
-/// (an approvals-resume thread claims the same session and could queue an
-/// entry between an earlier snapshot and our claim).
+/// [`run_session_turn_with_images`] plus the approval tool and the typed
+/// problem of the stop. Only the serve prompt route and ACP read the extras;
+/// serve passes its approval queue so the snapshot is taken AFTER the busy
+/// claim (an approvals-resume thread could queue an entry before it).
 pub fn run_session_turn_detailed(
     sessions: SharedSessions,
     session_id: &str,
@@ -1098,6 +1097,7 @@ fn finish(
         approval_tool,
         queue_mark,
         turn_end,
+        problem: crate::session::problem::wire(outcome),
     })
 }
 

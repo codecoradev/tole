@@ -206,6 +206,9 @@ impl Drop for Serve {
     }
 }
 
+/// The secret a "PROVIDER_LEAK" failure echoes; the serve under test has it in its environment.
+pub const LEAKED: &str = "sk-leak-0123456789abcdefXYZ";
+
 /// Provider mock: answers every call with a short final text; a request
 /// mentioning "slow" is answered after `slow_ms`; a conversation with
 /// "TOOL_MISSION" asks for a `write_file` (needs approval). #571 outcome
@@ -279,7 +282,13 @@ pub fn spawn_mock_gated(
                     )
                 };
                 if all.contains("PROVIDER_FAIL") {
-                    let data = "{\"error\":{\"message\":\"scripted failure\"}}";
+                    // "PROVIDER_LEAK": the failure text echoes a secret of the serve environment.
+                    let leak = if all.contains("PROVIDER_LEAK") {
+                        format!(" {LEAKED}")
+                    } else {
+                        String::new()
+                    };
+                    let data = format!("{{\"error\":{{\"message\":\"scripted failure{leak}\"}}}}");
                     let _ = s.write_all(
                         format!(
                             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
