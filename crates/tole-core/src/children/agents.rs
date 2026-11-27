@@ -257,7 +257,7 @@ pub const HANDOFF_FILE: &str = "handoff.json";
 
 /// Last line of every child mission, role or not (#1025): a child that lacks
 /// something must stop and say so, not stub it and look finished.
-const MISSING_INPUT_RULE: &str = "If something you need is missing (a file, a credential, access, a decision), say exactly what and stop. Do not mock, substitute or guess.";
+pub const MISSING_INPUT_RULE: &str = "If something you need is missing (a file, a credential, access, a decision), say exactly what and stop. Do not mock, substitute or guess.";
 
 /// The child's mission: what was asked, plus (when a role is set) its brief,
 /// the artifacts to read by reference, and always [`MISSING_INPUT_RULE`].
