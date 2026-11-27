@@ -3,6 +3,7 @@
 use crate::client::Client;
 use crate::error::{Error, Result};
 use crate::http::ResponseBody;
+use crate::route::Route;
 use crate::sse::{Event, FrameReader, SseItem};
 use std::time::{Duration, Instant};
 
@@ -67,12 +68,16 @@ pub enum StreamItem {
     },
 }
 
-/// Follows one session's events across reconnects. Entry frames are delivered
-/// exactly once, in order: it resumes with `after=<last seq>` and drops any
+/// Follows one session's events, or one discussion's (`Client::follow_discussion`),
+/// across reconnects. Entry frames (a discussion's `changed` frames) are
+/// delivered exactly once, in order: it resumes with `after=<last seq>` and drops any
 /// entry at or below that seq. That guarantee is for entries only; see
 /// [`StreamItem::Reconnected`] for what other frames may lose or repeat.
 pub struct ResumingStream {
     client: Client,
+    /// `Route::Events` or `Route::DiscussionEvents`.
+    route: Route,
+    /// The id of the session, or of the discussion.
     session: String,
     last_seq: u64,
     policy: ReconnectPolicy,
@@ -89,12 +94,14 @@ pub struct ResumingStream {
 impl ResumingStream {
     pub(crate) fn new(
         client: Client,
+        route: Route,
         session: String,
         after: u64,
         policy: ReconnectPolicy,
     ) -> Self {
         Self {
             client,
+            route,
             session,
             last_seq: after,
             policy,
@@ -138,7 +145,8 @@ impl ResumingStream {
                 return Ok(None);
             }
             let Some(reader) = self.reader.as_mut() else {
-                match self.client.events(
+                match self.client.stream(
+                    self.route,
                     &self.session,
                     self.last_seq,
                     Some(self.policy.idle_timeout),
@@ -163,15 +171,20 @@ impl ResumingStream {
                 }
                 Ok(Some(SseItem::Frame(frame))) => {
                     let event = Event::from_frame(&frame)?;
-                    match &event {
-                        Event::Entry(e) if e.seq <= self.last_seq => continue,
-                        Event::Entry(e) => {
+                    // The durable frames carry a seq: an entry, or a discussion's `changed`.
+                    let seq = match &event {
+                        Event::Entry(e) => Some(e.seq),
+                        Event::Changed(c) => Some(c.seq),
+                        _ => None,
+                    };
+                    match seq {
+                        Some(seq) if seq <= self.last_seq => continue,
+                        Some(seq) => {
                             // Progress: the only frame that proves the stream works.
-                            self.last_seq = e.seq;
+                            self.last_seq = seq;
                             self.failures = 0;
                         }
-                        Event::Closed { .. } => self.closed = true,
-                        _ => {}
+                        None => self.closed |= matches!(event, Event::Closed { .. }),
                     }
                     return Ok(Some(StreamItem::Event(event)));
                 }
