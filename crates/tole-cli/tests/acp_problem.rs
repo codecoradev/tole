@@ -82,11 +82,12 @@ struct Acp {
 }
 
 impl Acp {
-    fn spawn(args: &[&str]) -> Self {
+    fn spawn(args: &[&str], cwd: Option<&std::path::Path>) -> Self {
         let home = TestDir::new("tole-acp-problem-home");
         let mut child = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home.path(), &[])
             .args(args)
             .arg("acp")
+            .current_dir(cwd.unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))))
             .env("TOLE_BASE_URL", spawn_mock())
             .env("TOLE_MODEL", "mock-model")
             .env("TOLE_API_KEY", "sk-test")
@@ -158,7 +159,7 @@ impl Drop for Acp {
 
 #[test]
 fn a_provider_failure_keeps_the_refusal_and_carries_the_problem_in_meta() {
-    let done = Acp::spawn(&[]).prompt("PROVIDER_FAIL go");
+    let done = Acp::spawn(&[], None).prompt("PROVIDER_FAIL go");
     assert_eq!(done["result"]["stopReason"], "refusal", "{done}");
     let p = &done["result"]["_meta"]["tole"]["problem"];
     assert_eq!(p["kind"], "provider", "{done}");
@@ -180,12 +181,15 @@ fn a_provider_failure_keeps_the_refusal_and_carries_the_problem_in_meta() {
 
 #[test]
 fn a_final_answer_has_no_meta() {
-    let done = Acp::spawn(&[]).prompt("hello");
+    let done = Acp::spawn(&[], None).prompt("hello");
     assert_eq!(done["result"], json!({"stopReason": "end_turn"}), "{done}");
 }
 
 /// A detail nothing else redacts: a stop gate's reason is the gate's own
-/// output, so a secret it prints is redacted only by the egress.
+/// output, so a secret it prints is redacted only by the egress. A host runs
+/// a stop gate in the sandbox by default when `bwrap` works (as on CI), and
+/// the sandbox sees only the process's working directory: the script lives
+/// there, so the gate runs the same with and without a sandbox.
 #[cfg(unix)]
 #[test]
 fn a_secret_in_a_stop_gate_reason_never_leaves_in_the_problem() {
@@ -197,7 +201,7 @@ fn a_secret_in_a_stop_gate_reason_never_leaves_in_the_problem() {
     )
     .unwrap();
     let cmd = format!("/bin/sh {}", gate.display());
-    let done = Acp::spawn(&["--on-turnend", &cmd]).prompt("just answer");
+    let done = Acp::spawn(&["--on-turnend", &cmd], Some(dir.path())).prompt("just answer");
     assert_eq!(done["result"]["stopReason"], "refusal", "{done}");
     let p = &done["result"]["_meta"]["tole"]["problem"];
     assert_eq!(p["kind"], "stop_gate", "{done}");

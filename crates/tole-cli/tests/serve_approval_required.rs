@@ -119,16 +119,26 @@ fn the_other_non_final_outcomes_are_still_refusals() {
     );
 }
 
+/// A serve whose stop gate (`--on-turnend`) is a script that prints `says` and
+/// exits 2. The script lives IN the workspace: a host runs the gate in the
+/// sandbox by default when `bwrap` works (as on CI), and the sandbox sees only
+/// the working directory, so a script elsewhere would not run there.
+#[cfg(unix)]
+fn serve_with_gate(says: &str, env: &[(&str, &str)]) -> Serve {
+    let ws = serve_harness::workspace_dir();
+    std::fs::create_dir_all(&ws).unwrap();
+    let gate = ws.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\necho {says}\nexit 2\n")).unwrap();
+    let cmd = format!("/bin/sh {}", gate.display());
+    Serve::spawn_in_env_args(&spawn_mock(0), ws, true, env, &["--on-turnend", &cmd])
+}
+
 /// A blocked stop gate (`--on-turnend`, denied three times) is a refusal,
 /// not an approval stop, and queues nothing.
 #[cfg(unix)]
 #[test]
 fn a_blocked_stop_gate_is_still_a_refusal() {
-    let dir = common::TestDir::new("tole-gate");
-    let gate = dir.path().join("gate.sh");
-    std::fs::write(&gate, "#!/bin/sh\necho gate says no\nexit 2\n").unwrap();
-    let cmd = format!("/bin/sh {}", gate.display());
-    let serve = Serve::spawn_with_args(&spawn_mock(0), &["--on-turnend", &cmd]);
+    let serve = serve_with_gate("gate says no", &[]);
     let id = new_session(&serve);
     let body = prompt(&serve, &id, "just answer");
     assert_eq!(body["stopReason"], "refusal", "{body}");
@@ -181,18 +191,8 @@ fn a_secret_in_a_provider_error_never_leaves_in_the_problem() {
 #[cfg(unix)]
 #[test]
 fn a_secret_in_a_stop_gate_reason_never_leaves_in_the_problem() {
-    let dir = common::TestDir::new("tole-gate-leak");
-    let gate = dir.path().join("gate.sh");
-    std::fs::write(
-        &gate,
-        format!("#!/bin/sh\necho denied with {LEAKED}\nexit 2\n"),
-    )
-    .unwrap();
-    let cmd = format!("/bin/sh {}", gate.display());
     let env = [("TOLE_TEST_API_KEY", LEAKED)];
-    let ws = serve_harness::workspace_dir();
-    std::fs::create_dir_all(&ws).unwrap();
-    let serve = Serve::spawn_in_env_args(&spawn_mock(0), ws, true, &env, &["--on-turnend", &cmd]);
+    let serve = serve_with_gate(&format!("denied with {LEAKED}"), &env);
     let body = prompt(&serve, &new_session(&serve), "just answer");
     assert_eq!(body["problem"]["kind"], "stop_gate", "{body}");
     let detail = body["problem"]["detail"].as_str().expect("detail");
