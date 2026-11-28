@@ -57,12 +57,24 @@ services:
       - "7801"
 
   proxy:
-    # Not hardened like the tole service on purpose: the official image gives the
-    # binary a file capability (cap_net_bind_service), so `cap_drop: [ALL]` needs a
-    # matching `cap_add`, and a read-only root filesystem was not tried. Neither was
-    # run here; add them once you have checked them on your host.
     image: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     restart: unless-stopped
+    # Hardened like the tole service: no capability at all, no privilege gain, a
+    # read-only root filesystem (/tmp is a tmpfs; /data and /config are volumes).
+    # Run with Docker Engine 29.9.3: the proxy still binds 80 and 443 with
+    # `cap_drop: [ALL]` because Docker sets net.ipv4.ip_unprivileged_port_start=0
+    # in a container. Where that is not so (rootless Podman, a host that
+    # overrides it) add `cap_add: [NET_BIND_SERVICE]` or publish other ports.
+    # With the `localhost` name Caddy logs one error: it cannot install its local
+    # root CA into the container's trust store. Harmless, and a public name does
+    # not trigger it.
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     depends_on:
       tole:
         condition: service_healthy
