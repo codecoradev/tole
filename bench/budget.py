@@ -16,7 +16,7 @@ import math
 import tomllib
 from dataclasses import dataclass
 
-METRICS = ("cold_start_ms", "idle_rss_mb", "active_rss_mb", "per_turn_ms")
+METRICS = ("cold_start_ms", "idle_rss_mb", "active_rss_mb", "per_turn_ms", "binary_size_mib")
 
 
 class BudgetError(ValueError):

@@ -12,15 +12,17 @@ ceiling = 60
 [x86_64-linux.per_turn_ms]
 baseline = 3
 ceiling = 10
+[x86_64-linux.binary_size_mib]
+ceiling = 25
 """
 
 
 def mk(**kw):
-    return {"x": {"cold_start_ms": 25.0, "idle_rss_mb": 30.0, "active_rss_mb": 60.0, "per_turn_ms": 10.0, **kw}}
+    return {"x": {"cold_start_ms": 25.0, "idle_rss_mb": 30.0, "active_rss_mb": 60.0, "per_turn_ms": 10.0, "binary_size_mib": 25.0, **kw}}
 
 
 class Parse(unittest.TestCase):
-    def test_parses_all_four_metrics(self):
+    def test_parses_all_five_metrics(self):
         b = budget.parse_budget(GOOD)
         self.assertEqual(b["x86_64-linux"]["idle_rss_mb"], 30.5)
         self.assertEqual(set(b["x86_64-linux"]), set(budget.METRICS))
@@ -57,7 +59,7 @@ class Compare(unittest.TestCase):
     def test_every_metric_is_judged_independently(self):
         ceilings = mk()["x"]
         measured = {m: c * 2 for m, c in ceilings.items()}
-        self.assertEqual(sum(not v.ok for v in budget.compare(measured, ceilings)), 4)
+        self.assertEqual(sum(not v.ok for v in budget.compare(measured, ceilings)), 5)
 
     def test_unmeasured_budgeted_metric_is_an_error(self):
         ceilings = mk()["x"]

@@ -25,16 +25,15 @@ clap = { version = "4", features = ["derive"] }
 [workspace.lints.rust]
 unsafe_code = "deny"
 
-# Size-conscious release profile. The "16.7 MB, now ~9 MB" figure from #482 is
-# stale. Measured 2026-11-19 at 70cffd7 (one machine: x86_64 Linux, 4 cores),
-# `cargo build --release -p tole-cli` (default features): 23.8 MB stripped
-# (34.5 MB unstripped), 9.8 MB as a local tar.gz. docs/perf.md's 2026-11-13
-# table lists 19.5 MB for the same command, so the binary grew about 4.3 MB
-# (+22%) in six days; the cause is not bisected. The published v0.11.0 Linux
-# x86_64 asset is 8.4 MB (tar.gz; the gap to the local 9.8 MB is unexplained).
-# `--no-default-features`: 10.2 MB. Tried, not adopted: lto = "fat" 21.5 MB
-# (-9%) for 2.2x the build time; opt-level = "s" 18.3 MB (-23%), not
-# benchmarked here, expected to trade hot-path speed. See docs/perf.md.
+# Release profile. Size, measured and attributed in docs/perf/binary-size.md
+# (#991): 24.6 MB (23.5 MiB) stripped at 9dc6caf (x86_64 Linux, default
+# features, `cargo build --release -p tole-cli`), 35.5 MB unstripped. The growth since
+# v0.10.1 (11.4 MB) is the HTTP MCP client, the web tools, the secret detector's
+# regex stack and first-party code, not one regression. bench/budget.toml gates
+# the size (`binary_size_mib`). Tried and not adopted, with the runtime cost
+# measured: opt-level = "s" (-22.7% size; open of a 20k-entry session about +25%
+# slower, redaction of 4 KiB texts 25 to 55% slower), lto = "fat" (-9.0%, runtime
+# neutral, 2 to 3x the release build time). `--no-default-features`: 10.3 MB.
 # panic = "abort" is deliberately NOT set: tole relies on unwinding (Mutex
 # poison recovery via `lock().unwrap_or_else(|p| p.into_inner())`, turns run on
 # threads / spawn_blocking), and abort would kill every session of a

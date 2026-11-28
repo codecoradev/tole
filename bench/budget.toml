@@ -47,6 +47,26 @@ ceiling = 27
 baseline = 4.4
 ceiling = 18
 
+[x86_64-linux.binary_size_mib]
+# Size of the release binary in MiB (1 MiB = 1,048,576 bytes; #991). CI builds
+# with `strip = true`, so this is the stripped file; an unstripped local build
+# is about 1.4x larger and must not be compared with it.
+# Baseline: 24,628,832 bytes = 23.49 MiB, develop at 9dc6caf, 2026-11-28
+# (4-vCPU local container, rustc 1.97.0), rounded up.
+# Ceiling: 26 MiB, x1.11, which leaves 2.5 MiB. That is about 5 to 12 weeks of
+# first-party growth at the November rate of 0.2 to 0.5 MiB a week (about 8 at
+# 0.3), plus the floating `stable` toolchain of CI (the v0.12.0 asset built
+# there is 0.26% larger than the same commit built locally). It catches a jump
+# like the HTTP MCP client (3.2 MiB) in one step; the regex stack (1.5 MiB) and
+# the web tools (1.25 MiB) would each pass alone and trip it together, see
+# docs/perf/binary-size.md. Ordinary growth WILL reach it: the ceiling is
+# re-baselined on purpose, not raised by reflex. At each release the maintainer
+# who cuts it measures the new binary and either lowers the ceiling to measured
+# x1.11 or, if the size grew for a reason worth its bytes, raises it with the
+# `perf-budget-raise` label after reading what the growth bought.
+baseline = 23.5
+ceiling = 26
+
 # --- aarch64 Linux (baseline: PR #983 CI on the hosted ubuntu-24.04-arm runner,
 # --- 4 vCPU; same headroom factors and metric definitions as above)
 
@@ -67,3 +87,13 @@ ceiling = 22
 [aarch64-linux.per_turn_ms]
 baseline = 3.3
 ceiling = 14
+
+[aarch64-linux.binary_size_mib]
+# Same metric, headroom (x1.11) and re-baselining as x86_64. The baseline is an ESTIMATE, not a run of
+# this harness: the v0.12.0 aarch64 release asset unpacks to 20,465,216 bytes
+# (19.52 MiB, measured), scaled by the growth of the x86_64 binary from v0.12.0
+# to develop at 9dc6caf (+3.2%, 23,860,024 to 24,628,832 bytes) = 20.2 MiB.
+# Re-baseline from the first develop CI run of this job, as for the other
+# aarch64 metrics.
+baseline = 20.2
+ceiling = 22.5
