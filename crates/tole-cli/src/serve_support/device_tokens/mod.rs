@@ -1,9 +1,8 @@
-//! Per-device named tokens for `tole serve` (#1320, part 1: the token store; the
-//! `tole serve token` commands are the next change, and `tole serve` does not
-//! check these tokens yet).
+//! Per-device named tokens for `tole serve` (#1320, part 1: the store and the
+//! `tole serve token` commands; `tole serve` does not check them yet).
 //!
 //! A device token is a 256-bit secret from the OS random source, shown once
-//! when it is made and never stored: the file keeps only its
+//! by `tole serve token add` and never stored: the file keeps only its
 //! SHA-256 (a fast hash is right for a random 256-bit secret, and a request
 //! path cannot afford PBKDF2), a name, a scope and times.
 //!
@@ -42,10 +41,12 @@
 //! after [`RETRY_AFTER_SECS`] or when the file changes; a corrupt, unsafe or
 //! oversized file stays refused until the file changes.
 
+mod cmd;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use cmd::{cli, run, ServeAction, TokenAction};
 pub use store::{Added, Live, Store};
 
 use serde::{Deserialize, Serialize};
@@ -77,13 +78,15 @@ const VERSION: u8 = 1;
 const HASH_PREFIX: &str = "sha256:";
 
 /// What a token may do. Part 2 enforces it; part 1 only records it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Scope {
     /// Reads sessions and the event stream; answers no approval.
     #[serde(rename = "read-only")]
+    #[value(name = "read-only")]
     ReadOnly,
     /// Everything the shared bearer token can do.
     #[serde(rename = "full")]
+    #[value(name = "full")]
     Full,
 }
 

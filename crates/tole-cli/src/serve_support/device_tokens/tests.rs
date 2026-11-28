@@ -1,5 +1,6 @@
-//! What only the module itself can see: the shape check that spares the file.
+//! What only the module itself can see: the shape check that spares the file, and the time format.
 
+use super::cmd::utc;
 use super::*;
 use crate::test_dir::TestDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,12 @@ fn a_token_of_the_wrong_shape_costs_no_file_access() {
     // A token with the shape does read it.
     assert_eq!(live.lookup(&format!("{PREFIX}{}", "A".repeat(43))), None);
     assert!(live.loaded());
+}
+
+#[test]
+fn times_are_utc_minutes() {
+    assert_eq!(utc(0), "1970-01-01 00:00Z");
+    assert_eq!(utc(1_795_000_000), "2026-11-18 11:06Z");
 }
 
 /// A view over a store with one token, whose loads are counted and can be

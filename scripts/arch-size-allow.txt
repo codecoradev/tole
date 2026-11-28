@@ -1,6 +1,6 @@
 # 2026-11-28: a fifth owner-approved ONE-TIME raise (the owner's answer in the session of 2026-11-28): the
 # `crate tole-cli` total, for the device token feature of #1320 in two steps. Step 1, the token store (A):
-# 83928 -> 84964 (+1036). Step 2, the `tole serve token` CLI (B): 84964 -> 85158 (+194). It is for this feature
+# 83928 -> 84964 (+1036; other changes have since lowered the total to 84674). Step 2, the `tole serve token` CLI (B): 84674 -> 84868 (+194). It is for this feature
 # only; later work must offset its lines or wait for the owner. Never again without the owner.
 # 2026-11-26: a fourth owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 132 lines of module
 # glue (`//!` docs, imports, `mod` declarations, blank lines) that splitting serve.rs into 16 modules adds
@@ -23,7 +23,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 84674
+crate tole-cli 84868
 crate tole-core 64676
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -45,7 +45,7 @@ file crates/tole-cli/src/discuss/tests.rs 1056
 file crates/tole-cli/src/discuss/tool.rs 637
 file crates/tole-cli/src/discuss/tool_tests.rs 898
 file crates/tole-cli/src/doctor.rs 1561
-file crates/tole-cli/src/main.rs 2196
+file crates/tole-cli/src/main.rs 2194
 file crates/tole-cli/src/mission.rs 922
 file crates/tole-cli/src/plugin/cmd.rs 1658
 file crates/tole-cli/src/plugin/cmd_tests.rs 1989
