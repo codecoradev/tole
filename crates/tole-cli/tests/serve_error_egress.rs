@@ -47,11 +47,21 @@ fn a_secret_in_a_4xx_error_never_leaves() {
     );
 }
 
+/// Removes the directory that holds the workspace (the `Serve` removes only
+/// the workspace itself and its home): no `tole-*` entry is left behind (#781).
+struct RemoveOnDrop(std::path::PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A mission that fails to start its session directory is a 200 with
 /// `status: error`, not a 500: its `error` text is redacted too.
 #[test]
 fn a_secret_in_a_mission_error_never_leaves() {
-    let ws = serve_harness::workspace_dir().join(LEAKED);
+    let parent = RemoveOnDrop(serve_harness::workspace_dir());
+    let ws = parent.0.join(LEAKED);
     std::fs::create_dir_all(&ws).unwrap();
     // `.tole` is a file, so the session directory cannot be created.
     std::fs::write(ws.join(".tole"), "").unwrap();
