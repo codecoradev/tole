@@ -35,7 +35,9 @@ class Mcp:
     def __init__(self, cwd):
         self.p = subprocess.Popen(
             ["cora", "mcp"], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.fd = self.p.stdout.fileno()
+        self.buf = b""  # our own line buffer: select() only sees the fd, not a Python reader's buffer
         self.n = 0
         try:
             self._handshake()
@@ -56,12 +58,15 @@ class Mcp:
         self.n += 1
         self.send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
         while True:
-            if not select.select([self.p.stdout], [], [], READ_TIMEOUT)[0]:
-                raise RuntimeError(f"cora mcp gave no answer in {READ_TIMEOUT}s")
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError("cora mcp closed its output (run `cora mcp` by hand to see why)")
-            line = line.strip()
+            while b"\n" not in self.buf:
+                if not select.select([self.fd], [], [], READ_TIMEOUT)[0]:
+                    raise RuntimeError(f"cora mcp gave no answer in {READ_TIMEOUT}s")
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    raise RuntimeError("cora mcp closed its output (run `cora mcp` by hand to see why)")
+                self.buf += chunk
+            raw, self.buf = self.buf.split(b"\n", 1)
+            line = raw.decode("utf-8", "replace").strip()
             if line.startswith("{"):
                 try:
                     msg = json.loads(line)
@@ -155,7 +160,12 @@ def finalize(d, mcp, severity):
             loc = f"{i.get('file')}:{i.get('line')}" if i.get("line") else i.get("file")
             print(f"  [{i.get('severity')}] {loc} {i.get('title')}")
             print(f"      {str(i.get('body', ''))[:400]}")
-        if shown and status == 0:
+        lost = (out.get("rejected_items") or 0) + (out.get("dropped_by_validation") or 0)
+        if lost:
+            print(f"  {lost} finding(s) were rejected or dropped by validation (a file not in the diff, a malformed "
+                  "item): fix the findings file and run finalize again (not a pass)", file=sys.stderr)
+            status = 1
+        elif shown and status == 0:
             status = 2
     print("cora-agent-review: " + {0: "no findings", 2: "findings above: fix real ones, state the result "
                                    "in the PR Testing section", 1: "incomplete: not a pass"}[status])
