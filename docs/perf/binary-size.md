@@ -1,8 +1,10 @@
 # Release binary size
 
-Measured 2026-11-26 on `develop` at 146ee4c, for issue #991. This page records
-measurements and a recommendation. It changes no default: the release profile
-and the default features are the owner's decision.
+Measured 2026-11-26 on `develop` at 146ee4c, for issue #991, and re-checked on
+2026-11-28 at 9dc6caf. This page records measurements, a recommendation and,
+since 2026-11-28, the decision (section "Decision"): the one change is a size
+ceiling in the perf gate. The release profile and the default features are
+unchanged.
 
 Sizes are bytes of the stripped `tole` for `cargo build --release -p tole-cli`
 (default features), x86_64 Linux, unless a row says otherwise. "MB" is
@@ -92,6 +94,18 @@ Checks that the method is sound:
 | #984, the "after" of #991 | 70cffd7 | 2026-11-19 | 23,776,032 | +566,264 | 9,782,940 |
 | v0.12.0 | 33a7d04 | 2026-11-20 | 23,860,024 | +83,992 | 9,818,446 |
 | develop | 146ee4c | 2026-11-26 | 24,402,272 | +542,248 | 10,057,395 |
+| develop, re-measured by a second session (not reproduced here) | 1155e5d | 2026-11-28 | 24,457,216 | +54,944 | |
+| develop, re-measured for the gate | 9dc6caf | 2026-11-28 | 24,628,832 | +171,616 over 1155e5d, +226,560 over 146ee4c | |
+
+The 9dc6caf row: `cargo build --release -j 2 --locked -p tole-cli` with symbols
+kept (35,458,472 bytes), then `strip --strip-all`; 4-core Linux x86_64 container,
+rustc 1.97.0, 243 crates in `cargo tree`. Symbol bytes by the script at the end:
+`std` 3,858,179, `tole_cli` 2,904,688, rmcp 2,444,323 (unchanged), `tole_core`
+2,213,826, `tole` 1,008,642, tokio 487,622. rmcp and the other third-party
+figures equal the 146ee4c ones; the +226,560 bytes (+0.9%) of the two days are
+first-party and `std` code, which keeps growing at 0.2 to 0.5 MB a week. Bench
+harness on this binary: binary 23.49 MiB, cold start 3.9 ms, idle RSS 14.7 MB,
+active RSS 19.6 MB, per-turn 4.5 ms.
 
 b04ff42's parent, b573af2 (the develop commit before #533), builds to the same
 11,416,376 bytes as v0.10.1. The table's "before" (19,473,344) is 9,368 bytes
@@ -287,6 +301,26 @@ others, read 17.4 MB idle and 23.1 MB active against 12.4 and 17.7 here, so
 treat RSS differences below about 2 MB as unreliable; the cause of that shift
 was not investigated.
 
+### Runtime cost on CPU-bound paths (2026-11-28)
+
+The mock harness above does not exercise the paths where tole spends CPU
+itself. Two of them were measured with `opt-level = 3` and with `opt-level =
+"s"` (thin LTO both, `CARGO_PROFILE_RELEASE_OPT_LEVEL=s`), 9dc6caf, release
+test binaries built once per variant, interleaved, three runs per cell, one
+process per cell, shared 4-core container (about +-20% noise):
+
+| Path | `opt-level = 3` | `opt-level = "s"` | Change |
+|---|---:|---:|---:|
+| open of 20,020 `mixed` entries, `perf_replay` (ms) | 135, 139, 151 | 179, 180, 182 | +25 to +30% |
+| open of 100,022 `mixed` entries (ms) | 653, 757, 887 | 741, 809, 941 | +10 to +15%, inside the noise |
+| `SecretSet::redact`, 5 secrets, 4 KiB text (MB/s) | 3,150, 3,141, 2,756 | 1,389, 1,544, 2,376 | 25 to 55% slower |
+| same, 64 KiB text (MB/s) | 2,179, 3,051, 3,559 | 2,174, 2,691, 2,271 | not beyond the noise |
+| same, 1 MiB text (MB/s) | 558, 708, 932 | 585, 607, 463 | not beyond the noise |
+
+Both are paths a long session pays on every resume and every tool result, which
+the provider call does not hide. `lto = "fat"` was not re-run on them (it was
+runtime neutral on the harness above).
+
 ## Recommendation
 
 For the owner; nothing here is applied.
@@ -322,7 +356,7 @@ For the owner; nothing here is applied.
    shell-tools,tui` is 13.7 MB (-44%) and the MCP-capable default stays as is.
    That is a product decision (what the lean build omits), not a build
    setting.
-7. #921: add `binary_size_mb` to the gate as a ratcheted ceiling. The harness
+7. #921: add `binary_size_mb` to the gate as a ratcheted ceiling (taken, see "Decision"). The harness
    already reports the binary size next to its metrics (`binary 23.3 MB`, in
    MiB, for the 24.4 MB build); the growth here came from many steps of 0.5 to
    3 MB, which a ceiling just above the current 24.4 MB would catch one step
@@ -333,6 +367,36 @@ For the owner; nothing here is applied.
    the root `Cargo.toml` still describe #991 as open; the tar.gz gap is
    explained above.
 
+## Decision
+
+2026-11-28, delegated by the owner ("choose the best option and record it").
+
+1. **The size is gated.** `bench/budget.toml` gets `binary_size_mb`:
+   x86_64 baseline 23.5 MiB, ceiling 25 (x1.06); aarch64 baseline 20.2 MiB (an
+   estimate: the v0.12.0 aarch64 asset unpacks to 20,465,216 bytes, scaled by
+   +3.2%, the growth of the x86_64 binary since v0.12.0), ceiling 21.5. The
+   headroom covers the floating `stable` toolchain of CI and about a week of
+   first-party growth and leaves 1.5 MiB: the HTTP MCP client step (3.2 MiB)
+   fails the job, the regex stack (1.5 MiB) is at the edge, the web tools
+   (1.25 MiB) pass alone and trip it on top of a week of growth. It
+   is Recommendation 7, taken. It needs the `perf-budget-raise` label to merge
+   (it edits `bench/*.py`), and its first ratchet run reports an unknown metric
+   because the ratchet reads the head's file with the base's parser.
+2. **The profile does not change.** Of the measured levers only `lto = "fat"`
+   costs no runtime, for -9% and a release build two to three times longer on
+   every PR that runs a release job; `opt-level = "s"` is the big one (-22.7%)
+   and costs up to 30% on session open and on redaction of short results (the
+   section above); `panic = "abort"` is out. Not clearly beneficial, so not
+   applied. If distribution size starts to matter, `lto = "fat"` for the
+   release workflow is the first step, then `"s"` for the dependencies only
+   (-5.8%, the cheapest runtime cost of the "s" rows).
+3. **The growth is accepted as three decisions plus first-party code**
+   (Recommendation 1). Nothing is reverted.
+4. **Open, outside this repository:** the `uteke-privacy` request of
+   Recommendation 2 (`regex-lite` or trimmed `regex` features, -1.46 or -0.78
+   MB). It is the only separable third-party cost left, and tole cannot change
+   it from its manifest.
+
 ## Not measured
 
 - Other targets: macOS, Windows and aarch64 Linux were not built. Published
@@ -340,7 +404,7 @@ For the owner; nothing here is applied.
   aarch64-unknown-linux-gnu 9,186,517, x86_64-pc-windows-msvc 10,072,316,
   x86_64-unknown-linux-gnu 9,886,436 bytes.
 - Build time of each variant (compile cache in use).
-- Hot-path CPU cost of `opt-level = "s"` beyond the mock harness.
+- Hot-path CPU cost of `lto = "fat"` (the `opt-level = "s"` one is in "Runtime cost on CPU-bound paths").
 - The part of the first-party growth that belongs to each feature: `nm` module
   paths are not stable across the interval, and 268d75d to ac726bc was
   bisected once (a434107), not per commit.

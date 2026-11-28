@@ -47,6 +47,23 @@ ceiling = 27
 baseline = 4.4
 ceiling = 18
 
+[x86_64-linux.binary_size_mb]
+# Size of the release binary in MiB (#991). CI builds with `strip = true`, so
+# this is the stripped file; an unstripped local build is about 1.4x larger and
+# must not be compared with it. Deterministic for one toolchain, so the
+# headroom (x1.06) is not noise: it covers the floating `stable` toolchain of
+# CI (the v0.12.0 asset built there is 0.26% larger than the same commit built
+# locally) and about a week of first-party growth (it was +0.2 to +0.5 MB a
+# week in November). It leaves 1.5 MiB: the jumps this exists to catch were
+# 3.2 MiB (HTTP MCP client), 1.5 MiB (the regex stack, at the edge) and 1.25 MiB
+# (web tools, which alone would pass and trip it on top of a week of growth),
+# see docs/perf/binary-size.md.
+# Baseline: 24,628,832 bytes = 23.49 MiB, develop at 9dc6caf, 2026-11-28
+# (4-vCPU local container, rustc 1.97.0), rounded up. Raise it only with the
+# `perf-budget-raise` label and after reading what the new size buys.
+baseline = 23.5
+ceiling = 25
+
 # --- aarch64 Linux (baseline: PR #983 CI on the hosted ubuntu-24.04-arm runner,
 # --- 4 vCPU; same headroom factors and metric definitions as above)
 
@@ -67,3 +84,13 @@ ceiling = 22
 [aarch64-linux.per_turn_ms]
 baseline = 3.3
 ceiling = 14
+
+[aarch64-linux.binary_size_mb]
+# Same metric and headroom (x1.06). The baseline is an ESTIMATE, not a run of
+# this harness: the v0.12.0 aarch64 release asset unpacks to 20,465,216 bytes
+# (19.52 MiB, measured), scaled by the growth of the x86_64 binary from v0.12.0
+# to develop at 9dc6caf (+3.2%, 23,860,024 to 24,628,832 bytes) = 20.2 MiB.
+# Re-baseline from the first develop CI run of this job, as for the other
+# aarch64 metrics.
+baseline = 20.2
+ceiling = 21.5

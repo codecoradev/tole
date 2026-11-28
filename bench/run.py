@@ -9,7 +9,7 @@ no network, no secrets) and compares the result with bench/budget.toml.
     run.py render  report.json                                   # markdown
     run.py release-report --tag vX.Y.Z reports...                # release table
 
-Metrics (all four are budgeted per platform):
+Metrics (all five are budgeted per platform):
   cold_start_ms   wall time of `tole --version`, median of N spawns
   idle_rss_mb     VmRSS of a `tole serve` daemon that is up and idle
   active_rss_mb   peak RSS (the child's /proc VmHWM) of one `tole run` that makes
@@ -20,6 +20,9 @@ Metrics (all four are budgeted per platform):
                   call, one durable JSONL commit. The mock answers at once,
                   so provider latency is excluded; its own (small, constant)
                   cost is included.
+  binary_size_mb  size of the binary passed to --bin, in MiB (#991). CI builds
+                  with `strip = true`, so it is the stripped release binary;
+                  an unstripped local build is about 1.4 times larger.
 """
 
 from __future__ import annotations
@@ -323,11 +326,13 @@ def measure(binary: str) -> dict:
         finally:
             provider.close()
     version = subprocess.run([env.bin, "--version"], capture_output=True, text=True).stdout.strip()
+    binary_size_mb = Path(env.bin).stat().st_size / 1048576
     metrics = {
         "cold_start_ms": cold,
         "idle_rss_mb": idle,
         "active_rss_mb": sess["active_rss_mb"],
         "per_turn_ms": sess["per_turn_ms"],
+        "binary_size_mb": binary_size_mb,
     }
     return {
         "schema": SCHEMA,
@@ -336,7 +341,7 @@ def measure(binary: str) -> dict:
         "cpus": os.cpu_count(),
         "mem_total_mb": _mem_total_mb(),
         "binary": version,
-        "binary_size_mb": Path(env.bin).stat().st_size / 1048576,
+        "binary_size_mb": binary_size_mb,
         "commit": os.environ.get("GITHUB_SHA", ""),
         "rounds": {"short": ROUNDS_SHORT, "long": ROUNDS_LONG},
         "metrics": metrics,
@@ -388,12 +393,13 @@ def gate(report: dict, budget_text: str) -> tuple[list[budget.Verdict], str]:
     return verdicts, status
 
 
-UNITS = {"cold_start_ms": "ms", "idle_rss_mb": "MB", "active_rss_mb": "MB", "per_turn_ms": "ms"}
+UNITS = {"cold_start_ms": "ms", "idle_rss_mb": "MB", "active_rss_mb": "MB", "per_turn_ms": "ms", "binary_size_mb": "MB"}
 LABELS = {
     "cold_start_ms": "Cold start (`tole --version`)",
     "idle_rss_mb": "Idle RSS (`tole serve`)",
     "active_rss_mb": "Active-session RSS (peak)",
     "per_turn_ms": "Per-turn overhead",
+    "binary_size_mb": "Binary size (release, stripped)",
 }
 
 

@@ -177,7 +177,8 @@ unit test `a_large_text_with_invisible_characters_is_still_linear` redacts
 ## Release perf budget (#921)
 
 A CI gate on the release binary, separate from the threshold tests above:
-cold start, idle RSS, active-session RSS and per-turn overhead, measured with
+cold start, idle RSS, active-session RSS, per-turn overhead and binary size
+(#991), measured with
 the real `tole` and a mock provider, against the ceilings in
 `bench/budget.toml` (ratchet-only-downward). See `bench/README.md`.
 
@@ -238,17 +239,53 @@ unit), on one machine (x86_64 Linux, 4 cores): 23,776,128 bytes stripped
 (34,482,104 unstripped; the `strip` step in `release.yml` is a no-op after
 cargo's own). The table above lists 19,482,712 bytes for the same command six
 days earlier, so the binary grew about 4.3 MB (+22%); the cause is
-attributed in [binary-size.md](perf/binary-size.md). The old "~9 MB" in the
-`Cargo.toml` comment (#482) is stale.
+attributed in [binary-size.md](perf/binary-size.md): not one regression but
+three separable steps (the HTTP MCP client +3.3 MB, the secret detector's
+`regex` stack +1.6 MB, the built-in web tools +1.3 MB) and first-party code
+spread over hundreds of commits. The old "~9 MB" in the `Cargo.toml` comment
+(#482) was stale and is replaced.
 `--no-default-features`: 10,180,024 bytes. Compressed, the local default build
 is 9.8 MB as tar.gz, while the published v0.11.0 Linux x86_64 asset is
 8,398,403 bytes; the difference is explained in
 [binary-size.md](perf/binary-size.md) (the published asset is the 2026-11-14
 code). Variants tried: `lto = "fat"` 21,543,544 bytes (-9.4%,
-build 3m52s to 8m32s); `opt-level = "s"` 18,276,776 bytes (-23%; not
-benchmarked here, expected to trade hot-path speed). `cargo bloat --crates`
+build 3m52s to 8m32s); `opt-level = "s"` 18,276,776 bytes (-23%), whose
+runtime cost was measured on 2026-11-28 and is not small, see below. `cargo
+bloat --crates`
 figures cover the `.text` section only (17.1 MiB of the 22.7 MiB binary; the
 rest is rodata and other sections): std 2.9 MiB, tole_cli 2.6, rmcp 2.2,
 tole_core 2.1, serde_core 1.0, tole 0.9, tokio 0.5, serde_json 0.4, rustls 0.4.
+
+**Decision (2026-11-28, delegated by the owner on #991).** The size is now
+gated and the profile is unchanged.
+
+- Gate: `bench/budget.toml` has `binary_size_mb` per platform (see "Release
+  perf budget (#921)"): ceiling 25 MiB on x86_64 (baseline 23.49 MiB = 24,628,832
+  bytes at 9dc6caf, x1.06) and 21.5 MiB on aarch64 (an estimate, see the file).
+  That leaves 1.5 MiB: a step like the HTTP MCP client (3.2 MiB) fails the job,
+  the regex stack (1.5 MiB) is at the edge, a 1.25 MiB step passes alone and
+  trips it on top of a week of growth; ordinary first-party growth does not. The gate only moves down, so a ceiling is raised with the
+  `perf-budget-raise` label after reading what the new size buys.
+- Profile: `opt-level = 3`, thin LTO, `panic = "unwind"` stay. `opt-level =
+  "s"` is -5.5 MB (-22.7%) but costs on the paths that are CPU-bound rather
+  than provider-bound (release build, same machine, interleaved, three runs per
+  variant, one process per cell): opening a 20,020-entry `mixed` session
+  (`perf_replay`) 135 to 151 ms with `opt-level = 3` against 179 to 182 ms with
+  `"s"` (+25 to +30%), the 100,022-entry one 653 to 887 against 741 to 941 ms
+  (+10 to +15%, within the noise of the shared machine), and `SecretSet::redact`
+  of a 4 KiB text 2,756 to 3,150 MB/s against 1,389 to 2,376 MB/s (25 to 55%
+  slower); 64 KiB and 1 MiB texts did not differ beyond the noise. A size win of
+  23% bought with up to 30% on session open and on every redaction of a short
+  tool result is not taken. `lto = "fat"` is the one lever that does not cost
+  runtime (the mock harness reads per-turn 4.65 against 4.84 ms and 1.6 MB less
+  idle RSS) and saves 2.2 MB (-9%), but it doubles to triples the release build
+  (3m52s to 8m32s) in the release matrix, the `Perf budget` jobs and the CI
+  release job, so it is left to the owner as the first lever if distribution
+  size starts to matter; `panic = "abort"` stays off (see the `Cargo.toml`
+  comment).
+- Not done here: the `regex` stack of `uteke-privacy` (-1.46 MB with
+  `regex-lite`, -0.78 MB with trimmed features) cannot be changed from this
+  repository; it is a request to the `uteke-privacy` owner, who has to judge the
+  ASCII-only classes of a secret detector.
 
 Growth attributed with measured sizes (2026-11-26): see [binary-size.md](perf/binary-size.md).

@@ -1,7 +1,7 @@
 # bench: release perf budget gate (#921)
 
 Makes "lightweight" a checked number. CI builds the release `tole`, measures
-four metrics against a local mock provider, and fails when one is over its
+five metrics against a local mock provider, and fails when one is over its
 ceiling in [`budget.toml`](budget.toml).
 
 | File | Role |
@@ -25,6 +25,7 @@ random throwaway values generated per run). Every run uses a fresh `HOME`, works
 | `idle_rss_mb` | `VmRSS` of `tole serve` once `/health` answers and 1 s has passed, median of 3 |
 | `active_rss_mb` | peak RSS of one `tole run` doing 30 provider round-trips, each a `read_file` call (a turn is capped at 32 steps); the child's own `/proc/<pid>/status` `VmHWM`, sampled about every millisecond |
 | `per_turn_ms` | `(wall(30 round-trips) - wall(2 round-trips)) / 28`, medians of 11 runs; the slope cancels process start-up |
+| `binary_size_mb` | size of the `--bin` file in MiB (#991). The CI build has `strip = true`, so it is the stripped release binary; an unstripped local build is about 1.4 times larger and must not be compared with the ceiling. Deterministic for one toolchain, so the x1.06 headroom is for the floating `stable` toolchain and about a week of first-party growth, not noise |
 
 Peak RSS is read from the child's `VmHWM`, not from `wait4`'s `ru_maxrss`:
 `ru_maxrss` carries the parent's resident size across fork+exec, so it reported

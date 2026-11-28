@@ -4,12 +4,12 @@ import run
 
 BUDGET = "".join(
     f"[x86_64-linux.{m}]\nceiling = {c}\n"
-    for m, c in (("cold_start_ms", 10), ("idle_rss_mb", 20), ("active_rss_mb", 40), ("per_turn_ms", 10))
+    for m, c in (("cold_start_ms", 10), ("idle_rss_mb", 20), ("active_rss_mb", 40), ("per_turn_ms", 10), ("binary_size_mb", 12))
 )
 
 
 def report(platform="x86_64-linux", **over):
-    m = {"cold_start_ms": 3.0, "idle_rss_mb": 15.0, "active_rss_mb": 28.0, "per_turn_ms": 4.0, **over}
+    m = {"cold_start_ms": 3.0, "idle_rss_mb": 15.0, "active_rss_mb": 28.0, "per_turn_ms": 4.0, "binary_size_mb": 9.0, **over}
     return {
         "platform": platform, "binary": "tole 0", "cpu": "cpu", "cpus": 2, "mem_total_mb": 1024.0,
         "binary_size_mb": 9.0, "metrics": m,
@@ -29,6 +29,13 @@ class Gate(unittest.TestCase):
         self.assertEqual(status, "fail")
         bad = [v["metric"] for v in r["gate"]["verdicts"] if not v["ok"]]
         self.assertEqual(bad, ["idle_rss_mb"])
+
+    def test_a_binary_over_its_size_ceiling_fails_the_gate(self):
+        r = report(binary_size_mb=12.5)
+        _, status = run.gate(r, BUDGET)
+        self.assertEqual(status, "fail")
+        self.assertEqual([v["metric"] for v in r["gate"]["verdicts"] if not v["ok"]], ["binary_size_mb"])
+        self.assertIn("| Binary size (release, stripped) | 12.50 MB | 12 MB | -4% **OVER** |", run.render(r))
 
     def test_platform_without_budget_is_reported_not_gated(self):
         r = report(platform="aarch64-linux")
