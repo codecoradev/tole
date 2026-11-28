@@ -194,6 +194,10 @@ pub(crate) fn sessions_command(sessions_dir: &Path) -> Result<()> {
             row.1, name, row.2, row.3, row.4
         );
     }
+    // Store size (#1020), metadata only; on stderr so the stdout table is unchanged.
+    if let Some(l) = tole_cli::session::size::line(sessions_dir) {
+        eprintln!("{l}");
+    }
     Ok(())
 }
 

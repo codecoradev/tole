@@ -23,7 +23,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 84497
+crate tole-cli 84449
 crate tole-core 64210
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -45,7 +45,7 @@ file crates/tole-cli/src/discuss/tests.rs 1056
 file crates/tole-cli/src/discuss/tool.rs 637
 file crates/tole-cli/src/discuss/tool_tests.rs 898
 file crates/tole-cli/src/doctor.rs 1561
-file crates/tole-cli/src/main.rs 2194
+file crates/tole-cli/src/main.rs 2186
 file crates/tole-cli/src/mission.rs 922
 file crates/tole-cli/src/plugin/cmd.rs 1658
 file crates/tole-cli/src/plugin/cmd_tests.rs 1989
@@ -59,7 +59,6 @@ file crates/tole-cli/src/serve_support/transport.rs 882
 file crates/tole-cli/src/session/assemble.rs 953
 file crates/tole-cli/src/session/export.rs 546
 file crates/tole-cli/src/session/host.rs 1828
-file crates/tole-cli/src/session/index.rs 503
 file crates/tole-cli/src/session/runner.rs 768
 file crates/tole-cli/src/session/tools.rs 513
 file crates/tole-cli/src/session/usage.rs 781
