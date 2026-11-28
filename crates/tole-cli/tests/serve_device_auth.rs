@@ -10,7 +10,7 @@ use tole_cli::serve_support::device_tokens::{Scope, PREFIX};
 
 mod common;
 mod serve_harness;
-use serve_harness::raw::{device_token, json_of, raw, status_of, store_of};
+use serve_harness::raw::{device_token, json_of, raw, raw_declared, status_of, store_of};
 use serve_harness::{spawn_mock, Serve};
 
 const UNKNOWN: &str = "tole_dt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -122,12 +122,13 @@ fn a_full_device_token_does_what_the_shared_token_does() {
         upload.chars().take(80).collect::<String>()
     );
     let ro = bearer(&device_token(&serve, "watch", Scope::ReadOnly));
-    let refused = raw(
+    // Declared only: the server answers 413 from the header and closes, so the body is not sent.
+    let refused = raw_declared(
         serve.port,
         "POST",
         &format!("/sessions/{id}/images"),
         Some(&ro),
-        &big,
+        big.len(),
     );
     assert_eq!(
         status_of(&refused),
