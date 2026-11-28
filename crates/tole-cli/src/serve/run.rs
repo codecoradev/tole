@@ -14,6 +14,21 @@ use tole_cli::session_host::lock_sessions;
 /// scan-3 Wave-2 hardening).
 const MAX_CONNECTIONS: usize = 32;
 
+/// Device tokens (#1320) come from the token file in the data dir, read on each request that
+/// carries one; without a data dir there are none. A file that cannot be used is said once here
+/// and refuses every device token until it is fixed (the shared token and Basic are unaffected).
+fn with_device_tokens(auth: tole_cli::auth::Authenticator) -> tole_cli::auth::Authenticator {
+    use tole_cli::serve_support::device_tokens::{Live, Store};
+    let Ok(store) = Store::in_data_dir() else {
+        return auth;
+    };
+    let live = Live::new(store);
+    if let Some(why) = live.error() {
+        eprintln!("tole serve: device tokens are refused until this is fixed: {why}");
+    }
+    auth.with_device_tokens(live)
+}
+
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // No human answers a serve session's start-up: an `optional` sandbox
     // counts as `required` here (#601).
@@ -71,7 +86,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         profiles: cfg.profiles.clone(),
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
-        auth: cfg.auth,
+        auth: with_device_tokens(cfg.auth),
         workspace_root,
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),

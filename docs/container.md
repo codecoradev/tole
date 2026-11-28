@@ -219,9 +219,10 @@ Read [threat-model.md](threat-model.md) ("Remote approver trust boundary
 serve in a container (#1044)") and [desktop-design.md](desktop-design.md) 3.2 and 3.3 first. In short:
 
 - **The serve token is approval authority.** Whoever holds it can read every
-  transcript, start turns and approve Writes on the box. There are no scopes, no
-  per-device tokens and no revocation short of changing the secret and
-  restarting. Treat it like an SSH key: `openssl rand -hex 32`, a file, not in a
+  transcript, start turns and approve Writes on the box. The shared token has no
+  scope and no revocation short of changing the secret and restarting; a
+  per-device token (#1320, `tole serve token add`, `read-only` or `full`) is
+  revoked alone with no restart. Treat it like an SSH key: `openssl rand -hex 32`, a file, not in a
   chat or a shell history, rotate on any doubt.
 - **Public exposure invites a lock-out.** The failed-auth limiter (10 a minute)
   counts per source address, and behind the proxy that address is the proxy's:
@@ -322,8 +323,8 @@ container; the container only bounds where it lands):
   provider key), and send anything out over the open network.
 - It does not give a shell on the VPS or access outside the container's
   volumes, **unless** a command escapes the container (shared kernel, see above).
-- There are no scopes, no per-device tokens and no revocation list. Per-device
-  tokens (#1320) are separate work and this page does not depend on them.
+- The shared token has no scope and no revocation list; per-device tokens (#1320)
+  have both, and this page does not depend on them.
 
 **Rotate** (also after a laptop is lost, a screen was shared, or on any doubt;
 tested on the compose stack, old token `401` and new token `200` afterwards):
@@ -523,5 +524,6 @@ image.
   instruction" property for that; it is not built.
 - **Real-IP handling.** A trusted-proxy setting so tole's failed-auth limiter
   counts the client and not the proxy (a src change).
-- **Per-device tokens** (#1320) are being built separately; when they land, the
-  rotation and leak sections change.
+- **Per-device tokens** (#1320) are in; the rotation and leak sections above still
+  describe the shared token, and a lost device's token is revoked with
+  `tole serve token revoke <name>` (no restart).

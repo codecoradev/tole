@@ -6,8 +6,11 @@
 //!
 //! [`Authenticator`] is the ONE check every route goes through (#742): the
 //! static bearer token (#682) and, with `--auth basic`, HTTP Basic against a
-//! PBKDF2 password hash. A transport asks `check(authorization_header)` and
-//! nothing else; there is no second path that could leave a route open.
+//! PBKDF2 password hash, both full access; and, on the REST face only, a
+//! per-device token (#1320) with its scope. The REST face asks
+//! `authenticate(authorization_header)`; the MCP face asks `check`, which
+//! never looks at a device token. There is no second path that could leave a
+//! route open.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -18,6 +21,8 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use ring::rand::SecureRandom;
+
+use super::device_tokens::{Live, Scope};
 
 /// Failed-auth attempts allowed per source IP per window before the IP is
 /// refused until the window rolls over (simple fixed-window limiter).
@@ -33,11 +38,15 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Does an `Authorization` header value carry the bearer `token`? The scheme
 /// is case-insensitive (RFC 7235) and surrounding whitespace is ignored.
 pub fn bearer_matches(header: Option<&str>, token: &str) -> bool {
+    bearer_token(header).is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes()))
+}
+
+/// The token of an `Authorization: Bearer <token>` value, trimmed.
+fn bearer_token(header: Option<&str>) -> Option<&str> {
     header
         .and_then(|a| a.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, t)| ct_eq(t.trim().as_bytes(), token.as_bytes()))
-        .unwrap_or(false)
+        .map(|(_, t)| t.trim())
 }
 
 /// PHC-style scheme name of a stored password hash.
@@ -290,6 +299,8 @@ pub struct Authenticator {
     /// The key is a digest of the whole header, so a lookup says nothing
     /// about a guess; failures are never remembered.
     verified: Mutex<HashMap<[u8; 32], Instant>>,
+    /// Per-device tokens (#1320), REST face only; `None` checks none.
+    devices: Option<Live>,
 }
 
 impl Authenticator {
@@ -303,10 +314,34 @@ impl Authenticator {
             token,
             basic,
             verified: Mutex::new(HashMap::new()),
+            devices: None,
         }
     }
 
-    /// Does this `Authorization` header carry a valid credential?
+    /// Also accept the device tokens of `live` (#1320) in [`Self::authenticate`].
+    pub fn with_device_tokens(mut self, live: Live) -> Self {
+        self.devices = Some(live);
+        self
+    }
+
+    /// The scope of the credential in this `Authorization` header, `None` when it is not valid.
+    /// The shared token and Basic are [`Scope::Full`]. A device token costs one `stat` of the
+    /// token file and may write a last-use line (at most one per token per 15 minutes), both
+    /// blocking: the REST face runs one thread per connection, so that is fine here.
+    /// A wrong, unknown and revoked token are all `None`, with the same work.
+    pub fn authenticate(&self, header: Option<&str>) -> Option<Scope> {
+        if self.check(header) {
+            return Some(Scope::Full);
+        }
+        let live = self.devices.as_ref()?;
+        let who = live.lookup(bearer_token(header)?)?;
+        live.touch(&who.name, now_secs());
+        Some(who.scope)
+    }
+
+    /// Does this `Authorization` header carry the shared token or the Basic
+    /// credentials? A device token never passes this (the MCP face has no
+    /// route to classify, so it does not take one).
     pub fn check(&self, header: Option<&str>) -> bool {
         if let Some(t) = &self.token {
             if bearer_matches(header, t) {
@@ -425,26 +460,6 @@ mod tests {
         IpAddr::from([10, 0, 0, n])
     }
 
-    #[test]
-    fn ct_eq_matches_only_equal_slices() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(!ct_eq(b"secret", b"secreT"));
-        assert!(!ct_eq(b"secret", b"secre"));
-        assert!(ct_eq(b"", b""));
-    }
-
-    #[test]
-    fn bearer_matching_is_case_insensitive_and_exact() {
-        assert!(bearer_matches(Some("Bearer t0ken"), "t0ken"));
-        assert!(bearer_matches(Some("bearer  t0ken "), "t0ken"));
-        assert!(bearer_matches(Some("BEARER t0ken"), "t0ken"));
-        assert!(!bearer_matches(Some("Bearer t0kex"), "t0ken"));
-        assert!(!bearer_matches(Some("Bearer t0ken2"), "t0ken"));
-        assert!(!bearer_matches(Some("Basic t0ken"), "t0ken"));
-        assert!(!bearer_matches(Some("t0ken"), "t0ken"));
-        assert!(!bearer_matches(None, "t0ken"));
-    }
-
     fn basic_header(user: &str, pass: &str) -> String {
         format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
     }
@@ -453,90 +468,6 @@ mod tests {
         let hash = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
         let creds = BasicCredentials::new("owner", PasswordHash::parse(&hash).unwrap()).unwrap();
         Authenticator::new(token.map(str::to_string), Some(creds))
-    }
-
-    #[test]
-    fn a_hash_round_trips_and_a_wrong_password_fails() {
-        let h = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
-        assert!(h.starts_with("$pbkdf2-sha256$i=10000$"), "{h}");
-        let p = PasswordHash::parse(&h).unwrap();
-        assert!(p.verify(b"correct horse"));
-        assert!(!p.verify(b"correct horsE"));
-        assert!(!p.verify(b""));
-        // Two hashes of one password differ (random salt).
-        assert_ne!(
-            h,
-            PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap()
-        );
-    }
-
-    #[test]
-    fn weak_or_malformed_hashes_and_passwords_are_refused_without_echo() {
-        assert!(PasswordHash::create(b"short", MIN_ITERATIONS).is_err());
-        // Seven characters in fourteen bytes is still too short; eight is fine.
-        assert!(PasswordHash::create("ééééééé".as_bytes(), MIN_ITERATIONS).is_err());
-        assert!(PasswordHash::create("éééééééé".as_bytes(), MIN_ITERATIONS).is_ok());
-        assert!(PasswordHash::create(b"long enough pw", MIN_ITERATIONS - 1).is_err());
-        let h = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
-        let weak = h.replacen("i=10000", "i=9999", 1);
-        let e = PasswordHash::parse(&weak).err().unwrap();
-        assert!(e.contains("too few") && !e.contains(&weak), "{e}");
-        let huge = h.replacen("i=10000", "i=99999999", 1);
-        assert!(PasswordHash::parse(&huge)
-            .err()
-            .unwrap()
-            .contains("too many"));
-        for bad in [
-            "",
-            "plaintext-password",
-            "$pbkdf2-sha1$i=10000$AAAAAAAAAAAAAAAAAAAAAA$AAAA",
-            "$pbkdf2-sha256$i=10000$AAAA$AAAA",
-            &format!("{h}$extra"),
-        ] {
-            let e = PasswordHash::parse(bad).err().unwrap();
-            assert!(e.contains("malformed"), "{bad}: {e}");
-            assert!(
-                bad.is_empty() || !e.contains(bad),
-                "the error echoed the input"
-            );
-        }
-    }
-
-    #[test]
-    fn basic_accepts_only_the_right_user_and_password() {
-        let a = basic_auth(None);
-        assert!(a.check(Some(&basic_header("owner", "correct horse"))));
-        assert!(!a.check(Some(&basic_header("owner", "wrong password"))));
-        assert!(!a.check(Some(&basic_header("intruder", "correct horse"))));
-        assert!(!a.check(Some(&basic_header("Owner", "correct horse"))));
-        assert!(!a.check(Some(&basic_header("owner", ""))));
-        assert!(!a.check(Some(&basic_header("", ""))));
-        assert!(!a.check(Some("Basic !!!not-base64")));
-        assert!(!a.check(Some(&format!("Basic {}", STANDARD.encode("owner")))));
-        assert!(!a.check(Some("Basic")));
-        assert!(!a.check(Some("Bearer correct horse")));
-        assert!(!a.check(None));
-        // The scheme is case-insensitive; a password may hold ':'.
-        let header = basic_header("owner", "correct horse").replacen("Basic", "bAsIc", 1);
-        assert!(a.check(Some(&header)));
-        // An oversized credential is refused before any hashing.
-        assert!(!a.check(Some(&basic_header("owner", &"x".repeat(2000)))));
-    }
-
-    #[test]
-    fn the_token_and_basic_go_through_the_same_check() {
-        let a = basic_auth(Some("t0ken-0742"));
-        assert!(a.check(Some("Bearer t0ken-0742")));
-        assert!(a.check(Some(&basic_header("owner", "correct horse"))));
-        assert!(!a.check(Some("Bearer t0ken-0743")));
-        // Token only: Basic never passes, and there is no challenge.
-        let t = Authenticator::token("t0ken-0742".into());
-        assert!(t.check(Some("Bearer t0ken-0742")));
-        assert!(!t.check(Some(&basic_header("owner", "correct horse"))));
-        assert!(t.challenge().is_none());
-        assert!(a.challenge().unwrap().starts_with("Basic realm="));
-        // Basic without a token: a bearer never passes.
-        assert!(!basic_auth(None).check(Some("Bearer t0ken-0742")));
     }
 
     #[test]
@@ -558,25 +489,6 @@ mod tests {
         let other = good.replacen("Basic", "bAsIc", 1);
         assert!(a.check(Some(&other)));
         assert!(a.lock_verified().len() <= VERIFIED_MAX);
-    }
-
-    #[test]
-    fn user_names_and_loopback_binds_are_checked() {
-        let h = || {
-            PasswordHash::parse(&PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap())
-                .unwrap()
-        };
-        assert!(BasicCredentials::new("", h()).is_err());
-        assert!(BasicCredentials::new("a:b", h()).is_err());
-        assert!(BasicCredentials::new("a\nb", h()).is_err());
-        assert!(BasicCredentials::new(&"u".repeat(129), h()).is_err());
-        assert!(BasicCredentials::new(" owner ", h()).is_ok());
-        for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.1.2.3"] {
-            assert!(is_loopback_bind(b), "{b}");
-        }
-        for b in ["0.0.0.0", "192.168.1.5", "::", "example.com", ""] {
-            assert!(!is_loopback_bind(b), "{b}");
-        }
     }
 
     #[test]

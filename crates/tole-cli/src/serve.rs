@@ -33,9 +33,10 @@ use hooks::handle_hook;
 use images::{image_error, read_image, respond_image, upload_image};
 use live_sessions::{live, open_serve_session, resume_session, serve_storage_dir, warm_status};
 use pct::{id_between, with_id};
-use request::{read_request, ReadError};
+use request::{events_target, hook_target, image_target, read_request, upload_target, ReadError};
 use response::{respond, respond_unauthorized, respond_with};
 use session_routes::{compact_route, fork_route, name_route, tree_route, with_idle_session};
+use tole_cli::serve_support::device_tokens::Scope;
 use tole_cli::serve_support::profiles::ProfileSource;
 use tole_cli::serve_support::ready::is_probe;
 use tole_cli::serve_support::shutdown;
@@ -61,6 +62,7 @@ mod pct;
 mod request;
 mod response;
 mod run;
+mod scope;
 mod session_routes;
 mod state_views;
 mod token;
@@ -107,7 +109,7 @@ struct State {
     profiles: ProfileSource,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
-    /// Every route's auth, through `Authenticator::check` only (#742).
+    /// Every route's auth, through `Authenticator::authenticate` only (#742, #1320).
     auth: tole_cli::auth::Authenticator,
     /// Jail-of-jails root (canonical): `--workspace`, else the server
     /// cwd. Client-supplied session cwds must resolve inside it.
@@ -185,11 +187,6 @@ fn announce_turn(
 const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 // ---- Connection handling ----
 
-/// The route of a `/hooks/<route>` path.
-fn hook_target(path: &str) -> Option<&str> {
-    path.strip_prefix("/hooks/")
-        .map(|r| r.split('?').next().unwrap_or(r))
-}
 /// Panic-safe connection-count guard: decrements on Drop (normal or
 /// unwind), so the counter never permanently inflates after a panicking
 /// handler.
@@ -226,7 +223,10 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
                     429,
                     &json!({"error": "too many failed auth attempts"}),
                 );
-            } else if !verdict.unwrap_or_else(|| state.auth.check(authorization.as_deref())) {
+            } else if verdict
+                .unwrap_or_else(|| state.auth.authenticate(authorization.as_deref()))
+                .is_none()
+            {
                 if let Some(ip) = peer_ip {
                     state.auth_failures.record_failure(ip);
                 }
@@ -297,17 +297,24 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
         }
     }
 
-    // The one auth check (#742): every route below this line is behind it,
-    // for a bearer token and for Basic alike.
-    let authorized = is_probe(&req.path, req.authorization.is_some())
-        || req
-            .verdict
-            .unwrap_or_else(|| state.auth.check(req.authorization.as_deref()));
-    if !authorized {
+    // The one auth check (#742): every route below this line is behind it, for a bearer token,
+    // Basic and a device token alike (#1320). A wrong, unknown or revoked token is one 401.
+    let scope = if is_probe(&req.path, req.authorization.is_some()) {
+        Some(Scope::Full)
+    } else {
+        req.verdict
+            .unwrap_or_else(|| state.auth.authenticate(req.authorization.as_deref()))
+    };
+    let Some(scope) = scope else {
         if let Some(ip) = peer_ip {
             state.auth_failures.record_failure(ip);
         }
         respond_unauthorized(&mut stream, &state.auth);
+        return;
+    };
+    // A read-only token stops here on anything but a listed read, before any route runs.
+    if !scope::allows(scope, &req.method, &req.path) {
+        respond(&mut stream, 403, &json!({"error": scope::REFUSED}));
         return;
     }
 
@@ -316,6 +323,12 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
         let (status, payload) = state
             .ready
             .answer(tole_cli::cron::now(), req.authorization.is_some());
+        respond(&mut stream, status, &payload);
+        return;
+    }
+
+    if req.method == "GET" && req.path == "/info" {
+        let (status, payload) = info::route(&state, scope);
         respond(&mut stream, status, &payload);
         return;
     }
@@ -368,28 +381,6 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     respond(&mut stream, status, &payload);
 }
 
-/// `/sessions/{id}/images` -> `id` (the upload route).
-fn upload_target(path: &str) -> Option<&str> {
-    let id = path.strip_prefix("/sessions/")?.strip_suffix("/images")?;
-    (!id.is_empty() && !id.contains('/') && !id.contains('?')).then_some(id)
-}
-
-/// `/sessions/{id}/images/{hash}` -> `(id, hash)` (the read route).
-fn image_target(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/sessions/")?;
-    let (id, hash) = rest.split_once("/images/")?;
-    let ok = |s: &str| !s.is_empty() && !s.contains('/') && !s.contains('?');
-    (ok(id) && ok(hash)).then_some((id, hash))
-}
-
-/// `{collection}{id}/events[?query]` -> `(id, query)`: `/sessions/` and
-/// `/discussions/` have an event stream.
-fn events_target<'a>(path: &'a str, collection: &str) -> Option<(&'a str, &'a str)> {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let id = path.strip_prefix(collection)?.strip_suffix("/events")?;
-    (!id.is_empty() && !id.contains('/')).then_some((id, query))
-}
-
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (
@@ -400,7 +391,6 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
-        ("GET", "/info") => info::route(state),
         ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);

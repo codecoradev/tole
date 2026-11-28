@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use crate::common;
 
 pub mod discussion_mock;
+pub mod raw;
+pub mod routes;
 
 /// A new workspace directory for one `Serve`. The six tests of a binary run as
 /// threads of ONE process and each starts a serve at once, so a name built from

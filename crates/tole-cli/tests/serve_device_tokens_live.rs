@@ -1,5 +1,5 @@
-//! Per-device tokens, part 1 (#1320): the `Live` view part 2 will hold in
-//! `tole serve` (revoke seen on the next request, fail closed, coalesced last use).
+//! Per-device tokens (#1320): the `Live` view `tole serve` holds (revoke seen on the next
+//! request, fail closed, coalesced last use).
 
 mod common;
 use common::TestDir;

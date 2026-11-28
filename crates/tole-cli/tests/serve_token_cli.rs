@@ -1,7 +1,7 @@
 //! `tole serve token add|list|revoke` (#1320, part 1) on the real binary: the
 //! token is printed once on stdout and lands nowhere else, the file is
 //! owner-only and append-only, and the owner commands refuse under a session.
-//! `tole serve` does not check device tokens yet, so nothing here starts one.
+//! `tole serve` checks the tokens (`serve_device_scope`); nothing here starts one.
 
 #![cfg(feature = "shell-tools")]
 

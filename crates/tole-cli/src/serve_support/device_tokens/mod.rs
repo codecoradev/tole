@@ -1,5 +1,6 @@
-//! Per-device named tokens for `tole serve` (#1320, part 1: the store and the
-//! `tole serve token` commands; `tole serve` does not check them yet).
+//! Per-device named tokens for `tole serve` (#1320): the store, the `tole serve token` commands
+//! and, through [`Live`], the REST face's check (`Authenticator::authenticate`; the MCP face
+//! does not take device tokens).
 //!
 //! A device token is a 256-bit secret from the OS random source, shown once
 //! by `tole serve token add` and never stored: the file keeps only its
@@ -25,17 +26,17 @@
 //! them. **Restoring the file from a backup brings back every token revoked
 //! since the backup was taken: rotate all tokens after a restore.**
 //!
-//! For the enforcement of part 2 the whole surface is [`Live`]:
+//! The whole surface `tole serve` uses is [`Live`]:
 //! `live.lookup(presented)` is `Option<Principal>` (name and scope) and
 //! `live.touch(&name, now)` records the last use at most once per
 //! [`TOUCH_EVERY_SECS`] per name. A request costs one `stat` of the file
 //! (an append always changes its length, so a revoke is seen on the next
 //! request) and a comparison over every active hash with no early exit.
 //!
-//! For part 2, mind the cost model: `Live::lookup` holds a mutex while it
+//! Mind the cost model: `Live::lookup` holds a mutex while it
 //! reloads the file after a change, and `Live::touch` does synchronous file
-//! I/O under a try-lock. Call both from `spawn_blocking` (or an equivalent
-//! thread), not from an async task. `used` lines are never compacted: past
+//! I/O under a try-lock. Call both from a thread that may block (the REST
+//! face's connection thread), or from `spawn_blocking`, not from an async task. `used` lines are never compacted: past
 //! [`MAX_USED_FILE_BYTES`] last-used stops being recorded (the file is not
 //! rewritten to make room). A load that fails with an I/O error is retried
 //! after [`RETRY_AFTER_SECS`] or when the file changes; a corrupt, unsafe or
@@ -77,7 +78,7 @@ pub const RETRY_AFTER_SECS: u64 = 5;
 const VERSION: u8 = 1;
 const HASH_PREFIX: &str = "sha256:";
 
-/// What a token may do. Part 2 enforces it; part 1 only records it.
+/// What a token may do: `tole serve` enforces it on every route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Scope {
     /// Reads sessions and the event stream; answers no approval.
