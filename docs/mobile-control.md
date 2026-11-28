@@ -606,8 +606,8 @@ serve; a device token is revoked alone, with no restart).
   partly done.
   `POST /hooks/{name}` is signed by the sender and does not read the token, so a token of any
   scope changes nothing there.
-- A token sent in `Authorization` is checked on every route except `/health` and `/ready` without a
-  credential. A wrong, an unknown and a revoked token get the same `401 {"error":"unauthorized"}`
+- A token sent in `Authorization` is checked on every route except `/health` (never checked, even
+  with a bad credential) and `/ready` without a credential (with one it is checked). A wrong, an unknown and a revoked token get the same `401 {"error":"unauthorized"}`
   as a wrong shared token (the same bytes, with the Basic challenge when Basic is on) and count
   towards the per-IP failure limit like any wrong credential. A token of the wrong shape costs no
   file access; one of the right shape costs one `stat` of the token file and a comparison over the
@@ -619,9 +619,26 @@ serve; a device token is revoked alone, with no restart).
   thread, never once per request; a write that fails is dropped.
 - **`--transport mcp` does not take device tokens**: its tools are not routes that can be
   classified, so only the shared token and Basic open it, and a device token there is a `401`.
-- A token file that cannot be used (a damaged line, a wider mode, over its size cap) refuses every
-  device token (`401`) and is said once on stderr at start-up (and by `tole serve token list`); the
-  shared token and Basic are unaffected.
+- A token file that cannot be used (a damaged line, a wider mode, over its size cap), at start-up or
+  later, refuses every device token (`401`) and is said on stderr when a token is refused for it,
+  once per change of its state (and by `tole serve token list`); the shared token and Basic are
+  unaffected.
+- **Revoking a token ends the event streams it opened** (`/sessions/{id}/events`,
+  `/discussions/{id}/events`): the token is asked again on every pass of the stream (150 ms), and a
+  revoked one gets a plain close with no frame, then a `401` on reconnect. A stream opened with the
+  shared token or Basic is never cut by a revoke. A read-only token cannot hold the last 2 of the
+  8 event-stream slots (its 7th stream is `429`), so it cannot lock the owner out of them.
+- **A read-only token still reads everything**: full transcripts, tool outputs, the text of pending
+  approvals, `/cron/runs`, `/skills`, `/tools`. A leaked read-only token is a loss of
+  confidentiality equal to the shared token's; what it cannot do is change anything or answer an
+  approval.
+- A read-only upload over 1 MiB gets `413` (the ordinary body ceiling), not `403`; both come before
+  any side effect.
+- Residual: an agent session that can write the data dir could append an `add` line to the token
+  file (#601; `add` refuses under a session, but an interpreter that edits the file is not
+  stopped). The failed-auth limiter is per peer IP: behind a reverse proxy every client shares
+  the proxy's address, so a revoked device that keeps retrying locks out everyone behind it
+  (see the container notes on real-IP handling).
 - No token value reaches a log, an error, `/info` or a webhook: the server only ever holds its
   SHA-256, and compares it without an early exit.
 

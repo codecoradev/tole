@@ -22,7 +22,9 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use ring::rand::SecureRandom;
 
-use super::device_tokens::{Live, Scope};
+use super::device_tokens::Live;
+
+mod devices;
 
 /// Failed-auth attempts allowed per source IP per window before the IP is
 /// refused until the window rolls over (simple fixed-window limiter).
@@ -301,6 +303,8 @@ pub struct Authenticator {
     verified: Mutex<HashMap<[u8; 32], Instant>>,
     /// Per-device tokens (#1320), REST face only; `None` checks none.
     devices: Option<Live>,
+    /// The last store error said on stderr, so a change of state is said once.
+    store_error: Mutex<Option<String>>,
 }
 
 impl Authenticator {
@@ -315,28 +319,8 @@ impl Authenticator {
             basic,
             verified: Mutex::new(HashMap::new()),
             devices: None,
+            store_error: Mutex::new(None),
         }
-    }
-
-    /// Also accept the device tokens of `live` (#1320) in [`Self::authenticate`].
-    pub fn with_device_tokens(mut self, live: Live) -> Self {
-        self.devices = Some(live);
-        self
-    }
-
-    /// The scope of the credential in this `Authorization` header, `None` when it is not valid.
-    /// The shared token and Basic are [`Scope::Full`]. A device token costs one `stat` of the
-    /// token file and may write a last-use line (at most one per token per 15 minutes), both
-    /// blocking: the REST face runs one thread per connection, so that is fine here.
-    /// A wrong, unknown and revoked token are all `None`, with the same work.
-    pub fn authenticate(&self, header: Option<&str>) -> Option<Scope> {
-        if self.check(header) {
-            return Some(Scope::Full);
-        }
-        let live = self.devices.as_ref()?;
-        let who = live.lookup(bearer_token(header)?)?;
-        live.touch(&who.name, now_secs());
-        Some(who.scope)
     }
 
     /// Does this `Authorization` header carry the shared token or the Basic

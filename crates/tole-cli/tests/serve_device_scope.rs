@@ -145,16 +145,22 @@ fn a_read_only_token_gets_its_reads_and_a_403_on_every_write() {
                 assert_eq!(status_of(&a), status_of(&b), "{method} {path}: {a} / {b}");
             } else {
                 writes += 1;
-                let a = raw(
-                    serve.port,
-                    method,
-                    &path,
-                    Some(&ro),
-                    "{\"decision\":\"allow\"}",
-                );
-                assert_eq!(status_of(&a), 403, "{method} {path}: {a}");
-                assert_eq!(json_of(&a), json!({"error": REFUSED}), "{method} {path}");
-                assert!(!a.contains(&ro["Bearer ".len()..]), "the token is echoed");
+                // The path as written, with a query, a trailing slash, a `//` prefix and a dot
+                // segment: no spelling gets past the scope.
+                let spellings = [
+                    path.clone(),
+                    format!("{path}?x=1"),
+                    format!("{path}/"),
+                    format!("/{path}"),
+                    path.replacen('/', "/./", 1),
+                ];
+                for path in spellings {
+                    let body = "{\"decision\":\"allow\"}";
+                    let a = raw(serve.port, method, &path, Some(&ro), body);
+                    assert_eq!(status_of(&a), 403, "{method} {path}: {a}");
+                    assert_eq!(json_of(&a), json!({"error": REFUSED}), "{method} {path}");
+                    assert!(!a.contains(&ro["Bearer ".len()..]), "the token is echoed");
+                }
             }
         }
     }

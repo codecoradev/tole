@@ -336,7 +336,7 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // The event stream owns its connection for as long as it is open, so it
     // is served here rather than through `route` (which returns one JSON
     // body).
-    type Follow = fn(Conn, &Arc<State>, &str, &str, Option<&str>);
+    type Follow = fn(Conn, &Arc<State>, &str, &str, &request::Request, Scope);
     let streams: [(&str, Follow); 2] = [
         ("/sessions/", serve_events),
         ("/discussions/", discussion_events::serve),
@@ -344,7 +344,7 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     for (collection, follow) in streams.into_iter().filter(|_| req.method == "GET") {
         if let Some((id, query)) = events_target(&req.path, collection) {
             match pct::id(id) {
-                Ok(id) => follow(stream, &state, &id, query, req.last_event_id.as_deref()),
+                Ok(id) => follow(stream, &state, &id, query, &req, scope),
                 Err((status, payload)) => respond(&mut stream, status, &payload),
             }
             return;

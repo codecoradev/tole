@@ -15,18 +15,13 @@ use tole_cli::session_host::lock_sessions;
 const MAX_CONNECTIONS: usize = 32;
 
 /// Device tokens (#1320) come from the token file in the data dir, read on each request that
-/// carries one; without a data dir there are none. A file that cannot be used is said once here
-/// and refuses every device token until it is fixed (the shared token and Basic are unaffected).
+/// carries one; without a data dir there are none.
 fn with_device_tokens(auth: tole_cli::auth::Authenticator) -> tole_cli::auth::Authenticator {
     use tole_cli::serve_support::device_tokens::{Live, Store};
-    let Ok(store) = Store::in_data_dir() else {
-        return auth;
-    };
-    let live = Live::new(store);
-    if let Some(why) = live.error() {
-        eprintln!("tole serve: device tokens are refused until this is fixed: {why}");
+    match Store::in_data_dir() {
+        Ok(store) => auth.with_device_tokens(Live::new(store)),
+        Err(_) => auth,
     }
-    auth.with_device_tokens(live)
 }
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
