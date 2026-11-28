@@ -49,6 +49,11 @@ done
 case "$max_lines" in ''|*[!0-9]*) echo "review-local: --max-lines must be a number" >&2; exit 1 ;; esac
 [ "$max_lines" -gt 0 ] || { echo "review-local: --max-lines must be above 0" >&2; exit 1; }
 
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "$agent_dir" ]; then
+  mkdir -p "$agent_dir"
+  agent_dir="$(cd "$agent_dir" && pwd)"
+fi
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "review-local: not inside a git repository" >&2; exit 1; }
 cd "$(git rev-parse --show-toplevel)"
 
@@ -127,6 +132,8 @@ echo "review-local: $range, ${#files[@]} files, $n chunk(s), max $max_lines line
 
 status=0
 deterministic=0
+# A re-run into the same DIR must not leave chunks or findings of an older run.
+[ -z "$agent_dir" ] || [ "$dry_run" -eq 1 ] || rm -f "$agent_dir"/chunk-*
 for i in $(seq 1 "$n"); do
   count="$(wc -l <"$tmp/chunk-$i.paths" | tr -d ' ')"
   lines="$(changed_lines <"$tmp/chunk-$i.paths")"
@@ -135,7 +142,6 @@ for i in $(seq 1 "$n"); do
 
   tr '\n' '\0' <"$tmp/chunk-$i.paths" | xargs -0 -r git diff "$range" -- >"$tmp/chunk-$i.diff"
   if [ -n "$agent_dir" ]; then
-    mkdir -p "$agent_dir"
     cp "$tmp/chunk-$i.diff" "$agent_dir/chunk-$i.diff"
     continue
   fi
@@ -155,7 +161,7 @@ done
 
 if [ -n "$agent_dir" ] && [ "$dry_run" -eq 0 ]; then
   echo "review-local: agent mode: $n chunk(s) in $agent_dir"
-  python3 "$(dirname "$0")/cora-agent-review.py" prepare "$agent_dir"
+  python3 "$script_dir/cora-agent-review.py" prepare "$agent_dir"
   echo "review-local: now answer each $agent_dir/chunk-N.prompt.md with your model (a fresh reviewing agent, not the author)"
   echo "review-local: into $agent_dir/chunk-N.findings.json, then: scripts/cora-agent-review.py finalize $agent_dir"
   exit 0

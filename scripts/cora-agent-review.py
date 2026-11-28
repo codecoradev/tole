@@ -23,10 +23,12 @@ checkout (or worktree) that holds the branch under review.
 """
 import json
 import os
+import select
 import subprocess
 import sys
 
 RANK = {"info": 0, "minor": 1, "major": 2, "critical": 3}
+READ_TIMEOUT = 300  # seconds to wait for one answer of `cora mcp`
 
 
 class Mcp:
@@ -35,6 +37,13 @@ class Mcp:
             ["cora", "mcp"], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True)
         self.n = 0
+        try:
+            self._handshake()
+        except Exception:
+            self.close()
+            raise
+
+    def _handshake(self):
         self.call_raw("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                      "clientInfo": {"name": "cora-agent-review", "version": "1"}})
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -47,12 +56,17 @@ class Mcp:
         self.n += 1
         self.send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
         while True:
+            if not select.select([self.p.stdout], [], [], READ_TIMEOUT)[0]:
+                raise RuntimeError(f"cora mcp gave no answer in {READ_TIMEOUT}s")
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("cora mcp closed its output")
+                raise RuntimeError("cora mcp closed its output (run `cora mcp` by hand to see why)")
             line = line.strip()
             if line.startswith("{"):
-                msg = json.loads(line)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
                 if msg.get("id") == self.n:
                     if "error" in msg:
                         raise RuntimeError(msg["error"])
@@ -117,6 +131,12 @@ def finalize(d, mcp, severity):
             print(f"{name}: no {name}.findings.json (not reviewed: not a pass)", file=sys.stderr)
             status = 1
             continue
+        pj = os.path.join(d, name + ".prepare.json")
+        if os.path.exists(pj) and os.path.getmtime(fp) < os.path.getmtime(pj):
+            print(f"{name}: {name}.findings.json is older than its prepare: stale, review again (not a pass)",
+                  file=sys.stderr)
+            status = 1
+            continue
         try:
             issues = json.load(open(fp))
             if not isinstance(issues, list):
@@ -149,19 +169,20 @@ def main():
     mode, d = sys.argv[1], sys.argv[2]
     severity = "minor"
     if "--severity" in sys.argv:
-        severity = sys.argv[sys.argv.index("--severity") + 1]
+        k = sys.argv.index("--severity")
+        severity = sys.argv[k + 1] if k + 1 < len(sys.argv) else ""
         if severity not in RANK:
             print("cora-agent-review: --severity is info|minor|major|critical", file=sys.stderr)
             return 1
     top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip() or "."
     try:
         mcp = Mcp(top)
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError) as e:
         print(f"cora-agent-review: cannot start 'cora mcp': {e}", file=sys.stderr)
         return 1
     try:
         return prepare(d, mcp) if mode == "prepare" else finalize(d, mcp, severity)
-    except (RuntimeError, OSError, ValueError) as e:
+    except (RuntimeError, OSError, ValueError, KeyError, IndexError) as e:
         print(f"cora-agent-review: {e}", file=sys.stderr)
         return 1
     finally:
