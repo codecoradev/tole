@@ -54,6 +54,12 @@ const WRAPPERS: &[&str] = &[
     "coproc ",
     "builtin command ",
     "ionice -c3 ",
+    "timeout 5s ",
+    "timeout -s KILL 5 ",
+    "stdbuf -o L ",
+    "flock f ",
+    "taskset 0x1 ",
+    "sudo -g wheel ",
     "time</dev/null ",
     "env -u NOPE -C . ",
     "env --unset NOPE ",
@@ -80,6 +86,7 @@ const PROGRAMS: &[&str] = &[
     "./[[:lower:]]ole",
     "to{l,x}e",
     "${NOPE:-tole}",
+    "$(echo tole)",
 ];
 /// `{}` is the simple command.
 const CONTEXTS: &[&str] = &[

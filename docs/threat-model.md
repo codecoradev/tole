@@ -1325,7 +1325,10 @@ them. Two layers close the direct routes; neither is a boundary.
   that is a glob matching `tole` or `tole-cli` (`./tol? x`, `$PWD/to[l]e x`,
   `./[]t]ole x`, `./[[:lower:]]ole x`), brace expansion or a default value
   (`to{l,x}e y`, `${E:-tole} y`) or an ANSI-C string with an escape
-  (`$'\x74ole' x`), also as the program of a wrapper chain; the running binary under another name (a program word with `/proc/`, ending in
+  (`$'\x74ole' x`), also as the program of a wrapper chain, where the guard can
+  size the wrapper's options and positional (`env`, `timeout`, `stdbuf`, `strace`,
+  `flock`, `taskset`, `nice`, `ionice`, `watch`, `sudo`, `doas`, `exec`, `time`:
+  `timeout -s KILL 5 ./tol? x`, `flock f ./tol? x`, `sudo -g wheel $(echo tole) x`); the running binary under another name (a program word with `/proc/`, ending in
   `/exe` or naming `PPID`: `/proc/$PPID/exe x`); a shell named by a glob or a
   variable (`/bin/d?sh -c 'tole x'`, `$S -c ...`, `${SHELL:-sh} -c ...`: any
   program or wrapper word with `$ * ? [` is scanned for a `-c` payload);
@@ -1343,7 +1346,8 @@ them. Two layers close the direct routes; neither is a boundary.
   `time`, `env` and the other wrappers that is `tole` or `tole-cli`, with or
   without something glued to it (`! grep tole f`, `time cargo build -p
   tole-cli`, `sudo grep 'tole$' f`); `env` with an option containing `S`
-  before its program (`env --split-string="a b" make`, `env -iS ...`); a text
+  before its program (`env --split-string="a b" make`, `env -iS ...`); a glob that can match `tole` behind a nested quote layer
+  (`sh -c "sh -c 'ls *'"` is refused, `sh -c 'ls *'` as an argv is not); a text
   that costs too much to read (the work is capped at a small multiple of its
   size, and each nested text is read once); and a
   nested `sh -c '$(date)'` text whose payload starts with a substitution (`sh
@@ -1385,8 +1389,10 @@ text fed to a shell some other way (`sh <<< 'tole x'`, `bash <(echo tole x)`,
 checked), a name bound on an earlier line (`alias t=tole`, `hash -p`, `set --`, `for t in tole; do $t`,
 `read t`, extglob), a copied or linked binary under another name, and a command substitution that is not the first word a
 wrapper runs (`env FOO=$(echo tole) cmd` is fine; `env -i $(echo tole) x` and
-`env $(echo tole) x` are refused since #1307, but `nohup env -i FOO=1
-$(echo tole)` hides it behind one more option the guard cannot size); an interpreter
+`env $(echo tole) x` are refused since #1307, and so are the wrapper options
+the guard sizes, but `timeout --signal KILL 5 $(echo tole) x` hides it behind
+an option outside its table, with a glob, an ANSI-C string or `${E:-tole}` in
+the same place); an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
 into the data dir is not seen. A session with `run_command` has the

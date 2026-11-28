@@ -105,6 +105,10 @@ const ROUTES: &[&str] = &[
     "if $(echo tole) x; then :; fi",
     "! $(echo tole) x",
     "timeout 5 $(echo tole) x",
+    // A redirection that names a descriptor.
+    "{fd}>f tole x",
+    "{fd}<f tole x",
+    "{fd}>>f tole x",
     // A redirection glued to a wrapper or a shell.
     "time< f tole x",
     "nohup>f tole x",
@@ -147,6 +151,19 @@ const ROUTES: &[&str] = &[
 /// Routes that need a shell to read them: as a command line there is no brace
 /// group, no continuation line, no ANSI-C string and no function to define.
 const TEXT_ONLY: &[&str] = &[
+    // The program behind a wrapper option the guard has to size.
+    "timeout 5s $(echo tole) x",
+    "timeout 5s ./tol? x",
+    "timeout -s KILL 5 ./tol? x",
+    "nohup timeout 5s ./tol? x",
+    "timeout 5s ${E:-tole} x",
+    "stdbuf -o L $(echo tole) x",
+    "flock f ./tol? x",
+    "strace -o f $'\\x74ole' x",
+    "taskset 0x1 $(echo tole) x",
+    "sudo -g wheel $(echo tole) x",
+    "ionice -c 3 ./tol? x",
+    "sudo -u root -g wheel $(echo tole) x",
     // The running binary under another name, and a shell named by a glob or a variable.
     "/proc/$PPID/exe x",
     "/proc/${PPID}/exe x",
@@ -214,6 +231,19 @@ const ALLOWED: &[&str] = &[
     "sh -c \"nohup sh -c 'make > log 2>&1' &\"",
     "sh -c 'make 2>&1'",
     "sh -c \"echo a >f\"",
+    // Wrapper options that take an argument, then a program with arguments.
+    "timeout 5 ls $(pwd)",
+    "timeout 5s ls $(pwd)",
+    "timeout -s KILL 5 ls *",
+    "stdbuf -o L cat $(echo f)",
+    "flock f ls *",
+    "taskset 0x1 make -j4",
+    "taskset -c 0-3 ls *",
+    "sudo -g wheel ls *",
+    "sudo -E ls $(pwd)",
+    "strace -o f ls $(pwd)",
+    "time -p ls $(pwd)",
+    "nice -n 5 ls *",
     "time ls *",
     "timeout 30 grep -rn foo *",
     "env ls t*",

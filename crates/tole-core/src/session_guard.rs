@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod text;
-use text::{glob, novars, shell_words, unquote_shell};
+use text::{glob, novars, shell_words, takes, unquote_shell};
 
 /// Wrappers and shell keywords that run another program: every later word is
 /// checked as a possible program.
@@ -140,11 +140,12 @@ fn open(w: &str) -> bool {
     w.ends_with('\\') || ['\'', '"'].iter().any(|q| w.matches(*q).count() % 2 == 1)
 }
 
-/// Walks the options, assignments, redirections and numbers a wrapper takes up to its
-/// program: (an `env -S` / `--split-string` was seen, where the program is).
-/// An option that takes an argument (`-u`, `-C`, `-a`, `-P`, `--unset`,
-/// `--chdir`, `--argv0`, also as a cluster end: `-iu X`) skips it.
-fn opts(args: &[String]) -> (bool, usize) {
+/// Walks the options, assignments, redirections and numbers (`5s`, `0x1`) a
+/// wrapper takes up to its program: (an `env -S` / `--split-string` was seen,
+/// where the program is). An option that takes an argument (`takes`, also as a
+/// cluster end: `-iu X`) skips it.
+fn opts(args: &[String], wrapper: &str) -> (bool, usize) {
+    let (letters, mut lock) = takes(wrapper);
     let (mut i, mut split) = (0, false);
     while let Some(raw) = args.get(i) {
         let skip = lead_len(raw); // a redirection, `X+=1`, a variable word
@@ -162,10 +163,11 @@ fn opts(args: &[String]) -> (bool, usize) {
         } else if w.starts_with('-') && w.len() > 1 {
             split |= w.contains('S');
             // `-iu X` takes the next word; `-uX` has its argument attached.
-            let at = w.find(['u', 'C', 'a', 'P']);
-            i += usize::from(at.is_some_and(|k| k + 1 == w.len()));
+            let at = w[1..].find(|c| letters.contains(c));
+            i += usize::from(at.is_some_and(|k| k + 2 == w.len()));
         } else if w.is_empty()
-            || !(is_assignment(&w) || w.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            || !(is_assignment(&w) || w.starts_with(|c: char| c.is_ascii_digit()))
+                && !std::mem::take(&mut lock)
         {
             break;
         }
@@ -301,10 +303,10 @@ fn program_runs_tole(argv: &[String], words: &[String], i: usize, cx: &Cx, depth
             || argv[i + 1..]
                 .iter()
                 .any(|w| is_assignment(&unquote(w)) && open(w))
-            || (i..words.len()).any(|e| base(&words[e]) == "env" && opts(&argv[e + 1..]).0)
+            || (i..words.len()).any(|e| base(&words[e]) == "env" && opts(&argv[e + 1..], "env").0)
             // What the chain runs is a substitution or a word the guard cannot
             // read: `env $(echo tole) x`, `nohup env ./tol? x`.
-            || chain_unsure(argv, words, i + 1)
+            || chain_unsure(argv, words, i)
             || (i + 1..words.len()).any(|j| {
                 !is_assignment(&words[j])
                     && (is_tole(&words[j], cx) || is_tole(&stem(&argv[j]), cx))
@@ -332,18 +334,19 @@ fn named(list: &[&str], w: &str, own: &str) -> bool {
 
 /// The program a wrapper chain (from `argv[at]`) runs is a substitution or
 /// hidden: only the program word of each wrapper, not its arguments.
-fn chain_unsure(argv: &[String], words: &[String], mut at: usize) -> bool {
-    while let Some(w) = argv.get(at + opts(&argv[at..]).1) {
+fn chain_unsure(argv: &[String], words: &[String], mut wrap: usize) -> bool {
+    loop {
+        let from = wrap + 1;
+        let k = from + opts(&argv[from..], &base(&words[wrap])).1;
+        let Some(w) = argv.get(k) else { return false };
         if unsure(w) {
             return true;
         }
-        at += opts(&argv[at..]).1;
-        if !named(&WRAPPERS, &words[at], &stem(w)) {
+        if !named(&WRAPPERS, &words[k], &stem(w)) {
             return false;
         }
-        at += 1;
+        wrap = k;
     }
-    false
 }
 
 /// Does the shell at `argv[at]` run tole from its `-c` payload (`-c`, `-lc`, `-xc`)?

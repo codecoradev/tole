@@ -156,3 +156,20 @@ pub(super) fn shell_words(s: &str, quotes: bool) -> Vec<Vec<String>> {
     cmds.push(cmd);
     cmds
 }
+
+/// The letters of a wrapper's options that take an argument, and whether a lock
+/// file comes first (`flock f cmd`).
+pub(super) fn takes(wrapper: &str) -> (&'static str, bool) {
+    match wrapper {
+        "env" => ("uCaP", false),
+        "timeout" => ("sk", false),
+        "stdbuf" => ("ioe", false),
+        "strace" => ("oepsuEP", false),
+        "flock" => ("wEc", true),
+        "taskset" | "nice" | "ionice" | "watch" => ("cnpPd", false),
+        "sudo" | "doas" => ("ghprtCUuDRTa", false),
+        "exec" => ("a", false),
+        "time" => ("fo", false),
+        _ => ("", false),
+    }
+}
