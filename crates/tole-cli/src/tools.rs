@@ -9,8 +9,8 @@ use tole_core::tool::{Risk, Tool};
 /// Write a file under a fixed root directory. Inputs:
 /// `{ "path": "rel/path.txt", "content": "..." }`.
 ///
-/// Path jail: `path` must be relative, no `..`, no symlink escape — the
-/// resolved target must stay inside `root`. This is the structural
+/// Path jail: `path` is relative or absolute under `root`, no `..`, no symlink
+/// escape — the resolved target must stay inside `root`. This is the structural
 /// defense against the model escaping the working tree.
 pub struct WriteFileTool {
     root: PathBuf,
@@ -29,7 +29,7 @@ impl WriteFileTool {
     /// existing portion are resolved by canonicalization; the missing
     /// tail cannot be a symlink yet.
     fn jailed(&self, rel: &str) -> Option<PathBuf> {
-        let rel_path = Path::new(rel);
+        let rel_path = tole_core::file_tools::within_workspace(&self.root, rel)?;
         // Component-based validation (CodeCora scan #6/#12): on Windows,
         // drive-prefixed (`C:evil`) and rooted (`\evil`) relatives are NOT
         // `is_absolute()`, yet `Path::join` lets both escape the base — and
@@ -43,7 +43,7 @@ impl WriteFileTool {
         if !all_normal {
             return None;
         }
-        let target = self.root.join(rel_path);
+        let target = self.root.join(&rel_path);
         let canon_root = self.root.canonicalize().ok()?;
         // Deepest existing ancestor of `target`.
         let mut existing = target.as_path();
@@ -148,14 +148,10 @@ impl Tool for WriteFileTool {
             return Err("write_file: missing 'content'".into());
         };
         let Some(target) = self.jailed(path) else {
-            let why = if Path::new(path).has_root() {
-                "must be relative, not absolute"
-            } else {
-                "escapes the jail"
-            };
-            return Err(format!(
-                "write_file: path {why}: {path} (the workspace is {}; --workspace <dir> widens it)",
-                self.root.display()
+            return Err(tole_core::file_tools::refusal(
+                "write_file",
+                &self.root,
+                path,
             ));
         };
         let bytes = content.len();
@@ -172,7 +168,7 @@ impl Tool for WriteFileTool {
         Some(json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" },
+                "path": { "type": "string", "description": "Workspace-relative file path (no ..; absolute only inside the workspace)" },
                 "content": { "type": "string", "description": "Full file content to write (the file is created or overwritten)" }
             },
             "required": ["path", "content"]

@@ -29,6 +29,10 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
    (component-validated walk using `symlink_metadata`, final component
    opened with `O_NOFOLLOW` on unix, #68; a parent-directory swap between
    walk and open remains a residual race — see Deliberate limitations);
+   an absolute path is read as its relative remainder when it lies under the
+   workspace root (as given or canonical, compared as text) and then held to
+   the same checks, and is refused without touching the file system
+   otherwise (#1285);
    `run_command`/`job_start`
    run with cwd jailed but FULL process authority — the jail bounds *cwd*,
    not capability.

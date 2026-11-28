@@ -1,7 +1,7 @@
 //! `read_file` tool (E7): ReadOnly file read with the same path jail as
 //! `write_file`. The agent can read files inside the working tree but
-//! never traverse out of it (no `..`, no absolute paths, no symlink
-//! escapes).
+//! never traverse out of it (no `..`, no absolute path outside it, no
+//! symlink escapes).
 //!
 //! A sensitive file (`.env*`, keys, `.npmrc`, `.netrc`: see
 //! [`crate::sensitive`]) comes back redacted, with no content hash. The
@@ -11,10 +11,10 @@
 //! A regular file with more than one hard link is withheld by `read_file`
 //! (Unix only, #703): it may be a sensitive file under another name.
 
-use super::file_tools::refusal;
+use super::file_tools::resolve_in_jail;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Hard cap on file size (bytes) — a runaway read (e.g. pointing at a
 /// dataset) must not blow up the durable log / provider context.
@@ -56,42 +56,15 @@ impl ReadFileTool {
         Self { root, raw: true }
     }
 
-    /// Resolve `rel` inside the jail. Mirrors `WriteFileTool::jailed`
-    /// (deepest-existing-ancestor canonicalize), plus a symlink check on
-    /// the final target: reading *through* a symlink out of the jail is
-    /// also an escape. Errors distinguish escape from plain not-found so
-    /// the model gets actionable feedback.
+    /// Resolve `rel` inside the jail: the shared jail check (relative,
+    /// or absolute under the root; reading *through* a symlink out of the
+    /// jail is also an escape). Errors distinguish escape from plain
+    /// not-found so the model gets actionable feedback.
     fn jailed(&self, rel: &str) -> Result<PathBuf, String> {
         if rel.is_empty() {
             return Err("read_file: path is empty".to_string());
         }
-        let rel_path = Path::new(rel);
-        // Component-based validation (uniform with the other file tools;
-        // CodeCora scan #6/#12): drive-prefixed/rooted Windows relatives
-        // are NOT is_absolute() yet escape via join; a substring ".." both
-        // misses them and rejects benign names. Require all-normal
-        // components.
-        let all_normal = rel_path
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)));
-        if !all_normal {
-            return Err(refusal("read_file", &self.root, rel));
-        }
-        let target = self.root.join(rel_path);
-        if !target.exists() {
-            return Err(format!("read_file: not found in jail: {rel}"));
-        }
-        let canon_root = self
-            .root
-            .canonicalize()
-            .map_err(|e| format!("read_file: cannot resolve jail root: {e}"))?;
-        let canon_target = target
-            .canonicalize()
-            .map_err(|_| format!("read_file: not found in jail: {rel}"))?;
-        if canon_target != canon_root && !canon_target.starts_with(&canon_root) {
-            return Err(refusal("read_file", &self.root, rel));
-        }
-        Ok(canon_target)
+        resolve_in_jail(&self.root, rel, "read_file")
     }
 }
 
@@ -140,7 +113,7 @@ impl Tool for ReadFileTool {
         Some(json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" },
+                "path": { "type": "string", "description": "Workspace-relative file path (no ..; absolute only inside the workspace)" },
                 "offset": { "type": "integer", "minimum": 0, "description": "Character offset (NOT a line number). offset: 1086 starts at the 1086th character. To read by lines use start_line/end_line. Default 0" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Max characters, not lines (default/max 20000)" },
                 "start_line": { "type": "integer", "minimum": 1, "description": "First line to return (1-based line number). Exclusive with offset/limit" },
