@@ -35,6 +35,7 @@ pub(super) fn test_state(root: std::path::PathBuf, sessions_dir: std::path::Path
         discussions: Arc::default(),
         models: Default::default(),
         turn_events: std::sync::OnceLock::new(),
+        ready: Default::default(),
     }
 }
 
