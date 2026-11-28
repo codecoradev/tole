@@ -6,6 +6,8 @@
 //! program, under `check_command_argv`: `path_qualified_run.rs`.
 #![cfg(feature = "shell-tools")]
 
+#[path = "support/which.rs"]
+mod which;
 use serde_json::json;
 use tole_core::run_command::RunCommandTool;
 use tole_core::subprocess::check_destructive_argv;
@@ -120,7 +122,9 @@ fn every_path_qualified_program_is_still_refused() {
 fn run_command_keeps_the_destructive_text_and_the_payload_rule() {
     let t = RunCommandTool::new(std::env::temp_dir());
     let run = |c: &str| t.execute(json!({ "command": c })).unwrap_err();
-    assert!(run("/bin/rm -rf /").contains(DESTRUCTIVE));
+    if let Some(rm) = which::find_exe("rm") {
+        assert!(run(&format!("{} -rf /", rm.display())).contains(DESTRUCTIVE));
+    }
     assert!(run("bash -c '/bin/rm -rf /'").contains(DESTRUCTIVE));
     // A program in a shell text is still the shell's to resolve (#1286 only
     // lets a path through as the program; see `path_qualified_run.rs`).

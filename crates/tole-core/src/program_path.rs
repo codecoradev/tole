@@ -10,24 +10,24 @@
 //! with the argv the kernel would give it (the interpreter, its `#!` argument,
 //! the script path, then the caller's arguments): a name of tole, the same file
 //! as the running binary (a hard link too), the teardown and `rm` rules, and
-//! the session guard. The chain is the program and at most four interpreters
-//! (the kernel allows five scripts nested, so this is slightly stricter). A
-//! program inside a `sh -c` text stays refused (it is a shell's to resolve).
-//! A bare-name allow pattern never matches a path (`approval::argv_matches`),
-//! a deny matches its file name, and the sandbox keeps its own rule (a
-//! sandboxed command runs a bare name only).
+//! the session guard. A script argument that looks like `-c` is read by a shell
+//! interpreter as a command string, as `sh script -c ...` is by the blocklist,
+//! and is refused with the argv judged. The `#!` line is split at every blank
+//! (the kernel passes the rest as one argument: as strict or stricter). The
+//! chain is the program and at most four interpreters (the kernel allows five
+//! scripts nested). A program inside a `sh -c` text stays refused (a shell's to
+//! resolve). A bare-name allow never matches a path (`approval::argv_matches`),
+//! a deny matches its file name, and a sandboxed command runs a bare name only.
 //!
-//! Residual (`docs/threat-model.md`, RC-1): the file can be swapped between
-//! this check and the spawn, and a renamed COPY of a program is not what its
-//! name says. The first is the approval gate's and the sandbox's to stop, the
-//! second is what the session marker (`session_guard::mark`) is for.
+//! Residual (`docs/threat-model.md`, RC-1): a swap between this check and the
+//! spawn (the approval gate's and the sandbox's to stop), and a renamed COPY
+//! of a program (the session marker's, `session_guard::mark`).
 
 use crate::subprocess::check_destructive_argv;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// The most interpreters followed after the program. The kernel allows five
-/// scripts nested (`ELOOP` at the sixth), so this is slightly stricter.
+/// The most interpreters after the program (the kernel allows five scripts).
 const SHEBANG_DEPTH: usize = 4;
 const SHEBANG_MAX: u64 = 256;
 const MAX_LINKS: usize = 40;
@@ -114,8 +114,7 @@ fn open_runnable(f: &Path) -> Result<std::fs::File, &'static str> {
 #[cfg(unix)]
 fn running_exe() -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let by_proc = std::fs::metadata("/proc/self/exe");
-    let m = by_proc
+    let m = std::fs::metadata("/proc/self/exe")
         .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))
         .ok()?;
     Some((m.dev(), m.ino()))
@@ -138,8 +137,8 @@ fn file_id(_: &std::fs::File) -> Option<(u64, u64)> {
     None
 }
 
-/// The `#!` line of `file` (up to the first newline or NUL, as the kernel
-/// reads it), split at blanks: the interpreter and its optional argument.
+/// The `#!` line of `file` (up to a newline or NUL, as the kernel reads it),
+/// split at every blank: more words to judge than the kernel's one argument.
 fn shebang(file: &std::fs::File) -> Option<Vec<String>> {
     let mut head = Vec::new();
     file.take(SHEBANG_MAX).read_to_end(&mut head).ok()?;
@@ -210,8 +209,9 @@ pub fn check_command_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
         verdict.map_err(|why| match depth {
             0 => why,
             _ => format!(
-                "the `#!` line of {} runs a program that is refused: {why}",
-                esc(prog)
+                "the `#!` line of {} runs `{}`, which is refused: {why}",
+                esc(prog),
+                esc(&format!("{at} {}", tail.join(" ")))
             ),
         })?;
         let Some(words) = shebang(&file) else {

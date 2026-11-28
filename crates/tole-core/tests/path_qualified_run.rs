@@ -10,6 +10,8 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
+#[path = "support/which.rs"]
+mod which;
 use serde_json::{json, Value};
 use test_dir::{write_executable, TestDir};
 use tole_core::approval::{pattern_verdict, PatternVerdict, ToolRequest};
@@ -46,23 +48,11 @@ fn a_program_in_the_workspace_runs_by_its_relative_path() {
 #[test]
 fn a_system_program_runs_by_its_absolute_path() {
     let ws = TestDir::new("tole-pq-abs");
-    let out = run(&ws, "/bin/echo hi").unwrap();
+    let Some(echo) = which::find_exe("echo") else {
+        return;
+    };
+    let out = run(&ws, &format!("{} hi", echo.display())).unwrap();
     assert_eq!(out["stdout"].as_str().unwrap().trim(), "hi");
-}
-
-/// The `rm` of this host, when it is an ordinary binary named `rm` (a busybox
-/// or uutils multicall binary is not, and a wrapper script is judged by its
-/// interpreter, so the cases below skip then).
-fn real_rm() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join("rm"))
-        .find(|c| {
-            c.canonicalize().is_ok_and(|f| {
-                f.file_name().is_some_and(|n| n == "rm")
-                    && std::fs::read(&f).is_ok_and(|b| !b.starts_with(b"#!"))
-            })
-        })
 }
 
 #[test]
@@ -70,14 +60,22 @@ fn what_a_bare_name_is_refused_for_is_refused_behind_a_path() {
     let ws = TestDir::new("tole-pq-destructive");
     write_executable(ws.join("rm"), "#!/bin/sh\nexit 0\n");
     std::fs::create_dir(ws.join("sub")).unwrap();
-    std::os::unix::fs::symlink("/bin/echo", ws.join("sub/rm")).unwrap();
-    let mut lines = vec![
-        "./rm -rf /etc".to_string(),
-        "/bin/bash -c 'rm -rf /etc'".into(),
-        "/usr/bin/env dd if=/dev/zero of=/dev/sda".into(),
-        "/bin/sh -c 'echo hi; shutdown -h now'".into(),
-    ];
-    if let Some(rm_path) = real_rm() {
+    let mut lines = vec!["./rm -rf /etc".to_string()];
+    if let Some(echo) = which::find_exe("echo") {
+        std::os::unix::fs::symlink(echo.canonicalize().unwrap(), ws.join("sub/rm")).unwrap();
+        // A link NAMED rm that points at something harmless is `rm` by name.
+        lines.push("./sub/rm -rf /".into());
+    }
+    for (prog, args) in [
+        ("bash", "-c 'rm -rf /etc'"),
+        ("env", "dd if=/dev/zero of=/dev/sda"),
+        ("sh", "-c 'echo hi; shutdown -h now'"),
+    ] {
+        if let Some(p) = which::find_exe(prog) {
+            lines.push(format!("{} {args}", p.display()));
+        }
+    }
+    if let Some(rm_path) = which::find_real("rm") {
         let rm = rm_path.display();
         // A link is what it points to: `rm` under another name.
         std::os::unix::fs::symlink(rm_path.canonicalize().unwrap(), ws.join("harmless")).unwrap();
@@ -93,8 +91,6 @@ fn what_a_bare_name_is_refused_for_is_refused_behind_a_path() {
     for line in &lines {
         assert!(refused(&ws, line).contains(DESTRUCTIVE), "{line}");
     }
-    // A link NAMED rm that points at something harmless is `rm` by name.
-    assert!(refused(&ws, "./sub/rm -rf /").contains(DESTRUCTIVE));
 }
 
 #[test]
@@ -203,6 +199,9 @@ fn job_start_takes_the_same_rule() {
     let start = |c: &str| t.execute(json!({ "command": c }));
     assert!(start("./job.sh").is_ok());
     assert!(start("./nope").unwrap_err().contains(NO_FILE));
-    assert!(start("/bin/rm -rf /").unwrap_err().contains(DESTRUCTIVE));
+    if let Some(rm) = which::find_exe("rm") {
+        let err = start(&format!("{} -rf /", rm.display())).unwrap_err();
+        assert!(err.contains(DESTRUCTIVE), "{err}");
+    }
     assert!(start("./tole x").unwrap_err().contains("tole binary"));
 }

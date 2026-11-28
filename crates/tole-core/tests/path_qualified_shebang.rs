@@ -1,5 +1,6 @@
 //! #1286 review: what runs is judged, not what is written. A `#!` line is read
-//! as the kernel reads it (up to a NUL), every interpreter on the chain is
+//! up to a NUL as the kernel does (and split at every blank, which is as strict
+//! or stricter), every interpreter on the chain is
 //! judged and the chain is bounded, a program and an interpreter are judged
 //! under every name of their links, the running binary is refused by inode
 //! (a hard link too), and a file that is not a regular file is never opened
@@ -8,6 +9,8 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
+#[path = "support/which.rs"]
+mod which;
 use std::path::Path;
 use test_dir::{write_executable, TestDir};
 use tole_core::program_path::check_command_argv;
@@ -33,11 +36,14 @@ fn a_nul_ends_the_interpreter_as_it_does_in_the_kernel() {
     let ws = TestDir::new("tole-pqs-nul");
     plant_tole(&ws);
     write_executable(ws.join("nul"), b"#!./bin/tole\0junk\n".as_slice());
-    write_executable(ws.join("nul2"), b"#!/usr/bin/env\0 sh\n".as_slice());
     let err = refused(&ws, "./nul");
     assert!(err.contains("tole binary"), "{err}");
     // And the word after the NUL is not read as the interpreter's argument.
-    assert!(check(&ws, "./nul2").is_ok());
+    if let Some(env) = which::find_exe("env") {
+        let line = format!("#!{}\0 sh\n", env.display());
+        write_executable(ws.join("nul2"), line.into_bytes());
+        assert!(check(&ws, "./nul2").is_ok());
+    }
 }
 
 #[test]
@@ -94,7 +100,10 @@ fn a_link_to_a_shell_is_a_shell() {
     plant_tole(&ws);
     // `/bin/sh` is often a link to dash: the hops ("sh") are judged, not only
     // the file it ends at.
-    std::os::unix::fs::symlink("/bin/sh", ws.join("shl")).unwrap();
+    let Some(sh) = which::find_exe("sh") else {
+        return;
+    };
+    std::os::unix::fs::symlink(sh, ws.join("shl")).unwrap();
     for payload in ["tole x", "rm -rf /nonexistent"] {
         let argv = ["./shl", "-c", payload].map(str::to_string);
         let err = check_command_argv(&argv, &ws).expect_err(payload);
@@ -145,8 +154,11 @@ fn an_interpreter_is_judged_with_the_argv_the_kernel_runs() {
     let ws = TestDir::new("tole-pqs-argv");
     plant_tole(&ws);
     // `./rmx -rf /X` runs `rm ./rmx -rf /X`.
-    write_executable(ws.join("rmx"), "#!/bin/rm\n");
-    write_executable(ws.join("rmarg"), "#!/bin/rm -r\n");
+    let Some(rm) = which::find_exe("rm") else {
+        return;
+    };
+    write_executable(ws.join("rmx"), format!("#!{}\n", rm.display()));
+    write_executable(ws.join("rmarg"), format!("#!{} -r\n", rm.display()));
     for line in [
         "./rmx -rf /X",
         "./rmx --recursive /X",
@@ -158,14 +170,17 @@ fn an_interpreter_is_judged_with_the_argv_the_kernel_runs() {
     }
     // A plain script keeps its arguments, and so does what is harmless.
     write_executable(ws.join("plain"), "#!/bin/sh\n");
-    write_executable(ws.join("viaenv"), "#!/usr/bin/env python3\n");
-    for line in [
+    let mut harmless = vec![
         "./plain a b --version",
         "./plain -rf x",
         "./rmx",
         "./rmx ./local",
-        "./viaenv a -x",
-    ] {
+    ];
+    if let Some(env) = which::find_exe("env") {
+        write_executable(ws.join("viaenv"), format!("#!{} python3\n", env.display()));
+        harmless.push("./viaenv a -x");
+    }
+    for line in harmless {
         assert!(check(&ws, line).is_ok(), "{line}");
     }
     // The tail reaches the shell as the kernel gives it: `sh ./plain -c tole x`
@@ -179,7 +194,10 @@ fn nothing_is_allowed_that_the_same_command_by_bare_name_is_refused() {
     let ws = TestDir::new("tole-pqs-ab");
     plant_tole(&ws);
     write_executable(ws.join("plain"), "#!/bin/sh\n");
-    write_executable(ws.join("rmx"), "#!/bin/rm\n");
+    let Some(rm) = which::find_exe("rm") else {
+        return;
+    };
+    write_executable(ws.join("rmx"), format!("#!{}\n", rm.display()));
     let tails: [&[&str]; 8] = [
         &["-c", "tole x"],
         &["-c", "rm -rf /etc"],
@@ -222,4 +240,21 @@ fn a_link_loop_says_so() {
     let err = refused(&ws, "./a");
     assert!(err.contains("too many levels of symbolic links"), "{err}");
     assert!(!err.contains("no executable file"), "{err}");
+}
+
+#[test]
+fn a_refused_interpreter_shows_the_argv_that_was_judged() {
+    let ws = TestDir::new("tole-pqs-shown");
+    let Some(sh) = which::find_exe("sh") else {
+        return;
+    };
+    write_executable(ws.join("x.sh"), format!("#!{}\n", sh.display()));
+    // A script argument that looks like `-c` is read by a shell as a command
+    // string (as `sh x.sh -clean` is by the blocklist): refused, and the text
+    // says which argv was judged.
+    let argv = ["./x.sh", "-c", "rm -rf /etc"].map(str::to_string);
+    let err = check_command_argv(&argv, &ws).unwrap_err();
+    assert!(err.contains("the `#!` line of ./x.sh runs `"), "{err}");
+    assert!(err.contains("./x.sh -c rm -rf /etc"), "{err}");
+    assert!(err.contains("`, which is refused: "), "{err}");
 }

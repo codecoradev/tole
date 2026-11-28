@@ -5,6 +5,8 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
+#[path = "support/which.rs"]
+mod which;
 use serde_json::json;
 use std::path::PathBuf;
 use test_dir::TestDir;
@@ -23,7 +25,6 @@ fn catastrophic_argv_refused() {
         "mkfs.ext4 /dev/sda1",
         "dd if=/dev/zero of=/dev/sda",
         "shutdown -h now",
-        "/bin/rm -rf /",
         "sh -c 'rm -rf /etc'",
         "bash -lc 'dd if=/dev/zero of=/dev/sda'",
         "env FOO=1 rm -rf /",
@@ -35,6 +36,16 @@ fn catastrophic_argv_refused() {
         assert!(
             err.contains("destructive beyond the Write risk tier"),
             "{line}"
+        );
+    }
+    // A path to the real rm keeps the destructive refusal (host-specific path).
+    if let Some(rm) = which::find_exe("rm") {
+        let err = t
+            .execute(json!({ "command": format!("{} -rf /", rm.display()) }))
+            .unwrap_err();
+        assert!(
+            err.contains("destructive beyond the Write risk tier"),
+            "{err}"
         );
     }
 }

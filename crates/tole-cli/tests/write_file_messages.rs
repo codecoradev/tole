@@ -37,7 +37,7 @@ fn an_absolute_path_inside_the_workspace_writes_the_same_file_as_the_relative_on
 fn an_absolute_path_outside_the_workspace_is_refused_and_names_the_workspace() {
     let ws = TestDir::new("tole-wmsg-abs-out");
     let outside = std::env::temp_dir().join("tole-wmsg-outside.txt");
-    let root = ws.join("").to_string_lossy().to_string();
+    let root = ws.to_string_lossy().to_string();
     for p in [
         outside.to_str().unwrap().to_string(),
         ws.to_string_lossy().to_string(), // the workspace itself is no file
@@ -45,7 +45,7 @@ fn an_absolute_path_outside_the_workspace_is_refused_and_names_the_workspace() {
         let err = write(&ws, &p);
         assert!(err.contains("not inside the workspace"), "{err}");
         assert!(
-            err.contains(root.trim_end_matches('/')),
+            err.contains(root.trim_end_matches(['/', '\\'])),
             "names the root: {err}"
         );
         assert!(err.contains(&p), "names the path: {err}");
