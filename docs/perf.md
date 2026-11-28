@@ -127,25 +127,80 @@ TOLE_REPLAY_SIZES=100000 TOLE_REPLAY_PROFILES=mixed \
   cargo test -p tole-core --release --test perf_replay -- --nocapture   # measures
 ```
 
-**Recommendation (for the owner to confirm; no checkpoint is built here).**
-No checkpoint is needed at the sizes measured. A 20,000-entry session (about
-770 twelve-call turns) opens in about 0.1 to 0.15 s with 36 to 76 MiB of
-memory, and 100,000 entries (a 262 MiB log with large tool outputs) open in
-under 1 s, linearly, with about 15 ms more before the first provider call. That
-is within the 2 s budget of the first table, which was set for 50 entries and
-is met by 2,000 times as many. If a session grows without bound the first
-limit is memory (about 2 to 4 KiB per entry, 380 MiB at 100k `mixed` entries),
-not time; a checkpoint that only saved the parse would not lower it, because
-the provider is still fed from the entries. Primary trigger to revisit: a
-measured `open` over 1 s on a supported host (on this machine about 125,000
-`mixed` or 220,000 `small` entries), or a reported slow resume. Secondary,
-for orientation: the memory of the process that holds the sessions (a
-`tole serve` with many long sessions). If either trigger is reached, write the
-design note #1019 describes (an append-only checkpoint entry that carries the
-folded state, with a verifier that refolds from the full log).
+Re-measure (2026-11-28, `develop` at 9dc6caf, same test, same machine class
+and method as above; 4-core Linux x86_64 container, rustc 1.97.0,
+`cargo test --release`, load average 2 to 3 from other work on the host). The
+fixtures were built once, then each cell is three separate processes (one
+profile and one size each, so `RSS` is valid): the range of the three medians
+of 3 opens. Nothing in the open path changed between 1155e5d (an earlier run of
+the same method by another session) and 9dc6caf: `storage.rs` and the session
+code are untouched, only the secrets module, the session guard and test moves
+changed in `tole-core`.
 
-Not measured: a cold page cache or a slow disk (the first read of a large log
-adds its I/O time); macOS, ARM and Android hosts; sizes over 100,000 entries;
+| Profile | Entries | open | open_ro | first turn | RSS |
+|---|---|---|---|---|---|
+| small | 1,014 | 3.6-5.7 ms | 3.1-5.2 ms | 5.0-5.2 ms | 2 MiB |
+| small | 5,018 | 19-22 ms | 16-18 ms | 4.6-5.3 ms | 10 MiB |
+| small | 20,020 | 77-83 ms | 69-80 ms | 7.3-7.4 ms (one 67 ms outlier) | 36-37 MiB |
+| small | 100,022 | 379-442 ms | 361-383 ms | 17.7-18.7 ms | 179 MiB |
+| mixed | 1,014 | 6.5-7.6 ms | 5.6-6.7 ms | 5.4-5.7 ms | 5 MiB |
+| mixed | 5,018 | 33-42 ms | 27-36 ms | 5.2-6.3 ms | 20 MiB |
+| mixed | 20,020 | 139-152 ms | 132-152 ms | 9.0-13.9 ms | 76 MiB |
+| mixed | 100,022 | 625-687 ms | 640-696 ms | 19.2-23.8 ms | 381 MiB |
+
+Every cell sits inside, or within 15% of, the table above (and the other
+session's run at 1155e5d agreed too), `RSS` is identical, and the growth stays
+linear (5k to 100k: 19 to 21 times for `open`). So the figures are stable
+across three independent runs and the conclusion does not depend on one.
+
+Cold page cache (one size, one disk): the
+page cache was dropped (`echo 3 > /proc/sys/vm/drop_caches`) before each of two
+runs on the 262 MiB `mixed` fixture of 100,022 entries; the first `open` took
+**1,064 and 1,210 ms** against about 650 ms warm, so reading the file from
+this virtual disk adds about 0.4 to 0.5 s (roughly 600 MB/s); `open_ro`, run
+right after, was warm again (701 and 711 ms).
+
+**Decision (2026-11-28, delegated by the owner: "confirm no checkpoint if the
+measurements support it"). No checkpoint is built, and none is designed.** The
+measurements support it. A 20,000-entry session (about 770 twelve-call turns)
+opens in about 0.1 to 0.15 s with 36 to 76 MiB of memory. 100,000 entries (a
+262 MiB log with large tool outputs, about 3,850 turns) open in under 0.7 s
+warm and about 1.1 to 1.2 s from a cold cache, linearly, with about 15 to 25 ms
+more before the first provider call. The 2 s budget of the first table was set
+for 50 entries and is met by 2,000 times as many entries, warm or cold. If a session grows
+without bound the first limit is memory (about
+2 to 4 KiB per entry, 380 MiB at 100k `mixed` entries), not time; a checkpoint
+that only saved the parse would not lower it, because the provider is still fed
+from the entries, so a checkpoint is the wrong tool for that limit too. A
+checkpoint would also add a second source of truth to a log whose rule is that
+the entries are the truth.
+
+**Reopen this decision when any of these is measured or reported** (the
+thresholds are the whole of it; do not reopen on a feeling):
+
+1. `JsonlStorage::open` takes **over 1 s with a warm cache** on a supported
+   host (here: about 125,000 `mixed` or 220,000 `small` entries, a 330 MiB log),
+   or **over 2 s from a cold cache** (the 2 s budget above; here about 180,000
+   `mixed` entries), or a user reports a slow resume with the session's entry
+   count and file size.
+2. The process that holds the sessions (a `tole serve` with several long
+   sessions open at once, or one very long session) grows **past 1 GiB RSS**
+   because of replayed entries (here: about 270,000 `mixed` entries in one
+   session). That is a memory question first; the answer may be a lazy or
+   bounded fold, not a checkpoint.
+3. Real sessions turn out to have a very different entry mix from the fixtures
+   (for instance a median entry over 16 KiB). Re-run `perf_replay` with a
+   profile that matches before deciding.
+
+If a trigger fires, write the design note #1019 describes: an append-only
+checkpoint entry that carries the folded state (the rule "never mutate or delete
+entries" holds), the same idea as `ledger_checkpoint` in the skill ledger, with a
+verifier that refolds from the full log. The size report of #1020 (`tole
+sessions`, step 1 of the retention note) is the way to see the entry count and the
+size of the largest session on a host before any of this is needed.
+
+Not measured: a slow disk other than this virtual one (the cold figure above is one
+size on one disk); macOS, ARM and Android hosts; sizes over 100,000 entries;
 real sessions' usage rows (one more line per provider step, the mock provider
 reports none; same parse path); compaction entries (they do not shorten the
 replay, entries are never dropped); the stop-gate scan and the host's assemble
