@@ -251,7 +251,9 @@ Get them earlier, on your own machine:
    worktree of the branch. It is advisory like `review-local.sh`: the CI Cora
    Review stays the merge gate, and the independent read-only reviews that the
    approval, egress, auth, sandbox and guard paths need (AGENTS.md section 2)
-   still apply.
+   still apply. The deterministic `index-unused-import` findings that `prepare` lists
+   for a diff fragment are often false positives (the import is used elsewhere in the
+   file): the reviewer checks the file before reporting one.
 4. For a refactor, run `cora callers <symbol>`, `cora impact <symbol>` and
    `cora affected <files>` first when you move, rename or remove a public item,
    change a ledger, session, lock or config format, or touch the sandbox,
