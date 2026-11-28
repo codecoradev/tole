@@ -28,6 +28,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
+| Follow a discussion | `GET /discussions/{id}/events?after=<seq>` (#1094) | Server-Sent Events: a small `changed` signal per ledger step, see [Following a discussion](#following-a-discussion-1094) |
 | Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
 | Start in plan mode | `POST /sessions` `{cwd, "plan_mode": true}` (#947) | the same registry filter as `--plan-mode`: mutation tools (write, run_command, agent_start, todo_write, ...) are ABSENT from the session's tool list, not asked about. Answers `planMode: true`. A request can only turn it on: `false` or absence leaves the default, and a `tole serve --plan-mode` process keeps every session in plan mode. `400` for a non-boolean, or combined with `resume` |
 | Start with a profile | `POST /sessions` `{cwd, "profile": "<name>"}` (#740) | persona, allow list, memory room and model of a user-config profile, see [Session profiles](#session-profiles-740) |
@@ -317,8 +318,8 @@ terminal's `tole discuss resume` continues it (a stop and a finished discussion 
 
 Not here yet, and left to the owner (see the open questions of #1042): continuing a discussion with a note for the next
 round or reopening a closed one (the ledger has no owner-note event and a closed discussion is final), per-discussion
-tool allowance (#1039; it is the terminal's `--tool`, see `docs/faces.md`), and discussion events on the live stream (`GET /sessions/{id}/events` is per session; read
-`GET /discussions/{id}` while the `state` is `running`).
+tool allowance (#1039; it is the terminal's `--tool`, see `docs/faces.md`). A running discussion is followed on its own event
+stream, `GET /discussions/{id}/events` (below), not on a session's.
 
 The request body carries what the owner types for `tole discuss start`: `question`, `criteria`, `participants`,
 `budget_tokens` (required), `max_rounds`, `files` and `id`. Any other key (`tools`, `allow`, `profile`, `modes`,
@@ -483,6 +484,43 @@ Two kinds of frames, deliberately separate:
   stream with `fetch` and its own SSE parser (or the token has to be passed another way, a
   decision left to the web client, #529).
 
+## Following a discussion (#1094)
+
+`GET /discussions/{id}/events?after=<seq>` is a Server-Sent Events stream (`text/event-stream`, same bearer token) of one
+discussion, so a client follows it to its close without polling `GET /discussions/{id}`. A discussion is not a session, so
+it has its own stream (one per discussion, not one for all of them, which a client opens as many as it follows) fed by
+the discussion's own ledger, and it is a **signal, not a copy of the ledger**: a frame says that the ledger moved and
+where the discussion stands, and the client answers it with `GET /discussions/{id}`, the redacted audit view above.
+
+| `event:` | `id:` | Data |
+|---|---|---|
+| `changed` | the ledger `seq` | `{seq, round, step, tokens_used, closed}`. `seq` is the position of the last ledger line; `step` is what the ledger says must happen next (`contribute`, `summarize`, `check`, `decide`, `finish`, `done`); `round` the round that step belongs to |
+| `ready` | none | `{id, after, lastSeq, busy}`, sent after the first look at the ledger (`busy` is whether this server drives the discussion) |
+| `state` | none | `{state}`: `running` or `interrupted` flipped (a failed call, a resume), which the ledger does not record. Best effort, not replayed; `ready.busy` tells the state at the start |
+| `closed` | none | `{id}`: the discussion is closed; the stream ends |
+
+- **No polling, no loss, no repeat.** Frames are level signals: several ledger steps between two looks of the server (it
+  checks the ledger file about every 150 ms, one `stat` when it did not change) are one `changed` frame at the latest
+  `seq`, so nothing a client needs is skipped, only merged. A client that reconnects with `?after=<last seq seen>` (or
+  `Last-Event-ID`; an explicit `after` wins) gets one `changed` frame at once when the ledger is past it, and none when it
+  is not, so a dropped connection resumes without missing or repeating a frame. `tole-client`
+  `Client::follow_discussion` does this, with the same reconnect policy as `follow_events`, and ends on `closed`.
+- **Nothing a participant wrote reaches the stream.** The frames hold numbers, a flag, one word from a closed set and the id:
+  no contribution, digest, question, criterion or closing text, redacted or not (read those with `GET /discussions/{id}`).
+  Every frame still passes the process secret set, the one of that route, before it is written. A test plants a secret in
+  a contribution, a digest and the closing text and proves none of it is on the stream.
+- **When it ends.** `closed` ends it (also for a discussion that was already closed when the stream opened). A server that
+  shuts down ends it without `closed` and the client reconnects. A discussion that is open but not driven (`interrupted`)
+  keeps the stream open, with heartbeats, until a resume or a stop; `POST /discussions/{id}/resume` shows as `state: running`.
+  A ledger that cannot be read for about 3 s in a row (deleted, garbled, replaced by a link) ends the stream without a frame;
+  the reconnect gets the `404` or `500` of the first look. A ledger replaced by another readable one is not detected. A peer that
+  closed its connection is noticed within about 150 ms and frees its slot.
+- **Limits.** Counted in the same 8 open streams as a session's (the 9th gets `429`), heartbeat and
+  `TOLE_SERVE_HEARTBEAT_SECS` as in the [event stream](#event-stream-524). `401` without the token, `404` `no such
+  discussion`, `400` for a bad id or `after`. A ledger that cannot be read is a `500` that names no path.
+- `GET /info` lists the feature `discussions.events`. The frames are the `discussionEvents` group of the
+  committed JSON Schema (`crates/tole-client/schema/tole-client.schema.json`; `changed`, `ready`, `state`, `closed`).
+
 ## Images (#558)
 
 A graphical client attaches images in two steps: upload, then reference the upload in a prompt.
@@ -546,20 +584,29 @@ serve).
 
 ## Device tokens (#1320)
 
-Part 1 of #1320 is the token store, `tole_cli::serve_support::device_tokens`. The owner commands
-`tole serve token add|list|revoke` are the next change, so nothing creates a token yet, and
-**`tole serve` does not check device tokens**: a request is accepted with the shared bearer token
-(or Basic) and nothing else, and a device token sent today is refused like any wrong token. Part 2
-changes the serve middleware: a `read-only` token will be refused on every route that changes state
-or answers an approval, a `full` token will equal today's bearer token, a revoked token will be
-refused on the next request, and `GET /info` will report the scope of the calling token. Until part
-2 is released, a `read-only` token protects nothing.
+Part 1 of #1320 is on the owner's side only: **`tole serve` does not check device tokens yet.**
+A request is still accepted with the shared bearer token (or Basic) and nothing else; a device
+token sent today is refused like any wrong token. Part 2 changes the serve middleware: a
+`read-only` token will be refused on every route that changes state or answers an approval, a
+`full` token will equal today's bearer token, a revoked token will be refused on the next request,
+and `GET /info` will report the scope of the calling token. Until part 2 is released, a `read-only`
+token protects nothing.
 
-What the store does:
+What exists now, at a terminal, as the owner:
 
-- A token is `tole_dt_` and 43 characters (256 bits from the OS random source). `Store::add` returns
-  it once, to its caller; only its SHA-256 is stored, with the name, the scope, the time of creation
-  and a last-used time that part 2 fills in.
+```
+tole serve token add <name> --scope read-only|full   # prints the token once, on stdout
+tole serve token list                                # names, scopes, times; never a token
+tole serve token revoke <name>
+```
+
+- The token is `tole_dt_` and 43 characters (256 bits from the OS random source). It is printed once
+  and cannot be shown again: only its SHA-256 is stored, with the name, the scope, the time of
+  creation and a last-used time that part 2 fills in. The token goes to stdout alone, before
+  anything else is said (if it cannot be written, for example to a closed pipe, the new token is
+  revoked at once and the command fails); the sentence about it goes to stderr, last. It is never
+  an argument, so `T=$(tole serve token add phone --scope read-only)` keeps it out of the process
+  list **for `add` only**: using `$T` later in a command line shows it to every local process.
 - The file is `serve-tokens.jsonl` in the tole data dir (`$CODECORA_HOME/tole`), mode 0600, in a
   directory that is not group or world writable; a wider file is refused, not repaired. It is
   append-only by convention (no tole code rewrites it; the file system does not enforce it): a
@@ -570,10 +617,12 @@ What the store does:
   active tokens, and at most 64 tokens are active; errors show a name quoted and escaped.
 - A line that does not read back, a name added twice, a hash added twice (a revoked one included),
   a revoke of a name that is not active, or a newer record version makes the store unusable (every
-  call fails with the line number and writes nothing; no device token is valid until the owner
+  command fails with the line number and writes nothing; no device token is valid until the owner
   repairs the file by hand). Nothing is guessed, because a skipped revoke line would bring a
   revoked token back. For the same reason **restoring the file from a backup brings back every
   token revoked since the backup was taken: rotate all tokens after a restore.**
+- `add` and `revoke` refuse under an agent session (#684): a token holder or a model never mints or
+  revokes tokens. `list` shows no token and no hash.
 - For part 2 (the code that will enforce the scope): `Live::lookup` holds a mutex while it reloads
   the file and `Live::touch` writes synchronously, so the serve middleware must call them from
   `spawn_blocking` or an equivalent thread. Last-used lines are never compacted: after 3 MiB of
@@ -678,7 +727,7 @@ The checks, each `true` when it does not apply (so even `checks` does not say wh
 
 - `state`: a file can be created and removed in the tole data directory, in the cron directory when
   `--cron` is given or a webhook destination is configured, and in `--sessions-dir` when it is
-  given (a read-only volume, a full disk, a path that is not a directory). A directory that does
+  given (a read-only volume, one with no free inode, or a path that is not a directory; a volume that still has inodes but no free blocks is not proven to fail the probe, which writes no byte). A directory that does
   not exist yet is probed at its nearest existing parent and is never created. Without
   `--sessions-dir` the sessions live in each session's workspace and are not probed.
 - `cron`: with `--cron`, this process's in-process ticker wrote its heartbeat (`ticker.json`, the file
@@ -704,7 +753,7 @@ Authenticated like every route but `/health` and `/ready` (a missing or wrong cr
 client check the server it reached before it relies on a route or a field:
 
 ```json
-{"version":"0.12.0","protocolVersion":1,"features":["approvals","compact","cron","delegation.approvals","detach","discussions","effort","entries","events.sse","fork","hooks","images","interrupt","mcp","missions","models","profiles","resume","session.name","sessions.index","skills","tools","tree"]}
+{"version":"0.12.0","protocolVersion":1,"features":["approvals","compact","cron","delegation.approvals","detach","discussions","discussions.events","effort","entries","events.sse","fork","hooks","images","interrupt","mcp","missions","models","profiles","resume","session.name","sessions.index","skills","tools","tree"]}
 ```
 
 - `version` is the `tole` binary's version, and `protocolVersion` the number `GET /health` reports

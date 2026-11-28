@@ -58,6 +58,18 @@
       "required": ["cancelled","sessionId"],
       "type": "object"
     },
+    "Changed": {
+      "description": "`changed` (discussion stream, #1094): the ledger of a discussion is now at\n`seq`. A signal, not the ledger's lines: read the discussion with\n`GET /discussions/{id}`. Several ledger steps may\ncoalesce into one frame, and no contribution or text is ever in it.",
+      "properties": {
+        "closed": {"type":"boolean"},
+        "round": {"description":"The round being worked on.","format":"uint32","minimum":0,"type":"integer"},
+        "seq": {"description":"Position of the last ledger line; the `after` a resume would use.","format":"uint64","minimum":0,"type":"integer"},
+        "step": {"description":"What the ledger says must happen next: `contribute`, `summarize`,\n`check`, `decide`, `finish` or `done`. A string, not a closed set.","type":"string"},
+        "tokens_used": {"format":"uint64","minimum":0,"type":"integer"}
+      },
+      "required": ["seq","round","step","tokens_used","closed"],
+      "type": "object"
+    },
     "ClosedData": {
       "description": "`closed`: the session left the server.",
       "properties": {
@@ -729,6 +741,14 @@
       "required": ["skills","drafts","archived","notes"],
       "type": "object"
     },
+    "StateData": {
+      "description": "`state` (discussion stream): this server's view of the discussion flipped\n(`running`, `interrupted`; the ledger does not record it).",
+      "properties": {
+        "state": {"type":"string"}
+      },
+      "required": ["state"],
+      "type": "object"
+    },
     "TextData": {
       "description": "`text_delta` and `reasoning`.",
       "properties": {
@@ -800,8 +820,18 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
+  "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name and `discussionEvents` the same for GET /discussions/{id}/events (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
   "properties": {
+    "discussionEvents": {
+      "properties": {
+        "changed": {"$ref":"#/$defs/Changed"},
+        "closed": {"$ref":"#/$defs/ClosedData"},
+        "ready": {"$ref":"#/$defs/Ready"},
+        "state": {"$ref":"#/$defs/StateData"}
+      },
+      "required": ["changed","closed","ready","state"],
+      "type": "object"
+    },
     "events": {
       "properties": {
         "approval_requested": {"$ref":"#/$defs/Approval"},
@@ -877,7 +907,7 @@
       "type": "object"
     }
   },
-  "required": ["requests","responses","events"],
+  "required": ["requests","responses","events","discussionEvents"],
   "title": "tole serve client protocol",
   "type": "object",
   "x-tole-routes": [
@@ -1015,6 +1045,15 @@
       "request": null,
       "response": "Discussion",
       "stream": null
+    },
+    {
+      "method": "GET",
+      "path": "/discussions/{id}/events",
+      "query": ["after"],
+      "rawBody": null,
+      "request": null,
+      "response": null,
+      "stream": "discussionEvents"
     },
     {
       "method": "POST",

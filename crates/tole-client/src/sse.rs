@@ -191,47 +191,8 @@ pub struct Ready {
     pub busy: bool,
 }
 
-/// The `data:` payloads of the ephemeral frames that carry more than a
-/// shared type. Private to the decoder; the committed JSON Schema describes
-/// them (#1068), which is why they are named types and not local structs.
-pub(crate) mod payload {
-    use serde::Deserialize;
-    use serde_json::Value;
-
-    /// `text_delta` and `reasoning`.
-    #[derive(Deserialize)]
-    #[cfg_attr(test, derive(schemars::JsonSchema))]
-    pub(crate) struct TextData {
-        pub(crate) text: String,
-    }
-    /// `tool_started`.
-    #[derive(Deserialize)]
-    #[cfg_attr(test, derive(schemars::JsonSchema))]
-    pub(crate) struct ToolStartedData {
-        pub(crate) tool: String,
-        pub(crate) input: Value,
-    }
-    /// `tool_finished`.
-    #[derive(Deserialize)]
-    #[cfg_attr(test, derive(schemars::JsonSchema))]
-    pub(crate) struct ToolFinishedData {
-        pub(crate) tool: String,
-        pub(crate) ok: bool,
-        pub(crate) preview: String,
-    }
-    /// `resync`: ephemeral frames this slow stream lost.
-    #[derive(Deserialize)]
-    #[cfg_attr(test, derive(schemars::JsonSchema))]
-    pub(crate) struct ResyncData {
-        pub(crate) dropped: u64,
-    }
-    /// `closed`: the session left the server.
-    #[derive(Deserialize)]
-    #[cfg_attr(test, derive(schemars::JsonSchema))]
-    pub(crate) struct ClosedData {
-        pub(crate) id: String,
-    }
-}
+pub(crate) mod payload;
+pub use payload::Changed;
 
 /// A typed frame. Unknown event names are kept as [`Event::Other`], so a newer
 /// server never breaks an older client.
@@ -265,6 +226,13 @@ pub enum Event {
     Closed {
         id: String,
     },
+    /// Durable, discussion stream only: the ledger moved; `changed.seq` is its
+    /// position, like an entry's.
+    Changed(Changed),
+    /// Discussion stream only: the server's view flipped (`running`, `interrupted`).
+    DiscussionState {
+        state: String,
+    },
     Other {
         event: String,
         data: Value,
@@ -272,14 +240,14 @@ pub enum Event {
 }
 
 impl Event {
-    /// Decode a frame. Only a durable `entry` frame that does not decode is an
-    /// error: losing one would break the seq guarantee. Any other frame of a
+    /// Decode a frame. Only a durable `entry` or `changed` frame that does not
+    /// decode is an error: losing one would break the seq guarantee. Any other frame of a
     /// shape this client does not know (an unknown name, or a known one that a
     /// newer server changed) becomes [`Event::Other`] with its raw data, since
     /// ephemeral frames are best effort by design.
     pub fn from_frame(f: &Frame) -> Result<Event> {
         match Self::typed(f) {
-            Err(_) if f.event != "entry" => Ok(Event::Other {
+            Err(_) if !matches!(f.event.as_str(), "entry" | "changed") => Ok(Event::Other {
                 event: f.event.clone(),
                 data: serde_json::from_str(&f.data)
                     .unwrap_or_else(|_| Value::String(f.data.clone())),
@@ -289,7 +257,9 @@ impl Event {
     }
 
     fn typed(f: &Frame) -> Result<Event> {
-        use payload::{ClosedData, ResyncData, TextData, ToolFinishedData, ToolStartedData};
+        use payload::{
+            ClosedData, ResyncData, StateData, TextData, ToolFinishedData, ToolStartedData,
+        };
         fn data<T: serde::de::DeserializeOwned>(f: &Frame) -> Result<T> {
             Ok(serde_json::from_str(&f.data)?)
         }
@@ -324,6 +294,10 @@ impl Event {
             },
             "closed" => Event::Closed {
                 id: data::<ClosedData>(f)?.id,
+            },
+            "changed" => Event::Changed(data(f)?),
+            "state" => Event::DiscussionState {
+                state: data::<StateData>(f)?.state,
             },
             other => Event::Other {
                 event: other.to_string(),

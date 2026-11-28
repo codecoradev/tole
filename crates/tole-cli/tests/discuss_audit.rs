@@ -1,6 +1,15 @@
-use super::*;
-use tole_core::discussion::{parse_digest, Contract, CriterionVerdict};
-use tole_core::discussion_log::Reserve;
+//! `tole discuss show|list` and `GET /discussions` (#588): the audit view of a
+//! ledger, read-only and redacted, never a raw contribution. (Moved from the unit
+//! tests of `src/discuss/audit.rs`; it needs nothing private.)
+
+use serde_json::Value;
+use std::path::Path;
+use tole_cli::discuss::audit::{discussions, LINE_CHARS};
+use tole_core::discussion::{parse_digest, Contract, CriterionVerdict, RoundSummary};
+use tole_core::discussion_log::{DiscussionLog, Reserve};
+use tole_core::secrets::SecretSet;
+
+mod common;
 
 const SECRET: &str = "sk-audit-disc-0123456789abcdef";
 
@@ -8,7 +17,7 @@ fn secrets() -> SecretSet {
     SecretSet::collect([("AUDIT_API_KEY".to_string(), SECRET.to_string())], [])
 }
 
-use crate::test_dir::TestDir;
+use common::TestDir;
 fn tmp(tag: &str) -> TestDir {
     TestDir::new(&format!("tole-auditdisc-{tag}"))
 }
