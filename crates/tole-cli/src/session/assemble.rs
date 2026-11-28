@@ -408,9 +408,7 @@ pub fn route_session(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Face policy (#943)
-// ---------------------------------------------------------------------------
+// ---- Face policy (#943) ----
 
 /// Where a face's shell tools (`run_command`, `git`, `gh`) run. Files are
 /// jailed to the workspace on every face; only the shell directory differs.

@@ -112,9 +112,7 @@ impl SessionToolState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_new
-// ---------------------------------------------------------------------------
+// ---- tole_session_new ----
 
 struct SessionNewTool(SessionToolState);
 
@@ -184,9 +182,7 @@ impl Tool for SessionNewTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_prompt
-// ---------------------------------------------------------------------------
+// ---- tole_session_prompt ----
 
 struct SessionPromptTool(SessionToolState);
 
@@ -244,9 +240,7 @@ impl Tool for SessionPromptTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_interrupt — soft interrupt (#377)
-// ---------------------------------------------------------------------------
+// ---- tole_session_interrupt — soft interrupt (#377) ----
 
 /// Steers the target session's in-flight turn WITHOUT cancelling it: the
 /// message lands at the turn's next safe point as an attributed user-role
@@ -309,9 +303,7 @@ impl Tool for SessionInterruptTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_detach — stop waiting, keep the work (#217)
-// ---------------------------------------------------------------------------
+// ---- tole_session_detach — stop waiting, keep the work (#217) ----
 
 /// Detaches the target session's in-flight turn: nothing is aborted — the
 /// running tool settles, the turn ends `detached` (resumable), background
@@ -359,9 +351,7 @@ impl Tool for SessionDetachTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_cancel — the MCP face of #178
-// ---------------------------------------------------------------------------
+// ---- tole_session_cancel — the MCP face of #178 ----
 
 /// Cancels the target session's in-flight turn (`run_session_turn`
 /// observes the token at its next checkpoint and settles `cancelled`).
@@ -431,9 +421,7 @@ impl Tool for SessionCancelTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tole_session_status / tole_session_list
-// ---------------------------------------------------------------------------
+// ---- tole_session_status / tole_session_list ----
 
 struct SessionStatusTool(SessionToolState);
 
