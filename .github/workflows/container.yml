@@ -499,7 +499,10 @@ jobs:
             if grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest unknown|name unknown|not found|404' <<<"$out"; then
               return 1
             fi
-            echo "::error::cannot tell whether $1 exists (the registry answered with something other than not found): $out" >&2
+            # The reply is registry text: one line, no colons or newlines, so it
+            # cannot form a workflow command of its own.
+            safe=$(printf '%s' "$out" | tr -d '\r' | tr '\n:' '  ' | head -c 300)
+            echo "::error::cannot tell whether $1 exists (the registry answered with something other than not found): $safe" >&2
             exit 1
           }
           # The digest of a tag. Captured first and parsed after, so awk never
