@@ -50,15 +50,18 @@ fn a_system_program_runs_by_its_absolute_path() {
     assert_eq!(out["stdout"].as_str().unwrap().trim(), "hi");
 }
 
-/// The `rm` of this host, when it is an ordinary file named `rm` (a busybox
-/// or uutils multicall binary is not, and the cases below skip then).
+/// The `rm` of this host, when it is an ordinary binary named `rm` (a busybox
+/// or uutils multicall binary is not, and a wrapper script is judged by its
+/// interpreter, so the cases below skip then).
 fn real_rm() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join("rm"))
         .find(|c| {
-            c.canonicalize()
-                .is_ok_and(|f| f.file_name().is_some_and(|n| n == "rm"))
+            c.canonicalize().is_ok_and(|f| {
+                f.file_name().is_some_and(|n| n == "rm")
+                    && std::fs::read(&f).is_ok_and(|b| !b.starts_with(b"#!"))
+            })
         })
 }
 

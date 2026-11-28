@@ -6,9 +6,12 @@
 //! the blocklist, read on what the path really is, has nothing against it.
 //! Nothing a bare name is refused for is allowed here. The program is judged
 //! under every name it goes by (the one written, each link on the way, the
-//! file it resolves to), and so is every interpreter on its `#!` chain (the
-//! kernel follows four): a name of tole, the same file as the running binary
-//! (a hard link too), the teardown and `rm` rules, and the session guard. A
+//! file it resolves to), and so is every interpreter on its `#!` chain, each
+//! with the argv the kernel would give it (the interpreter, its `#!` argument,
+//! the script path, then the caller's arguments): a name of tole, the same file
+//! as the running binary (a hard link too), the teardown and `rm` rules, and
+//! the session guard. The chain is the program and at most four interpreters
+//! (the kernel allows five scripts nested, so this is slightly stricter). A
 //! program inside a `sh -c` text stays refused (it is a shell's to resolve).
 //! A bare-name allow pattern never matches a path (`approval::argv_matches`),
 //! a deny matches its file name, and the sandbox keeps its own rule (a
@@ -23,7 +26,8 @@ use crate::subprocess::check_destructive_argv;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// The most interpreters the kernel follows (`BINPRM_MAX_RECURSION`).
+/// The most interpreters followed after the program. The kernel allows five
+/// scripts nested (`ELOOP` at the sixth), so this is slightly stricter.
 const SHEBANG_DEPTH: usize = 4;
 const SHEBANG_MAX: u64 = 256;
 const MAX_LINKS: usize = 40;
@@ -43,21 +47,42 @@ struct Found {
     file: PathBuf,
 }
 
+const GONE: &str = "no executable file is there";
+
 /// Follow `path` (read from `cwd`) through its links: the file name of each
-/// hop, then the canonical file. `None`: it does not resolve or has no name.
-fn follow(path: &str, cwd: &Path) -> Option<Found> {
+/// hop, then the canonical file. `Err` is why it does not resolve.
+fn follow(path: &str, cwd: &Path) -> Result<Found, &'static str> {
     let mut p = cwd.join(path);
     let mut names = Vec::new();
+    let mut resolved = false;
     for _ in 0..MAX_LINKS {
-        names.push(p.file_name()?.to_str()?.to_string());
-        if !std::fs::symlink_metadata(&p).ok()?.is_symlink() {
+        names.push(
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(GONE)?
+                .to_string(),
+        );
+        if !std::fs::symlink_metadata(&p)
+            .map_err(|_| GONE)?
+            .is_symlink()
+        {
+            resolved = true;
             break;
         }
-        p = p.parent()?.join(std::fs::read_link(&p).ok()?);
+        let to = std::fs::read_link(&p).map_err(|_| GONE)?;
+        p = p.parent().ok_or(GONE)?.join(to);
     }
-    let file = p.canonicalize().ok()?;
-    names.push(file.file_name()?.to_str()?.to_string());
-    Some(Found { names, file })
+    if !resolved {
+        return Err("too many levels of symbolic links");
+    }
+    let file = p.canonicalize().map_err(|_| GONE)?;
+    names.push(
+        file.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(GONE)?
+            .to_string(),
+    );
+    Ok(Found { names, file })
 }
 
 /// Open `f` for inspection: not through a link and never blocking on a pipe;
@@ -69,7 +94,7 @@ fn open_runnable(f: &Path) -> Result<std::fs::File, &'static str> {
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NONBLOCK | libc::O_NOFOLLOW);
     let file = o.open(f).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => "it cannot be read",
-        _ => "no executable file is there",
+        _ => GONE,
     })?;
     let meta = file.metadata().map_err(|_| "it cannot be read")?;
     #[cfg(unix)]
@@ -79,26 +104,38 @@ fn open_runnable(f: &Path) -> Result<std::fs::File, &'static str> {
     if meta.is_file() && exec {
         Ok(file)
     } else {
-        Err("no executable file is there")
+        Err(GONE)
     }
 }
 
-/// Is `f` the running executable (the same inode, so a hard link counts)?
+/// The (device, inode) of the running binary, read through the process and not
+/// through a path that is gone once the binary is replaced or deleted. `None`:
+/// it cannot be read, and the caller refuses.
 #[cfg(unix)]
-fn is_running_exe(f: &std::fs::File) -> bool {
+fn running_exe() -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    match (
-        f.metadata(),
-        std::env::current_exe().and_then(|e| e.metadata()),
-    ) {
-        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
-        _ => false,
-    }
+    let by_proc = std::fs::metadata("/proc/self/exe");
+    let m = by_proc
+        .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))
+        .ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// The same identity for `f`: a hard link to the running binary has it too.
+#[cfg(unix)]
+fn file_id(f: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
 }
 
 #[cfg(not(unix))]
-fn is_running_exe(_: &std::fs::File) -> bool {
-    false
+fn running_exe() -> Option<(u64, u64)> {
+    Some((0, 0))
+}
+
+#[cfg(not(unix))]
+fn file_id(_: &std::fs::File) -> Option<(u64, u64)> {
+    None
 }
 
 /// The `#!` line of `file` (up to the first newline or NUL, as the kernel
@@ -143,6 +180,12 @@ pub fn check_command_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
     if prog.rsplit('/').next().is_some_and(is_tole) {
         return check_destructive_argv(argv);
     }
+    let Some(me) = running_exe() else {
+        return Err(format!(
+            "refused \u{2014} the program is written as a path ({}) and this process cannot read the identity of its own binary, so it cannot tell whether the path is the tole binary.",
+            esc(prog)
+        ));
+    };
     let (mut at, mut tail) = (prog.clone(), argv[1..].to_vec());
     for depth in 0..=SHEBANG_DEPTH {
         let refuse = |why: &str| {
@@ -157,9 +200,9 @@ pub fn check_command_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
                 cwd.display()
             )
         };
-        let found = follow(&at, cwd).ok_or_else(|| refuse("no executable file is there"))?;
+        let found = follow(&at, cwd).map_err(refuse)?;
         let file = open_runnable(&found.file).map_err(refuse)?;
-        let verdict = if is_running_exe(&file) {
+        let verdict = if file_id(&file) == Some(me) {
             Err("a session may not run the tole binary (this is its file)".to_string())
         } else {
             judge(&found, &tail, cwd)
@@ -175,14 +218,16 @@ pub fn check_command_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
             return Ok(());
         };
         // The kernel runs the interpreter (a path, read from the child's
-        // working directory) with its optional argument, then the script.
+        // working directory) with its optional argument, the script as it was
+        // written and then the caller's arguments: that is what is judged next.
         let Some((interp, rest)) = words.split_first() else {
             return Err(refuse("its `#!` line names no interpreter"));
         };
-        (at, tail) = (interp.clone(), rest.to_vec());
+        let script = std::mem::replace(&mut at, interp.clone());
+        tail = [rest, &[script], tail.as_slice()].concat();
     }
     Err(format!(
-        "refused \u{2014} the program ({}) has a `#!` chain deeper than the kernel follows.",
+        "refused \u{2014} the program ({}) has a `#!` chain deeper than is followed here (the program and four interpreters).",
         esc(prog)
     ))
 }

@@ -11,6 +11,7 @@ mod test_dir;
 use std::path::Path;
 use test_dir::{write_executable, TestDir};
 use tole_core::program_path::check_command_argv;
+use tole_core::subprocess::check_destructive_argv;
 
 fn check(ws: &Path, line: &str) -> Result<(), String> {
     let argv: Vec<String> = line.split(' ').map(str::to_string).collect();
@@ -57,13 +58,13 @@ fn every_interpreter_on_the_chain_is_judged_and_the_chain_is_bounded() {
     }
     assert!(
         check(&ws, "./c3").is_ok(),
-        "four levels is the kernel's limit"
+        "the program and four interpreters is the most followed"
     );
-    // ... but deeper than the kernel follows is refused, not guessed.
+    // ... but deeper than that is refused, not guessed.
     write_executable(ws.join("c4"), "#!./c3\n");
     write_executable(ws.join("c5"), "#!./c4\n");
     let err = refused(&ws, "./c5");
-    assert!(err.contains("deeper than the kernel follows"), "{err}");
+    assert!(err.contains("deeper than is followed here"), "{err}");
     // An interpreter that is not there, or none at all.
     write_executable(ws.join("gone"), "#!./nothing\n");
     write_executable(ws.join("empty"), "#!\n");
@@ -137,4 +138,88 @@ fn a_pipe_is_refused_and_never_waited_on() {
         let err = refused(&ws, line);
         assert!(err.contains("no executable file is there"), "{line}: {err}");
     }
+}
+
+#[test]
+fn an_interpreter_is_judged_with_the_argv_the_kernel_runs() {
+    let ws = TestDir::new("tole-pqs-argv");
+    plant_tole(&ws);
+    // `./rmx -rf /X` runs `rm ./rmx -rf /X`.
+    write_executable(ws.join("rmx"), "#!/bin/rm\n");
+    write_executable(ws.join("rmarg"), "#!/bin/rm -r\n");
+    for line in [
+        "./rmx -rf /X",
+        "./rmx --recursive /X",
+        "./rmarg /X",
+        "./rmarg ../x",
+    ] {
+        let err = refused(&ws, line);
+        assert!(err.contains("destructive"), "{line}: {err}");
+    }
+    // A plain script keeps its arguments, and so does what is harmless.
+    write_executable(ws.join("plain"), "#!/bin/sh\n");
+    write_executable(ws.join("viaenv"), "#!/usr/bin/env python3\n");
+    for line in [
+        "./plain a b --version",
+        "./plain -rf x",
+        "./rmx",
+        "./rmx ./local",
+        "./viaenv a -x",
+    ] {
+        assert!(check(&ws, line).is_ok(), "{line}");
+    }
+    // The tail reaches the shell as the kernel gives it: `sh ./plain -c tole x`
+    // reads `tole x` as a command text to a guard that cannot tell, and refuses.
+    let argv = ["./plain", "-c", "tole x"].map(str::to_string);
+    assert!(check_command_argv(&argv, &ws).is_err());
+}
+
+#[test]
+fn nothing_is_allowed_that_the_same_command_by_bare_name_is_refused() {
+    let ws = TestDir::new("tole-pqs-ab");
+    plant_tole(&ws);
+    write_executable(ws.join("plain"), "#!/bin/sh\n");
+    write_executable(ws.join("rmx"), "#!/bin/rm\n");
+    let tails: [&[&str]; 8] = [
+        &["-c", "tole x"],
+        &["-c", "rm -rf /etc"],
+        &["-c", "dd if=/dev/zero of=/dev/sda"],
+        &["-rf", "/X"],
+        &["-r", "../x"],
+        &["env", "tole"],
+        &["a", "tole"],
+        &["--version"],
+    ];
+    for (script, bare) in [("./plain", "sh"), ("./rmx", "rm")] {
+        for tail in tails {
+            let rest: Vec<String> = tail.iter().map(|s| s.to_string()).collect();
+            let path: Vec<String> = [script.to_string()]
+                .into_iter()
+                .chain(rest.clone())
+                .collect();
+            // What the kernel runs, by bare name.
+            let by_name: Vec<String> = [bare.to_string(), script.to_string()]
+                .into_iter()
+                .chain(rest)
+                .collect();
+            let bare_refused = check_destructive_argv(&by_name).is_err()
+                || tole_core::session_guard::check_session_argv(&by_name, &ws).is_err();
+            if bare_refused {
+                assert!(
+                    check_command_argv(&path, &ws).is_err(),
+                    "{script} {tail:?} is refused as `{bare}` and must be refused here"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_link_loop_says_so() {
+    let ws = TestDir::new("tole-pqs-loop");
+    std::os::unix::fs::symlink("b", ws.join("a")).unwrap();
+    std::os::unix::fs::symlink("a", ws.join("b")).unwrap();
+    let err = refused(&ws, "./a");
+    assert!(err.contains("too many levels of symbolic links"), "{err}");
+    assert!(!err.contains("no executable file"), "{err}");
 }

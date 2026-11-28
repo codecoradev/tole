@@ -197,3 +197,105 @@ fn execute_cwd_is_jailed() {
     let want = jail.canonicalize().unwrap_or_default();
     assert_eq!(got, want);
 }
+
+#[test]
+fn execute_caps_streams_independently_and_flags() {
+    let t = RunCommandTool::new(std::env::temp_dir());
+    let out = t
+        .execute(json!({"command": "sh -c 'echo ok; echo ok >&2'"}))
+        .unwrap();
+    assert_eq!(out["stdout_truncated"], false);
+    assert_eq!(out["stderr_truncated"], false);
+    assert_eq!(out["stdout"], "ok\n");
+    // 3000 chars: over the stderr budget (2000), under stdout's (4000).
+    let out = t
+        .execute(
+            json!({"command": "sh -c 'head -c 3000 /dev/zero | tr \"\\0\" x | tee /dev/stderr'"}),
+        )
+        .unwrap();
+    assert_eq!(out["stdout_truncated"], false);
+    assert_eq!(out["stderr_truncated"], true);
+    assert!(out["stderr"].as_str().unwrap().chars().count() <= 2000);
+}
+
+#[test]
+fn execute_long_output_keeps_head_and_tail() {
+    let t = RunCommandTool::new(std::env::temp_dir());
+    let cmd = r#"sh -c 'printf HEAD_MARK; head -c 40000 /dev/zero | tr "\0" y; printf TAIL_MARK'"#;
+    let out = t.execute(json!({ "command": cmd })).unwrap();
+    let s = out["stdout"].as_str().unwrap();
+    assert!(
+        s.starts_with("HEAD_MARK") && s.ends_with("TAIL_MARK"),
+        "{s}"
+    );
+    assert!(s.contains("characters omitted"));
+    assert_eq!(out["stdout_truncated"], true);
+}
+
+/// #598: a command gets no secret by default, `GITHUB_TOKEN` included;
+/// an explicit grant to `run_command` restores that one token.
+#[cfg(unix)]
+#[test]
+fn a_command_gets_no_secret_unless_one_is_granted_to_run_command() {
+    use tole_core::secret_release::Release;
+    std::env::set_var("GITHUB_TOKEN", "t598-gh-token-value");
+    std::env::set_var("TOLE_T598_OTHER_TOKEN", "t598-other-value");
+    let out = |t: &RunCommandTool, name: &str| {
+        t.execute(json!({"command": format!("printenv {name}")}))
+            .unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // The process release (the default here): nothing for commands.
+    let mut t = RunCommandTool::new(std::env::temp_dir());
+    assert_eq!(out(&t, "GITHUB_TOKEN"), "");
+    t.release = Some(Release::default().with(
+        "GITHUB_TOKEN",
+        ["gh", "git", "run_command"].map(String::from),
+    ));
+    assert_eq!(out(&t, "GITHUB_TOKEN").trim(), "t598-gh-token-value");
+    assert_eq!(out(&t, "TOLE_T598_OTHER_TOKEN"), "", "only the granted one");
+}
+
+/// #684: the tole binary is refused in EVERY session kind, not only
+/// child agents (the default tool is a root session's).
+#[cfg(unix)]
+#[test]
+fn root_session_refuses_the_tole_binary() {
+    let dir = TestDir::new("tole-rc-684");
+    let t = RunCommandTool::new(dir.to_path_buf());
+    assert!(!t.child_agent_mode);
+    for line in [
+        "tole cron resume job-1",
+        "env tole cron resume job-1",
+        "sh -c 'tole plugin approve x --hash h'",
+        "env -u TOLE_UNDER_SESSION printenv",
+    ] {
+        let err = t
+            .execute(json!({ "command": line }))
+            .err()
+            .unwrap_or_else(|| panic!("must refuse: {line}"));
+        assert!(err.contains("#684"), "{line}: {err}");
+    }
+    // Ordinary commands that mention the name still run.
+    let ok = t.execute(json!({ "command": "echo tole" })).unwrap();
+    assert_eq!(ok["status"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #684: what a session starts carries the marker the owner-only
+/// subcommands refuse on.
+#[cfg(unix)]
+#[test]
+fn spawned_commands_carry_the_session_marker() {
+    let dir = TestDir::new("tole-rc-684m");
+    let t = RunCommandTool::new(dir.to_path_buf());
+    let out = t
+        .execute(json!({ "command": "sh -c 'printenv | grep ^TOLE_UNDER'" }))
+        .unwrap();
+    assert_eq!(out["status"], 0, "{out}");
+    let env = out["stdout"].as_str().unwrap();
+    assert!(env.lines().any(|l| l == "TOLE_UNDER_SESSION=1"), "{env}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
