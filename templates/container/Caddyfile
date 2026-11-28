@@ -8,6 +8,8 @@
 #   - no `encode` block: do not compress text/event-stream (a compressor holds
 #     data back until its buffer fills).
 #   - request_buffers: see the comment below (tole refuses chunked request bodies).
+#   - flush_interval -1 is belt and braces: in a test Caddy 2.11.9 also streamed a
+#     text/event-stream response unbatched without it. Keep it.
 #   - no timeouts on the upstream: serve sends a `: ping` comment every 15 s
 #     (TOLE_SERVE_HEARTBEAT_SECS), and POST /sessions/{id}/prompt answers only
 #     when the whole turn is over (minutes), so any read timeout would cut a
@@ -31,11 +33,12 @@
 	reverse_proxy tole:7801 {
 		flush_interval -1
 		# tole accepts only request bodies with a Content-Length and answers 400 to
-		# any Transfer-Encoding (serve.rs). A client that streams a body of unknown
-		# length (HTTP/2 or HTTP/3 without content-length, or chunked HTTP/1.1) would
-		# be forwarded as chunked. request_buffers reads the body (up to the cap of
-		# a 10 MiB upload) before forwarding and then sends it with a Content-Length.
-		# From Caddy's documentation; not run here.
+		# any Transfer-Encoding (serve.rs). Run against Caddy 2.11.9 with a mock
+		# upstream: with request_buffers a body of unknown length that arrives over
+		# HTTP/2 is forwarded with a Content-Length (without it, chunked), but a
+		# chunked HTTP/1.1 request body is still forwarded chunked. `tole-client`
+		# always sends a Content-Length, so it is not affected; a client that sends
+		# chunked HTTP/1.1 bodies needs the nginx recipe (it always sets a length).
 		request_buffers 12MB
 		# tole speaks HTTP/1.1 and ends a streamed response by closing it.
 		transport http {
