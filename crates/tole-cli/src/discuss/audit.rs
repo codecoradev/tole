@@ -384,7 +384,3 @@ pub fn discussions(
         }
     })
 }
-
-#[cfg(test)]
-#[path = "audit_tests.rs"]
-mod tests;

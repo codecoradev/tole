@@ -4,7 +4,8 @@ use super::State;
 use serde_json::{json, Value};
 
 /// One stable name per route group of `docs/mobile-control.md`; never renamed.
-const FEATURES: &str = "approvals compact cron delegation.approvals detach discussions effort \
+const FEATURES: &str =
+    "approvals compact cron delegation.approvals detach discussions discussions.events effort \
     entries events.sse fork hooks images interrupt missions models profiles resume session.name \
     sessions.index skills tools tree";
 
