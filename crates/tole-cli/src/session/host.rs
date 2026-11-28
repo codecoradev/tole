@@ -1097,7 +1097,7 @@ fn finish(
         approval_tool,
         queue_mark,
         turn_end,
-        problem: crate::session::problem::wire(outcome),
+        problem: crate::session::problem::wire(outcome, &storage.egress_secrets()),
     })
 }
 
