@@ -78,6 +78,41 @@ fn revoking_a_token_ends_its_session_stream_and_not_the_shared_tokens() {
     assert_eq!(open(&serve, &path, Some(&ro)).err().unwrap().0, 401);
 }
 
+/// A stream is tied to ITS token: revoking one of two read-only tokens ends only that one's stream,
+/// and a token made again under the same name is another token, so the old one's stream still ends.
+#[test]
+fn a_stream_follows_its_own_token_and_not_its_name_or_the_others() {
+    let serve = Serve::spawn(&spawn_mock(0));
+    let id = new_session(&serve);
+    let path = format!("/sessions/{id}/events");
+    let (a, b) = (
+        device_token(&serve, "a", Scope::ReadOnly),
+        device_token(&serve, "b", Scope::ReadOnly),
+    );
+    let (sa, sb) = (
+        open(&serve, &path, Some(&a)).unwrap(),
+        open(&serve, &path, Some(&b)).unwrap(),
+    );
+    sa.until(WITHIN, |f| f.event == "ready");
+    sb.until(WITHIN, |f| f.event == "ready");
+
+    store_of(&serve).revoke("a", now()).unwrap();
+    until_it_ends(&sa, ENDS_WITHIN);
+    // B's stream is still open a few passes later, and still gets what happens next.
+    assert!(sb
+        .next(Duration::from_secs(1))
+        .is_none_or(|f| f.event != "closed"));
+    prompt(&serve, &id, "after a was revoked");
+    sb.until(WITHIN, |f| f.event == "entry");
+
+    // `b` revoked and made again: the new secret works, the old one's stream ends.
+    store_of(&serve).revoke("b", now()).unwrap();
+    let again = device_token(&serve, "b", Scope::ReadOnly);
+    until_it_ends(&sb, ENDS_WITHIN);
+    assert!(open(&serve, &path, Some(&again)).is_ok());
+    assert_eq!(open(&serve, &path, Some(&b)).err().unwrap().0, 401);
+}
+
 fn started(ledger: &std::path::Path, id: &str) -> DiscussionLog {
     let l = DiscussionLog::at(ledger, id).unwrap();
     let names = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -132,4 +167,65 @@ fn a_read_only_token_cannot_take_the_last_stream_slots() {
     let b = open(&serve, &path, Some(&full)).unwrap();
     assert!(open(&serve, &path, Some(&full)).is_err(), "eight in all");
     drop((held, a, b));
+}
+
+/// Revoking while a long replay is under way ends it: the reader does not read until the token is
+/// revoked, so the server is blocked on a full socket in the middle of the replay, and what comes
+/// out afterwards is a fraction of the transcript.
+#[test]
+fn revoking_a_token_ends_a_replay_that_is_under_way() {
+    use std::io::{Read, Write};
+    let serve = Serve::spawn(&spawn_mock(0));
+    let ro = device_token(&serve, "watch", Scope::ReadOnly);
+    let id = new_session(&serve);
+    prompt(&serve, &id, "one real turn");
+    // A transcript of 4000 entries of 16 KiB (64 MiB) after the real turn: one entry per line,
+    // numbered on from the highest `seq` of the file (a line is a record or an array of them).
+    let file = serve.session_file(&id);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let max = |v: &serde_json::Value| v["seq"].as_u64().unwrap_or(0);
+    let mut seq = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .flat_map(|v| v.as_array().cloned().unwrap_or_else(|| vec![v]))
+        .map(|v| max(&v))
+        .max()
+        .unwrap();
+    let pad = "x".repeat(16 * 1024);
+    let mut out = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap(),
+    );
+    const MADE: u64 = 4000;
+    for _ in 0..MADE {
+        seq += 1;
+        let e = serde_json::json!({"kind": "entry", "seq": seq, "id": format!("e_{seq}"),
+            "type": "message", "timestamp": 1_795_000_000_000u64,
+            "payload": {"role": "user", "text": pad}});
+        writeln!(out, "{e}").unwrap();
+    }
+    out.flush().unwrap();
+    drop(out);
+
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", serve.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    write!(
+        s,
+        "GET /sessions/{id}/events HTTP/1.1\r\nAuthorization: Bearer {ro}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    // Not read yet: the server fills the socket and waits in the middle of the replay.
+    std::thread::sleep(Duration::from_secs(3));
+    store_of(&serve).revoke("watch", now()).unwrap();
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got);
+    let entries = String::from_utf8_lossy(&got)
+        .matches("event: entry")
+        .count() as u64;
+    assert!(
+        entries < MADE / 2,
+        "{entries} of {MADE} entries were delivered after the revoke"
+    );
 }

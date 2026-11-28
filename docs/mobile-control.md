@@ -609,7 +609,7 @@ serve; a device token is revoked alone, with no restart).
 - A token sent in `Authorization` is checked on every route except `/health` (never checked, even
   with a bad credential) and `/ready` without a credential (with one it is checked). A wrong, an unknown and a revoked token get the same `401 {"error":"unauthorized"}`
   as a wrong shared token (the same bytes, with the Basic challenge when Basic is on) and count
-  towards the per-IP failure limit like any wrong credential. A token of the wrong shape costs no
+  towards the per-IP failure limit like any wrong credential. A token of the wrong shape (a mistyped shared token, say) costs no
   file access; one of the right shape costs one `stat` of the token file and a comparison over the
   active hashes with no early exit, whether it is unknown or revoked. A token added or revoked is
   seen on the next request, without a restart.
@@ -625,8 +625,11 @@ serve; a device token is revoked alone, with no restart).
   unaffected.
 - **Revoking a token ends the event streams it opened** (`/sessions/{id}/events`,
   `/discussions/{id}/events`): the token is asked again on every pass of the stream (150 ms), and a
-  revoked one gets a plain close with no frame, then a `401` on reconnect. A stream opened with the
-  shared token or Basic is never cut by a revoke. A read-only token cannot hold the last 2 of the
+  revoked one gets a plain close with no frame, then a `401` on reconnect. A replay of a long transcript is checked every 64 entries too. A stream opened with the
+  shared token or Basic is never cut by a revoke. The check is fail closed: a transient I/O error on
+  the token file (retried after 5 seconds) also ends device-token streams until the retry, and the
+  client reconnects. An open stream does not refresh the last-used time of its token (only
+  authenticating a request does). A read-only token cannot hold the last 2 of the
   8 event-stream slots (its 7th stream is `429`), so it cannot lock the owner out of them.
 - **A read-only token still reads everything**: full transcripts, tool outputs, the text of pending
   approvals, `/cron/runs`, `/skills`, `/tools`. A leaked read-only token is a loss of

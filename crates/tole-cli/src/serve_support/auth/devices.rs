@@ -3,7 +3,7 @@
 //! fields and helpers there.
 
 use super::{bearer_token, now_secs, Authenticator};
-use crate::serve_support::device_tokens::{Live, Scope};
+use crate::serve_support::device_tokens::{shaped, Live, Scope};
 
 impl Authenticator {
     /// Also accept the device tokens of `live` (#1320) in [`Self::authenticate`].
@@ -22,20 +22,30 @@ impl Authenticator {
             return Some(Scope::Full);
         }
         let live = self.devices.as_ref()?;
-        let Some(who) = live.lookup(bearer_token(header)?) else {
+        let token = bearer_token(header)?;
+        let Some(who) = live.lookup(token) else {
             // A file that cannot be used refuses every device token: say so, once per change.
-            let now = live.error();
-            let mut last = self.store_error.lock().unwrap_or_else(|p| p.into_inner());
-            if *last != now {
-                if let Some(why) = &now {
-                    eprintln!("tole serve: device tokens are refused until this is fixed: {why}");
-                }
-                *last = now;
+            // Only a token of the right shape reaches the file; any other costs nothing.
+            if shaped(token) {
+                self.say_store_error(live.error());
             }
             return None;
         };
+        self.say_store_error(None);
         live.touch(&who.name, now_secs());
         Some(who.scope)
+    }
+
+    /// Says a token-file error on stderr when it differs from the last one said; a usable file
+    /// (`None`) forgets it, so the same damage twice is said twice.
+    fn say_store_error(&self, now: Option<String>) {
+        let mut last = self.store_error.lock().unwrap_or_else(|p| p.into_inner());
+        if *last != now {
+            if let Some(why) = &now {
+                eprintln!("tole serve: device tokens are refused until this is fixed: {why}");
+            }
+            *last = now;
+        }
     }
 
     /// Is this still an active device token? An event stream opened with one asks again on every

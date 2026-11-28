@@ -10,7 +10,9 @@ use tole_cli::serve_support::device_tokens::{Scope, PREFIX};
 
 mod common;
 mod serve_harness;
-use serve_harness::raw::{device_token, json_of, raw, raw_declared, status_of, store_of};
+use serve_harness::raw::{
+    device_token, json_of, raw, raw_declared, spawn_logged, status_of, store_of,
+};
 use serve_harness::{spawn_mock, Serve};
 
 const UNKNOWN: &str = "tole_dt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -204,48 +206,8 @@ fn device_tokens_work_next_to_basic() {
 /// No token value reaches the serve's log or a body, however it was presented.
 #[test]
 fn no_token_value_reaches_a_log_or_a_body() {
-    use std::process::Stdio;
-    let work = common::TestDir::new("tole-dt-log-work");
-    let home = common::TestDir::new("tole-dt-log-home");
-    let log = home.join("serve.log");
-    let store = tole_cli::serve_support::device_tokens::Store::new(&home.join("tole"));
-    let mock = spawn_mock(0);
-    let mut child = None;
-    let mut port = 0;
-    for _ in 0..5 {
-        port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
-            .args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
-            .args(["--workspace", work.to_str().unwrap()])
-            .current_dir(work.path())
-            .env("TOLE_BASE_URL", &mock)
-            .env("TOLE_MODEL", "mock-model")
-            .env("TOLE_API_KEY", "sk-test")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
-        let up = common::poll_until(std::time::Duration::from_secs(20), || {
-            if c.try_wait().ok().flatten().is_some() {
-                return Some(false);
-            }
-            std::fs::read_to_string(&log)
-                .is_ok_and(|l| l.contains("listening on"))
-                .then_some(true)
-        });
-        if up == Some(true) {
-            child = Some(c);
-            break;
-        }
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    let mut child = child.expect("tole serve did not start");
+    let serve = spawn_logged(&spawn_mock(0));
+    let (store, port) = (serve.store(), serve.port);
 
     let secret = |name, scope| {
         store
@@ -273,9 +235,7 @@ fn no_token_value_reaches_a_log_or_a_body() {
     ] {
         answers.push_str(&raw(port, method, path, Some(&bearer(token)), "{}"));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let logged = std::fs::read_to_string(&log).unwrap();
+    let logged = serve.text();
     assert!(logged.contains("listening on"));
     for (name, token) in [("read-only", &ro), ("full", &full), ("revoked", &old)] {
         assert!(
@@ -284,4 +244,52 @@ fn no_token_value_reaches_a_log_or_a_body() {
         );
         assert!(!logged.contains(token.as_str()), "{name} token in the log");
     }
+}
+
+fn said(serve: &serve_harness::raw::Logged) -> usize {
+    serve.text().matches("device tokens are refused").count()
+}
+
+/// A token file that cannot be read refuses device tokens and is said on stderr once per change of
+/// state, and only when a token of the right shape asks: a wrong-shape token never reaches the file.
+#[test]
+fn a_damaged_token_file_is_said_once_per_state_and_only_to_a_device_token() {
+    let serve = spawn_logged(&spawn_mock(0));
+    let port = serve.port;
+    let store = serve.store();
+    let good = bearer(
+        store
+            .add("phone", Scope::Full, now())
+            .unwrap()
+            .secret
+            .expose(),
+    );
+    let file = serve.home.join("tole/serve-tokens.jsonl");
+    let healthy = std::fs::read_to_string(&file).unwrap();
+    let damage = || {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        f.write_all(b"oops\n").unwrap();
+    };
+    let get = |credential: &str| status_of(&raw(port, "GET", "/sessions", Some(credential), ""));
+
+    damage();
+    // A mistyped shared token or a wrong-shape bearer costs no look at the file.
+    assert_eq!(get("Bearer t0ken-typo"), 401);
+    assert_eq!(get("Bearer wrong"), 401);
+    assert_eq!(said(&serve), 0, "{}", serve.text());
+    // A token of the right shape is refused, and the state is said once.
+    assert_eq!(get(&good), 401);
+    assert_eq!(get(&good), 401);
+    assert_eq!(get(&bearer(UNKNOWN)), 401);
+    assert_eq!(said(&serve), 1, "{}", serve.text());
+    // Mended: the token works again. Damaged the same way again: said again.
+    std::fs::write(&file, &healthy).unwrap();
+    assert_eq!(get(&good), 200);
+    damage();
+    assert_eq!(get(&good), 401);
+    assert_eq!(said(&serve), 2, "{}", serve.text());
 }

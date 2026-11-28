@@ -174,7 +174,11 @@ pub(super) fn serve_events(
         // Durable frames (a read error just retries on the next pass).
         let polled = match tail.poll() {
             Ok(entries) => {
-                for e in entries {
+                for (n, e) in entries.into_iter().enumerate() {
+                    // A long replay asks again too, every 64 entries.
+                    if n % 64 == 0 && !who.valid(state) {
+                        return;
+                    }
                     if !write_all(&mut stream, &entry_frame(&e)) {
                         return;
                     }

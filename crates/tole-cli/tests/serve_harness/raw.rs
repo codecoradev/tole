@@ -74,3 +74,76 @@ pub fn device_token(serve: &Serve, name: &str, scope: Scope) -> String {
     let added = store_of(serve).add(name, scope, now).unwrap();
     added.secret.expose().to_string()
 }
+
+/// A `tole serve` whose stderr is the file `log`, over a private home and workspace.
+pub struct Logged {
+    pub child: std::process::Child,
+    pub port: u16,
+    pub log: std::path::PathBuf,
+    pub home: crate::common::TestDir,
+    _work: crate::common::TestDir,
+}
+
+impl Logged {
+    pub fn text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The token store of this serve (its data dir is `<home>/tole`).
+    pub fn store(&self) -> Store {
+        Store::new(&self.home.join("tole"))
+    }
+}
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn spawn_logged(mock: &str) -> Logged {
+    use crate::common;
+    let work = common::TestDir::new("tole-dt-log-work");
+    let home = common::TestDir::new("tole-dt-log-home");
+    let log = home.join("serve.log");
+    for _ in 0..5 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut c = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
+            .args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
+            .args(["--workspace", work.to_str().unwrap()])
+            .current_dir(work.path())
+            .env("TOLE_BASE_URL", mock)
+            .env("TOLE_MODEL", "mock-model")
+            .env("TOLE_API_KEY", "sk-test")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let up = common::poll_until(Duration::from_secs(20), || {
+            if c.try_wait().ok().flatten().is_some() {
+                return Some(false);
+            }
+            std::fs::read_to_string(&log)
+                .is_ok_and(|l| l.contains("listening on"))
+                .then_some(true)
+        });
+        if up == Some(true) {
+            return Logged {
+                child: c,
+                port,
+                log,
+                home,
+                _work: work,
+            };
+        }
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    panic!("tole serve did not start");
+}
