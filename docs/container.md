@@ -150,9 +150,12 @@ removes an empty file in `/data/sessions` and in the tole data directory under `
 write probe and not a space alarm: watch free space from the host (`df -h`, the
 orchestrator's volume metric). To see what is using it:
 `du -sh /data/sessions /data/codecora/tole/images` and `ls -lS /data/sessions | head`
-inside the container. Retention is a proposal awaiting an owner decision, see
-[session-retention-design.md](session-retention-design.md) (#1020), which also
-says what can be said about sizing the volume.
+inside the container. Retention is decided in part and built in part: a whole
+settled session file may be moved by an owner command, nothing deletes one, and
+only a read-only size report exists so far (`tole sessions` and `tole doctor` print
+the number of session files, their bytes, the largest and the oldest); the archive
+command is not built. See [session-retention-design.md](session-retention-design.md)
+section 12 (#1020), which also says what can be said about sizing the volume.
 
 ## TLS and the live event stream
 
