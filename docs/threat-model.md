@@ -15,6 +15,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Workspace files | `--workspace` dir (default cwd) | Readable AND writable by the model via tools |
 | Host env of child processes | inherited by spawned commands | See ENV-1 |
 | Subprocess execution authority | run_command / job_start / git / gh | The model chooses argv within argv-split + jail rules |
+| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential; an interpreter that edits it is not stopped (defense in depth only, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
 
 ## Trust boundaries
 
@@ -523,9 +524,10 @@ denied (a stolen device cannot bank future approvals), every decision
 is audited on the session, and there is no push endpoint in tole — the
 phone pulls, so the attack surface tole exposes is exactly the
 authenticated REST face. Scoped device tokens (per-device, revocable,
-read-only vs approver roles) are the recognized follow-up; until then
-the deployment guidance is a dedicated OS user + minimal
-`--allow`/`--trust` on the serve process.
+read-only vs approver roles) are #1320: part 1 (the token store) exists but nothing creates a token yet and
+`tole serve` does not check them, so until part 2 enforces the scope the deployment guidance is
+unchanged: a dedicated OS user + minimal `--allow`/`--trust` on the serve
+process.
 
 ### Remote MCP servers (#530)
 
@@ -1445,8 +1447,8 @@ serve credential is still approval authority.
 | **The credential crosses the internet in clear** | tole serves plain HTTP; the example proxy ends TLS (Caddy, automatic certificate) and publishes the only ports; the tole service publishes none. The desktop requires `https://` for a non-loopback server (D6) | HTTP between proxy and tole on the compose network: any container on that network can reach it, so the network holds these two services only. `tole-client` can connect over `https://` since #1071 (see "HTTPS to a remote serve"); the desktop does not use it for a remote entry yet (#1044 follow-up) |
 | **Token or provider key baked into an image, a compose file or an argument list** | The serve token is a Docker secret read with `--token-file`; the provider key is a secret file the entrypoint copies into `TOLE_API_KEY` for tole; nothing is in the image, the compose file, `docker inspect` or `ps`. tole is non-dumpable and scrubs secret-shaped variables from its children | The secret files are readable by the container user, so a command the model runs (approved by the owner) can `cat` the token and approve its own Writes, as in fleet-daemon.md "Sandbox decision". Not closed here; follow-up: root-start entrypoint with `--token-fd` |
 | **Lock-out of the owner from the internet** (the failed-auth limiter counts the proxy's address) | `Caddyfile`/`nginx.conf`: the nginx template rate-limits requests; the recommended deployment is a private network or an address allowlist at the proxy | Anyone who can reach the proxy can send ten wrong tokens a minute and make every request answer `429` (a denial of service, not a bypass); tole does not read `X-Forwarded-For` (follow-up: a trusted-proxy setting) |
-| **A proxy that buffers or times out the event stream** | The templates turn response buffering and compression off, set no read timeout below a turn (`POST .../prompt` answers when the turn ends) and pass `TOLE_SERVE_HEARTBEAT_SECS`; a dropped stream resumes losslessly with `?after=<seq>`; `scripts/container/stream_probe.py` checks both through a given URL | Ephemeral frames (`text_delta`) of a gap are lost by design. The settings are written from the proxies' documentation and were not run against a proxy in the lane that wrote them |
-| **A command the model runs escapes the "container as sandbox"** | Non-root user, all capabilities dropped, `no-new-privileges`, read-only root filesystem, process cap, no published port, ledgers outside the file-tool jail (`--sessions-dir /data/sessions`) | The container is not the command sandbox of sandbox-design.md: commands run as the container user with open outbound network, can read `/data` and the secret files, and share the host kernel. bwrap is not installed and normally cannot run in a container without relaxing seccomp or AppArmor; an `optional` sandbox counts as `required` in serve |
+| **A proxy that buffers or times out the event stream** | The templates turn response buffering and compression off, set no read timeout below a turn (`POST .../prompt` answers when the turn ends) and pass `TOLE_SERVE_HEARTBEAT_SECS`; a dropped stream resumes losslessly with `?after=<seq>`; `scripts/container/stream_probe.py` checks both through a given URL | Ephemeral frames (`text_delta`) of a gap are lost by design. Run against Caddy 2.11.9 and nginx 1.27 on one Docker host with a stand-in provider (2026-11-28): frames arrive unbatched and the resume check passes; not run with a public certificate or a real provider. Caddy's `request_buffers` does not turn a chunked HTTP/1.1 request body into a `Content-Length` one (tole answers `400`; `tole-client` sends a length, nginx does it) |
+| **A command the model runs escapes the "container as sandbox"** | Non-root user, all capabilities dropped (the proxy too), `no-new-privileges`, read-only root filesystem, process cap, no published port, ledgers outside the file-tool jail (`--sessions-dir /data/sessions`) | The container is not the command sandbox of sandbox-design.md: commands run as the container user with open outbound network, can read `/data` and the secret files, and share the host kernel. bwrap is not installed and normally cannot run in a container without relaxing seccomp or AppArmor; an `optional` sandbox counts as `required` in serve |
 
 ### Approval auto mode (#995, proposed, design only)
 

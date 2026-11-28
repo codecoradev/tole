@@ -577,10 +577,46 @@ curl -H "Authorization: Bearer $TOKEN" -o shot.png \
 The serve credential, the token or the Basic password, **is approval authority**
 (see the threat model): a
 phone holding it can let code write to the box. Practical scoping until
-dedicated device tokens exist (#follow-up): run missions under a
+enforced device tokens exist (#1320, part 2): run missions under a
 dedicated OS user, keep `--allow`/`--trust` minimal on the serve
 process, and treat the token as a revocable secret (rotate = restart
 serve).
+
+## Device tokens (#1320)
+
+Part 1 of #1320 is the token store, `tole_cli::serve_support::device_tokens`. The owner commands
+`tole serve token add|list|revoke` are the next change, so nothing creates a token yet, and
+**`tole serve` does not check device tokens**: a request is accepted with the shared bearer token
+(or Basic) and nothing else, and a device token sent today is refused like any wrong token. Part 2
+changes the serve middleware: a `read-only` token will be refused on every route that changes state
+or answers an approval, a `full` token will equal today's bearer token, a revoked token will be
+refused on the next request, and `GET /info` will report the scope of the calling token. Until part
+2 is released, a `read-only` token protects nothing.
+
+What the store does:
+
+- A token is `tole_dt_` and 43 characters (256 bits from the OS random source). `Store::add` returns
+  it once, to its caller; only its SHA-256 is stored, with the name, the scope, the time of creation
+  and a last-used time that part 2 fills in.
+- The file is `serve-tokens.jsonl` in the tole data dir (`$CODECORA_HOME/tole`), mode 0600, in a
+  directory that is not group or world writable; a wider file is refused, not repaired. It is
+  append-only by convention (no tole code rewrites it; the file system does not enforce it): a
+  revoke is a new line. The last component of the token file and of its lock is opened with
+  `O_NOFOLLOW` (unix only); parent directories are followed, as for the other tole stores. The
+  owner of the file is not compared with the effective uid, so the protection is the mode of the
+  file and directory, not who owns them. A name is `[a-z0-9][a-z0-9._-]{0,63}`, unique among
+  active tokens, and at most 64 tokens are active; errors show a name quoted and escaped.
+- A line that does not read back, a name added twice, a hash added twice (a revoked one included),
+  a revoke of a name that is not active, or a newer record version makes the store unusable (every
+  call fails with the line number and writes nothing; no device token is valid until the owner
+  repairs the file by hand). Nothing is guessed, because a skipped revoke line would bring a
+  revoked token back. For the same reason **restoring the file from a backup brings back every
+  token revoked since the backup was taken: rotate all tokens after a restore.**
+- For part 2 (the code that will enforce the scope): `Live::lookup` holds a mutex while it reloads
+  the file and `Live::touch` writes synchronously, so the serve middleware must call them from
+  `spawn_blocking` or an equivalent thread. Last-used lines are never compacted: after 3 MiB of
+  file they stop being recorded. A reload that fails with an I/O error is retried after 5 seconds
+  or when the file changes; a corrupt, unsafe or oversized file stays refused until it changes.
 
 ## Local socket and per-launch credential (#1043)
 
