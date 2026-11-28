@@ -571,14 +571,11 @@ file (`tole sessions` itself still replays every file for its table). It
 has no warning threshold: a threshold needs a config key on the usual
 flag, environment and config layers, and the numbers it would act on do not
 exist yet. The image directories are not in the report (decision 6): use
-`du` as section 10 says. The size-report change (branch
-`feat/sessions-size-report`) adds no row to `docs/faces.md`: the face parity test
-compares tools and prompts and passes. That is a gap against `AGENTS.md` §6, which
-asks for a row in the hand-kept "Capabilities the test cannot see" table for a
-capability on one face (the report exists on the CLI only; `tole serve` lists
-sessions through `GET /sessions/index` and has no size report). The row (CLI only,
-policy: an owner report on the host) is to be added to that change; the archive
-command gets its row in the same way.
+`du` as section 10 says. The size-report change (#1339) adds a row to the hand-kept "Capabilities the
+test cannot see" table of `docs/faces.md`, as `AGENTS.md` §6 asks for a capability
+on one face: the report exists on the CLI only (`tole serve` lists sessions
+through `GET /sessions/index` and has no size report), by policy (an owner
+report on the host). The archive command gets its row in the same way.
 
 **What is not built.** The archive command (step 3). It waits for the data of
 step 2 to show a problem, as section 11 says. When it is built it follows
