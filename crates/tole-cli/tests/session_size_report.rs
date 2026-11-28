@@ -100,6 +100,10 @@ fn bytes_are_shown_in_binary_units() {
     assert_eq!(human(1536 * 1024), "1.5 MiB");
     assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GiB");
     assert_eq!(human(5000 * 1024 * 1024 * 1024), "5000.0 GiB");
+    // The unit is chosen after rounding.
+    assert_eq!(human(1_048_575), "1.0 MiB");
+    assert_eq!(human(1_073_741_823), "1.0 GiB");
+    assert_eq!(human(1_048_473), "1023.9 KiB");
 }
 
 fn tole(cwd: &Path, home: &Path, args: &[&str]) -> Output {

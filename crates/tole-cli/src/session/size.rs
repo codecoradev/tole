@@ -41,35 +41,35 @@ pub fn scan(dir: &Path) -> Option<SizeReport> {
         }) {
             r.largest = Some((id.to_string(), m.len()));
         }
-        let at = at.map_or(0, |d| d.as_secs());
-        if r.oldest
-            .as_ref()
-            .is_none_or(|(i, t)| (at, id) < (*t, i.as_str()))
-        {
+        // No readable mtime: left out of "oldest" (it would win with 1970).
+        let at = at.map(|d| d.as_secs());
+        if let Some(at) = at.filter(|&at| {
+            r.oldest
+                .as_ref()
+                .is_none_or(|(i, t)| (at, id) < (*t, i.as_str()))
+        }) {
             r.oldest = Some((id.to_string(), at));
         }
     }
     Some(r)
 }
 
-/// Bytes as `B`, `KiB`, `MiB` or `GiB` with one decimal.
+/// Bytes as `B`, `KiB`, `MiB` or `GiB` with one decimal. The unit is chosen
+/// after rounding, so `1_048_575` is `1.0 MiB` and not `1024.0 KiB`.
 pub fn human(bytes: u64) -> String {
-    let mut v = bytes as f64;
-    for unit in ["B", "KiB", "MiB"] {
-        if v < 1024.0 {
-            return if unit == "B" {
-                format!("{bytes} B")
-            } else {
-                format!("{v:.1} {unit}")
-            };
-        }
-        v /= 1024.0;
+    let (mut v, mut u) = (bytes as f64, 0);
+    while u < 3 && (v * 10.0).round() / 10.0 >= 1024.0 {
+        (v, u) = (v / 1024.0, u + 1);
     }
-    format!("{v:.1} GiB")
+    match u {
+        0 => format!("{bytes} B"),
+        _ => format!("{v:.1} {}", ["", "KiB", "MiB", "GiB"][u]),
+    }
 }
 
 impl SizeReport {
-    /// The one-line report, or `None` for a directory with no session file.
+    /// The one-line report, or `None` for a directory with no session file with a
+    /// readable modification time.
     pub fn line(&self) -> Option<String> {
         let ((big, big_bytes), (old, at)) = (self.largest.as_ref()?, self.oldest.as_ref()?);
         let day = super::assemble::civil_from_days((*at / 86400) as i64);
