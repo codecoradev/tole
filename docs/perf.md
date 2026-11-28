@@ -132,10 +132,9 @@ and method as above; 4-core Linux x86_64 container, rustc 1.97.0,
 `cargo test --release`, load average 2 to 3 from other work on the host). The
 fixtures were built once, then each cell is three separate processes (one
 profile and one size each, so `RSS` is valid): the range of the three medians
-of 3 opens. Nothing in the open path changed between 1155e5d (an earlier run of
-the same method by another session) and 9dc6caf: `storage.rs` and the session
-code are untouched, only the secrets module, the session guard and test moves
-changed in `tole-core`.
+of 3 opens. Since the first recorded run nothing changed under `session/` or in
+`JsonlStorage::open`; the secrets redaction on the commit path did change, so
+read the `first turn` column (which commits) with that in mind.
 
 | Profile | Entries | open | open_ro | first turn | RSS |
 |---|---|---|---|---|---|
@@ -148,25 +147,30 @@ changed in `tole-core`.
 | mixed | 20,020 | 139-152 ms | 132-152 ms | 9.0-13.9 ms | 76 MiB |
 | mixed | 100,022 | 625-687 ms | 640-696 ms | 19.2-23.8 ms | 381 MiB |
 
-Every cell sits inside, or within 15% of, the table above (and the other
-session's run at 1155e5d agreed too), `RSS` is identical, and the growth stays
-linear (5k to 100k: 19 to 21 times for `open`). So the figures are stable
-across three independent runs and the conclusion does not depend on one.
+Every cell sits inside, or within 20% of, the table above (two runs are
+recorded here), and `RSS` is identical. The `first turn` cells are single
+samples that include an fdatasync, with a floor of about 5 ms, so their spread
+says little. The growth stays linear: from 5k to 100k entries (19.9 times) `open`
+grows 16 to 20 times (`small` about 20, `mixed` about 17).
 
 Cold page cache (one size, one disk): the
 page cache was dropped (`echo 3 > /proc/sys/vm/drop_caches`) before each of two
-runs on the 262 MiB `mixed` fixture of 100,022 entries; the first `open` took
+runs on the 262 MiB `mixed` fixture of 100,022 entries, with
+`TOLE_REPLAY_REPS=1` (the test reports the median of `TOLE_REPLAY_REPS` opens,
+default 3, which would hide a cold first open; with 1 the reported `open` is the
+cold one); the first `open` took
 **1,064 and 1,210 ms** against about 650 ms warm, so reading the file from
-this virtual disk adds about 0.4 to 0.5 s (roughly 600 MB/s); `open_ro`, run
+this virtual disk adds about 0.4 to 0.5 s (roughly 500 to 600 MB/s); `open_ro`, run
 right after, was warm again (701 and 711 ms).
 
 **Decision (2026-11-28, delegated by the owner: "confirm no checkpoint if the
 measurements support it"). No checkpoint is built, and none is designed.** The
 measurements support it. A 20,000-entry session (about 770 twelve-call turns)
 opens in about 0.1 to 0.15 s with 36 to 76 MiB of memory. 100,000 entries (a
-262 MiB log with large tool outputs, about 3,850 turns) open in under 0.7 s
-warm and about 1.1 to 1.2 s from a cold cache, linearly, with about 15 to 25 ms
-more before the first provider call. The 2 s budget of the first table was set
+262 MiB log with large tool outputs, about 3,850 turns) open in under 0.9 s
+warm in both runs (0.63 to 0.69 s in the latest) and about 1.1 to 1.2 s from a
+cold cache, linearly, with a first turn of 18 to 24 ms at 100k entries (about 13
+to 19 ms over the 5 ms floor). The 2 s budget of the first table was set
 for 50 entries and is met by 2,000 times as many entries, warm or cold. If a session grows
 without bound the first limit is memory (about
 2 to 4 KiB per entry, 380 MiB at 100k `mixed` entries), not time; a checkpoint
@@ -175,29 +179,34 @@ from the entries, so a checkpoint is the wrong tool for that limit too. A
 checkpoint would also add a second source of truth to a log whose rule is that
 the entries are the truth.
 
-**Reopen this decision when any of these is measured or reported** (the
-thresholds are the whole of it; do not reopen on a feeling):
+**Reopen this decision on a measurement or a report with numbers that meets any
+of these** (a bare impression of slowness is not one; ask for the figures):
 
 1. `JsonlStorage::open` takes **over 1 s with a warm cache** on a supported
-   host (here: about 125,000 `mixed` or 220,000 `small` entries, a 330 MiB log),
-   or **over 2 s from a cold cache** (the 2 s budget above; here about 180,000
-   `mixed` entries), or a user reports a slow resume with the session's entry
-   count and file size.
+   host (here, extrapolated linearly because sizes above 100k were not measured:
+   about 125,000 `mixed` entries, about 330 MiB, or about 220,000 `small`
+   entries, about 107 MiB), or **over 2 s from a cold cache** (the 2 s budget
+   above; here about 165,000 to 190,000 `mixed` entries, same extrapolation), or
+   a user reports a slow resume with the session's entry count and file size.
 2. The process that holds the sessions (a `tole serve` with several long
    sessions open at once, or one very long session) grows **past 1 GiB RSS**
    because of replayed entries (here: about 270,000 `mixed` entries in one
    session). That is a memory question first; the answer may be a lazy or
    bounded fold, not a checkpoint.
 3. Real sessions turn out to have a very different entry mix from the fixtures
-   (for instance a median entry over 16 KiB). Re-run `perf_replay` with a
+   (for instance a mean entry, file bytes over entries, above 8 KiB, about 3 times
+   the 2.7 KiB of the `mixed` fixture). Re-run `perf_replay` with a
    profile that matches before deciding.
 
 If a trigger fires, write the design note #1019 describes: an append-only
 checkpoint entry that carries the folded state (the rule "never mutate or delete
-entries" holds), the same idea as `ledger_checkpoint` in the skill ledger, with a
-verifier that refolds from the full log. The size report of #1020 (`tole
-sessions`, step 1 of the retention note) is the way to see the entry count and the
-size of the largest session on a host before any of this is needed.
+entries" holds; `ledger_checkpoint` of the skill ledger is an existing precedent
+for a checkpoint record), with a verifier that refolds from the full log. The
+size report of #1020 (`tole sessions` and `tole doctor`, step 2 of the retention
+note; it is built in its own change and this decision does not depend on it)
+shows the number of files, the total, the largest and the oldest, so it is the
+way to see the size of the largest session on a host before any of this is
+needed; it prints no entry count.
 
 Not measured: a slow disk other than this virtual one (the cold figure above is one
 size on one disk); macOS, ARM and Android hosts; sizes over 100,000 entries;
