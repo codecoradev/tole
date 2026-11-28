@@ -1,10 +1,11 @@
 //! Reading one request off a connection: the request line, headers and body, under a
 //! size ceiling and a total deadline per request.
 
-use super::{hook_target, upload_target, SERVE_IO_TIMEOUT};
+use super::SERVE_IO_TIMEOUT;
 use anyhow::Result;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::{Duration, Instant};
+use tole_cli::serve_support::device_tokens::Scope;
 use tole_cli::serve_support::transport::Conn;
 
 /// Total budget for reading one request (request line, headers and body).
@@ -22,9 +23,9 @@ pub(super) struct Request {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) authorization: Option<String>,
-    /// The verdict `read_request` already reached for this header (only an
+    /// The scope `read_request` already found for this header (`Some(None)`: refused; only an
     /// image upload is checked while reading), so it is hashed once.
-    pub(super) verdict: Option<bool>,
+    pub(super) verdict: Option<Option<Scope>>,
     /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
     /// on reconnect).
     pub(super) last_event_id: Option<String>,
@@ -47,7 +48,7 @@ pub(super) enum ReadError {
     /// auth would be a token-validity oracle outside the limiter (#558).
     TooLarge {
         authorization: Option<String>,
-        verdict: Option<bool>,
+        verdict: Option<Option<Scope>>,
     },
     /// `/hooks/<route>` for a route that does not exist (404, body unread).
     NoHookRoute,
@@ -203,8 +204,9 @@ pub(super) fn read_request(
     // carries a valid credential: pre-auth buffering stays at MAX_BODY_BYTES.
     // An IP over its failure budget is not even checked (no hashing for it).
     let verdict = (method == "POST" && upload_target(&path).is_some() && !limited)
-        .then(|| auth.check(authorization.as_deref()));
-    let upload = verdict == Some(true);
+        .then(|| auth.authenticate(authorization.as_deref()));
+    // Only a token that may upload gets the larger body ceiling.
+    let upload = verdict == Some(Some(Scope::Full));
     let ceiling = if upload {
         MAX_UPLOAD_BYTES
     } else {
@@ -240,4 +242,32 @@ pub(super) fn read_request(
         body,
         hook,
     })
+}
+
+/// The route of a `/hooks/<route>` path.
+pub(super) fn hook_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/hooks/")
+        .map(|r| r.split('?').next().unwrap_or(r))
+}
+
+/// `/sessions/{id}/images` -> `id` (the upload route).
+pub(super) fn upload_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/sessions/")?.strip_suffix("/images")?;
+    (!id.is_empty() && !id.contains('/') && !id.contains('?')).then_some(id)
+}
+
+/// `/sessions/{id}/images/{hash}` -> `(id, hash)` (the read route).
+pub(super) fn image_target(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/sessions/")?;
+    let (id, hash) = rest.split_once("/images/")?;
+    let ok = |s: &str| !s.is_empty() && !s.contains('/') && !s.contains('?');
+    (ok(id) && ok(hash)).then_some((id, hash))
+}
+
+/// `{collection}{id}/events[?query]` -> `(id, query)`: `/sessions/` and
+/// `/discussions/` have an event stream.
+pub(super) fn events_target<'a>(path: &'a str, collection: &str) -> Option<(&'a str, &'a str)> {
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let id = path.strip_prefix(collection)?.strip_suffix("/events")?;
+    (!id.is_empty() && !id.contains('/')).then_some((id, query))
 }

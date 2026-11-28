@@ -20,7 +20,7 @@ a documented row below or a bug.
 
 | Difference | Why it is allowed |
 |---|---|
-| **Identity and authentication** | The CLI runs as the owner at a terminal. `serve` and `mcp-http` authenticate a bearer token. `acp` and `mcp` trust the parent process that spawned them. Cron runs as the owner without anyone present. |
+| **Identity and authentication** | The CLI runs as the owner at a terminal. `serve` and `mcp-http` authenticate a bearer token; `serve` also takes per-device tokens with a `read-only` or `full` scope (#1320), `mcp-http` does not (its tools cannot be classified as reads or writes). `acp` and `mcp` trust the parent process that spawned them. Cron runs as the owner without anyone present. |
 | **Input and output format** | A terminal line, a JSON route, an ACP message, an MCP tool call, a scheduled prompt and its delivered summary. The turn runner underneath is the same (#944). |
 | **Approval delivery channel** | The interactive prompt (CLI, ACP editor), the approvals queue answered over a route (`serve`), a pre-authorized allowlist (`tole mcp`, cron), or a delegated approver for a child agent. The gate itself, `gate::authorize`, is one function on every face. |
 

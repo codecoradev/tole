@@ -289,7 +289,7 @@ struct Cached {
     retry_at: Option<Instant>,
 }
 
-/// The view `tole serve` holds (part 2): a cached fold that is re-read when
+/// The view `tole serve` holds: a cached fold that is re-read when
 /// the file changes, so a revoke applies on the next request, and a coalesced
 /// last-use writer. A file that cannot be used means no device token is
 /// valid. A failure that belongs to the file (corrupt, unsafe, too large) is

@@ -25,7 +25,8 @@
 //!   resume), which the ledger does not record.
 //! - `closed`: the discussion is closed; the stream ends after it.
 
-use super::events::{after_of, write_all};
+use super::events::{after_of, write_all, Follower};
+use super::request::Request;
 use super::response::respond;
 use super::State;
 use serde_json::{json, Value};
@@ -33,6 +34,7 @@ use std::io::{ErrorKind, Read};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tole_cli::events::{frame, heartbeat_interval, Heartbeat, HEARTBEAT, HEARTBEAT_ENV};
+use tole_cli::serve_support::device_tokens::Scope;
 use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::Conn;
 use tole_core::discussion_log::{DiscussionLog, Next, State as Ledger};
@@ -63,8 +65,13 @@ pub(super) fn serve(
     state: &Arc<State>,
     id: &str,
     query: &str,
-    last_event_id: Option<&str>,
+    req: &Request,
+    scope: Scope,
 ) {
+    let (who, last_event_id) = (
+        Follower::new(state, scope, req),
+        req.last_event_id.as_deref(),
+    );
     let after = match after_of(query, last_event_id) {
         Ok(n) => n,
         Err((status, payload)) => return respond(&mut stream, status, &payload),
@@ -81,7 +88,7 @@ pub(super) fn serve(
     let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
     // The slot first: a refused stream parses nothing, so the cap bounds the
     // number of ledger reads (up to 16 MB each) a client can cause.
-    let Some(_slot) = state.streams.try_acquire() else {
+    let Some(_slot) = who.slot(state) else {
         let busy = json!({"error": "too many open event streams"});
         return respond(&mut stream, 429, &busy);
     };
@@ -115,6 +122,9 @@ pub(super) fn serve(
     // which a quiet discussion would otherwise find only at a heartbeat.
     let _ = stream.set_read_timeout(Some(POLL));
     loop {
+        if !who.valid(state) {
+            return;
+        }
         // Asked BEFORE the ledger is read: a thread that ends after its last
         // line was written is seen as ended only with that line in the read.
         let driven = state.discussions.state(id, false);

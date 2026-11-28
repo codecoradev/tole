@@ -417,6 +417,7 @@
       "properties": {
         "features": {"description":"Sorted, stable feature names (`entries`, `events.sse`, `missions`, ...).","items":{"type":"string"},"type":"array"},
         "protocolVersion": {"description":"The version of the serve wire contract, the same number `GET /health`\nreports as `protocol`.","format":"uint32","minimum":0,"type":"integer"},
+        "scope": {"description":"What the token this client sent may do: `full` or `read-only` (an open\nvocabulary: treat an unknown word as `read-only`). `None` from a server\nthat does not report it, which has no read-only tokens either.","type":["string","null"]},
         "version": {"description":"The `tole` binary's version.","type":"string"}
       },
       "required": ["version","protocolVersion","features"],

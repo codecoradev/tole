@@ -15,7 +15,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Workspace files | `--workspace` dir (default cwd) | Readable AND writable by the model via tools |
 | Host env of child processes | inherited by spawned commands | See ENV-1 |
 | Subprocess execution authority | run_command / job_start / git / gh | The model chooses argv within argv-split + jail rules |
-| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential, so `add` and `revoke` refuse under an agent session (#684, defense in depth, not a boundary: an interpreter that edits the file is not stopped, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
+| Device tokens (#1320) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential, so `add` and `revoke` refuse under an agent session (#684, defense in depth, not a boundary: an interpreter that edits the file is not stopped, see #601). **Enforcement (the REST face of `tole serve`):** the shared token and Basic stay `full`; a device token is looked up by the SHA-256 of what was sent, compared over every active hash with no early exit, on every route but `/health` and an uncredentialed `/ready`. A `read-only` token passes only `GET` on an explicit list of read routes and gets `403` on everything else before the route runs (every `POST`, any other method, any path not listed, so a route added later is refused until it is listed), the answer to an approval included, so it cannot approve a Write or change a session, mission, discussion or cron job; a test walks the whole route table. A wrong, unknown and revoked token get one `401` (the bytes of a wrong shared token) and count towards the per-IP failure limit; a revoke is seen on the next request. `GET /info` reports the scope. A file that cannot be read refuses every device token, never a guess. No token value is logged, returned or sent in a webhook. `--transport mcp` takes no device token (its tools cannot be classified as reads or writes). `POST /hooks/{name}` is signed by its sender and never reads the token. Revoking a token also ends the event streams it opened (checked every 150 ms), and a read-only token cannot take the last 2 of the 8 stream slots. A file damaged after start-up is said on stderr once per change of state. Residual: the failed-auth limiter is per peer IP, so behind a proxy a revoked device that keeps retrying locks out everyone sharing the proxy address; an agent session that can write the data dir could append an `add` line (#601). A `read-only` token reads every transcript and the approvals list (a pending approval shows the tool and its summary), so it is for a device you trust to look, not for one you do not; its scope is not bound to a session; the last-used time is written at most once per 15 minutes per token and is information, not authority |
 
 ## Trust boundaries
 
@@ -523,12 +523,13 @@ restart), decisions are one-shot per (session, effect) with expiry to
 denied (a stolen device cannot bank future approvals), every decision
 is audited on the session, and there is no push endpoint in tole — the
 phone pulls, so the attack surface tole exposes is exactly the
-authenticated REST face. Scoped device tokens (per-device, revocable,
-read-only vs approver roles) are #1320: part 1 (the store and
-`tole serve token add|list|revoke`) exists but `tole serve` does not check
-them yet, so until part 2 enforces the scope the deployment guidance is
-unchanged: a dedicated OS user + minimal `--allow`/`--trust` on the serve
-process.
+authenticated REST face. Scoped device tokens (#1320: per-device,
+revocable with no restart, `read-only` or `full`; `tole serve token
+add|list|revoke`, see "Device tokens" in `docs/mobile-control.md`) let a
+phone watch a task with a `read-only` token that cannot answer an
+approval. The deployment guidance is unchanged for the shared token and
+for a `full` device token: a dedicated OS user + minimal
+`--allow`/`--trust` on the serve process.
 
 ### Remote MCP servers (#530)
 

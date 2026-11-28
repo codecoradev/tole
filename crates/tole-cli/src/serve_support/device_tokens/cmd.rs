@@ -19,9 +19,7 @@ use super::{Entry, Scope, Store, StoreError};
 /// `tole serve <action>`: what is not the server itself.
 #[derive(Subcommand, Debug)]
 pub enum ServeAction {
-    /// Per-device tokens: one named, scoped secret per device. `tole serve`
-    /// does not check them yet (#1320, part 2); the shared bearer token and
-    /// Basic auth are unchanged.
+    /// Per-device tokens: one named, scoped secret per device (#1320).
     Token {
         #[command(subcommand)]
         action: TokenAction,
@@ -99,10 +97,6 @@ pub fn run(
                     ),
                 });
             }
-            writeln!(
-                err,
-                "tole: `tole serve` does not check device tokens yet (#1320, part 2)."
-            )?;
             writeln!(
                 err,
                 "tole: token {:?} ({}) created. It is shown only now; keep it.",

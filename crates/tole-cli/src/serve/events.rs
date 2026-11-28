@@ -1,14 +1,55 @@
 //! `GET /sessions/{id}/events` (#524): the Server-Sent Events stream of one session.
 
+use super::request::Request;
 use super::response::respond;
 use super::State;
 use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tole_cli::serve_support::device_tokens::Scope;
 use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::Conn;
 use tole_cli::session_host::lock_sessions;
+
+/// Who follows a stream. A read-only caller leaves [`RESERVED_FOR_FULL`] slots to the others, and
+/// one that came with a device token (`device`: its `Authorization` value) is asked again on
+/// every pass, so revoking the token ends its stream with a plain close (the reconnect is a 401).
+/// The shared token and Basic cannot be revoked and are not asked again.
+#[derive(Clone, Copy)]
+pub(super) struct Follower<'a> {
+    pub(super) scope: Scope,
+    pub(super) device: Option<&'a str>,
+}
+
+/// Event-stream slots a read-only token cannot take, of `MAX_STREAMS`.
+const RESERVED_FOR_FULL: usize = 2;
+
+impl<'a> Follower<'a> {
+    pub(super) fn new(state: &State, scope: Scope, req: &'a Request) -> Self {
+        Self {
+            scope,
+            device: req
+                .authorization
+                .as_deref()
+                .filter(|a| !state.auth.check(Some(a))),
+        }
+    }
+
+    pub(super) fn slot(&self, state: &State) -> Option<tole_cli::events::StreamSlot> {
+        let keep = if self.scope == Scope::ReadOnly {
+            RESERVED_FOR_FULL
+        } else {
+            0
+        };
+        state.streams.try_acquire_keeping(keep)
+    }
+
+    pub(super) fn valid(&self, state: &State) -> bool {
+        self.device
+            .is_none_or(|d| state.auth.device_token_valid(Some(d)))
+    }
+}
 
 pub(super) fn write_all(stream: &mut Conn, text: &str) -> bool {
     stream
@@ -50,9 +91,14 @@ pub(super) fn serve_events(
     state: &Arc<State>,
     id: &str,
     query: &str,
-    last_event_id: Option<&str>,
+    req: &Request,
+    scope: Scope,
 ) {
     use tole_cli::events::{entry_frame, frame, ApprovalWatch, EntryTail, Heartbeat, HEARTBEAT};
+    let (who, last_event_id) = (
+        Follower::new(state, scope, req),
+        req.last_event_id.as_deref(),
+    );
     let after = match after_of(query, last_event_id) {
         Ok(n) => n,
         Err((status, payload)) => {
@@ -68,7 +114,7 @@ pub(super) fn serve_events(
         respond(&mut stream, 404, &json!({"error": "unknown session"}));
         return;
     };
-    let Some(_slot) = state.streams.try_acquire() else {
+    let Some(_slot) = who.slot(state) else {
         respond(
             &mut stream,
             429,
@@ -115,6 +161,9 @@ pub(super) fn serve_events(
         Some(n)
     };
     loop {
+        if !who.valid(state) {
+            return;
+        }
         if ready_sent {
             match send_approvals(&mut stream, &mut approvals) {
                 None => return,
@@ -125,7 +174,11 @@ pub(super) fn serve_events(
         // Durable frames (a read error just retries on the next pass).
         let polled = match tail.poll() {
             Ok(entries) => {
-                for e in entries {
+                for (n, e) in entries.into_iter().enumerate() {
+                    // A long replay asks again too, every 64 entries.
+                    if n % 64 == 0 && !who.valid(state) {
+                        return;
+                    }
                     if !write_all(&mut stream, &entry_frame(&e)) {
                         return;
                     }

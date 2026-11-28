@@ -10,13 +10,14 @@ event stream ship with #524, image upload and read with #558; see the UI epic #5
 ## The surface uteke-mobile consumes
 
 All routes live under `tole serve` (bearer-token auth, or HTTP Basic with
-`--auth basic` (#742, "HTTP Basic auth" below), on everything except `/health` and `/ready`;
+`--auth basic` (#742, "HTTP Basic auth" below), or a per-device token (#1320, "Device tokens"
+below), on everything except `/health` and `/ready`;
 decisions revalidate per request; auth failures are rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
 | Probe readiness (an orchestrator, a container `HEALTHCHECK`) | `GET /ready` (#1017) | `200 {"status":"ok"}` when serve can do its work, `503 {"status":"not ready"}` when it cannot (the `checks` only with a credential), see [`GET /ready`](#get-ready). No token needed, like `/health` |
-| Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features"}`: the binary version, the wire contract version and the feature names this server has, see [`GET /info`](#get-info). Behind the token, like every route but `/health` and `/ready` |
+| Probe the server | `GET /info` (#1024) | `200 {"version", "protocolVersion", "features", "scope"}`: the binary version, the wire contract version, the feature names this server has and what the calling token may do (`full` or `read-only`), see [`GET /info`](#get-info). Behind the token, like every route but `/health` and `/ready` |
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
 | Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
@@ -576,23 +577,75 @@ curl -H "Authorization: Bearer $TOKEN" -o shot.png \
 
 The serve credential, the token or the Basic password, **is approval authority**
 (see the threat model): a
-phone holding it can let code write to the box. Practical scoping until
-enforced device tokens exist (#1320, part 2): run missions under a
-dedicated OS user, keep `--allow`/`--trust` minimal on the serve
-process, and treat the token as a revocable secret (rotate = restart
-serve).
+phone holding it can let code write to the box. That holds for the shared token and Basic. A
+`read-only` device token (#1320, "Device tokens" below) cannot answer an approval or change
+anything. Whatever the credential: run missions under a dedicated OS user, keep `--allow`/`--trust`
+minimal on the serve process, and treat the shared token as a revocable secret (rotate = restart
+serve; a device token is revoked alone, with no restart).
 
 ## Device tokens (#1320)
 
-Part 1 of #1320 is on the owner's side only: **`tole serve` does not check device tokens yet.**
-A request is still accepted with the shared bearer token (or Basic) and nothing else; a device
-token sent today is refused like any wrong token. Part 2 changes the serve middleware: a
-`read-only` token will be refused on every route that changes state or answers an approval, a
-`full` token will equal today's bearer token, a revoked token will be refused on the next request,
-and `GET /info` will report the scope of the calling token. Until part 2 is released, a `read-only`
-token protects nothing.
+`tole serve` accepts, next to the shared bearer token and Basic (both `full`, unchanged), a
+**per-device token**: one named secret per device, with a scope, made by the owner at a terminal
+(below) and sent as `Authorization: Bearer tole_dt_...`.
 
-What exists now, at a terminal, as the owner:
+- `full` is what the shared token can do.
+- `read-only` may read and nothing else: `GET` on `/health`, `/info`, `/ready`, `/models`,
+  `/sessions`, `/sessions/index`, `/sessions/{id}`, `.../status`, `.../entries`, `.../events`,
+  `.../tree`, `.../images/{hash}`, `/approvals` (the list), `/missions/{id}`, `/discussions`,
+  `/discussions/{id}`, `.../events`, `/profiles`, `/skills`, `/tools`, `/cron/jobs` and
+  `/cron/runs`. **Every other request is refused with `403 {"error":"this token is read-only"}`
+  before the route runs**: every `POST` (open or resume a session, prompt, cancel, interrupt,
+  detach, fork, compact, name, model, effort, image upload, missions, discussions including
+  `estimate`, cron pause and resume, **the answer to an approval**), any other method, and any path
+  that is not in the list (a route added later is refused until it is listed, so a read-only token
+  fails closed). There is no read-only `POST`: `POST /discussions/estimate` computes and writes
+  nothing, but it is a `POST` and is refused. A read-only token can list approvals and never
+  answer one, allow or deny, a delegated child's included. The refusal comes
+  before the route runs (its body has been read off the socket and is dropped unused), so nothing is
+  partly done.
+  `POST /hooks/{name}` is signed by the sender and does not read the token, so a token of any
+  scope changes nothing there.
+- A token sent in `Authorization` is checked on every route except `/health` (never checked, even
+  with a bad credential) and `/ready` without a credential (with one it is checked). A wrong, an unknown and a revoked token get the same `401 {"error":"unauthorized"}`
+  as a wrong shared token (the same bytes, with the Basic challenge when Basic is on) and count
+  towards the per-IP failure limit like any wrong credential. A token of the wrong shape (a mistyped shared token, say) costs no
+  file access; one of the right shape costs one `stat` of the token file and a comparison over the
+  active hashes with no early exit, whether it is unknown or revoked. A token added or revoked is
+  seen on the next request, without a restart.
+- `GET /info` reports `"scope": "full"` or `"read-only"` for the calling credential (the shared
+  token and Basic are `full`). `tole-client` reads it as `Info::scope`.
+- The last-used time is written at most once per 15 minutes per token, on the request's own
+  thread, never once per request; a write that fails is dropped.
+- **`--transport mcp` does not take device tokens**: its tools are not routes that can be
+  classified, so only the shared token and Basic open it, and a device token there is a `401`.
+- A token file that cannot be used (a damaged line, a wider mode, over its size cap), at start-up or
+  later, refuses every device token (`401`) and is said on stderr when a token is refused for it,
+  once per change of its state (and by `tole serve token list`); the shared token and Basic are
+  unaffected.
+- **Revoking a token ends the event streams it opened** (`/sessions/{id}/events`,
+  `/discussions/{id}/events`): the token is asked again on every pass of the stream (150 ms), and a
+  revoked one gets a plain close with no frame, then a `401` on reconnect. A replay of a long transcript is checked every 64 entries too. A stream opened with the
+  shared token or Basic is never cut by a revoke. The check is fail closed: a transient I/O error on
+  the token file (retried after 5 seconds) also ends device-token streams until the retry, and the
+  client reconnects. An open stream does not refresh the last-used time of its token (only
+  authenticating a request does). A read-only token cannot hold the last 2 of the
+  8 event-stream slots (its 7th stream is `429`), so it cannot lock the owner out of them.
+- **A read-only token still reads everything**: full transcripts, tool outputs, the text of pending
+  approvals, `/cron/runs`, `/skills`, `/tools`. A leaked read-only token is a loss of
+  confidentiality equal to the shared token's; what it cannot do is change anything or answer an
+  approval.
+- A read-only upload over 1 MiB gets `413` (the ordinary body ceiling), not `403`; both come before
+  any side effect.
+- Residual: an agent session that can write the data dir could append an `add` line to the token
+  file (#601; `add` refuses under a session, but an interpreter that edits the file is not
+  stopped). The failed-auth limiter is per peer IP: behind a reverse proxy every client shares
+  the proxy's address, so a revoked device that keeps retrying locks out everyone behind it
+  (see the container notes on real-IP handling).
+- No token value reaches a log, an error, `/info` or a webhook: the server only ever holds its
+  SHA-256, and compares it without an early exit.
+
+At a terminal, as the owner:
 
 ```
 tole serve token add <name> --scope read-only|full   # prints the token once, on stdout
@@ -602,7 +655,7 @@ tole serve token revoke <name>
 
 - The token is `tole_dt_` and 43 characters (256 bits from the OS random source). It is printed once
   and cannot be shown again: only its SHA-256 is stored, with the name, the scope, the time of
-  creation and a last-used time that part 2 fills in. The token goes to stdout alone, before
+  creation and a last-used time that `tole serve` fills in. The token goes to stdout alone, before
   anything else is said (if it cannot be written, for example to a closed pipe, the new token is
   revoked at once and the command fails); the sentence about it goes to stderr, last. It is never
   an argument, so `T=$(tole serve token add phone --scope read-only)` keeps it out of the process
@@ -623,9 +676,9 @@ tole serve token revoke <name>
   token revoked since the backup was taken: rotate all tokens after a restore.**
 - `add` and `revoke` refuse under an agent session (#684): a token holder or a model never mints or
   revokes tokens. `list` shows no token and no hash.
-- For part 2 (the code that will enforce the scope): `Live::lookup` holds a mutex while it reloads
-  the file and `Live::touch` writes synchronously, so the serve middleware must call them from
-  `spawn_blocking` or an equivalent thread. Last-used lines are never compacted: after 3 MiB of
+- `Live::lookup` holds a mutex while it reloads the file and `Live::touch` writes synchronously, so
+  they run on the REST face's connection thread (one per connection) and would need `spawn_blocking`
+  in an async host. Last-used lines are never compacted: after 3 MiB of
   file they stop being recorded. A reload that fails with an I/O error is retried after 5 seconds
   or when the file changes; a corrupt, unsafe or oversized file stays refused until it changes.
 
@@ -753,7 +806,7 @@ Authenticated like every route but `/health` and `/ready` (a missing or wrong cr
 client check the server it reached before it relies on a route or a field:
 
 ```json
-{"version":"0.12.0","protocolVersion":1,"features":["approvals","compact","cron","delegation.approvals","detach","discussions","discussions.events","effort","entries","events.sse","fork","hooks","images","interrupt","mcp","missions","models","profiles","resume","session.name","sessions.index","skills","tools","tree"]}
+{"version":"0.12.0","protocolVersion":1,"features":["approvals","compact","cron","delegation.approvals","detach","discussions","discussions.events","effort","entries","events.sse","fork","hooks","images","interrupt","mcp","missions","models","profiles","resume","session.name","sessions.index","skills","tools","tree"],"scope":"full"}
 ```
 
 - `version` is the `tole` binary's version, and `protocolVersion` the number `GET /health` reports
@@ -765,7 +818,10 @@ client check the server it reached before it relies on a route or a field:
   without a protocol bump; a newer server may list more, and a client ignores the ones it does
   not know. Two names depend on the process: `mcp` (this binary can list connected MCP servers,
   `GET /tools`) and `auth.basic` (the server also accepts HTTP Basic, `--auth basic`).
-- Nothing else is reported: no path, user name, key or configuration value.
+- `scope` (#1320) is what the calling credential may do: `full` (the shared token, Basic and a
+  `full` device token) or `read-only`. A client treats a word it does not know as `read-only`. A
+  server older than this field omits it and has no read-only tokens.
+- Nothing else is reported: no path, user name, key, token name or configuration value.
 - A server older than the route answers `404 {"error": "not found"}`. `tole-client` has
   `Client::info()` and `Info::has(name)`.
 
