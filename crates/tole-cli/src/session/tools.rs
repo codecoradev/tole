@@ -234,8 +234,8 @@ impl Tool for SessionPromptTool {
         // the turn: run_session_turn addresses the map by id.
         let session_id = lock_sessions(&self.0.sessions)
             .resolve_id(input.get("session_id").and_then(Value::as_str))?;
-        let (stop, text) =
-            run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)?;
+        let (stop, text) = run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)
+            .map_err(|e| crate::session::problem::egress_error(&e))?;
         let mut out = json!({ "stop_reason": stop });
         if let Some(t) = text {
             out["text"] = json!(t);

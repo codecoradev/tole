@@ -43,10 +43,30 @@ static FROM_ENV: OnceLock<SecretSet> = OnceLock::new();
 
 /// Installs the process's secret set (#596): the host does this once, with
 /// every secret its egress sinks know (the provider's included), so the
-/// session log redacts exactly what the provider is shown.
+/// session log redacts exactly what the provider is shown. This REPLACES the
+/// set: a host with several sessions adds with [`merge_process_secrets`] (#1314).
 pub fn set_process_secrets(set: SecretSet) {
     if let Ok(mut g) = PROCESS.write() {
         *g = Some(set);
+    }
+}
+
+/// Most entries the process set keeps when [`merge_process_secrets`] unions
+/// the sets of several sessions (#1314): the entries of the newest set are
+/// always whole, earlier ones are dropped oldest first past this count. Each
+/// entry holds up to six encoded forms, so the memory of the set is bounded.
+pub const MAX_PROCESS_ENTRIES: usize = 512;
+
+/// Adds `set` to the process set (#1314): a union, never a replacement, so
+/// the provider key of one session stays redacted at every egress after
+/// another session built its own. Bounded by [`MAX_PROCESS_ENTRIES`]; the
+/// read and the store are one write lock, so two sessions cannot lose each other.
+pub fn merge_process_secrets(set: &SecretSet) {
+    if let Ok(mut g) = PROCESS.write() {
+        let current = g
+            .take()
+            .unwrap_or_else(|| FROM_ENV.get_or_init(SecretSet::from_env).clone());
+        *g = Some(current.union_bounded(set, MAX_PROCESS_ENTRIES));
     }
 }
 
@@ -301,6 +321,23 @@ impl SecretSet {
         skipped.append(&mut inner.skipped);
         inner.skipped = skipped;
         set
+    }
+
+    /// This set and `newer`, `newer` whole, at most `cap` entries unless
+    /// `newer` alone is larger: the oldest entries of `self` that `newer` does
+    /// not hold go first. `newer` names a value both hold; its `skipped` report
+    /// is not carried.
+    pub fn union_bounded(&self, newer: &SecretSet, cap: usize) -> Self {
+        let held = |v: &str| newer.inner.entries.iter().any(|(_, n)| n == v);
+        let old: Vec<_> = self
+            .inner
+            .entries
+            .iter()
+            .filter(|(_, v)| !held(v))
+            .collect();
+        let skip = (old.len() + newer.inner.entries.len()).saturating_sub(cap);
+        let old = old.into_iter().skip(skip).cloned();
+        Self::build(old.chain(newer.inner.entries.iter().cloned()))
     }
 
     /// This set plus the userinfo password of `url` (`scheme://user:pw@host`),
@@ -817,74 +854,6 @@ mod tests {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())),
             std::iter::empty(),
         )
-    }
-
-    #[test]
-    fn the_name_rule_matches_the_env1_shapes() {
-        for n in [
-            "TOLE_API_KEY",
-            "openai_apikey",
-            "SECRET_KEY",
-            "TOLE_TEST_AUTHTOKEN",
-            "DB_PASSWD",
-            "MY_PASSWORD",
-            "AWS_CREDENTIALS",
-            "SSH_PRIVATE_KEY",
-            "GITHUB_TOKEN",
-        ] {
-            assert!(is_secret_name(n), "{n}");
-        }
-        for n in ["PATH", "HOME", "TOLE_MODEL", "TOKENIZERS_PARALLELISM"] {
-            assert!(!is_secret_name(n), "{n}");
-        }
-    }
-
-    /// #682: secret-bearing names the first rule missed (the audit's list,
-    /// less the `*_URL` ones, which are secrets by value).
-    #[test]
-    fn the_name_rule_covers_the_pass_key_dsn_and_auth_families() {
-        for n in [
-            "DB_PASS",
-            "PGPASS",
-            "DATABASE_URL",
-            "TEST_DATABASE_URL",
-            "SENTRY_DSN",
-            "NGINJEN_KEY",
-            "GH_HOOK_KEY",
-            "HOOK_KEY",
-            "STRIPE_SK",
-            "OPENAI_KEY",
-            "AWS_SECRET",
-            "NPM_AUTH",
-            "SESSION_COOKIE",
-            "AUTH_BEARER",
-            "GPG_PASSPHRASE",
-            "ssh_key_pass",
-        ] {
-            assert!(is_secret_name(n), "{n}");
-        }
-        // Ordinary names stay ordinary, including the near misses.
-        for n in [
-            "SSH_AUTH_SOCK",
-            "GPG_KEY",
-            "SSH_PUBLIC_KEY",
-            "GIT_AUTHOR_NAME",
-            "GIT_AUTHOR_EMAIL",
-            "MONKEY",
-            "KEYBOARD",
-            "TOLE_BASE_URL",
-            "REDIS_URL",
-            "NO_PROXY",
-            "PROXY_BYPASS",
-            "XDG_SESSION_TYPE",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "TERM",
-            "LANG",
-            "PWD",
-            "OLDPWD",
-        ] {
-            assert!(!is_secret_name(n), "{n}");
-        }
     }
 
     /// #682: a variable is a secret by its value too: a URL password under

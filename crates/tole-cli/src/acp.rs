@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tole_cli::approver::{InteractiveApprover, PromptFn};
-use tole_cli::session::problem::prompt_result;
+use tole_cli::session::problem::{egress_error, prompt_result};
 use tole_cli::session_host::{
     lock_sessions, new_session_id, open_session, run_session_turn_detailed, validate_session_id,
     AdmitError, Sessions,
@@ -1238,7 +1238,7 @@ fn reply(conn: &Conn, id: Option<Value>, result: Value) {
 fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
     let Some(id) = id else { return };
     conn.send_line(
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}})
+        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": egress_error(message)}})
             .to_string(),
     );
 }

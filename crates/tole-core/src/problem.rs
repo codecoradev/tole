@@ -119,7 +119,7 @@ pub struct WireProblem {
 
 impl Problem {
     fn redacted(&self, secrets: &SecretSet) -> WireProblem {
-        let cut = |t: &String, max| bounded(&secrets.redact(t), max);
+        let cut = |t: &String, max| redact_then_cut(t, secrets, max);
         WireProblem {
             kind: self.kind,
             subject: self.subject.as_ref().map(|t| cut(t, MAX_SUBJECT_BYTES)),
@@ -201,6 +201,13 @@ impl TurnOutcome {
 
 /// Kind, subject, retryable and detail of a problem, borrowed from the outcome.
 type Parts<'a> = (ProblemKind, Option<&'a str>, bool, Option<Cow<'a, str>>);
+
+/// `text` as it may leave the process (#1314): redacted with `secrets`, THEN
+/// cut to `max` bytes, so a cut never leaves part of a secret behind. The one
+/// function behind a [`WireProblem`] and the error text of a face.
+pub fn redact_then_cut(text: &str, secrets: &SecretSet, max: usize) -> String {
+    bounded(&secrets.redact(text), max)
+}
 
 /// `text` cut to `max` bytes on a character boundary.
 fn bounded(text: &str, max: usize) -> String {

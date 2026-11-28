@@ -104,8 +104,9 @@ pub fn build(
     let reserve = fallback_config(&primary, env)?;
     // #596: the session log redacts with every secret a provider request
     // is redacted with (both providers' keys and URL passwords), so the log
-    // never holds a value the provider was not shown redacted.
-    tole_core::secrets::set_process_secrets(log_secrets(&secrets, &primary, reserve.as_ref()));
+    // never holds a value the provider was not shown redacted. Merged, never
+    // replaced (#1314): another session's provider key stays redacted.
+    tole_core::secrets::merge_process_secrets(&log_secrets(&secrets, &primary, reserve.as_ref()));
     let Some(reserve) = reserve else {
         return Ok(Box::new(make(primary)));
     };

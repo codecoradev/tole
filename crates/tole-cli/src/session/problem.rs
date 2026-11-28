@@ -2,7 +2,8 @@
 //! host and the TUI turn a kind, a subject and a detail into a sentence.
 //! tole-core ships the typed problem only; the wording is a face's job.
 
-use tole_core::problem::{Problem, ProblemKind, WireProblem};
+use tole_core::problem::{redact_then_cut, Problem, ProblemKind, WireProblem, MAX_DETAIL_BYTES};
+use tole_core::secrets::SecretSet;
 use tole_core::turn::TurnOutcome;
 
 /// Where a sentence is shown. The same problem reads differently on each.
@@ -58,10 +59,18 @@ pub fn describe_problem(problem: &Problem, face: Face) -> Option<String> {
 }
 
 /// The problem of a settled turn as it leaves the process (#1023): `subject`
-/// and `detail` redacted with the egress secret set, then cut. `None` for a
-/// final answer, a cancel and a detach.
-pub fn wire(outcome: &TurnOutcome) -> Option<WireProblem> {
-    outcome.problem_redacted(&crate::approvals::egress_secrets())
+/// and `detail` redacted with `secrets` (the session storage's
+/// `egress_secrets()`), then cut. `None` for a final answer, a cancel and a
+/// detach.
+pub fn wire(outcome: &TurnOutcome, secrets: &SecretSet) -> Option<WireProblem> {
+    outcome.problem_redacted(secrets)
+}
+
+/// An error text of a face as it leaves the process (#1314): the serve `error`
+/// of a 500 and the ACP error reply, redacted with the process egress set then
+/// cut, like the `detail` of [`wire`].
+pub fn egress_error(text: &str) -> String {
+    redact_then_cut(text, &crate::approvals::egress_secrets(), MAX_DETAIL_BYTES)
 }
 
 /// The `tole serve` prompt answer (`POST /sessions/{id}/prompt`): the queued

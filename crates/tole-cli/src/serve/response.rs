@@ -45,6 +45,14 @@ pub(super) fn respond_with(
     payload: &serde_json::Value,
     extra: &str,
 ) {
+    // #1314: the error text of a 500 can carry a storage or provider message.
+    let mut redacted;
+    let mut payload = payload;
+    if let (500, Some(e)) = (status, payload["error"].as_str()) {
+        redacted = payload.clone();
+        redacted["error"] = json!(tole_cli::session::problem::egress_error(e));
+        payload = &redacted;
+    }
     let body = payload.to_string();
     let reason = reason_phrase(status);
     let head = format!(
