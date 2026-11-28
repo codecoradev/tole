@@ -2,10 +2,14 @@ name: Cora AI Code Review
 
 on:
   pull_request:
-    # Develop only since #1021 (2026-11-20, owner decision): release syncs
-    # develop -> main are already fully reviewed on develop; requiring a
-    # second Cora pass on each release PR backed up the review queue.
-    branches: [develop]
+    # #1021 (2026-11-20) took `main` out because a second Cora pass over a
+    # release sync that was already fully reviewed on develop cannot finish.
+    # #1022 (owner decision, 2026-11-28) puts it back: a release sync whose
+    # tree equals a develop commit is skipped by proof (step "Is this a
+    # release sync..." below, green with a visible notice); anything else
+    # aimed at main (a second commit, a differing file, another head branch)
+    # gets the normal review, so nothing reaches main unreviewed.
+    branches: [develop, main]
     types: [opened, synchronize, ready_for_review, reopened]
   # Merge queue (#806): the review was done on the PR head; the job is skipped
   # (reports success) on a queue entry so the required check still reports.
@@ -145,8 +149,8 @@ jobs:
       # If develop has no script yet, or anything is unclear, the review runs.
       # The workflow file of a pull_request run comes from the merge ref, so
       # this step takes effect for a release branch built after it landed.
-      # Note: the trigger above lists develop only (#1021); this step does
-      # nothing for a PR to main until `main` is listed there again.
+      # The trigger above lists main again (#1022), so this step applies to
+      # every PR into main.
       - name: Is this a release sync with the tree of develop?
         id: release_sync
         env:
@@ -168,7 +172,7 @@ jobs:
             {
               echo "### Cora review"
               echo "**skipped, tree identical to develop at \`$develop_sha\`** (tree \`$tree\`)."
-              echo "This is a release sync: one commit on top of \`main\` whose tree equals a commit on \`develop\`, so every file was reviewed in the PR that put it there."
+              echo "This is a release sync: one commit on top of \`main\` whose tree equals a commit on \`develop\`, so it holds nothing that did not land on \`develop\` through its required checks and its review process."
               echo "No Cora verdict exists for this PR. Check by hand: \`git rev-parse <pr-head>^{tree}\` equals \`git rev-parse $develop_sha^{tree}\`."
             } >> "$GITHUB_STEP_SUMMARY"
           else

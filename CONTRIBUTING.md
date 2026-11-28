@@ -146,9 +146,9 @@ Never merge on schedule or assumption:
 ### Release sync PRs (#1022)
 
 A release sync (`chore/release-*` into `main`, one squash commit with the tree
-of `develop`) is one big diff in which every file was already reviewed by Cora
-in the PR that put it on `develop`, and it is more than the Cora Review job can
-cover. When the job runs on such a PR it **skips the review by tree identity**:
+of `develop`) is one big diff whose content already landed on `develop`
+through its required checks and its review process, and it is more than the
+Cora Review job can cover. When the job runs on such a PR it **skips the review by tree identity**:
 the step `Is this a release sync with the tree of develop?` in
 `.github/workflows/cora-review.yml` runs `scripts/cora-release-sync.sh` (read
 from `develop`, tested by `scripts/test-cora-release-sync.sh`) and skips only
@@ -176,16 +176,20 @@ git log --first-parent -n 200 --format='%H %T' origin/develop | grep "$(git rev-
 A second commit (a version bump on top of the sync, say), a differing file, a
 fork or another branch name runs the review as before. The workflow file of a
 `pull_request` run comes from the merge ref, so a change to it only takes
-effect for a release branch built after it landed on `develop`. Since #1021 the
-trigger lists `develop` only, so a PR into `main` gets no `Cora Review` run at
-all until `main` is listed again; the skip applies from then on.
+effect for a release branch built after it landed on `develop`. The trigger
+lists `main` again (#1022, owner decision 2026-11-28; #1021 had taken it out),
+so every PR into `main` gets a `Cora Review` run: a release sync is skipped by
+the proof above, anything else is reviewed. Cut the release from a
+`chore/release-*` branch so the proof can apply; a PR from `develop` itself is
+reviewed in full and can end red ("Review could not complete") on a large
+range, which is not a required check on `main`.
 
 Residual risks of the skip, for whoever merges the release PR:
 
 - The decision is made when the job runs. If `main` moves afterwards the job is
   not re-run (the same holds for a PR retargeted to `main`). Merge only a sync
-  that is up to date with `main` (the owner's "require branches to be up to
-  date" or a merge queue), or push the release branch again.
+  that is up to date with `main` (check it by hand: "require branches to be up
+  to date" is not enabled on `main`), or push the release branch again.
 - Any of the newest 200 first-parent `develop` trees qualifies, not only the
   tip, so a release cut some merges back is accepted (all of that content was
   reviewed on `develop`, but main then lags the tip). Compare the sync with
