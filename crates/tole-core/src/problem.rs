@@ -215,9 +215,14 @@ fn bounded(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let mut end = max - ELLIPSIS.len();
+    // Room for the ellipsis, else a plain cut: never more than `max` bytes.
+    let (keep, tail) = match max.checked_sub(ELLIPSIS.len()) {
+        Some(keep) => (keep, ELLIPSIS),
+        None => (max, ""),
+    };
+    let mut end = keep;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{ELLIPSIS}", &text[..end])
+    format!("{}{tail}", &text[..end])
 }

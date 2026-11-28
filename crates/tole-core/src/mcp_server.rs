@@ -21,6 +21,7 @@
 //! Logging hygiene: stderr is safe (stdio transport speaks on stdout);
 //! anything writing to stdout outside the protocol would corrupt it.
 
+use crate::secrets::redact_text;
 use crate::tool::{Risk, ToolRegistry};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -246,11 +247,10 @@ impl ServerHandler for RegistryServer {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        // Tool execution is SYNCHRONOUS and can block for a long time
-        // (git runs with a 120s budget; run_command 420s). It must run
-        // on a blocking thread, not pin the async runtime's workers
-        // (cora full-scan #29): one slow tool call would stall every
-        // other request this runtime is serving.
+        // Tool execution is SYNCHRONOUS and can block for a long time (git runs
+        // with a 120s budget; run_command 420s). It must run on a blocking
+        // thread, not pin the async runtime's workers (cora full-scan #29): one
+        // slow tool call would stall every other request this runtime is serving.
         let server = self.clone();
         let executed = tokio::task::spawn_blocking(move || server.execute_checked(&name, args))
             .await
@@ -260,7 +260,7 @@ impl ServerHandler for RegistryServer {
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
             )])
             .into()),
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(redact_text(&e))]).into()),
         }
     }
 }

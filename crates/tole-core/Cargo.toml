@@ -64,6 +64,10 @@ name = "mcp_admission"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_tool_error_redaction"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_lazy"
 required-features = ["mcp"]
 

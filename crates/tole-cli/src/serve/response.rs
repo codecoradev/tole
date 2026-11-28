@@ -45,13 +45,17 @@ pub(super) fn respond_with(
     payload: &serde_json::Value,
     extra: &str,
 ) {
-    // #1314: the error text of a 500 can carry a storage or provider message.
+    // #1314: the `error` text of any answer can carry a storage, provider or
+    // path text: redacted with the egress set and cut (idempotent).
     let mut redacted;
     let mut payload = payload;
-    if let (500, Some(e)) = (status, payload["error"].as_str()) {
-        redacted = payload.clone();
-        redacted["error"] = json!(tole_cli::session::problem::egress_error(e));
-        payload = &redacted;
+    if let Some(e) = payload["error"].as_str() {
+        let safe = tole_cli::session::problem::egress_error(e);
+        if safe != e {
+            redacted = payload.clone();
+            redacted["error"] = json!(safe);
+            payload = &redacted;
+        }
     }
     let body = payload.to_string();
     let reason = reason_phrase(status);

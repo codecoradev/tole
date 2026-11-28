@@ -1,7 +1,7 @@
 //! #1314: `SecretSet::union_bounded` and `merge_process_secrets`: a union that
 //! keeps the newest set whole and drops the oldest entries past the cap.
 
-use tole_core::secrets::{merge_process_secrets, process_secrets, SecretSet};
+use tole_core::secrets::{add_role_secret, merge_process_secrets, process_secrets, SecretSet};
 
 fn one(name: &str, value: &str) -> SecretSet {
     SecretSet::default().with(name, value)
@@ -43,4 +43,14 @@ fn merging_into_the_process_set_never_drops_what_an_earlier_merge_added() {
     let before = process_secrets().names().len();
     merge_process_secrets(&one("SESSION_B", "session-b-secret-0123456789"));
     assert_eq!(process_secrets().names().len(), before);
+}
+
+/// `add_role_secret` merges like a session build: it never replaces what an
+/// earlier merge added (it used to read the set, then store a copy of it).
+#[test]
+fn a_role_secret_joins_the_process_set_without_replacing_it() {
+    merge_process_secrets(&one("BEFORE", "before-secret-0123456789"));
+    add_role_secret("ROLE", "role-secret-0123456789");
+    let out = process_secrets().redact("before-secret-0123456789 role-secret-0123456789");
+    assert_eq!(out, "«BEFORE» «ROLE»");
 }

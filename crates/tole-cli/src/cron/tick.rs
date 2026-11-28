@@ -485,9 +485,8 @@ pub fn run_claimed(
         (c, r)
     });
     let end = now + started.elapsed().as_secs() as i64;
-
-    // Keep the output (redacted). A failed write is recorded on the run,
-    // never a reason to leave a claim unsettled.
+    // Keep the output and `usage` (redacted, #1314: `usage.error` can name a path). A
+    // failed write is recorded on the run, never a reason to leave a claim unsettled.
     let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
     let results: Vec<(Claimed, RunResult)> = results
         .into_iter()
@@ -499,6 +498,7 @@ pub fn run_claimed(
             if let (Err(e), Some(u)) = (written, r.usage.as_object_mut()) {
                 u.insert("output_error".into(), e.to_string().into());
             }
+            r.usage = secrets.redact_value(&r.usage);
             (c, r)
         })
         .collect();

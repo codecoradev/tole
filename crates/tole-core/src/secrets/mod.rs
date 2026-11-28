@@ -46,9 +46,7 @@ static FROM_ENV: OnceLock<SecretSet> = OnceLock::new();
 /// session log redacts exactly what the provider is shown. This REPLACES the
 /// set: a host with several sessions adds with [`merge_process_secrets`] (#1314).
 pub fn set_process_secrets(set: SecretSet) {
-    if let Ok(mut g) = PROCESS.write() {
-        *g = Some(set);
-    }
+    *PROCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(set);
 }
 
 /// Most entries the process set keeps when [`merge_process_secrets`] unions
@@ -60,21 +58,27 @@ pub const MAX_PROCESS_ENTRIES: usize = 512;
 /// Adds `set` to the process set (#1314): a union, never a replacement, so
 /// the provider key of one session stays redacted at every egress after
 /// another session built its own. Bounded by [`MAX_PROCESS_ENTRIES`]; the
-/// read and the store are one write lock, so two sessions cannot lose each other.
+/// read and the store are one write lock, so two merges cannot lose each other
+/// ([`add_role_secret`] merges too), and a poisoned lock is used as it is, never
+/// reset to the environment set.
 pub fn merge_process_secrets(set: &SecretSet) {
-    if let Ok(mut g) = PROCESS.write() {
-        let current = g
-            .take()
-            .unwrap_or_else(|| FROM_ENV.get_or_init(SecretSet::from_env).clone());
-        *g = Some(current.union_bounded(set, MAX_PROCESS_ENTRIES));
-    }
+    let mut g = PROCESS.write().unwrap_or_else(|e| e.into_inner());
+    let current = g
+        .clone()
+        .unwrap_or_else(|| FROM_ENV.get_or_init(SecretSet::from_env).clone());
+    *g = Some(current.union_bounded(set, MAX_PROCESS_ENTRIES));
+}
+
+/// `text` redacted with the process set (#1314), for a sink that has no set at hand.
+pub fn redact_text(text: &str) -> String {
+    process_secrets().redact(text).into_owned()
 }
 
 /// The process's secret set: what [`set_process_secrets`] installed, else
 /// [`SecretSet::from_env`], built once and cached. Cheap to call (an `Arc`
 /// clone): the matcher is never rebuilt per use.
 pub fn process_secrets() -> SecretSet {
-    if let Some(s) = PROCESS.read().ok().and_then(|g| g.clone()) {
+    if let Some(s) = PROCESS.read().unwrap_or_else(|e| e.into_inner()).clone() {
         return s;
     }
     FROM_ENV.get_or_init(SecretSet::from_env).clone()
@@ -172,7 +176,7 @@ pub fn add_role_secret(name: &str, value: &str) {
         }
         g.push((name.to_string(), value.to_string()));
     }
-    set_process_secrets(process_secrets().with(name, value));
+    merge_process_secrets(&SecretSet::default().with(name, value));
 }
 
 /// The secrets recorded with [`add_role_secret`], in order.
