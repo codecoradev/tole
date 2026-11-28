@@ -15,10 +15,13 @@
 #                 stray tag cannot freeze `stable`; the floating tags only move
 #                 forward, so a re-run of an old tag never takes `stable` back.
 #
-# nightly -> nightly, nightly-YYYYMMDD, sha-<7>
+# nightly -> sha-<7>, nightly-YYYYMMDD, nightly
 # release -> X.Y.Z, sha-<7>, and for a final release (no prerelease suffix) also
 #            X.Y when no higher X.Y.* final tag exists and `stable` when no higher
 #            final tag exists at all.
+# The FIRST line is the anchor of the build: X.Y.Z (release) or sha-<7> (nightly).
+# The publish job writes the tags in this order, so a partial write leaves the
+# anchor, and a re-run finds it and reuses its digest.
 # There is deliberately no `latest`.
 #
 # Versions: each of X, Y and Z is 0 or has no leading zero, at most 6 digits; the
@@ -39,7 +42,7 @@ case "$channel" in
 nightly)
     date="${DATE:-}"
     [[ "$date" =~ ^[0-9]{8}$ ]] || die "DATE must be YYYYMMDD, got '${date}'"
-    printf '%s\n' "nightly" "nightly-${date}" "sha-${short}"
+    printf '%s\n' "sha-${short}" "nightly-${date}" "nightly"
     ;;
 release)
     git_tag="${GIT_TAG:-}"

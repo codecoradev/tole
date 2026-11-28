@@ -154,33 +154,62 @@ zero and at most six digits, and a prerelease suffix is at most 40 characters;
 anything else fails in the first job, before an image is pushed. The tag rules are
 `scripts/container/image-tags.sh`, with a self-test.
 
-What the workflow guarantees about the tags, and how:
+What the workflow guarantees about the tags, how, and what it does not:
 
-- **`X.Y.Z`, `nightly-YYYYMMDD` and `sha-*` are never moved.** They are created
-  only when absent. `sha-<7 hex>` names the first image built from that commit
-  (a release at the commit of an earlier nightly keeps the nightly's `sha-` tag).
+- **`X.Y.Z`, `nightly-YYYYMMDD` and `sha-*` are not re-pointed by the workflow.**
+  They are created only when the registry answers "not found" for them. Any other
+  answer (a 5xx, a rate limit, an auth error) fails the job; it is never read as
+  "absent". `sha-<7 hex>` names the first image built from that commit (a release
+  at the commit of an earlier nightly keeps the nightly's `sha-` tag). Not
+  guaranteed: someone with write access to the package can still delete or move a
+  tag by hand, and a registry that wrongly answers "not found" for a tag that
+  exists would let it be re-created (the check cannot see past the registry).
 - **`stable` and `X.Y` move forward only.** "Highest" is computed over the final
   release tags that are **on `main`** (`git tag --merged origin/main`), so a stray
   or refused tag (one not on `main`, or malformed, like `v999999999999.0.0`) never
-  counts and cannot freeze them. The list is read again in the `publish` job right
-  before the tags are made, so a run that started earlier cannot take `stable`
-  back. A re-run of an old release leaves `stable` and `X.Y` where they are.
+  counts and cannot freeze them. The list is read again in the `tags` job right
+  before `publish` makes the tags, so a run that started earlier cannot take
+  `stable` back. A re-run of an old release leaves `stable` and `X.Y` where they
+  are. A few seconds pass between that read and the tag write; two release runs
+  are serialised by the shared group, so this is not a race between releases.
 - **`nightly` only moves to the head of `develop`.** A run whose commit is not the
   head of `develop` (a re-run of an old nightly) builds and tests but publishes
   nothing, and says why in its summary. If `develop` moves while a nightly builds,
-  that run keeps its exact tags and leaves `nightly` alone.
-- **The tags of one build never disagree.** If the anchor tag already exists
-  (`X.Y.Z` for a release, `sha-<7 hex>` for a nightly), the run is a re-run after
-  a partial failure: every tag it still has to create is pointed at the digest of
-  the anchor, not at the rebuilt image.
+  that run keeps its exact tags and leaves `nightly` alone. A scheduled nightly
+  is skipped when `sha-<7 hex>` of the head exists; if an earlier run died after
+  writing it but before `nightly` moved, start a manual run (it does not skip).
+- **The tags of one run point at one image, and a re-run completes them.**
+  The tags are written by one `imagetools create` call, **anchor first** (`X.Y.Z`
+  for a release, `sha-<7 hex>` for a nightly). On a re-run, if the anchor exists,
+  the run first checks that its image carries this commit in the
+  `org.opencontainers.image.revision` label (pulled and read; a missing label or
+  another commit **fails the run**, which is what a release tag deleted and
+  pushed again on another commit looks like), and only then points every missing
+  tag at the anchor's digest, not at the rebuilt image. To repair a re-pointed
+  tag, delete the package version that carries the old `X.Y.Z` (GitHub,
+  organisation Packages, `tole`, the version list; its tags go with it) and re-run;
+  check `stable` and `X.Y` afterwards. **Not guaranteed:** the order in which
+  `imagetools create` writes the tags of one call was not verified. If it dies
+  half way and the anchor was not written yet, a re-run finds no anchor and points
+  all tags at its own rebuilt image: still one image per tag set, but a different
+  digest of the same commit than the half-written tags had for a moment.
 - **What is pushed is what was tested.** Each platform is pushed by digest first,
   then that digest is pulled and smoke-tested; tags are made only after both
   platforms passed. A digest that failed the test stays in the registry untagged.
+- **Credentials.** The checkouts keep no token in `.git`. The job that pushes
+  (`build-push`) drops its registry login (`docker logout`) before it runs the
+  checked-out smoke script. The job that writes the tags (`publish`) has no
+  checkout and runs no file of the repository; the tag list comes from the
+  `tags` job, which has no `packages` permission.
 - **Order.** Every release run shares one concurrency group and every nightly run
   another, so two tags pushed together are published one after the other. GitHub
   keeps one pending run per group and **cancels an older pending one**: when you
   push several release tags within minutes, look at the Actions list and re-run
-  any release run that shows "Cancelled" (the re-run is safe, see above).
+  any release run that shows "Cancelled" (the re-run is safe, see above). There
+  is no alert for that, so the `plan` job of every release run lists the earlier
+  release tags on `main` that have no `X.Y.Z` image (only tags whose tree has this
+  workflow) as a warning and in the job summary, with the re-run instructions; a
+  registry error there counts as "could not check", never as "missing".
 
 **Which tag to pull**
 
@@ -213,7 +242,11 @@ commands. To pin an exact build, append its digest: `TOLE_IMAGE_TAG=0.12.0@sha25
 (Docker then ignores the tag and checks the digest).
 Docker keeps the previous image locally until you prune it, so a rollback of a
 deploy you just made needs no download: `docker image ls ghcr.io/codecoradev/tole`.
-The digest of what runs now: `docker compose images tole`.
+The digest of what runs now (the index digest, the one the workflow summary prints):
+`docker image inspect --format '{{json .RepoDigests}}' "$(docker compose images -q tole)"`.
+It lists a digest only for an image that was pulled from a registry, not for one
+built locally. (Written from the command line documentation; not run against a
+real container here.)
 
 **Where the publishing runs.** `.github/workflows/container.yml`:
 
@@ -221,7 +254,7 @@ The digest of what runs now: `docker compose images tole`.
   `templates/container/`, the workflow) builds both platforms and runs
   `scripts/container/smoke.sh` on each (`tole --version`, uid 10001, `tole serve`
   reaches `healthy` through the image's own HEALTHCHECK), and parses the compose
-  file. It pushes nothing and has no `packages` permission. A fork's pull request
+  file. It pushes nothing and never has `packages: write` (the `plan` job has `packages: read`, to ask the registry what exists). A fork's pull request
   and a manual run from a branch other than `develop` do the same.
 - The nightly (schedule, or a manual run from `develop`) and a release tag push the
   image. Each platform builds on a native runner (no emulation), is pushed by
@@ -711,7 +744,7 @@ not run once**. What was checked, by reading and by running what can run here:
 - The workflow parses as YAML (PyYAML), every `run:` block passes `bash -n`, and
   every `${{ }}` expression was read against the contexts GitHub allows at that
   place. `actionlint` and `shellcheck` were not available.
-- `scripts/container/test-image-tags.sh` passes (27 cases: both channels,
+- `scripts/container/test-image-tags.sh` passes (29 cases, the anchor first among them: both channels,
   forward-only floating tags, numeric version order, prerelease and its length
   cap, backport, stray malformed or huge tags in the list, leading zeros, no
   `latest`, every refusal). The version match of `smoke.sh` (`1.2.3` does not
@@ -731,4 +764,13 @@ GHCR links the package and takes the visibility change as described; the
 `gh api` query of the nightly's CI gate and the concurrency expression (read, run
 only through a `jq` stand-in for the gate); `docker pull` of a digest on the
 arm64 runner; the re-run paths (anchor reuse, a develop head that moved), which
-need a registry; that GitHub keeps a cancelled pending release run re-runnable.
+need a registry; that GitHub keeps a cancelled pending release run re-runnable; the exact text a
+registry gives for a tag or a package that does not exist (the "not found" test
+looks for `MANIFEST_UNKNOWN`, `NAME_UNKNOWN`, `manifest unknown`, `name unknown`,
+`not found` and `404`: if GHCR answers differently for a package that does not
+exist yet, the first publish fails closed with "cannot tell whether ... exists"
+and the pattern needs one more string); `docker image inspect` reading the revision
+label of a pulled index on the runner; the write order of `imagetools create` for
+several `-t` flags; the `docker compose images -q` and `RepoDigests` command in
+"Rolling back"; the "release tags without an image" warning (it reads trees and
+the registry; it has not run).

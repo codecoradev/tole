@@ -23,7 +23,7 @@ refuse() {
     if [ "$rc" -eq 2 ] && [ -z "$out" ]; then echo "ok   $name"; else echo "FAIL $name: rc=$rc out='$out'"; fail=1; fi
 }
 
-expect "nightly" "nightly nightly-20261128 sha-0123456" CHANNEL=nightly SHA=$SHA DATE=20261128
+expect "nightly, the anchor sha- first" "sha-0123456 nightly-20261128 nightly" CHANNEL=nightly SHA=$SHA DATE=20261128
 expect "release newest" "0.12.0 sha-0123456 0.12 stable" CHANNEL=release SHA=$SHA GIT_TAG=v0.12.0 RELEASE_TAGS="$ALL"
 expect "release first of a new minor" "0.13.0 sha-0123456 0.13 stable" CHANNEL=release SHA=$SHA GIT_TAG=v0.13.0 RELEASE_TAGS="$ALL"
 expect "release patch of the newest minor" "0.12.1 sha-0123456 0.12 stable" CHANNEL=release SHA=$SHA GIT_TAG=v0.12.1 RELEASE_TAGS="$ALL"
@@ -53,6 +53,12 @@ refuse "release without tag" CHANNEL=release SHA=$SHA
 refuse "tag without v" CHANNEL=release SHA=$SHA GIT_TAG=0.12.0
 refuse "tag with two parts" CHANNEL=release SHA=$SHA GIT_TAG=v0.12
 refuse "branch name as tag" CHANNEL=release SHA=$SHA GIT_TAG=develop
+
+# The first line is the anchor: X.Y.Z for a release, sha-<7> for a nightly.
+first=$(env -i PATH="$PATH" CHANNEL=nightly SHA=$SHA DATE=20261128 "$tags" | head -n 1)
+[ "$first" = "sha-0123456" ] && echo "ok   nightly anchor is first" || { echo "FAIL nightly anchor: $first"; fail=1; }
+first=$(env -i PATH="$PATH" CHANNEL=release SHA=$SHA GIT_TAG=v0.12.0 RELEASE_TAGS="$ALL" "$tags" | head -n 1)
+[ "$first" = "0.12.0" ] && echo "ok   release anchor is first" || { echo "FAIL release anchor: $first"; fail=1; }
 
 # No channel ever prints a bare latest.
 for args in "CHANNEL=nightly DATE=20261128" "CHANNEL=release GIT_TAG=v0.13.0"; do

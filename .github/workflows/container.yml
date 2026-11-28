@@ -28,10 +28,11 @@ name: Container image
 # Ordering: all release runs share one concurrency group and all nightly runs
 # another (a group queues one run and replaces an older pending one, so a
 # superseded release run has to be re-run by hand, see docs/container.md). The
-# `publish` job re-reads the tags of main (release) or the head of develop
-# (nightly) right before it tags, so a stale or re-run job cannot move `stable`,
-# `X.Y` or `nightly` backwards, and on a re-run it reuses the digest an existing
-# exact tag already points at, so the tags of one release never disagree.
+# `tags` job re-reads the tags of main (release) or the head of develop
+# (nightly) right before `publish` tags, so a stale or re-run job cannot move
+# `stable`, `X.Y` or `nightly` backwards, and on a re-run `publish` reuses the
+# digest an existing anchor tag points at (after checking it was built from the
+# same commit), so the tags of one build agree.
 #
 # Platforms: linux/amd64 and linux/arm64, each built on a native runner (no QEMU)
 # and merged into one multi-arch tag by the `publish` job.
@@ -96,6 +97,8 @@ jobs:
         with:
           # All tags and the history of main: the release checks need them.
           fetch-depth: 0
+          # The repository is public: later `git fetch` needs no token in .git.
+          persist-credentials: false
 
       - name: Self-test of the tag rules
         run: |
@@ -219,6 +222,51 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
+      # A release run that GitHub cancelled as "superseded" (several tags pushed
+      # close together keep only the newest pending run per group) gives no alert.
+      # List the earlier release tags on main that have no exact-version image, and
+      # say how to repair. Only tags whose tree contains this workflow count (older
+      # releases never had an image). Reading only: any registry error counts as
+      # "could not check", never as "missing".
+      - name: Warn about release tags without an image
+        if: steps.plan.outputs.channel == 'release' && steps.plan.outputs.publish == 'true'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -uo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null 2>&1 || true
+          missing=()
+          unknown=0
+          while IFS= read -r t; do
+            [ -n "$t" ] && [ "$t" != "$REF_NAME" ] || continue
+            git cat-file -e "${t}:.github/workflows/container.yml" 2>/dev/null || continue
+            out=$(docker buildx imagetools inspect "${IMAGE}:${t#v}" 2>&1); rc=$?
+            if [ "$rc" -eq 0 ]; then continue; fi
+            if grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest unknown|name unknown|not found|404' <<<"$out"; then
+              missing+=("$t")
+            else
+              unknown=$((unknown + 1))
+            fi
+          done < <(git tag --merged origin/main | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' | sort -V | tail -n 20)
+          {
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "### Release tags on main without an image"
+              echo ""
+              printf -- '- `%s`\n' "${missing[@]}"
+              echo ""
+              echo "Such a tag was probably cancelled as superseded by a newer pending run. Open Actions, \"Container image\", the run of that tag, and \"Re-run all jobs\" (safe: the exact tag is only created when absent). If the run no longer exists, delete the tag and push it again."
+            fi
+            if [ "$unknown" -gt 0 ]; then
+              echo ""
+              echo "Could not check $unknown tag(s): the registry answered with an error that is not \"not found\"."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::warning::release tags on main without an image: ${missing[*]} (see the job summary)"
+          fi
+
   # Pull requests and manual runs from other branches: build both platforms and
   # smoke-test, push nothing. No `packages` permission at all.
   build-check:
@@ -238,6 +286,8 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Build
         uses: docker/build-push-action@v6
@@ -255,10 +305,10 @@ jobs:
         if: matrix.platform == 'linux/amd64'
         run: docker compose -f templates/container/compose.yaml config -q
 
-  # Nightly and release: build each platform on a native runner, push it by digest
-  # (no tag yet), then pull THAT digest and smoke-test it, so what is tested is what
-  # is published. An untagged digest that fails the test is harmless: the `publish`
-  # job runs only when both platforms passed.
+  # Nightly and release: build each platform on a native runner and push it by
+  # digest (no tag yet). The digest is pulled back and smoke-tested, so what is
+  # tested is what is published. An untagged digest that fails the test is
+  # harmless: the later jobs run only when both platforms passed.
   build-push:
     name: Build, push and test (${{ matrix.platform }})
     needs: plan
@@ -279,6 +329,8 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -289,7 +341,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # `org.opencontainers.image.source` is what links the package to this
-      # repository on GHCR.
+      # repository on GHCR. `org.opencontainers.image.revision` is what `publish`
+      # checks before it reuses an existing image on a re-run.
       - name: Build and push by digest
         id: push
         uses: docker/build-push-action@v6
@@ -316,14 +369,21 @@ jobs:
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest from the push"; exit 1; }
           echo "ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
+      # Pull while logged in (the package may still be private), then drop the
+      # credential BEFORE the checked-out smoke script runs: it finds the image
+      # locally and needs no registry.
+      - name: Pull the pushed digest
+        env:
+          REF: ${{ steps.digest.outputs.ref }}
+        run: |
+          set -euo pipefail
+          docker pull "$REF"
+          docker logout ghcr.io
       - name: Smoke test the pushed digest
         env:
           REF: ${{ steps.digest.outputs.ref }}
           EXPECT_VERSION: ${{ needs.plan.outputs.expect_version }}
-        run: |
-          set -euo pipefail
-          docker pull "$REF"
-          scripts/container/smoke.sh "$REF" "$EXPECT_VERSION"
+        run: scripts/container/smoke.sh "$REF" "$EXPECT_VERSION"
 
       - name: Record the digest
         env:
@@ -339,27 +399,72 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Put the tags on one multi-arch index built from the two tested digests.
-  #  - The exact tags (X.Y.Z, nightly-YYYYMMDD, sha-*) are created only when absent.
-  #  - If the anchor tag (X.Y.Z for a release, sha-<7> for a nightly) already exists,
-  #    this is a re-run after a partial failure: every tag of this run is pointed at
-  #    the digest the anchor already has, never at the rebuilt image, so the tags of
-  #    one release never disagree.
-  #  - Right before tagging, the tag list is read again: for a release, the final
-  #    tags that are on main now; for a nightly, whether develop still is this
-  #    commit (if it moved, the rolling `nightly` is left alone).
+  # The final tag list, read right before tagging. It has no `packages` permission
+  # and is the only place that runs the checked-out tag script after the build, so
+  # `publish`, which holds `packages: write`, executes no file of the checkout.
+  #  - release: the final tags that are on main now (a newer release pushed
+  #    meanwhile keeps `stable` and `X.Y` from moving backwards);
+  #  - nightly: whether develop still is this commit (if it moved, the rolling
+  #    `nightly` is left out).
+  # The first tag of the list is the anchor (X.Y.Z, or sha-<7> for a nightly).
+  tags:
+    name: Final tag list
+    needs: [plan, build-push]
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.final.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the tags again
+        id: final
+        env:
+          PLANNED_TAGS: ${{ needs.plan.outputs.tags }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          COMMIT: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --force --tags origin main develop
+          if [ "$CHANNEL" = "release" ]; then
+            tags=$(CHANNEL=release SHA="$COMMIT" GIT_TAG="$REF_NAME" RELEASE_TAGS="$(git tag --merged origin/main)" scripts/container/image-tags.sh)
+          else
+            tags="$PLANNED_TAGS"
+            head=$(git rev-parse origin/develop)
+            if [ "$head" != "$COMMIT" ]; then
+              echo "::warning::develop moved to $head during the build: the rolling nightly tag is not moved"
+              tags=$(printf '%s\n' "$tags" | grep -vx nightly || true)
+            fi
+          fi
+          {
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "$tags"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # Put the tags on one multi-arch index built from the two tested digests, in ONE
+  # `imagetools create` call. No checkout here: nothing from the repository runs
+  # while this job holds `packages: write`.
+  #  - Exact tags (X.Y.Z, nightly-YYYYMMDD, sha-*) are created only when absent.
+  #  - If the anchor (the first tag) exists, this is a re-run: its image must carry
+  #    this commit as `org.opencontainers.image.revision` (else the job fails), and
+  #    every tag still to be created goes to ITS digest, not to the rebuilt image.
+  #  - A registry answer that is not a clear "not found" fails the job; it is never
+  #    read as "absent".
   publish:
     name: Publish tags
-    needs: [plan, build-push]
+    needs: [plan, build-push, tags]
     if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           pattern: digests-*
@@ -375,37 +480,57 @@ jobs:
 
       - name: Create the multi-arch tags
         env:
-          PLANNED_TAGS: ${{ needs.plan.outputs.tags }}
+          TAGS: ${{ needs.tags.outputs.tags }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
           COMMIT: ${{ github.sha }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          git fetch --quiet --force --tags origin main develop
 
-          # The tag list, read again now.
-          if [ "$CHANNEL" = "release" ]; then
-            TAGS=$(CHANNEL=release SHA="$COMMIT" GIT_TAG="$REF_NAME" RELEASE_TAGS="$(git tag --merged origin/main)" scripts/container/image-tags.sh)
-            anchor="${REF_NAME#v}"
-          else
-            TAGS="$PLANNED_TAGS"
-            anchor="sha-${COMMIT:0:7}"
-            head=$(git rev-parse origin/develop)
-            if [ "$head" != "$COMMIT" ]; then
-              echo "::warning::develop moved to $head during the build: the rolling nightly tag is not moved"
-              TAGS=$(printf '%s\n' "$TAGS" | grep -vx nightly || true)
+          # 0 = the tag exists, 1 = the registry says "not found". Anything else
+          # (a 5xx, a rate limit, an auth error) stops the job: it is not "absent".
+          registry_has() {
+            local out rc
+            set +e
+            out=$(docker buildx imagetools inspect "$1" 2>&1)
+            rc=$?
+            set -e
+            [ "$rc" -eq 0 ] && return 0
+            if grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest unknown|name unknown|not found|404' <<<"$out"; then
+              return 1
             fi
-          fi
+            echo "::error::cannot tell whether $1 exists (the registry answered with something other than not found): $out" >&2
+            exit 1
+          }
+          # The digest of a tag. Captured first and parsed after, so awk never
+          # ends a pipe early (SIGPIPE under pipefail). The caller validates it.
+          digest_of() {
+            local out
+            out=$(docker buildx imagetools inspect "$1") || return 1
+            awk '/^Digest:/ && !d {print $2; d=1}' <<<"$out"
+          }
+
+          anchor=$(head -n 1 <<<"$TAGS")
+          [ -n "$anchor" ] || { echo "::error::empty tag list"; exit 1; }
 
           cd "${RUNNER_TEMP}/digests"
           [ "$(ls | wc -l)" -eq 2 ] || { echo "::error::expected the digests of amd64 and arm64"; ls; exit 1; }
 
           sources=()
           annotation=()
-          if docker buildx imagetools inspect "${IMAGE}:${anchor}" >/dev/null 2>&1; then
-            anchor_digest=$(docker buildx imagetools inspect "${IMAGE}:${anchor}" | awk '/^Digest:/ {print $2; exit}')
+          if registry_has "${IMAGE}:${anchor}"; then
+            anchor_digest=$(digest_of "${IMAGE}:${anchor}") || true
             [[ "$anchor_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::cannot read the digest of ${IMAGE}:${anchor}"; exit 1; }
-            echo "::notice::${IMAGE}:${anchor} exists (a re-run): every tag of this run goes to its digest ${anchor_digest}, not to the rebuilt image"
+            # Fail closed: reuse the image only when it was built from THIS commit
+            # (a release tag deleted and pushed again on another commit would
+            # otherwise put the new tags on the old image).
+            docker pull --quiet "${IMAGE}@${anchor_digest}" >/dev/null
+            revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${IMAGE}@${anchor_digest}")
+            if [ "$revision" != "$COMMIT" ]; then
+              echo "::error::${IMAGE}:${anchor} exists but was built from '${revision:-no revision label}', this run is ${COMMIT}. Not reusing it. If the tag ${REF_NAME} was moved to another commit, delete the package version that carries ${anchor} (GitHub, organisation Packages, tole, the version list; the tags on it go too), then re-run this job. Check stable and the X.Y tag afterwards."
+              exit 1
+            fi
+            echo "::notice::${IMAGE}:${anchor} exists and was built from this commit (a re-run): every tag of this run goes to its digest ${anchor_digest}, not to the rebuilt image"
             sources=("${IMAGE}@${anchor_digest}")
           else
             for d in *; do sources+=("${IMAGE}@sha256:${d}"); done
@@ -419,7 +544,7 @@ jobs:
             # Exact tags: sha-*, nightly-YYYYMMDD, X.Y.Z[-prerelease]. One that
             # exists is left alone.
             if [[ "$tag" == sha-* || "$tag" == nightly-* || "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
-              if docker buildx imagetools inspect "${IMAGE}:${tag}" >/dev/null 2>&1; then
+              if registry_has "${IMAGE}:${tag}"; then
                 echo "::notice::${IMAGE}:${tag} already exists, not overwritten"
                 continue
               fi
@@ -440,7 +565,8 @@ jobs:
           # Both platforms must be in the index.
           docker buildx imagetools inspect --raw "${IMAGE}:${first}" \
             | jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64","arm64"]' >/dev/null
-          digest=$(docker buildx imagetools inspect "${IMAGE}:${first}" | awk '/^Digest:/ {print $2; exit}')
+          digest=$(digest_of "${IMAGE}:${first}") || true
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::cannot read the digest of ${IMAGE}:${first}"; exit 1; }
 
           {
             echo "### Published \`${CHANNEL}\` image"
