@@ -211,7 +211,7 @@ tole chat                                   # multi-turn REPL on one durable ses
 tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
-tole sessions                               # list durable sessions (+ serve profile when set)
+tole sessions                               # list durable sessions (+ serve profile when set), then the size of the store
 tole sessions --all [--grep <text>]         # every project's sessions + where they live
 tole sessions --tree                        # sessions with their forks nested
 tole branch <id> [--at <entry>]             # fork a session at a settled entry, then resume the fork
