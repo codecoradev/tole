@@ -23,7 +23,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 84903
+crate tole-cli 84674
 crate tole-core 64676
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -52,7 +52,7 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 1091
+file crates/tole-cli/src/serve.rs 1076
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
@@ -91,9 +91,9 @@ file crates/tole-cli/tests/serve_webhook_out.rs 649
 file crates/tole-cli/tests/serve_webhook_turn.rs 808
 file crates/tole-cli/tests/skill_approval_e2e.rs 605
 file crates/tole-cli/tests/verify_sandbox.rs 1171
-file crates/tole-client/src/client.rs 616
+file crates/tole-client/src/client.rs 612
 file crates/tole-client/src/http.rs 807
-file crates/tole-client/src/sse.rs 540
+file crates/tole-client/src/sse.rs 514
 file crates/tole-client/src/types.rs 895
 file crates/tole-core/src/action_summary.rs 966
 file crates/tole-core/src/approval.rs 610

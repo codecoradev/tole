@@ -118,6 +118,29 @@ pub(super) fn param<'a>(query: &'a str, key: &str) -> Result<Option<Cow<'a, str>
     raw_param(query, key).map(id).transpose()
 }
 
+/// The id of a route shaped `{prefix}{id}{suffix}`, or `None` when the path is
+/// not of that shape. The id may be empty (`/discussions//resume`) and the
+/// caller refuses it. A path that is only the suffix after the collection
+/// (`/discussions/resume`) starts with the prefix and ends with the suffix at
+/// once, and slicing it by the two lengths made a reversed range and a panic,
+/// so the prefix is stripped first and the suffix from what is left.
+pub(super) fn id_between<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)?.strip_suffix(suffix)
+}
+
+/// Runs `f` with the percent-decoded id of a route matched by [`id_between`]
+/// (the match is on the raw path, the id is decoded after it: see `pct`), or
+/// answers the `400` of a value that does not decode.
+pub(super) fn with_id(
+    raw: Option<&str>,
+    f: impl FnOnce(&str) -> (u16, serde_json::Value),
+) -> (u16, serde_json::Value) {
+    match id(raw.unwrap_or_default()) {
+        Ok(id) => f(&id),
+        Err(refused) => refused,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

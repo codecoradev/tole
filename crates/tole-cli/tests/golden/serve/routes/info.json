@@ -6,6 +6,7 @@
     "delegation.approvals",
     "detach",
     "discussions",
+    "discussions.events",
     "effort",
     "entries",
     "events.sse",
