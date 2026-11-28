@@ -621,7 +621,9 @@ tole mission "ship the feature" --max-steps 48 --max-minutes 15 \
   --verify "cargo test" --yes
 ```
 
-Autonomous turn-chaining toward a goal (#199): the existing turn
+Autonomous turn-chaining toward a goal (#199; running one unattended, which
+tools to pre-approve and how to write the `--verify` gate:
+[docs/mission-patterns.md](docs/mission-patterns.md)): the existing turn
 machinery looped until the model declares `MISSION_COMPLETE` (and
 `--verify` exits 0, when set) or a budget trips (`--max-steps`,
 `--max-minutes`, `--max-tokens`). Every chained turn is a normal durable turn — after a
