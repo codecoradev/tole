@@ -23,11 +23,14 @@ fn an_absolute_path_inside_the_workspace_writes_the_same_file_as_the_relative_on
     t.execute(json!({ "path": inside, "content": "a" }))
         .unwrap();
     assert_eq!(std::fs::read_to_string(ws.join("sub/in.txt")).unwrap(), "a");
-    // Same approval target as the relative form.
-    assert_eq!(
-        t.approval_target(&json!({ "path": inside })),
-        t.approval_target(&json!({ "path": "sub/in.txt" }))
-    );
+    // The approval target and the whole summary are the relative form's.
+    let both = |p: &str| {
+        let input = json!({ "path": p, "content": "b" });
+        (t.approval_target(&input), t.action_summary(&input))
+    };
+    assert_eq!(both(&inside), both("sub/in.txt"));
+    assert_eq!(both(&inside).0.as_deref(), Some("sub/in.txt"));
+    assert!(both(&inside).1.is_some_and(|s| s.inside_workspace));
 }
 
 #[test]

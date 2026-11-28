@@ -179,8 +179,8 @@ fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &
 ///   (absolute, tilde, or upward-normalizing relative) is refused; scoped
 ///   recursive rm stays Write-tier territory. Flag clusters containing
 ///   r/R count as recursive (`-rfv` included).
-/// - Path-qualified programs (`/bin/rm`) are refused outright: bare
-///   names resolve via PATH, which is the audited surface. The reason says
+/// - Path-qualified programs (`/bin/rm`) are refused outright here (the cron
+///   rule; run_command and job_start use `program_path`). The reason says
 ///   so (use the bare name) unless the name behind the path is itself a
 ///   teardown program or a recursive `rm` (#1286).
 ///
@@ -271,7 +271,7 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
             let why = if tole {
                 "a session may not run the tole binary at all (owner-only records are written by the owner from a terminal, issue #684), so there is no bare name to use".to_string()
             } else {
-                format!("run_command resolves programs through PATH only, so use the bare name (`{name}`)")
+                format!("a program is taken here by its bare name, resolved through PATH, so use the bare name (`{name}`)")
             };
             return Err(format!(
                 "refused \u{2014} the program is written as a path ({}); {why}.",

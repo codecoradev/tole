@@ -1,6 +1,8 @@
-//! #1285: the file tools tell an absolute path (it must be relative) from a
-//! path that escapes the jail, and both name the workspace. The jail itself
-//! is unchanged: every case below is still refused.
+//! #1285: the file tools take an absolute path that lies inside the workspace
+//! as the same file as its relative form, and tell a path outside it from one
+//! that escapes the jail; both refusals name the workspace. The jail itself is
+//! unchanged: every refusal below is still a refusal and nothing outside is
+//! touched.
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
@@ -61,17 +63,16 @@ fn an_absolute_path_inside_the_workspace_is_the_same_file_as_the_relative_one() 
         std::fs::read_to_string(ws.join("sub/f.txt")).unwrap(),
         "kept"
     );
-    // The approval summary names the same target as the relative form.
+    // The approval target and the whole summary are the relative form's.
     let both = |p: String| {
-        let t = edit.approval_target(&json!({ "path": p })).unwrap();
+        let input = json!({ "path": p, "old_hash": "0", "old_text": "kept", "new_text": "x" });
         (
-            t,
-            edit.action_summary(&json!({ "path": abs(&ws, "sub/f.txt") }))
-                .unwrap()
-                .target,
+            edit.approval_target(&input).unwrap(),
+            edit.action_summary(&input).unwrap(),
         )
     };
     assert_eq!(both(abs(&ws, "sub/f.txt")), both("sub/f.txt".into()));
+    assert_eq!(both(abs(&ws, "sub/f.txt")).0, "sub/f.txt");
     DeleteFileTool::new(ws.to_path_buf())
         .execute(json!({ "path": abs(&ws, "sub/f.txt") }))
         .unwrap();

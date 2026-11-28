@@ -4,10 +4,11 @@
 //! keep that rule). `run_command` and `job_start` call [`check_command_argv`]
 //! instead, which lets a path through when it names a real executable file and
 //! the blocklist, read on what the path really is, has nothing against it.
-//! Nothing a bare name is refused for is allowed here: the same teardown and
-//! `rm` rules run on the name as written AND on the name of the file it
-//! resolves to (a symlink to `rm` is `rm`), a tole binary is never let
-//! through (the session guard runs next, and so does it on a `#!` line), and a
+//! Nothing a bare name is refused for is allowed here. The program is judged
+//! under every name it goes by (the one written, each link on the way, the
+//! file it resolves to), and so is every interpreter on its `#!` chain (the
+//! kernel follows four): a name of tole, the same file as the running binary
+//! (a hard link too), the teardown and `rm` rules, and the session guard. A
 //! program inside a `sh -c` text stays refused (it is a shell's to resolve).
 //! A bare-name allow pattern never matches a path (`approval::argv_matches`),
 //! a deny matches its file name, and the sandbox keeps its own rule (a
@@ -20,22 +21,116 @@
 
 use crate::subprocess::check_destructive_argv;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// The longest `#!` line read.
+/// The most interpreters the kernel follows (`BINPRM_MAX_RECURSION`).
+const SHEBANG_DEPTH: usize = 4;
 const SHEBANG_MAX: u64 = 256;
+const MAX_LINKS: usize = 40;
 
 fn esc(s: &str) -> String {
     s.chars().take(120).flat_map(char::escape_debug).collect()
 }
 
-fn base(w: &str) -> &str {
-    w.rsplit('/').next().unwrap_or(w)
-}
-
 fn is_tole(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(n.strip_suffix(".exe").unwrap_or(&n), "tole" | "tole-cli")
+}
+
+/// A program as exec sees it: every name it goes by, and the file it is.
+struct Found {
+    names: Vec<String>,
+    file: PathBuf,
+}
+
+/// Follow `path` (read from `cwd`) through its links: the file name of each
+/// hop, then the canonical file. `None`: it does not resolve or has no name.
+fn follow(path: &str, cwd: &Path) -> Option<Found> {
+    let mut p = cwd.join(path);
+    let mut names = Vec::new();
+    for _ in 0..MAX_LINKS {
+        names.push(p.file_name()?.to_str()?.to_string());
+        if !std::fs::symlink_metadata(&p).ok()?.is_symlink() {
+            break;
+        }
+        p = p.parent()?.join(std::fs::read_link(&p).ok()?);
+    }
+    let file = p.canonicalize().ok()?;
+    names.push(file.file_name()?.to_str()?.to_string());
+    Some(Found { names, file })
+}
+
+/// Open `f` for inspection: not through a link and never blocking on a pipe;
+/// only a regular file with an execute bit passes. `Err` is the reason.
+fn open_runnable(f: &Path) -> Result<std::fs::File, &'static str> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = o.open(f).map_err(|e| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "it cannot be read",
+        _ => "no executable file is there",
+    })?;
+    let meta = file.metadata().map_err(|_| "it cannot be read")?;
+    #[cfg(unix)]
+    let exec = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+    #[cfg(not(unix))]
+    let exec = true;
+    if meta.is_file() && exec {
+        Ok(file)
+    } else {
+        Err("no executable file is there")
+    }
+}
+
+/// Is `f` the running executable (the same inode, so a hard link counts)?
+#[cfg(unix)]
+fn is_running_exe(f: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        f.metadata(),
+        std::env::current_exe().and_then(|e| e.metadata()),
+    ) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_running_exe(_: &std::fs::File) -> bool {
+    false
+}
+
+/// The `#!` line of `file` (up to the first newline or NUL, as the kernel
+/// reads it), split at blanks: the interpreter and its optional argument.
+fn shebang(file: &std::fs::File) -> Option<Vec<String>> {
+    let mut head = Vec::new();
+    file.take(SHEBANG_MAX).read_to_end(&mut head).ok()?;
+    let line = head.strip_prefix(b"#!")?;
+    let end = line.iter().position(|b| matches!(b, 0 | b'\n'));
+    let line = String::from_utf8_lossy(&line[..end.unwrap_or(line.len())]).into_owned();
+    Some(
+        line.split([' ', '\t'])
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Judge a program under every name it goes by, with `tail` as its arguments.
+fn judge(found: &Found, tail: &[String], cwd: &Path) -> Result<(), String> {
+    if found.names.iter().any(|n| is_tole(n)) {
+        return Err("a session may not run the tole binary (a file or link named tole)".into());
+    }
+    let mut argv = vec![String::new()];
+    argv.extend_from_slice(tail);
+    for name in &found.names {
+        argv[0] = name.clone();
+        check_destructive_argv(&argv)?;
+        crate::session_guard::check_session_argv(&argv, cwd)?;
+    }
+    argv[0] = found.file.to_string_lossy().into_owned();
+    crate::session_guard::check_session_argv(&argv, cwd)
 }
 
 /// [`check_destructive_argv`] for the tools that run `argv` from `cwd`, where
@@ -45,79 +140,49 @@ pub fn check_command_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
         return check_destructive_argv(argv);
     };
     // A tole binary is never let through, found or not (the session guard).
-    if is_tole(base(prog)) {
+    if prog.rsplit('/').next().is_some_and(is_tole) {
         return check_destructive_argv(argv);
     }
-    // What exec will run: a relative path is read from `cwd`, `~` is no shell's.
-    let file = cwd.join(prog).canonicalize().ok().filter(|f| runnable(f));
-    let Some(file) = file else {
-        return Err(format!(
-            "refused \u{2014} the program is written as a path ({}) but no executable file is there (a relative path is read from the workspace, {}; there is no shell, so `~` and `$VAR` are not expanded).",
-            esc(prog),
-            cwd.display()
-        ));
-    };
-    // The blocklist reads names: the one written and the one it resolves to.
-    let Some(real) = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !is_tole(n))
-    else {
-        return Err(format!(
-            "refused \u{2014} the program ({}) resolves to a file named tole (a session may not run the tole binary) or to a name that cannot be read.",
-            esc(prog)
-        ));
-    };
-    let mut by_name = argv.to_vec();
-    for name in [base(prog), real] {
-        by_name[0] = name.to_string();
-        check_destructive_argv(&by_name)?;
-    }
-    // A `#!` line names the program that really runs: the same rules for it.
-    if let Some(line) = shebang(&file) {
-        let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-        let named = words.first().is_some_and(|w| is_tole(base(w)));
-        let mut inner = words.clone();
-        if let Some(w) = inner.first_mut() {
-            *w = base(w).to_string();
-        }
-        let bad = named
-            .then(|| "a session may not run the tole binary".to_string())
-            .or_else(|| crate::session_guard::check_session_argv(&words, cwd).err())
-            .or_else(|| check_destructive_argv(&inner).err());
-        if let Some(why) = bad {
-            return Err(format!(
-                "refused \u{2014} {} starts with a `#!` line that is refused: {why}",
+    let (mut at, mut tail) = (prog.clone(), argv[1..].to_vec());
+    for depth in 0..=SHEBANG_DEPTH {
+        let refuse = |why: &str| {
+            let via = if depth == 0 {
+                String::new()
+            } else {
+                format!(", the interpreter of a `#!` line ({})", esc(prog))
+            };
+            format!(
+                "refused \u{2014} the program is written as a path ({}{via}) but {why} (a relative path is read from the workspace, {}; there is no shell, so `~` and `$VAR` are not expanded).",
+                esc(&at),
+                cwd.display()
+            )
+        };
+        let found = follow(&at, cwd).ok_or_else(|| refuse("no executable file is there"))?;
+        let file = open_runnable(&found.file).map_err(refuse)?;
+        let verdict = if is_running_exe(&file) {
+            Err("a session may not run the tole binary (this is its file)".to_string())
+        } else {
+            judge(&found, &tail, cwd)
+        };
+        verdict.map_err(|why| match depth {
+            0 => why,
+            _ => format!(
+                "the `#!` line of {} runs a program that is refused: {why}",
                 esc(prog)
-            ));
-        }
+            ),
+        })?;
+        let Some(words) = shebang(&file) else {
+            return Ok(());
+        };
+        // The kernel runs the interpreter (a path, read from the child's
+        // working directory) with its optional argument, then the script.
+        let Some((interp, rest)) = words.split_first() else {
+            return Err(refuse("its `#!` line names no interpreter"));
+        };
+        (at, tail) = (interp.clone(), rest.to_vec());
     }
-    Ok(())
-}
-
-/// A regular file with an execute bit (any file where there is no such bit).
-fn runnable(f: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(f) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let exec = {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let exec = true;
-    meta.is_file() && exec
-}
-
-/// The `#!` line of `f` (without the marker), when it has one.
-fn shebang(f: &Path) -> Option<String> {
-    let mut head = Vec::new();
-    std::fs::File::open(f)
-        .ok()?
-        .take(SHEBANG_MAX)
-        .read_to_end(&mut head)
-        .ok()?;
-    let text = String::from_utf8_lossy(head.strip_prefix(b"#!")?).into_owned();
-    Some(text.lines().next().unwrap_or_default().to_string())
+    Err(format!(
+        "refused \u{2014} the program ({}) has a `#!` chain deeper than the kernel follows.",
+        esc(prog)
+    ))
 }

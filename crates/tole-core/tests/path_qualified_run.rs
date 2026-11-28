@@ -1,8 +1,9 @@
 //! #1286: `run_command` and `job_start` run a program written as a path when
-//! it is an executable file the blocklist has nothing against, read on the
-//! name as written, on the name the file resolves to and on its `#!` line.
-//! Everything a bare name is refused for is refused here too, the tole binary
-//! under any spelling included. The cron argv rule is untouched
+//! it is an executable file the blocklist has nothing against, read on every
+//! name it goes by and on its `#!` chain. Everything a bare name is refused
+//! for is refused here too, the tole binary included (by name, link, `#!` line
+//! and inode; a renamed copy is the session marker's, see the module text of
+//! `program_path`). The cron argv rule is untouched
 //! (`check_destructive_argv` still refuses every path; see
 //! `path_qualified_program.rs`).
 #![cfg(all(unix, feature = "shell-tools"))]
@@ -49,30 +50,48 @@ fn a_system_program_runs_by_its_absolute_path() {
     assert_eq!(out["stdout"].as_str().unwrap().trim(), "hi");
 }
 
+/// The `rm` of this host, when it is an ordinary file named `rm` (a busybox
+/// or uutils multicall binary is not, and the cases below skip then).
+fn real_rm() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("rm"))
+        .find(|c| {
+            c.canonicalize()
+                .is_ok_and(|f| f.file_name().is_some_and(|n| n == "rm"))
+        })
+}
+
 #[test]
 fn what_a_bare_name_is_refused_for_is_refused_behind_a_path() {
     let ws = TestDir::new("tole-pq-destructive");
     write_executable(ws.join("rm"), "#!/bin/sh\nexit 0\n");
-    std::os::unix::fs::symlink("/bin/rm", ws.join("harmless")).unwrap();
     std::fs::create_dir(ws.join("sub")).unwrap();
     std::os::unix::fs::symlink("/bin/echo", ws.join("sub/rm")).unwrap();
-    for line in [
-        "/bin/rm -rf /",
-        "/usr/bin/rm -r ../outside",
-        "./rm -rf /etc",
+    let mut lines = vec![
+        "./rm -rf /etc".to_string(),
+        "/bin/bash -c 'rm -rf /etc'".into(),
+        "/usr/bin/env dd if=/dev/zero of=/dev/sda".into(),
+        "/bin/sh -c 'echo hi; shutdown -h now'".into(),
+    ];
+    if let Some(rm_path) = real_rm() {
+        let rm = rm_path.display();
         // A link is what it points to: `rm` under another name.
-        "./harmless -rf /",
-        "/bin/bash -c 'rm -rf /etc'",
-        "/usr/bin/env dd if=/dev/zero of=/dev/sda",
-        "/bin/sh -c 'echo hi; shutdown -h now'",
-    ] {
+        std::os::unix::fs::symlink(rm_path.canonicalize().unwrap(), ws.join("harmless")).unwrap();
+        lines.extend([
+            format!("{rm} -rf /"),
+            format!("{rm} -r ../outside"),
+            "./harmless -rf /".into(),
+        ]);
+        std::fs::create_dir(ws.join("build")).unwrap();
+        // Scoped `rm` stays allowed like the bare name.
+        assert!(run(&ws, &format!("{rm} -rf ./build")).is_ok());
+    }
+    for line in &lines {
         assert!(refused(&ws, line).contains(DESTRUCTIVE), "{line}");
     }
-    // A link NAMED rm that points at something harmless is `rm` by name, and
-    // scoped `rm` stays allowed like the bare name.
+    // A link NAMED rm that points at something harmless is `rm` by name.
     assert!(refused(&ws, "./sub/rm -rf /").contains(DESTRUCTIVE));
-    std::fs::create_dir(ws.join("build")).unwrap();
-    assert!(run(&ws, "/bin/rm -rf ./build").is_ok());
 }
 
 #[test]
@@ -110,7 +129,8 @@ fn the_tole_binary_is_never_let_through_under_a_path() {
         format!("#!{}/bin/tole cron\n", ws.display()),
     );
     write_executable(ws.join("viaenv"), "#!/usr/bin/env tole\n");
-    write_executable(ws.join("tear"), "#!/sbin/shutdown\n");
+    write_executable(ws.join("shutdown"), "#!/bin/sh\n");
+    write_executable(ws.join("tear"), format!("#!{}/shutdown\n", ws.display()));
     for line in [
         "./bin/tole discuss list",
         "/nonexistent/tole discuss list", // not found is not a way round
