@@ -204,7 +204,7 @@ pub struct State {
     pub closed: Option<(Gate, String)>,
     /// The owner's decisions about allowed tools, in ledger order (#1039).
     pub tool_approvals: Vec<ToolApproval>,
-    last_seq: u64,
+    pub last_seq: u64, // seq of the last ledger line: where a follower resumes
 }
 
 impl State {

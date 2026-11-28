@@ -62,6 +62,7 @@ const SERVE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/missions/{id}/cancel"),
     ("GET", "/discussions"),
     ("GET", "/discussions/{id}"),
+    ("GET", "/discussions/{id}/events"),
     ("POST", "/discussions/estimate"),
     ("POST", "/discussions"),
     ("POST", "/discussions/{id}/resume"),
