@@ -88,6 +88,11 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         discussions: Arc::default(),
         models: models::ModelCatalog::from_env(),
         turn_events: std::sync::OnceLock::new(),
+        ready: tole_cli::serve_support::ready::Readiness::new(
+            cfg.sessions_dir.as_deref(),
+            cfg.cron,
+            !webhook_out.is_empty(),
+        ),
     });
     if !state.hooks.is_empty() {
         let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
@@ -103,18 +108,17 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // Every helper thread (sender, ticker, event workers) ends when `stop` is
     // set at shutdown, and is waited for within the grace period (#1014).
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut helpers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let helpers = &state.ready.helpers;
     if !webhook_out.is_empty() {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!(
             "tole serve: webhook sender for {} destination(s)",
             webhook_out.len()
         );
-        helpers.push(tole_cli::cron::webhook::spawn_sender(
-            dir,
-            Arc::clone(&webhook_out),
-            Arc::clone(&stop),
-        ));
+        helpers.add(
+            true,
+            tole_cli::cron::webhook::spawn_sender(dir, Arc::clone(&webhook_out), Arc::clone(&stop)),
+        );
     }
     // Approval events (#911): when a destination lists them, the approval queue
     // tells a sender thread about each request and each resolution, and a timer
@@ -126,7 +130,9 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         Arc::clone(&state.approvals),
         Arc::clone(&stop),
     );
-    helpers.extend(spawned.threads);
+    for thread in spawned.threads {
+        helpers.add(true, thread);
+    }
     if let Some(turns) = spawned.turns {
         let _ = state.turn_events.set(turns);
     }
@@ -135,9 +141,10 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         eprintln!("tole serve: cron ticker on {}", dir.display());
         let queue = Arc::clone(&state.approvals);
         let stop = Arc::clone(&stop);
-        helpers.push(std::thread::spawn(move || {
-            tole_cli::cron::serve_ticker(&dir, queue, &stop)
-        }));
+        helpers.add(
+            false,
+            std::thread::spawn(move || tole_cli::cron::serve_ticker(&dir, queue, &stop)),
+        );
     }
     use std::sync::atomic::Ordering;
     let mut draining: Option<shutdown::Countdown> = None;
@@ -162,7 +169,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
             let turns = tole_cli::session_host::detach_running_turns(&state.sessions);
             let missions = state.missions.cancel_running();
             let drained = turns + missions == 0
-                && helpers.iter().all(|h| h.is_finished())
+                && helpers.running() == 0
                 && state.live_connections.load(Ordering::Relaxed) == 0;
             if let Some(ending) = countdown.check(drained) {
                 break ending;
@@ -204,7 +211,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
             .iter()
             .filter(|(_, st)| *st.busy.lock().expect("busy lock"))
             .count();
-        let alive = helpers.iter().filter(|h| !h.is_finished()).count();
+        let alive = helpers.running();
         format!("{turns} running turn(s) and {alive} helper thread(s)")
     };
     if ending == shutdown::Ending::Clean {

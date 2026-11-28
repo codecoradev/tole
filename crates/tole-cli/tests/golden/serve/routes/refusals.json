@@ -26,6 +26,14 @@
     "status": 200
   },
   {
+    "authenticated": false,
+    "body": {
+      "status": "ok"
+    },
+    "request": "GET /ready",
+    "status": 200
+  },
+  {
     "authenticated": true,
     "body": {
       "error": "not found"

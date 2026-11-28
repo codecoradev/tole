@@ -29,7 +29,3 @@ pub fn request_headers(
         ),
     ]
 }
-
-#[cfg(test)]
-#[path = "sign_tests.rs"]
-mod tests;

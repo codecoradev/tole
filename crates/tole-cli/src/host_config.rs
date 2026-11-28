@@ -3,9 +3,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-// ---------------------------------------------------------------------------
-// Wiring
-// ---------------------------------------------------------------------------
+// ---- Wiring ----
 
 /// Host knobs shared by the command fns: the file-tools jail root, the
 /// MCP server list, the memory backend. Bundled so per-command
