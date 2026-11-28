@@ -4,6 +4,7 @@
 #
 #   scripts/container/smoke.sh tole-serve:local [EXPECTED_VERSION]
 #
+# IMAGE may be a tag or a digest reference (name@sha256:...).
 # Checks: the binary runs (and reports EXPECTED_VERSION when given), the image
 # runs as uid 10001, and `tole serve` started the way the compose recipe starts it
 # (token from a secret file, the entrypoint reading the provider key file) reaches
@@ -24,9 +25,13 @@ trap cleanup EXIT
 echo "== tole --version"
 version_line="$(docker run --rm "$image" tole --version)"
 echo "$version_line"
-if [ -n "$want_version" ] && ! grep -Fq "$want_version" <<<"$version_line"; then
-    echo "smoke: expected version $want_version in '$version_line'" >&2
-    exit 1
+if [ -n "$want_version" ]; then
+    # `tole <version>` as whole words: 1.2.3 must not match 1.2.30 or 11.2.3.
+    esc="$(printf '%s' "$want_version" | sed 's/[][\\.*^$+?(){}|/]/\\&/g')"
+    if ! grep -Eq "(^|[[:space:]])tole ${esc}([[:space:]]|\$)" <<<"$version_line"; then
+        echo "smoke: expected 'tole $want_version' in '$version_line'" >&2
+        exit 1
+    fi
 fi
 
 echo "== user"

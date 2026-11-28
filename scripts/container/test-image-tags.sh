@@ -33,7 +33,18 @@ expect "tag list without the tag itself" "0.1.0 sha-0123456 0.1 stable" CHANNEL=
 expect "numeric not lexical order" "0.10.1 sha-0123456 0.10" CHANNEL=release SHA=$SHA GIT_TAG=v0.10.1 RELEASE_TAGS="$ALL"
 expect "prerelease gets the exact tag only" "1.0.0-rc.2 sha-0123456" CHANNEL=release SHA=$SHA GIT_TAG=v1.0.0-rc.2 RELEASE_TAGS="$ALL"
 
+STRAY=$'v999999999999.0.0\nv1000000.0.0\nv01.0.0\nv0.12.0\nv0.11.0'
+expect "stray huge or malformed tags in the list never freeze stable" "0.13.0 sha-0123456 0.13 stable" CHANNEL=release SHA=$SHA GIT_TAG=v0.13.0 RELEASE_TAGS="$STRAY"
+expect "six digits are accepted" "999999.0.0 sha-0123456 999999.0 stable" CHANNEL=release SHA=$SHA GIT_TAG=v999999.0.0 RELEASE_TAGS="$ALL"
+expect "prerelease suffix of 40 characters" "1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sha-0123456" CHANNEL=release SHA=$SHA GIT_TAG=v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RELEASE_TAGS="$ALL"
+
 refuse "no channel" SHA=$SHA
+refuse "leading zero in major" CHANNEL=release SHA=$SHA GIT_TAG=v01.2.3
+refuse "leading zero in minor" CHANNEL=release SHA=$SHA GIT_TAG=v1.02.3
+refuse "leading zero in patch" CHANNEL=release SHA=$SHA GIT_TAG=v1.2.03
+refuse "huge major" CHANNEL=release SHA=$SHA GIT_TAG=v999999999999.0.0
+refuse "seven digits" CHANNEL=release SHA=$SHA GIT_TAG=v1000000.0.0
+refuse "prerelease suffix of 41 characters" CHANNEL=release SHA=$SHA GIT_TAG=v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 refuse "unknown channel" CHANNEL=latest SHA=$SHA
 refuse "bad sha" CHANNEL=nightly SHA=xyz DATE=20261128
 refuse "missing sha" CHANNEL=nightly DATE=20261128

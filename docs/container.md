@@ -141,18 +141,46 @@ on purpose, so nothing changes under a deploy that did not choose a channel.
 | Channel | Built from | Tags | Moves? |
 |---|---|---|---|
 | Production | a release tag `vX.Y.Z` that is on `main` | `X.Y.Z` | never, one image per release |
-| | | `X.Y` | to the newest final release of that minor |
-| | | `stable` | to the newest final release |
+| | | `X.Y` | to the newest final release of that minor (of the tags on `main`) |
+| | | `stable` | to the newest final release (of the tags on `main`) |
 | | | `sha-<7 hex>` | never |
 | Nightly | the head of `develop`, once a day (03:17 UTC; skipped when `develop` has no commit since the last nightly) | `nightly` | every night, to the newest |
 | | | `nightly-YYYYMMDD` | never, that day's build |
 | | | `sha-<7 hex>` | never |
 
 A prerelease tag (`v1.0.0-rc.1`) gets only `1.0.0-rc.1` and `sha-<7 hex>`: never
-`X.Y` or `stable`. The floating tags move forward only: re-running the workflow
-of an old release does not take `stable` back. `X.Y.Z`, `nightly-YYYYMMDD` and
-`sha-*` are created only when absent, so a re-run never overwrites them. The
-tag rules are `scripts/container/image-tags.sh`, with a self-test.
+`X.Y` or `stable`. A version is `vX.Y.Z` with each part `0` or without a leading
+zero and at most six digits, and a prerelease suffix is at most 40 characters;
+anything else fails in the first job, before an image is pushed. The tag rules are
+`scripts/container/image-tags.sh`, with a self-test.
+
+What the workflow guarantees about the tags, and how:
+
+- **`X.Y.Z`, `nightly-YYYYMMDD` and `sha-*` are never moved.** They are created
+  only when absent. `sha-<7 hex>` names the first image built from that commit
+  (a release at the commit of an earlier nightly keeps the nightly's `sha-` tag).
+- **`stable` and `X.Y` move forward only.** "Highest" is computed over the final
+  release tags that are **on `main`** (`git tag --merged origin/main`), so a stray
+  or refused tag (one not on `main`, or malformed, like `v999999999999.0.0`) never
+  counts and cannot freeze them. The list is read again in the `publish` job right
+  before the tags are made, so a run that started earlier cannot take `stable`
+  back. A re-run of an old release leaves `stable` and `X.Y` where they are.
+- **`nightly` only moves to the head of `develop`.** A run whose commit is not the
+  head of `develop` (a re-run of an old nightly) builds and tests but publishes
+  nothing, and says why in its summary. If `develop` moves while a nightly builds,
+  that run keeps its exact tags and leaves `nightly` alone.
+- **The tags of one build never disagree.** If the anchor tag already exists
+  (`X.Y.Z` for a release, `sha-<7 hex>` for a nightly), the run is a re-run after
+  a partial failure: every tag it still has to create is pointed at the digest of
+  the anchor, not at the rebuilt image.
+- **What is pushed is what was tested.** Each platform is pushed by digest first,
+  then that digest is pulled and smoke-tested; tags are made only after both
+  platforms passed. A digest that failed the test stays in the registry untagged.
+- **Order.** Every release run shares one concurrency group and every nightly run
+  another, so two tags pushed together are published one after the other. GitHub
+  keeps one pending run per group and **cancels an older pending one**: when you
+  push several release tags within minutes, look at the Actions list and re-run
+  any release run that shows "Cancelled" (the re-run is safe, see above).
 
 **Which tag to pull**
 
@@ -196,11 +224,18 @@ The digest of what runs now: `docker compose images tole`.
   file. It pushes nothing and has no `packages` permission. A fork's pull request
   and a manual run from a branch other than `develop` do the same.
 - The nightly (schedule, or a manual run from `develop`) and a release tag push the
-  image. Each platform builds on a native runner (no emulation), is smoke-tested
-  **before** it is pushed, and is pushed by digest; a last job puts the tags on
-  one index of the two digests and checks that both platforms are in it. A tag
-  push is refused unless its commit is on `main` (the same rule as `release.yml`),
-  and the smoke test requires `tole --version` to report the tag's version.
+  image. Each platform builds on a native runner (no emulation), is pushed by
+  digest and then pulled back and smoke-tested **by that digest**; a last job puts
+  the tags on one index of the two digests and checks that both platforms are in
+  it. A tag push is refused unless its commit is on `main` (the same rule as
+  `release.yml`), and the smoke test requires `tole --version` to report exactly
+  `tole <the tag's version>`.
+- A nightly publishes only when its commit is the head of `develop` and the `CI`
+  workflow run of that push to `develop` succeeded (still running, missing or red:
+  the run builds and tests but publishes nothing, and the next night tries again).
+  A manual run has the input `skip_ci_gate` for the first package creation or a
+  repair. The gate is the whole `CI` workflow, so an unrelated red job holds the
+  nightly back; that is on purpose.
 - Only the two jobs that push have `packages: write`, and only when the repository
   is `codecoradev/tole`.
 - Not published with the image: a signature, an SBOM or a provenance attestation
@@ -211,7 +246,8 @@ The digest of what runs now: `docker compose images tole`.
 **One-time steps for the owner** (a workflow cannot do them):
 
 1. Run the workflow once (Actions, "Container image", "Run workflow", branch
-   `develop`). It creates the package.
+   `develop`; tick `skip_ci_gate` if CI of the head is not green). It creates the
+   package.
 2. Make it public: GitHub, organisation `codecoradev`, **Packages**, `tole`,
    **Package settings**, **Danger Zone**, **Change visibility**, **Public**.
    (If the button is greyed out, an organisation owner has to allow public
@@ -225,9 +261,32 @@ The digest of what runs now: `docker compose images tole`.
    **Connect repository** on the package page. Under **Manage Actions access**
    the repository must be listed with **Write** (it is, when the workflow created
    the package; add it by hand if the package was pushed from elsewhere first).
-4. Optional: add the `Container image` build check as a required check of `develop`
+4. Optional, recommended: an Environment on the two pushing jobs. Repository
+   **Settings**, **Environments**, **New environment** (name it `container-publish`),
+   **Deployment branches and tags**, **Selected branches and tags**, add the branch
+   `develop` and the tag pattern `v*`; then add `environment: container-publish`
+   to the jobs `build-push` and `publish` of the workflow (two lines). See "Known
+   limits" for why.
+5. Optional: add the `Container image` build check as a required check of `develop`
    only if every pull request should run it; it is path-filtered, so a required
    check would block pull requests that do not touch the recipe. Leave it advisory.
+
+**Known limits** (left as they are, on purpose):
+
+- **A pull request can change the workflow.** A pull request from a branch of this
+  repository runs the workflow text of that branch, and a collaborator who can push
+  a branch could edit it. The guarantees for pull request runs (no push, no
+  `packages` permission, never a fork) are only as strong as the text of the
+  workflow that review approves; branch protection and review of the workflow file
+  are what hold them. The Environment above is the technical backstop: a job in
+  it can only run for `develop` and `v*` tags.
+- **Floating action versions hold the token.** The workflow uses `actions/*` and
+  `docker/*` at a floating major, as every workflow of this repository does, and
+  those steps run with the `GITHUB_TOKEN` of the pushing jobs, which can write the
+  package. Dependabot (`github-actions`, weekly) keeps them current; pinning to a
+  full commit is a repository-wide decision, not made here.
+- **The nightly's gate is the smoke test and the `CI` run of the commit**, not the
+  other workflows (security scans, perf budget).
 
 No secret and no repository variable is needed: the workflow logs in with the
 run's `GITHUB_TOKEN`.
@@ -652,9 +711,11 @@ not run once**. What was checked, by reading and by running what can run here:
 - The workflow parses as YAML (PyYAML), every `run:` block passes `bash -n`, and
   every `${{ }}` expression was read against the contexts GitHub allows at that
   place. `actionlint` and `shellcheck` were not available.
-- `scripts/container/test-image-tags.sh` passes (18 cases: both channels,
-  forward-only floating tags, numeric version order, prerelease, backport, no
-  `latest`, every refusal).
+- `scripts/container/test-image-tags.sh` passes (27 cases: both channels,
+  forward-only floating tags, numeric version order, prerelease and its length
+  cap, backport, stray malformed or huge tags in the list, leading zeros, no
+  `latest`, every refusal). The version match of `smoke.sh` (`1.2.3` does not
+  match `1.2.30` or `11.2.3`) was run by hand on its own.
 - `docker compose config` parses `templates/container/compose.yaml` with the
   default variables and with `TOLE_IMAGE` and `TOLE_IMAGE_TAG` set to a GHCR
   image.
@@ -666,4 +727,8 @@ of the Dockerfile on either platform; `smoke.sh` against a real image (the
 wrong assumption there fails every nightly until fixed); `docker buildx imagetools
 create --annotation` and the `jq` index check; the `ubuntu-24.04-arm` build
 time of the Rust stage (the earlier amd64 build took 4 min 55 s at 3 jobs); that
-GHCR links the package and takes the visibility change as described.
+GHCR links the package and takes the visibility change as described; the
+`gh api` query of the nightly's CI gate and the concurrency expression (read, run
+only through a `jq` stand-in for the gate); `docker pull` of a digest on the
+arm64 runner; the re-run paths (anchor reuse, a develop head that moved), which
+need a registry; that GitHub keeps a cancelled pending release run re-runnable.
