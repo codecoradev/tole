@@ -427,7 +427,8 @@ step cannot run there. What was done instead, and what that does and does not sh
   tests did not need (the provider was a plain-HTTP stand-in).
 - **The compose file, unchanged but for the Caddy hardening,** `docker compose up
   --no-build -d` with that test image: `tole` reached `healthy` (the real
-  `healthcheck.sh` inside the container), the proxy started after it, and with
+  `healthcheck.sh` inside the container; that run used the script as it was then, with
+  `GET /health`, and was not repeated after #1318 moved it to `GET /ready`), the proxy started after it, and with
   the secrets owned by root and mode `0600` the stack failed as documented
   (entrypoint exit 64, restart loop) and with owner 10001 and `0400` it started.
   Inside the running container: uid 10001, root filesystem read-only (a write to
