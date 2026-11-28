@@ -48,9 +48,12 @@ pub fn stream_item(mapper: &mut EntryMapper, item: &StreamItem) -> Vec<TaskEvent
             }
             Event::Resync { .. } => vec![TaskEvent::Resync],
             Event::Closed { .. } => vec![TaskEvent::Closed],
-            Event::ToolStarted { .. } | Event::ToolFinished { .. } | Event::Other { .. } => {
-                Vec::new()
-            }
+            // The discussion stream's frames (#1094) never reach a task's.
+            Event::ToolStarted { .. }
+            | Event::ToolFinished { .. }
+            | Event::Changed(_)
+            | Event::DiscussionState { .. }
+            | Event::Other { .. } => Vec::new(),
         },
     }
 }

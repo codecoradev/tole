@@ -214,3 +214,33 @@ fn a_secret_in_a_stop_gate_reason_never_leaves_in_the_problem() {
         "the secret left: {done}"
     );
 }
+
+/// #1314: the error reply of ACP (`reply_error`) is redacted with the egress
+/// secret set like the problem's detail. A session file that no longer opens
+/// names the offending header value in its message.
+#[test]
+fn a_secret_in_a_storage_error_never_leaves_in_the_error_reply() {
+    let cwd = TestDir::new("tole-acp-error");
+    let sessions = cwd.path().join(".tole/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("corrupt.jsonl"), format!("\"{LEAKED}\"\n")).unwrap();
+    let mut acp = Acp::spawn(&[], Some(cwd.path()));
+    acp.call(
+        1,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let params = json!({"sessionId": "corrupt", "cwd": cwd.to_string_lossy()});
+    let reply = acp.call(2, "session/load", params);
+    let message = reply["error"]["message"].as_str().expect("an error reply");
+    assert!(message.contains("corrupt session file"), "{reply}");
+    assert!(
+        !reply.to_string().contains(LEAKED),
+        "the secret left: {reply}"
+    );
+    assert!(
+        !message.contains("sk-leak-"),
+        "a head of it is left: {reply}"
+    );
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+}

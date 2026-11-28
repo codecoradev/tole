@@ -1,8 +1,15 @@
-use super::*;
-use tole_core::skill_curator::{RunTracker, UsageLedger};
+//! Run outcomes for the skill curator (#593): the classification of a turn and a
+//! mission, and what is written to the usage ledger. Moved from the unit tests
+//! of `skill/outcome.rs` unchanged (they use the public API only).
 
-fn ledger(tag: &str) -> (UsageLedger, crate::test_dir::TestDir) {
-    let d = crate::test_dir::TestDir::new(&format!("tole-outcome-{tag}"));
+mod common;
+use common::TestDir;
+use tole_cli::skill::outcome::{classify_mission, classify_turn, record_with, Outcome};
+use tole_core::skill_curator::{RunTracker, UsageLedger};
+use tole_core::turn::TurnOutcome;
+
+fn ledger(tag: &str) -> (UsageLedger, TestDir) {
+    let d = TestDir::new(&format!("tole-outcome-{tag}"));
     (UsageLedger::new(d.join("usage.jsonl")), d)
 }
 

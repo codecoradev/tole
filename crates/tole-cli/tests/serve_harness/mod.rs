@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::common;
 
+pub mod discussion_mock;
+
 /// A new workspace directory for one `Serve`. The six tests of a binary run as
 /// threads of ONE process and each starts a serve at once, so a name built from
 /// the pid and the clock alone can repeat (a coarse clock, as on a virtualised CI

@@ -105,15 +105,18 @@
 //! One method per route of the desktop's set: sessions (create, resume, prompt,
 //! cancel, interrupt, detach, status, entries, events, fork, tree, compact,
 //! name, model, effort, images), approvals, models, missions, and the
-//! discussion, cron, profile, skill and tool routes of #1042. [`Route::ALL`]
+//! discussion, cron, profile, skill and tool routes of #1042, and the event
+//! stream of a discussion (#1094, [`Client::follow_discussion`]). [`Route::ALL`]
 //! lists them. `crates/tole-cli/tests/client_routes.rs` compares that list with
 //! the routes `tole serve` registers and fails on a route on one side only,
 //! except for the few the client leaves out on purpose.
 
+mod body;
 mod client;
 mod error;
 mod http;
 mod info;
+mod path;
 mod problem;
 mod resume;
 mod route;
@@ -134,7 +137,7 @@ pub use info::Info;
 pub use problem::Problem;
 pub use resume::{ReconnectPolicy, ResumingStream, StreamItem};
 pub use route::Route;
-pub use sse::{Event, Frame, FrameReader, Ready, SseItem, SseParser};
+pub use sse::{Changed, Event, Frame, FrameReader, Ready, SseItem, SseParser};
 pub use tls::TlsTransport;
 pub use transport::{Connection, TcpTransport, Transport};
 pub use types::*;

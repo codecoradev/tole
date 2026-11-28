@@ -21,6 +21,7 @@ pub enum Route {
     Models,
     Discussions,
     Discussion,
+    DiscussionEvents,
     DiscussionEstimate,
     StartDiscussion,
     ResumeDiscussion,
@@ -48,7 +49,7 @@ pub enum Route {
 }
 
 impl Route {
-    pub const ALL: [Route; 39] = [
+    pub const ALL: [Route; 40] = [
         Route::Health,
         Route::Info,
         Route::Sessions,
@@ -64,6 +65,7 @@ impl Route {
         Route::Models,
         Route::Discussions,
         Route::Discussion,
+        Route::DiscussionEvents,
         Route::DiscussionEstimate,
         Route::StartDiscussion,
         Route::ResumeDiscussion,
@@ -135,6 +137,7 @@ impl Route {
             Route::Models => "/models",
             Route::Discussions => "/discussions",
             Route::Discussion => "/discussions/{id}",
+            Route::DiscussionEvents => "/discussions/{id}/events",
             Route::DiscussionEstimate => "/discussions/estimate",
             Route::StartDiscussion => "/discussions",
             Route::ResumeDiscussion => "/discussions/{id}/resume",

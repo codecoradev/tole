@@ -82,7 +82,3 @@ pub fn record_turn(o: &TurnOutcome) {
 pub fn record_mission(status: &str) {
     record(classify_mission(status));
 }
-
-#[cfg(test)]
-#[path = "outcome_tests.rs"]
-mod tests;

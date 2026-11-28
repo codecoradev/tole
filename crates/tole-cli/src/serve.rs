@@ -32,6 +32,7 @@ use events::serve_events;
 use hooks::handle_hook;
 use images::{image_error, read_image, respond_image, upload_image};
 use live_sessions::{live, open_serve_session, resume_session, serve_storage_dir, warm_status};
+use pct::{id_between, with_id};
 use request::{read_request, ReadError};
 use response::{respond, respond_unauthorized, respond_with};
 use session_routes::{compact_route, fork_route, name_route, tree_route, with_idle_session};
@@ -46,6 +47,7 @@ use tole_core::storage::Storage;
 
 mod approval_audit;
 mod cron;
+mod discussion_events;
 mod discussions;
 mod events;
 mod hooks;
@@ -321,10 +323,15 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // The event stream owns its connection for as long as it is open, so it
     // is served here rather than through `route` (which returns one JSON
     // body).
-    if req.method == "GET" {
-        if let Some((id, query)) = events_target(&req.path) {
+    type Follow = fn(Conn, &Arc<State>, &str, &str, Option<&str>);
+    let streams: [(&str, Follow); 2] = [
+        ("/sessions/", serve_events),
+        ("/discussions/", discussion_events::serve),
+    ];
+    for (collection, follow) in streams.into_iter().filter(|_| req.method == "GET") {
+        if let Some((id, query)) = events_target(&req.path, collection) {
             match pct::id(id) {
-                Ok(id) => serve_events(stream, &state, &id, query, req.last_event_id.as_deref()),
+                Ok(id) => follow(stream, &state, &id, query, req.last_event_id.as_deref()),
                 Err((status, payload)) => respond(&mut stream, status, &payload),
             }
             return;
@@ -375,34 +382,12 @@ fn image_target(path: &str) -> Option<(&str, &str)> {
     (ok(id) && ok(hash)).then_some((id, hash))
 }
 
-/// `/sessions/{id}/events[?query]` -> `(id, query)`.
-fn events_target(path: &str) -> Option<(&str, &str)> {
+/// `{collection}{id}/events[?query]` -> `(id, query)`: `/sessions/` and
+/// `/discussions/` have an event stream.
+fn events_target<'a>(path: &'a str, collection: &str) -> Option<(&'a str, &'a str)> {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let id = path.strip_prefix("/sessions/")?.strip_suffix("/events")?;
+    let id = path.strip_prefix(collection)?.strip_suffix("/events")?;
     (!id.is_empty() && !id.contains('/')).then_some((id, query))
-}
-
-/// The id of a route shaped `{prefix}{id}{suffix}`, or `None` when the path is
-/// not of that shape. The id may be empty (`/discussions//resume`) and the
-/// caller refuses it. A path that is only the suffix after the collection
-/// (`/discussions/resume`) starts with the prefix and ends with the suffix at
-/// once, and slicing it by the two lengths made a reversed range and a panic,
-/// so the prefix is stripped first and the suffix from what is left.
-fn id_between<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
-    path.strip_prefix(prefix)?.strip_suffix(suffix)
-}
-
-/// Runs `f` with the percent-decoded id of a route matched by [`id_between`]
-/// (the match is on the raw path, the id is decoded after it: see `pct`), or
-/// answers the `400` of a value that does not decode.
-fn with_id(
-    raw: Option<&str>,
-    f: impl FnOnce(&str) -> (u16, serde_json::Value),
-) -> (u16, serde_json::Value) {
-    match pct::id(raw.unwrap_or_default()) {
-        Ok(id) => f(&id),
-        Err(refused) => refused,
-    }
 }
 
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
