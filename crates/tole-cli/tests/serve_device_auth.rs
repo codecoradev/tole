@@ -265,6 +265,12 @@ fn a_damaged_token_file_is_said_once_per_state_and_only_to_a_device_token() {
             .expose(),
     );
     let file = serve.home.join("tole/serve-tokens.jsonl");
+    // The first use writes its last-use line; after it the file only changes by what the test does,
+    // so both damages below are the same bytes and the same error text.
+    assert_eq!(
+        status_of(&raw(port, "GET", "/sessions", Some(&good), "")),
+        200
+    );
     let healthy = std::fs::read_to_string(&file).unwrap();
     let damage = || {
         use std::io::Write;
@@ -277,6 +283,7 @@ fn a_damaged_token_file_is_said_once_per_state_and_only_to_a_device_token() {
     let get = |credential: &str| status_of(&raw(port, "GET", "/sessions", Some(credential), ""));
 
     damage();
+    let damaged = std::fs::read_to_string(&file).unwrap();
     // A mistyped shared token or a wrong-shape bearer costs no look at the file.
     assert_eq!(get("Bearer t0ken-typo"), 401);
     assert_eq!(get("Bearer wrong"), 401);
@@ -290,6 +297,11 @@ fn a_damaged_token_file_is_said_once_per_state_and_only_to_a_device_token() {
     std::fs::write(&file, &healthy).unwrap();
     assert_eq!(get(&good), 200);
     damage();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        damaged,
+        "the same damage twice"
+    );
     assert_eq!(get(&good), 401);
     assert_eq!(said(&serve), 2, "{}", serve.text());
 }
