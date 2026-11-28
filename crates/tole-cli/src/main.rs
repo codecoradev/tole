@@ -303,7 +303,7 @@ enum Command {
     },
     /// Run an autonomous mission: budgeted turn-chaining toward a goal
     /// (issue #199). Every chained turn is a normal durable turn —
-    /// crash mid-mission resumes exactly where it stopped; Destructive
+    /// crash mid-mission: `tole resume` first, then `--resume`; Destructive
     /// tools stay un-auto-allowable. Termination: the model declares
     /// MISSION_COMPLETE (and `--verify` exits 0, when set), or a budget
     /// trips (`--max-steps` / `--max-minutes`), or the verify gate fails

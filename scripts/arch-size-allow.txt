@@ -1,6 +1,6 @@
 # 2026-11-28: a fifth owner-approved ONE-TIME raise (the owner's answer in the session of 2026-11-28): the
 # `crate tole-cli` total, for the device token feature of #1320 in two steps. Step 1, the token store (A):
-# 83952 -> 84988 (+1036). Step 2, the `tole serve token` CLI (B): 84988 -> 85182 (+194). It is for this feature
+# 83928 -> 84964 (+1036). Step 2, the `tole serve token` CLI (B): 84964 -> 85158 (+194). It is for this feature
 # only; later work must offset its lines or wait for the owner. Never again without the owner.
 # 2026-11-26: a fourth owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 132 lines of module
 # glue (`//!` docs, imports, `mod` declarations, blank lines) that splitting serve.rs into 16 modules adds
@@ -23,9 +23,8 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 85182
+crate tole-cli 85158
 crate tole-core 64689
-file crates/tole-cli/src/acp.rs 1446
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
@@ -53,17 +52,17 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 1104
+file crates/tole-cli/src/serve.rs 1091
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
 file crates/tole-cli/src/serve_support/transport.rs 882
-file crates/tole-cli/src/session/assemble.rs 955
+file crates/tole-cli/src/session/assemble.rs 953
 file crates/tole-cli/src/session/export.rs 546
 file crates/tole-cli/src/session/host.rs 1828
 file crates/tole-cli/src/session/index.rs 503
 file crates/tole-cli/src/session/runner.rs 768
-file crates/tole-cli/src/session/tools.rs 525
+file crates/tole-cli/src/session/tools.rs 513
 file crates/tole-cli/src/session/usage.rs 781
 file crates/tole-cli/src/skill/approve.rs 1274
 file crates/tole-cli/src/skill/curator.rs 736
