@@ -142,6 +142,18 @@ version step first. Do not run two servers on the same
 `docker run --rm -v tole_tole-data:/data -v "$PWD":/b debian:bookworm-slim tar czf /b/tole-data.tgz -C /data .`
 (the volume name is prefixed with the compose project name).
 
+**Disk growth.** Nothing in tole removes or rotates a session file or a spilled
+image: the ledgers and `/data/codecora/tole/images` only grow, and they share the
+`tole-data` volume with the config and the cron store, so a full volume stops all
+of it. `GET /ready` fails on a read-only volume (its `state` check creates and
+removes an empty file in `/data/sessions` and in the tole data directory under `/data/codecora`), but it is a
+write probe and not a space alarm: watch free space from the host (`df -h`, the
+orchestrator's volume metric). To see what is using it:
+`du -sh /data/sessions /data/codecora/tole/images` and `ls -lS /data/sessions | head`
+inside the container. Retention is a proposal awaiting an owner decision, see
+[session-retention-design.md](session-retention-design.md) (#1020), which also
+says what can be said about sizing the volume.
+
 ## TLS and the live event stream
 
 tole serves plain HTTP; TLS ends at the proxy the owner runs (decision D6 of
