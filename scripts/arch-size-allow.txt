@@ -19,7 +19,7 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 83951
+crate tole-cli 83928
 crate tole-core 64689
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
@@ -48,7 +48,7 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 1102
+file crates/tole-cli/src/serve.rs 1091
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
@@ -70,8 +70,6 @@ file crates/tole-cli/src/webhook_out/approval_sender_tests.rs 859
 file crates/tole-cli/src/webhook_out/outbox_tests.rs 539
 file crates/tole-cli/src/webhook_out/send_tests.rs 667
 file crates/tole-cli/src/webhook_out/volatile_tests.rs 537
-file crates/tole-cli/tests/acp_approval.rs 651
-file crates/tole-cli/tests/acp_config_options.rs 734
 file crates/tole-cli/tests/client_contract.rs 812
 file crates/tole-cli/tests/config_apply.rs 741
 file crates/tole-cli/tests/config_sensitive.rs 1141

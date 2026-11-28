@@ -1,41 +1,16 @@
 //! D3 (issue #96): `tole serve` — tole as an HTTP daemon.
 //!
-//! A long-running, token-authenticated HTTP server exposing the session
-//! host over REST:
-//!
-//! - `GET  /health`                → liveness (no auth)
-//! - `POST /sessions`              → open a session (`{"cwd": "..."}`)
-//! - `GET  /sessions`              → list session ids + busy flags
-//! - `GET  /sessions/{id}`         → session status
-//! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
-//! - `POST /sessions` also takes `{"resume": "<id>"}` to reopen an existing
-//!   session (#524)
-//! - `GET  /sessions/{id}/events?after=<seq>` → Server-Sent Events: durable
-//!   `entry` frames replayed from a `seq`, ephemeral text/tool/approval
-//!   frames (#524; see `tole_cli::events`)
-//! - `GET  /sessions/{id}/entries?after=<seq>&limit=<n>` → one page of the
-//!   session log (#524; see `tole_cli::protocol`)
-//! - `POST /sessions/{id}/interrupt` → steer the running turn without
-//!   cancelling it (`{"text": "...", "urgent": false}`, #377)
-//! - `POST /sessions/{id}/images` → upload one image as the raw body (#558);
-//!   `POST /sessions/{id}/prompt` takes `"images": [<id>]` next to `text`
-//! - `GET  /sessions/{id}/images/{fnv1a64}` → the bytes of an image recorded
-//!   in that session's log (#558; see `tole_cli::serve_images`)
+//! A long-running, token-authenticated HTTP server exposing the session host over REST
+//! (routes: `docs/mobile-control.md`). `GET /health` is liveness and `GET /ready` readiness
+//! (#1017), both without auth.
 //!
 //! `--socket <path>` (#1043) listens on a Unix domain socket in a private (0700)
 //! directory instead of TCP; routes, auth and the event stream are the same
-//! code path (see `tole_cli::serve_support::transport`). `GET /health` also
-//! returns the protocol and binary version.
+//! code path (see `tole_cli::serve_support::transport`).
 //!
-//! SIGTERM and SIGINT start a graceful shutdown (#1014; see
-//! `tole_cli::serve_support::shutdown`): new requests get 503, running turns are
-//! detached through the session host's detach path, the cron ticker and the
-//! webhook senders stop, and the process exits 0 once nothing is left, or
-//! non-zero when `--shutdown-grace` (default 20 s) runs out or a second signal
-//! arrives.
+//! SIGTERM and SIGINT start a graceful shutdown (#1014; `tole_cli::serve_support::shutdown`).
 //!
-//! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
-//! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`,
+//! Auth is a static bearer token (env `TOLE_SERVE_TOKEN`,
 //! `--token-file` or `--token`) or, with `--auth basic`, HTTP Basic against a
 //! password hash (#742; the token still works next to it when one is set) —
 //! refuses to start without credentials. Binds 127.0.0.1 by default; `--bind`
@@ -61,6 +36,7 @@ use request::{read_request, ReadError};
 use response::{respond, respond_unauthorized, respond_with};
 use session_routes::{compact_route, fork_route, name_route, tree_route, with_idle_session};
 use tole_cli::serve_support::profiles::ProfileSource;
+use tole_cli::serve_support::ready::is_probe;
 use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::Conn;
 use tole_cli::session::problem::prompt_answer;
@@ -166,6 +142,8 @@ struct State {
     /// The `turn_finished` webhook callback (#962), set once at start-up when a
     /// destination lists the event. Empty, no turn path does anything extra.
     turn_events: std::sync::OnceLock<tole_cli::webhook_out::turn::TurnNotifier>,
+    /// What `GET /ready` checks, and the helper threads it and the drain watch (#1017).
+    ready: tole_cli::serve_support::ready::Readiness,
 }
 
 /// Announces a settled turn of a `tole serve` session to the destinations that
@@ -296,7 +274,9 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
     // local socket every peer shares one bucket, so the unauthenticated liveness
     // probe is exempt there: a client with a stale token must not be able to make
     // a running serve look dead to the one that attaches (TCP is unchanged).
-    let socket_probe = stream.is_local_socket() && req.method == "GET" && req.path == "/health";
+    let socket_probe = stream.is_local_socket()
+        && req.method == "GET"
+        && is_probe(&req.path, req.authorization.is_some());
     if limited && !socket_probe {
         respond(
             &mut stream,
@@ -317,7 +297,7 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
 
     // The one auth check (#742): every route below this line is behind it,
     // for a bearer token and for Basic alike.
-    let authorized = req.path == "/health"
+    let authorized = is_probe(&req.path, req.authorization.is_some())
         || req
             .verdict
             .unwrap_or_else(|| state.auth.check(req.authorization.as_deref()));
@@ -326,6 +306,15 @@ fn handle_conn(mut stream: Conn, state: Arc<State>) {
             state.auth_failures.record_failure(ip);
         }
         respond_unauthorized(&mut stream, &state.auth);
+        return;
+    }
+
+    // `/ready` (#1017): the status for anyone, the checks only for a credential that passed.
+    if req.method == "GET" && req.path == "/ready" {
+        let (status, payload) = state
+            .ready
+            .answer(tole_cli::cron::now(), req.authorization.is_some());
+        respond(&mut stream, status, &payload);
         return;
     }
 
