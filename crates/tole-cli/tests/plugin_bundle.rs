@@ -1,4 +1,8 @@
-use super::*;
+//! The plugin bundle manifest (`tole_cli::plugin::bundle`).
+
+mod common;
+
+use tole_cli::plugin::bundle::*;
 
 const OK: &str = r#"
 name = "acme"
@@ -61,7 +65,7 @@ fn a_manifest_that_could_widen_a_grant_or_inject_is_refused() {
 
 #[test]
 fn load_hashes_the_exact_bytes_and_any_change_moves_the_hash() {
-    let dir = crate::test_dir::TestDir::new("tole-bundle-load");
+    let dir = common::TestDir::new("tole-bundle-load");
     let file = dir.join(FILE);
     std::fs::write(&file, OK).unwrap();
     let a = load(&dir).unwrap();
@@ -75,7 +79,7 @@ fn load_hashes_the_exact_bytes_and_any_change_moves_the_hash() {
 
 #[test]
 fn a_huge_or_non_text_manifest_is_refused() {
-    let dir = crate::test_dir::TestDir::new("tole-bundle-big");
+    let dir = common::TestDir::new("tole-bundle-big");
     let file = dir.join(FILE);
     std::fs::write(&file, vec![b'#'; MAX_BYTES as usize + 1]).unwrap();
     assert!(load(&file).unwrap_err().contains("larger"));

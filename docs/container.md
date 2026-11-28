@@ -7,7 +7,7 @@ changes. What is here:
 
 | File | What it is |
 |---|---|
-| [`Dockerfile`](../Dockerfile) | Multi-stage build of the release binary of `tole-cli` (default features), a Debian slim runtime, a non-root user (uid 10001), `tole serve` as the command, a `HEALTHCHECK` on `GET /health` |
+| [`Dockerfile`](../Dockerfile) | Multi-stage build of the release binary of `tole-cli` (default features), a Debian slim runtime, a non-root user (uid 10001), `tole serve` as the command, a `HEALTHCHECK` on `GET /ready` |
 | [`.dockerignore`](../.dockerignore) | The build context is `Cargo.toml`, `Cargo.lock`, `crates/` and `scripts/container/` only |
 | [`scripts/container/`](../scripts/container) | `docker-entrypoint.sh` (reads a secret file into `TOLE_API_KEY`), `healthcheck.sh`, `stream_probe.py` (the streaming and resume test client) |
 | [`templates/container/compose.yaml`](../templates/container/compose.yaml) | tole plus one Caddy proxy; only the proxy publishes ports |
@@ -98,8 +98,13 @@ lists both).
   modes. That matters on a bind-mounted workspace a person on the host also
   edits; use a named volume or change the `umask` line in the entrypoint.
 - **Health.** `HEALTHCHECK` runs `healthcheck.sh` (bash `/dev/tcp`, no curl in
-  the image): `GET /health` on the container's loopback must answer `200`. It
-  answers `503` while serve drains after SIGTERM.
+  the image): `GET /ready` on the container's loopback must answer `200`: the
+  state directories (`/data/codecora`, `/data/sessions`) take a write, and with
+  `--cron` the ticker beats. It answers `503` when one does not (a read-only or full
+  volume shows up here) and while serve drains after SIGTERM. `GET /health` is the
+  liveness answer (the process is up) for a probe that must not fail on a full disk;
+  a Kubernetes readiness probe uses `/ready`, a liveness probe `/health`. Neither
+  takes a token (mobile-control.md, "`GET /ready`").
 - **Stop.** SIGTERM drains for `--shutdown-grace` (default 20 s; running turns
   are detached and stay resumable, see mobile-control.md "Shutdown"). The
   compose file sets `stop_grace_period: 30s`, above the grace; Docker's own
@@ -205,7 +210,8 @@ serve in a container (#1044)") and [desktop-design.md](desktop-design.md) 3.2 an
   tunnel) or restrict the proxy to the addresses you use; the nginx template
   adds a request-rate limit, which only slows a flood. Do this at the proxy; tole
   has nothing to restrict it by.
-- **`/health` and the webhook routes need no token.** `/health` tells anyone the exact tole version. Webhook routes keep
+- **`/health`, `/ready` and the webhook routes need no token.** `/health` tells anyone the exact tole version; `/ready` tells
+  anyone whether serve works (`200` or `503`, no detail; the failing check only with the token). Webhook routes keep
   their own HMAC gate; a route configured `insecure_loopback` is refused by
   serve on a non-loopback bind, which `0.0.0.0` is.
 - **HTTP between the proxy and tole.** The traffic on the compose network is

@@ -199,6 +199,7 @@ fn health_is_open_and_names_the_protocol_and_binary_version(s: &Server) {
         assert_eq!(r.body["protocol"], 1);
         assert_eq!(r.body["version"], env!("CARGO_PKG_VERSION"));
     }
+    assert_eq!(s.http("GET", "/ready", None, None).code, 200);
 }
 
 fn every_route_but_health_wants_the_token(s: &Server) {
@@ -286,13 +287,12 @@ fn repeated_wrong_tokens_are_rate_limited(s: &Server) {
     assert_eq!(last, 429);
     // The limiter keys the peer: even the right token waits out the window.
     assert_eq!(s.get("/sessions").code, 429);
-    // The liveness probe: on the socket every peer shares the bucket, so
-    // `/health` stays reachable (an attaching client must be able to see a
-    // running serve); on TCP it is limited as before.
-    let health = s.http("GET", "/health", None, None).code;
-    match s.transport {
-        Transport::Socket => assert_eq!(health, 200),
-        Transport::Tcp => assert_eq!(health, 429),
+    // The probes: on the socket every peer shares the bucket, so `/health` and `/ready` stay
+    // reachable (an attaching client must see a running serve); on TCP they are limited as before.
+    let open = matches!(s.transport, Transport::Socket);
+    for path in ["/health", "/ready"] {
+        let code = s.http("GET", path, None, None).code;
+        assert_eq!(code, if open { 200 } else { 429 }, "{path}");
     }
 }
 

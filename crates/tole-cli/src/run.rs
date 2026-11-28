@@ -14,9 +14,7 @@ use tole_core::storage::{JsonlStorage, Storage};
 #[cfg(feature = "shell-tools")]
 use tole_core::turn::TurnOutcome;
 
-// ---------------------------------------------------------------------------
-// Commands
-// ---------------------------------------------------------------------------
+// ---- Commands ----
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_command(
