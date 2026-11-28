@@ -15,7 +15,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Workspace files | `--workspace` dir (default cwd) | Readable AND writable by the model via tools |
 | Host env of child processes | inherited by spawned commands | See ENV-1 |
 | Subprocess execution authority | run_command / job_start / git / gh | The model chooses argv within argv-split + jail rules |
-| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential; an interpreter that edits it is not stopped (defense in depth only, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
+| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential, so `add` and `revoke` refuse under an agent session (#684, defense in depth, not a boundary: an interpreter that edits the file is not stopped, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
 
 ## Trust boundaries
 
@@ -524,8 +524,9 @@ denied (a stolen device cannot bank future approvals), every decision
 is audited on the session, and there is no push endpoint in tole — the
 phone pulls, so the attack surface tole exposes is exactly the
 authenticated REST face. Scoped device tokens (per-device, revocable,
-read-only vs approver roles) are #1320: part 1 (the token store) exists but nothing creates a token yet and
-`tole serve` does not check them, so until part 2 enforces the scope the deployment guidance is
+read-only vs approver roles) are #1320: part 1 (the store and
+`tole serve token add|list|revoke`) exists but `tole serve` does not check
+them yet, so until part 2 enforces the scope the deployment guidance is
 unchanged: a dedicated OS user + minimal `--allow`/`--trust` on the serve
 process.
 

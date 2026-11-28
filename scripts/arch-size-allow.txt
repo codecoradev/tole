@@ -42,7 +42,7 @@ file crates/tole-cli/src/discuss/tests.rs 1056
 file crates/tole-cli/src/discuss/tool.rs 637
 file crates/tole-cli/src/discuss/tool_tests.rs 898
 file crates/tole-cli/src/doctor.rs 1561
-file crates/tole-cli/src/main.rs 2196
+file crates/tole-cli/src/main.rs 2194
 file crates/tole-cli/src/mission.rs 922
 file crates/tole-cli/src/plugin/cmd.rs 1658
 file crates/tole-cli/src/plugin/cmd_tests.rs 1989

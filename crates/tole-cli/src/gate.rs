@@ -86,6 +86,11 @@ pub(crate) fn gate_policy(cmd: &Command) -> GatePolicy {
         } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } | Command::Hook { .. } => GatePolicy::Skip,
+        // `serve token ...` only edits the token file; the server itself keeps `NoPrompt`.
+        #[cfg(feature = "shell-tools")]
+        Command::Serve {
+            action: Some(_), ..
+        } => GatePolicy::Skip,
         Command::Webhook { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.

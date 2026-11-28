@@ -613,7 +613,12 @@ enum Command {
     /// Serve tole over HTTP (issue #96): token-authenticated daemon;
     /// `--transport mcp` serves the multi-session MCP surface (#137).
     #[cfg(feature = "shell-tools")]
+    #[command(args_conflicts_with_subcommands = true)]
     Serve {
+        /// Not the server: `token add|list|revoke` manages per-device tokens (#1320).
+        #[command(subcommand)]
+        action: Option<tole_cli::serve_support::device_tokens::ServeAction>,
+
         /// TCP port to listen on.
         #[arg(long, default_value_t = 7801)]
         port: u16,
@@ -1771,6 +1776,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Serve {
+            action: Some(action),
+            ..
+        } => tole_cli::serve_support::device_tokens::cli(action),
+        #[cfg(feature = "shell-tools")]
+        Command::Serve {
+            action: None,
             port,
             socket,
             bind,
@@ -2126,20 +2137,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Audit { goal, json, .. } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
-            let data = tole_core::paths::tole_data_dir().ok_or_else(|| {
-                anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)")
-            })?;
-            let log = tole_cli::delegate::log_path(&data, &root)
-                .ok_or_else(|| anyhow!("cannot canonicalize the workspace {}", root.display()))?;
-            let out = tole_cli::audit::audit(
-                &log,
-                goal.as_deref(),
-                json,
-                &tole_core::secrets::SecretSet::from_env(),
-            )
-            .map_err(anyhow::Error::msg)?;
-            print!("{out}");
-            Ok(())
+            owner_cmds::audit_command(&root, goal.as_deref(), json)
         }
         Command::Status { id } => {
             let id = match id {

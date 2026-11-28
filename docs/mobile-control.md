@@ -545,20 +545,29 @@ serve).
 
 ## Device tokens (#1320)
 
-Part 1 of #1320 is the token store, `tole_cli::serve_support::device_tokens`. The owner commands
-`tole serve token add|list|revoke` are the next change, so nothing creates a token yet, and
-**`tole serve` does not check device tokens**: a request is accepted with the shared bearer token
-(or Basic) and nothing else, and a device token sent today is refused like any wrong token. Part 2
-changes the serve middleware: a `read-only` token will be refused on every route that changes state
-or answers an approval, a `full` token will equal today's bearer token, a revoked token will be
-refused on the next request, and `GET /info` will report the scope of the calling token. Until part
-2 is released, a `read-only` token protects nothing.
+Part 1 of #1320 is on the owner's side only: **`tole serve` does not check device tokens yet.**
+A request is still accepted with the shared bearer token (or Basic) and nothing else; a device
+token sent today is refused like any wrong token. Part 2 changes the serve middleware: a
+`read-only` token will be refused on every route that changes state or answers an approval, a
+`full` token will equal today's bearer token, a revoked token will be refused on the next request,
+and `GET /info` will report the scope of the calling token. Until part 2 is released, a `read-only`
+token protects nothing.
 
-What the store does:
+What exists now, at a terminal, as the owner:
 
-- A token is `tole_dt_` and 43 characters (256 bits from the OS random source). `Store::add` returns
-  it once, to its caller; only its SHA-256 is stored, with the name, the scope, the time of creation
-  and a last-used time that part 2 fills in.
+```
+tole serve token add <name> --scope read-only|full   # prints the token once, on stdout
+tole serve token list                                # names, scopes, times; never a token
+tole serve token revoke <name>
+```
+
+- The token is `tole_dt_` and 43 characters (256 bits from the OS random source). It is printed once
+  and cannot be shown again: only its SHA-256 is stored, with the name, the scope, the time of
+  creation and a last-used time that part 2 fills in. The token goes to stdout alone, before
+  anything else is said (if it cannot be written, for example to a closed pipe, the new token is
+  revoked at once and the command fails); the sentence about it goes to stderr, last. It is never
+  an argument, so `T=$(tole serve token add phone --scope read-only)` keeps it out of the process
+  list **for `add` only**: using `$T` later in a command line shows it to every local process.
 - The file is `serve-tokens.jsonl` in the tole data dir (`$CODECORA_HOME/tole`), mode 0600, in a
   directory that is not group or world writable; a wider file is refused, not repaired. It is
   append-only by convention (no tole code rewrites it; the file system does not enforce it): a
@@ -569,10 +578,12 @@ What the store does:
   active tokens, and at most 64 tokens are active; errors show a name quoted and escaped.
 - A line that does not read back, a name added twice, a hash added twice (a revoked one included),
   a revoke of a name that is not active, or a newer record version makes the store unusable (every
-  call fails with the line number and writes nothing; no device token is valid until the owner
+  command fails with the line number and writes nothing; no device token is valid until the owner
   repairs the file by hand). Nothing is guessed, because a skipped revoke line would bring a
   revoked token back. For the same reason **restoring the file from a backup brings back every
   token revoked since the backup was taken: rotate all tokens after a restore.**
+- `add` and `revoke` refuse under an agent session (#684): a token holder or a model never mints or
+  revokes tokens. `list` shows no token and no hash.
 - For part 2 (the code that will enforce the scope): `Live::lookup` holds a mutex while it reloads
   the file and `Live::touch` writes synchronously, so the serve middleware must call them from
   `spawn_blocking` or an equivalent thread. Last-used lines are never compacted: after 3 MiB of
