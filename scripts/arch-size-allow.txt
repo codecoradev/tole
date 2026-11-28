@@ -1,6 +1,6 @@
 # 2026-11-28: a fifth owner-approved ONE-TIME raise (the owner's answer in the session of 2026-11-28): the
 # `crate tole-cli` total, for the device token feature of #1320 in two steps. Step 1, the token store (A):
-# 83928 -> 84964 (+1036). Step 2, the `tole serve token` CLI (B): 84964 -> 85158 (+194). It is for this feature
+# 83928 -> 84964 (+1036; other changes have since lowered the total to 84674). Step 2, the `tole serve token` CLI (B): 84674 -> 84868 (+194). It is for this feature
 # only; later work must offset its lines or wait for the owner. Never again without the owner.
 # 2026-11-26: a fourth owner-approved ONE-TIME raise: the `crate tole-cli` total, by the 132 lines of module
 # glue (`//!` docs, imports, `mod` declarations, blank lines) that splitting serve.rs into 16 modules adds
@@ -23,8 +23,8 @@
 #   - an entry within its cap fails (remove it).
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
-crate tole-cli 85158
-crate tole-core 64689
+crate tole-cli 84868
+crate tole-core 64676
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
@@ -52,7 +52,7 @@ file crates/tole-cli/src/plugin/cmd_tests.rs 1989
 file crates/tole-cli/src/plugin/gate.rs 940
 file crates/tole-cli/src/plugin/gate_tests.rs 701
 file crates/tole-cli/src/review_gate.rs 945
-file crates/tole-cli/src/serve.rs 1091
+file crates/tole-cli/src/serve.rs 1076
 file crates/tole-cli/src/serve_support/auth.rs 649
 file crates/tole-cli/src/serve_support/events.rs 724
 file crates/tole-cli/src/serve_support/images.rs 526
@@ -91,9 +91,9 @@ file crates/tole-cli/tests/serve_webhook_out.rs 649
 file crates/tole-cli/tests/serve_webhook_turn.rs 808
 file crates/tole-cli/tests/skill_approval_e2e.rs 605
 file crates/tole-cli/tests/verify_sandbox.rs 1171
-file crates/tole-client/src/client.rs 616
+file crates/tole-client/src/client.rs 612
 file crates/tole-client/src/http.rs 807
-file crates/tole-client/src/sse.rs 540
+file crates/tole-client/src/sse.rs 514
 file crates/tole-client/src/types.rs 895
 file crates/tole-core/src/action_summary.rs 966
 file crates/tole-core/src/approval.rs 610
@@ -131,7 +131,7 @@ file crates/tole-core/src/sandbox.rs 872
 file crates/tole-core/src/sandbox/command.rs 1770
 file crates/tole-core/src/sandbox/command_tests.rs 2240
 file crates/tole-core/src/sandbox_tests.rs 934
-file crates/tole-core/src/secrets/mod.rs 1384
+file crates/tole-core/src/secrets/mod.rs 1359
 file crates/tole-core/src/session/storage.rs 1729
 file crates/tole-core/src/skills/approval.rs 1289
 file crates/tole-core/src/skills/curator.rs 705

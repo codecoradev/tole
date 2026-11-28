@@ -13,8 +13,10 @@
 //! does not depend on a serde_json feature another crate turns on.
 
 use crate::route::Route;
-use crate::sse::payload::{ClosedData, ResyncData, TextData, ToolFinishedData, ToolStartedData};
-use crate::sse::Ready;
+use crate::sse::payload::{
+    ClosedData, ResyncData, StateData, TextData, ToolFinishedData, ToolStartedData,
+};
+use crate::sse::{Changed, Ready};
 use crate::types::*;
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, SchemaGenerator};
@@ -63,6 +65,10 @@ fn sorted(v: Value) -> Value {
 /// the root `events` group, keyed by event name.
 const EVENT_STREAM: &str = "events";
 
+/// The same for the route of a discussion's stream (#1094): its frames are the
+/// root `discussionEvents` group.
+const DISCUSSION_STREAM: &str = "discussionEvents";
+
 /// What `route_types` names for the answer of the image read: the bytes of an
 /// image (`image/png`, `image/jpeg`, `image/gif` or `image/webp`), not JSON.
 /// The image upload takes the same bytes as its request body; the route entry's
@@ -89,6 +95,7 @@ fn route_types(r: Route) -> (Option<&'static str>, &'static str, &'static [&'sta
         Route::Models => (None, "Models", &[]),
         Route::Discussions => (None, "DiscussionList", &[]),
         Route::Discussion => (None, "Discussion", &[]),
+        Route::DiscussionEvents => (None, DISCUSSION_STREAM, &["after"]),
         Route::DiscussionEstimate => (Some("DiscussionRequest"), "DiscussionEstimate", &[]),
         Route::StartDiscussion => (Some("DiscussionRequest"), "DiscussionStarted", &[]),
         Route::ResumeDiscussion => (None, "DiscussionResumed", &[]),
@@ -195,12 +202,18 @@ pub(crate) fn generate() -> Value {
         ("resync", g.subschema_for::<ResyncData>()),
         ("closed", g.subschema_for::<ClosedData>()),
     ]);
+    let discussion_events = group(vec![
+        ("changed", g.subschema_for::<Changed>()),
+        ("ready", g.subschema_for::<Ready>()),
+        ("state", g.subschema_for::<StateData>()),
+        ("closed", g.subschema_for::<ClosedData>()),
+    ]);
     let routes: Vec<Value> = Route::ALL
         .iter()
         .map(|&r| {
             let (req, res, query) = route_types(r);
             let (response, stream) = match res {
-                EVENT_STREAM => (Value::Null, json!(EVENT_STREAM)),
+                EVENT_STREAM | DISCUSSION_STREAM => (Value::Null, json!(res)),
                 IMAGE_BYTES => (Value::Null, Value::Null),
                 _ => (json!(res), Value::Null),
             };
@@ -225,10 +238,11 @@ pub(crate) fn generate() -> Value {
     sorted(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "tole serve client protocol",
-        "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
+        "description": "Generated from the wire and event types of the tole-client crate; do not edit. `requests` and `responses` hold the JSON bodies, `events` the `data:` of each Server-Sent Event of GET /sessions/{id}/events by event name and `discussionEvents` the same for GET /discussions/{id}/events (a frame whose name is not listed is not an error: keep its data as opaque JSON), and `x-tole-routes` which route takes and returns what (`rawBody` names the side of a route whose body is the bytes of an image, not JSON).",
         "type": "object",
-        "properties": {"requests": requests, "responses": responses, "events": events},
-        "required": ["requests", "responses", "events"],
+        "properties": {"requests": requests, "responses": responses, "events": events,
+                       "discussionEvents": discussion_events},
+        "required": ["requests", "responses", "events", "discussionEvents"],
         "$defs": defs,
         "x-tole-routes": routes,
     }))
@@ -320,10 +334,15 @@ fn every_route_names_types_that_the_document_defines() {
             }
         }
     }
-    // A stream route points at a group of the root `events` property.
+    // A stream route points at a group of the root properties.
     let streams: Vec<&str> = routes.iter().filter_map(|r| r["stream"].as_str()).collect();
-    assert_eq!(streams, [EVENT_STREAM], "exactly the event route streams");
+    assert_eq!(
+        streams,
+        [EVENT_STREAM, DISCUSSION_STREAM],
+        "exactly the two event routes stream"
+    );
     assert!(doc["properties"][EVENT_STREAM].is_object());
+    assert!(doc["properties"][DISCUSSION_STREAM].is_object());
     // The raw side of an image route has no JSON type; the other side does.
     let raw: Vec<(&str, &str)> = routes
         .iter()
@@ -376,9 +395,8 @@ fn the_entry_mirror_matches_tole_core() {
 fn every_event_name_is_one_the_decoder_types() {
     use crate::sse::{Event, Frame};
     let doc = generate();
-    let events = doc["properties"]["events"]["properties"]
-        .as_object()
-        .unwrap();
+    let group = |name: &str| doc["properties"][name]["properties"].as_object().unwrap();
+    let (events, discussion_events) = (group("events"), group("discussionEvents"));
     let entry = json!({"seq": 1, "id": "e_1", "parentId": null, "type": "message", "timestamp": 1, "payload": {}});
     let approval = json!({"id": "a", "tool": "t", "status": "pending"});
     let sample = |name: &str| match name {
@@ -390,9 +408,13 @@ fn every_event_name_is_one_the_decoder_types() {
         "approval_requested" | "approval_resolved" => approval.clone(),
         "resync" => json!({"dropped": 3}),
         "closed" => json!({"id": "s"}),
+        "changed" => {
+            json!({"seq": 4, "round": 1, "step": "check", "tokens_used": 9, "closed": false})
+        }
+        "state" => json!({"state": "interrupted"}),
         other => panic!("no sample for event {other}: add one"),
     };
-    for name in events.keys() {
+    for name in events.keys().chain(discussion_events.keys()) {
         let frame = Frame {
             id: None,
             event: name.clone(),
@@ -405,8 +427,8 @@ fn every_event_name_is_one_the_decoder_types() {
         );
     }
     assert_eq!(
-        events.len(),
-        10,
+        (events.len(), discussion_events.len()),
+        (10, 4),
         "a decoder arm was added or removed: update the schema"
     );
 }

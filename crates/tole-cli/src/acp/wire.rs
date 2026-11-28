@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use tole_cli::session::problem::egress_error;
 
 /// Shared connection state: outgoing JSON-RPC lines are pushed to the
 /// writer thread; responses to agent-initiated requests (permission) are
@@ -101,7 +102,7 @@ pub(super) fn reply(conn: &Conn, id: Option<Value>, result: Value) {
 pub(super) fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
     let Some(id) = id else { return };
     conn.send_line(
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}})
+        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": egress_error(message)}})
             .to_string(),
     );
 }

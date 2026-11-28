@@ -1,8 +1,10 @@
 //! The blocking [`Client`]: one method per route.
 
+use crate::body::ErasedBody;
 use crate::error::{status_error, Error, Result, MAX_ERROR_BODY};
 use crate::http::{self, Request, ResponseBody};
 use crate::info::Info;
+use crate::path::{path_of, pct};
 use crate::resume::{ReconnectPolicy, ResumingStream};
 use crate::route::Route;
 use crate::sse::FrameReader;
@@ -11,7 +13,6 @@ use crate::types::*;
 #[cfg(unix)]
 use crate::unix::UnixTransport;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
 use std::io::Read;
@@ -64,34 +65,6 @@ fn nonzero(what: &str, d: Duration) -> Result<()> {
         return Err(Error::InvalidConfig(format!("the {what} cannot be zero")));
     }
     Ok(())
-}
-
-/// Percent-encode one path segment or query value.
-fn pct(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// The request path of `route`: `{id}` and `{hash}` filled in (each
-/// percent-encoded, so a value can never add a segment or a query), then the
-/// query string.
-fn path_of(route: Route, id: Option<&str>, hash: Option<&str>, query: &str) -> String {
-    let mut path = route
-        .template()
-        .replace("{id}", &pct(id.unwrap_or("")))
-        .replace("{hash}", &pct(hash.unwrap_or("")));
-    if !query.is_empty() {
-        path.push('?');
-        path.push_str(query);
-    }
-    path
 }
 
 impl Client {
@@ -172,7 +145,7 @@ impl Client {
             nonzero("timeout", t)?;
         }
         let accept = match route {
-            Route::Events => "text/event-stream",
+            Route::Events | Route::DiscussionEvents => "text/event-stream",
             // The bytes of an image: any type serve recorded.
             Route::ReadImage => "image/*, application/json",
             _ => "application/json",
@@ -345,9 +318,32 @@ impl Client {
         after: u64,
         idle_timeout: Option<Duration>,
     ) -> Result<FrameReader<ResponseBody>> {
+        self.stream(Route::Events, id, after, idle_timeout)
+    }
+
+    /// One connection of the event stream of discussion `id` (#1094), from the
+    /// `seq` after `after`: `changed` frames say the ledger moved (read it with
+    /// [`Client::discussion`]), and `closed` ends it. Use
+    /// [`Client::follow_discussion`] to reconnect.
+    pub fn discussion_events(
+        &self,
+        id: &str,
+        after: u64,
+        idle_timeout: Option<Duration>,
+    ) -> Result<FrameReader<ResponseBody>> {
+        self.stream(Route::DiscussionEvents, id, after, idle_timeout)
+    }
+
+    pub(crate) fn stream(
+        &self,
+        route: Route,
+        id: &str,
+        after: u64,
+        idle_timeout: Option<Duration>,
+    ) -> Result<FrameReader<ResponseBody>> {
         let (status, mut resp) = self.open(
-            Route::Events,
-            &path_of(Route::Events, Some(id), None, &format!("after={after}")),
+            route,
+            &path_of(route, Some(id), None, &format!("after={after}")),
             None,
             idle_timeout,
             // The head (and a refusal's body) must follow the first byte
@@ -381,7 +377,25 @@ impl Client {
     /// `after=<last seq>`, so no entry is lost or delivered twice. Other
     /// frames are best effort: see [`StreamItem::Reconnected`](crate::StreamItem::Reconnected).
     pub fn follow_events(&self, id: &str, after: u64, policy: ReconnectPolicy) -> ResumingStream {
-        ResumingStream::new(self.clone(), id.to_string(), after, policy)
+        ResumingStream::new(self.clone(), Route::Events, id.to_string(), after, policy)
+    }
+
+    /// [`Client::follow_events`] for a discussion (#1094): the `changed` frames
+    /// of its ledger, each `seq` once and in order across reconnects, until
+    /// the server says `closed`.
+    pub fn follow_discussion(
+        &self,
+        id: &str,
+        after: u64,
+        policy: ReconnectPolicy,
+    ) -> ResumingStream {
+        ResumingStream::new(
+            self.clone(),
+            Route::DiscussionEvents,
+            id.to_string(),
+            after,
+            policy,
+        )
     }
 
     /// The owner's discussions, as `tole discuss list --json` shows them.
@@ -576,17 +590,6 @@ impl Client {
     }
 }
 
-/// Object-safe view of a serializable request body.
-trait ErasedBody {
-    fn to_json(&self) -> Result<Vec<u8>>;
-}
-
-impl<T: Serialize> ErasedBody for T {
-    fn to_json(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,13 +602,6 @@ mod tests {
             }
             assert!(a.template().starts_with('/'));
         }
-    }
-
-    #[test]
-    fn segments_are_percent_encoded() {
-        assert_eq!(pct("srv-1_a.b~"), "srv-1_a.b~");
-        assert_eq!(pct("../x y"), "..%2Fx%20y");
-        assert_eq!(pct("a\r\nb"), "a%0D%0Ab");
     }
 
     #[test]

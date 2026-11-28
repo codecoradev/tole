@@ -10,11 +10,31 @@ use tole_cli::serve_support::shutdown;
 use tole_cli::serve_support::transport::Conn;
 use tole_cli::session_host::lock_sessions;
 
-fn write_all(stream: &mut Conn, text: &str) -> bool {
+pub(super) fn write_all(stream: &mut Conn, text: &str) -> bool {
     stream
         .write_all(text.as_bytes())
         .and_then(|()| stream.flush())
         .is_ok()
+}
+
+/// The `seq` a stream resumes after: an explicit `after=<seq>` of `query`
+/// wins over the `Last-Event-ID` header, and a stream with neither starts at
+/// 0. Shared by the session and the discussion stream.
+pub(super) fn after_of(
+    query: &str,
+    last_event_id: Option<&str>,
+) -> Result<u64, (u16, serde_json::Value)> {
+    match super::pct::raw_param(query, "after") {
+        Some(a) => a.parse().map_err(|_| {
+            (
+                400,
+                json!({"error": "after must be a non-negative integer"}),
+            )
+        }),
+        None => Ok(last_event_id
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)),
+    }
 }
 
 /// `GET /sessions/{id}/events?after=<seq>` (#524): Server-Sent Events.
@@ -33,27 +53,12 @@ pub(super) fn serve_events(
     last_event_id: Option<&str>,
 ) {
     use tole_cli::events::{entry_frame, frame, ApprovalWatch, EntryTail, Heartbeat, HEARTBEAT};
-    let param = |name: &str| {
-        query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
-    };
-    // An explicit `after` wins over the header; both are a `seq`.
-    let after = match param("after") {
-        Some(a) => match a.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
-                respond(
-                    &mut stream,
-                    400,
-                    &json!({"error": "after must be a non-negative integer"}),
-                );
-                return;
-            }
-        },
-        None => last_event_id
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0),
+    let after = match after_of(query, last_event_id) {
+        Ok(n) => n,
+        Err((status, payload)) => {
+            respond(&mut stream, status, &payload);
+            return;
+        }
     };
     let path = {
         let sessions = lock_sessions(&state.sessions);
