@@ -42,7 +42,8 @@ continuity, infra facts.
 - `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
   branch before a PR, `--agent DIR` for the agent-as-reviewer flow with
   `cora-agent-review.py`; `arch-check.sh`: crate kinds and the crate dependency
-  matrix, #1249).
+  matrix, #1249; `container/`: the container image recipe's scripts, used by
+  `.github/workflows/container.yml`, #1015).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
   ignores.
@@ -117,6 +118,8 @@ cargo deny check licenses bans sources   # exits 1 on a licence outside deny.tom
 cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 1 cora error (non-blocking)
 # only when you touch scripts/arch-* (#1249):
 python3 scripts/test_arch_lint.py # self-test of the architecture guardrail (rules and fail-closed paths)
+# only when you touch the container recipe (Dockerfile, scripts/container/, templates/container/, .github/workflows/container.yml; #1015):
+scripts/container/test-image-tags.sh   # self-test of the image tag rules (nightly and release channels, no `latest`); docs/container.md "Channels and tags"
 # only when you touch crates/tole-desktop or crates/tole-desktop-model (#1028; run `cargo fetch` once first):
 scripts/test-desktop-check.sh # self-test of the guardrail script
 scripts/desktop-check.sh      # exits 1 on: dependency graph (no toolkit in the model, no session host in the desktop, toolkit optional and exactly pinned), size caps (500 lines per file, 50,000 per crate). ADVISORY (warns only): literals in the ui layer

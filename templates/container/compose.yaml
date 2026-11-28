@@ -17,7 +17,11 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: tole-serve:${TOLE_IMAGE_TAG:-local}
+    # Built from the Dockerfile by default (tole-serve:local). To run the published
+    # image instead set TOLE_IMAGE=ghcr.io/codecoradev/tole and TOLE_IMAGE_TAG to a
+    # version or a channel (docs/container.md, "Channels and tags"), then
+    #   docker compose pull tole && docker compose up -d --no-build
+    image: ${TOLE_IMAGE:-tole-serve}:${TOLE_IMAGE_TAG:-local}
     restart: unless-stopped
     init: true
     # `tole serve` drains for --shutdown-grace (default 20 s) after SIGTERM;
