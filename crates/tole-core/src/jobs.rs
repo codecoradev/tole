@@ -331,7 +331,7 @@ impl Tool for JobStartTool {
         }
         // RC-1 (threat model): the SAME destructive-argv refusal as
         // run_command — detached execution is not an exemption.
-        crate::subprocess::check_destructive_argv(&argv)?;
+        crate::program_path::check_command_argv(&argv, &self.root)?;
         if self.child_agent_mode {
             crate::agents::check_child_agent_argv(&argv)?;
         }

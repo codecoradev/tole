@@ -225,12 +225,12 @@ impl Tool for RunCommandTool {
         if program.is_empty() {
             return Err("program name must not be empty".into());
         }
-        // No shell → no PATH trickery beyond what exec itself resolves;
-        // still refuse obvious absolute/relative path forms so the audit
-        // line always names a program, not a path traversal.
+        // No shell → no PATH trickery beyond what exec itself resolves.
         // RC-1 (threat model): destructive argv refused pre-spawn, via
-        // the shared helper (also applied by job_start).
-        crate::subprocess::check_destructive_argv(&argv)?;
+        // the shared helper (also applied by job_start); a program written
+        // as a path passes only as an executable file it is no worse than
+        // its name for (#1286).
+        crate::program_path::check_command_argv(&argv, &self.cwd)?;
         if self.child_agent_mode {
             crate::agents::check_child_agent_argv(&argv)?;
         }
@@ -354,7 +354,7 @@ mod tests {
 
     /// Token matching must not over-refuse benign commands whose ARGUMENT
     /// TEXT merely contains destructive keywords (CodeCora #3), and
-    /// path-qualified PROGRAMS are refused (wrapper/PATH bypass).
+    /// a path-qualified program inside a shell text is refused.
     #[test]
     fn benign_commands_with_destructive_looking_args_pass() {
         // ISOLATED jail (cora full-scan #18): this test EXECUTES
@@ -384,9 +384,9 @@ mod tests {
             .execute(json!({ "command": "rm -rf ./a/../build" }))
             .is_ok());
         let _ = std::fs::remove_dir_all(&jail);
-        // Path-qualified program: refused (PATH resolution is the way).
+        // Path-qualified program in a shell text: refused (the shell resolves it).
         let err = t
-            .execute(json!({ "command": "/bin/echo hi" }))
+            .execute(json!({ "command": "sh -c '/bin/echo hi'" }))
             .expect_err("path-qualified program must be refused");
         assert!(err.contains("written as a path"), "{err}");
     }
