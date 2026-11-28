@@ -2,6 +2,8 @@
 //! `GET /cron/runs`, `tole cron runs` and the delivery targets never carry a
 //! secret that a spawn error echoes (an agent job names a workdir that is gone).
 
+#![cfg(feature = "shell-tools")]
+
 use tole_cli::cron::{self, store, CreateSpec, TickOptions};
 
 mod common;

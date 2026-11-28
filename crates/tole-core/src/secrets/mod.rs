@@ -176,7 +176,9 @@ pub fn add_role_secret(name: &str, value: &str) {
         }
         g.push((name.to_string(), value.to_string()));
     }
-    merge_process_secrets(&SecretSet::default().with(name, value));
+    if !process_secrets().holds(value) {
+        merge_process_secrets(&SecretSet::default().with(name, value));
+    }
 }
 
 /// The secrets recorded with [`add_role_secret`], in order.

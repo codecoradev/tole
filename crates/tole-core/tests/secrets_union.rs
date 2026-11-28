@@ -54,3 +54,15 @@ fn a_role_secret_joins_the_process_set_without_replacing_it() {
     let out = process_secrets().redact("before-secret-0123456789 role-secret-0123456789");
     assert_eq!(out, "«BEFORE» «ROLE»");
 }
+
+/// A value the process set already holds keeps its first name: a role secret
+/// that is also an env value does not rename it.
+#[test]
+fn a_role_secret_keeps_the_first_name_of_a_value_the_set_holds() {
+    merge_process_secrets(&one("FIRST_NAME", "shared-value-0123456789"));
+    add_role_secret("hooks.second", "shared-value-0123456789");
+    assert_eq!(
+        process_secrets().redact("shared-value-0123456789"),
+        "«FIRST_NAME»"
+    );
+}
