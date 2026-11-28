@@ -32,11 +32,24 @@ test prints its seed). The helpers are in `crates/tole-cli/tests/crash_loop/`.
 |---|---|---|---|
 | The model call (`planning`) | finishes the turn once, same session | `POST /sessions {"resume"}` settles the turn without a model call and answers `"interrupted": true`; the cut-off prompt is not answered, the next prompt is accepted (#1230) | **exit 1, `status: error`**, nothing written; run `tole resume` first |
 | A tool effect (`executing`) | see "Replay" below | the same settle: the open call is failed, outcome UNKNOWN, never re-run | as above |
-| An approval pending in serve's queue | the write never ran; nothing to resume | the queue is in memory and is gone; resume, and the model asks again: one new row | (a mission started over serve) the session is parked; `tole mission --resume` continues it directly |
+| An approval pending in serve's queue | the write never ran; nothing to resume | the queue is in memory and is gone; resume, and the model asks again: one new row | (a mission started over serve) the session is parked; `tole mission --resume` continues it directly, **unless the kill came before the denial was written** (see below) |
 | Settled | `nothing to resume` (exit 1) | a new prompt works | continues the mission |
 
 Pinned by `serve_crash_resume.rs`, `serve_crash_effect.rs` and
 `mission_crash_resume.rs`.
+
+The approval row is queued before the call is denied: serve's queue approver
+enqueues the row and answers deny, and only then does the turn write its
+`error` entry and the denial note that parks it. A kill in that short window
+(milliseconds on a quiet machine, longer on a busy one) leaves the register at
+`planning` with no note, the same state as a kill in the model call, so
+`tole mission --resume` refuses it and `tole resume <id>` (exit 2: the model
+asks again and nothing is allowed) has to come first. The row is lost either
+way and the effect has not run. `a_serve_mission_killed_at_a_pending_approval_...`
+takes whichever recovery its log needs, and
+`a_serve_mission_killed_before_its_denial_is_written_needs_two_steps` pins the
+cut-off state by cutting a parked log back to it (a prefix of an append-only
+log is what the kill leaves).
 
 The mission row is the surprise: `mission.rs` says a crash mid-mission
 "resumes exactly where it stopped", but `tole mission --resume` starts its

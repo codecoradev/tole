@@ -253,7 +253,3 @@ pub fn file_hash(path: &str) -> String {
 pub fn live_hash(entry: &plugin_lock::LockEntry) -> Option<String> {
     entry.bundle.as_ref().map(|b| file_hash(&b.path))
 }
-
-#[cfg(test)]
-#[path = "bundle_tests.rs"]
-mod tests;

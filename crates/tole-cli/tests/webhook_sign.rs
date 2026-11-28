@@ -1,4 +1,6 @@
-use super::*;
+//! The signed headers of an outbound webhook (`tole_cli::webhook_out::sign`).
+
+use tole_cli::webhook_out::sign::request_headers;
 
 /// The pinned vector of `docs/webhook-delivery-design.md` section 3, computed
 /// once with an independent HMAC-SHA256 (Python `hmac`), not with this code.

@@ -3,8 +3,8 @@
 //! A mission is NOT a new engine — it is the existing turn machinery run
 //! in a loop: turn → check termination → (budget left?) resume with a
 //! continuation prompt. Every chained turn is a normal durable turn, so
-//! a crash mid-mission resumes exactly where it stopped (the E5
-//! guarantee) and cancel works unchanged. Termination:
+//! a crash is recovered by `tole resume` (E5) and then `--resume`, and
+//! cancel works unchanged. Termination:
 //!
 //! 1. the model declares completion — a final message containing
 //!    [`MISSION_COMPLETE_MARKER`] (the mission system prompt pins the

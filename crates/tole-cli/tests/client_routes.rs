@@ -34,6 +34,7 @@ use serve_harness::{spawn_mock, Serve};
 const SERVE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/health"),
     ("GET", "/info"),
+    ("GET", "/ready"),
     ("GET", "/models"),
     ("GET", "/sessions"),
     ("GET", "/sessions/index"),
@@ -81,6 +82,12 @@ const NOT_IN_CLIENT: &[(&str, &str, &str)] = &[
         "GET",
         "/sessions/{id}",
         "an alias of GET /sessions/{id}/status, which has a method",
+    ),
+    (
+        "GET",
+        "/ready",
+        "the readiness probe of an orchestrator or a container HEALTHCHECK, which reads the \
+         status code and holds no token; a client attaches with `health()` and `info()`",
     ),
     (
         "POST",
