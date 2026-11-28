@@ -88,14 +88,19 @@ continuity, infra facts.
   evidence), CI auto-fix max 3 attempts then escalate. The Cora Review job
   has a 30-min limit; large change-sets (~40+ files or ~850+ lines) can still
   time out — split into ~15–20-file PRs.
-  **Release flow (#1021, 2026-11-20):** PRs into `main` (from `develop` or
-  `chore/release-*`) are exempt from the Cora gate: the work was already
-  reviewed on `develop`, the Cora Review workflow no longer runs on PRs to
-  `main`, and `Cora Review` is not a required check there. Every other
-  required check still gates the release PR.
-  If `Cora Review` runs on a PR to `main` again, a release sync (one commit on the tip of
-  `main`, same git tree as a `develop` commit) is skipped by tree identity (#1022);
-  CONTRIBUTING, "Release sync PRs", has the by-hand check.
+  **Release flow (#1021, #1022):** `Cora Review` runs on PRs into `main`
+  again (owner decision, 2026-11-28; #1021 had taken it out on 2026-11-20
+  because a review of a whole release range cannot finish). A release sync
+  (head `chore/release-*` in this repository, one commit on the tip of
+  `main`, same git tree as one of the newest 200 first-parent `develop`
+  commits) is skipped by that proof, ends green and writes "skipped, tree
+  identical to develop at <sha>" in its summary: it holds nothing that did not
+  land on `develop` through its required checks and its review process. Any doubt, a second commit, a differing file, a
+  fork, another head branch name: the normal review runs, and a review that
+  cannot finish is red. `Cora Review` is not a required check on `main`;
+  every other required check still gates the release PR. CONTRIBUTING,
+  "Release sync PRs", has the by-hand check. Cut releases from a
+  `chore/release-*` branch so the proof applies.
   **Exception (#914):** a PR whose every file is excluded by `review.exclude`
   in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
   job then skips the review, ends green and writes "Nothing to review" in its
