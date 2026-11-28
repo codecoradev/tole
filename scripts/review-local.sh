@@ -14,6 +14,11 @@
 #   -s, --severity S   minimum severity: info|minor|major|critical
 #                      (default: minor)
 #   -n, --dry-run      print the chunk plan and exit, no review
+#   -a, --agent DIR    no LLM key: write the chunks to DIR (chunk-N.diff) and
+#                      prepare the review through `cora mcp` (cora.review_prepare);
+#                      you or a fresh reviewing agent answer each
+#                      DIR/chunk-N.prompt.md into DIR/chunk-N.findings.json, then run
+#                      `scripts/cora-agent-review.py finalize DIR`
 #   -h, --help         show this help
 #
 # Exit codes: 0 no findings, 2 findings reported, 1 error (no cora binary, no
@@ -25,6 +30,7 @@ base=""
 max_lines=600
 severity="minor"
 dry_run=0
+agent_dir=""
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
@@ -34,6 +40,7 @@ while [ $# -gt 0 ]; do
     -m|--max-lines) max_lines="${2:?--max-lines needs a number}"; shift 2 ;;
     -s|--severity) severity="${2:?--severity needs a level}"; shift 2 ;;
     -n|--dry-run) dry_run=1; shift ;;
+    -a|--agent) agent_dir="${2:?--agent needs a directory}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "review-local: unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -127,6 +134,11 @@ for i in $(seq 1 "$n"); do
   if [ "$dry_run" -eq 1 ]; then sed 's/^/    /' "$tmp/chunk-$i.paths"; continue; fi
 
   tr '\n' '\0' <"$tmp/chunk-$i.paths" | xargs -0 -r git diff "$range" -- >"$tmp/chunk-$i.diff"
+  if [ -n "$agent_dir" ]; then
+    mkdir -p "$agent_dir"
+    cp "$tmp/chunk-$i.diff" "$agent_dir/chunk-$i.diff"
+    continue
+  fi
   set +e
   cora review --diff-file "$tmp/chunk-$i.diff" --format compact --no-color \
     --severity "$severity" >"$tmp/chunk-$i.out" 2>"$tmp/chunk-$i.err"
@@ -140,6 +152,14 @@ for i in $(seq 1 "$n"); do
        status=1 ;;
   esac
 done
+
+if [ -n "$agent_dir" ] && [ "$dry_run" -eq 0 ]; then
+  echo "review-local: agent mode: $n chunk(s) in $agent_dir"
+  python3 "$(dirname "$0")/cora-agent-review.py" prepare "$agent_dir"
+  echo "review-local: now answer each $agent_dir/chunk-N.prompt.md with your model (a fresh reviewing agent, not the author)"
+  echo "review-local: into $agent_dir/chunk-N.findings.json, then: scripts/cora-agent-review.py finalize $agent_dir"
+  exit 0
+fi
 
 if [ "$deterministic" -eq 1 ]; then
   echo "review-local: WARNING no LLM is configured, so only deterministic checks ran." >&2
