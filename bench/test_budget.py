@@ -12,13 +12,13 @@ ceiling = 60
 [x86_64-linux.per_turn_ms]
 baseline = 3
 ceiling = 10
-[x86_64-linux.binary_size_mb]
+[x86_64-linux.binary_size_mib]
 ceiling = 25
 """
 
 
 def mk(**kw):
-    return {"x": {"cold_start_ms": 25.0, "idle_rss_mb": 30.0, "active_rss_mb": 60.0, "per_turn_ms": 10.0, "binary_size_mb": 25.0, **kw}}
+    return {"x": {"cold_start_ms": 25.0, "idle_rss_mb": 30.0, "active_rss_mb": 60.0, "per_turn_ms": 10.0, "binary_size_mib": 25.0, **kw}}
 
 
 class Parse(unittest.TestCase):

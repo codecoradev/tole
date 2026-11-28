@@ -26,11 +26,11 @@ clap = { version = "4", features = ["derive"] }
 unsafe_code = "deny"
 
 # Release profile. Size, measured and attributed in docs/perf/binary-size.md
-# (#991): 24.6 MB stripped at 9dc6caf (x86_64 Linux, default features,
-# `cargo build --release -p tole-cli`), 35.5 MB unstripped. The growth since
+# (#991): 24.6 MB (23.5 MiB) stripped at 9dc6caf (x86_64 Linux, default
+# features, `cargo build --release -p tole-cli`), 35.5 MB unstripped. The growth since
 # v0.10.1 (11.4 MB) is the HTTP MCP client, the web tools, the secret detector's
 # regex stack and first-party code, not one regression. bench/budget.toml gates
-# the size (`binary_size_mb`). Tried and not adopted, with the runtime cost
+# the size (`binary_size_mib`). Tried and not adopted, with the runtime cost
 # measured: opt-level = "s" (-22.7% size; open of a 20k-entry session about +25%
 # slower, redaction of 4 KiB texts 25 to 55% slower), lto = "fat" (-9.0%, runtime
 # neutral, 2 to 3x the release build time). `--no-default-features`: 10.3 MB.

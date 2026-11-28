@@ -356,7 +356,7 @@ For the owner; nothing here is applied.
    shell-tools,tui` is 13.7 MB (-44%) and the MCP-capable default stays as is.
    That is a product decision (what the lean build omits), not a build
    setting.
-7. #921: add `binary_size_mb` to the gate as a ratcheted ceiling (taken, see "Decision"). The harness
+7. #921: add `binary_size_mib` to the gate as a ratcheted ceiling (taken, see "Decision"). The harness
    already reports the binary size next to its metrics (`binary 23.3 MB`, in
    MiB, for the 24.4 MB build); the growth here came from many steps of 0.5 to
    3 MB, which a ceiling just above the current 24.4 MB would catch one step
@@ -364,21 +364,23 @@ For the owner; nothing here is applied.
    measurement.
 8. Follow-up documentation fixes once a decision is made: `docs/perf.md` ("the
    cause is not bisected", "unexplained" tar.gz gap) and the size comment in
-   the root `Cargo.toml` still describe #991 as open; the tar.gz gap is
-   explained above.
+   the root `Cargo.toml` described #991 as open; the tar.gz gap is explained
+   above (taken: this change rewrites both texts).
 
 ## Decision
 
 2026-11-28, delegated by the owner ("choose the best option and record it").
 
-1. **The size is gated.** `bench/budget.toml` gets `binary_size_mb`:
-   x86_64 baseline 23.5 MiB, ceiling 25 (x1.06); aarch64 baseline 20.2 MiB (an
+1. **The size is gated.** `bench/budget.toml` gets `binary_size_mib`:
+   x86_64 baseline 23.5 MiB, ceiling 26 (x1.11); aarch64 baseline 20.2 MiB (an
    estimate: the v0.12.0 aarch64 asset unpacks to 20,465,216 bytes, scaled by
-   +3.2%, the growth of the x86_64 binary since v0.12.0), ceiling 21.5. The
-   headroom covers the floating `stable` toolchain of CI and about a week of
-   first-party growth and leaves 1.5 MiB: the HTTP MCP client step (3.2 MiB)
-   fails the job, the regex stack (1.5 MiB) is at the edge, the web tools
-   (1.25 MiB) pass alone and trip it on top of a week of growth. It
+   +3.2%, the growth of the x86_64 binary since v0.12.0), ceiling 22.5. The
+   headroom covers the floating `stable` toolchain of CI and leaves 2.5 MiB, about
+   5 to 12 weeks of first-party growth at 0.2 to 0.5 MiB a week: the HTTP MCP
+   client step (3.2 MiB) fails the job in one go, the regex stack (1.5 MiB) and
+   the web tools (1.25 MiB) pass alone and trip it together. Ordinary growth will
+   reach it, so it is re-baselined on purpose at each release (see the comment in
+   `budget.toml`), not raised by reflex. It
    is Recommendation 7, taken. It needs the `perf-budget-raise` label to merge
    (it edits `bench/*.py`), and its first ratchet run reports an unknown metric
    because the ratchet reads the head's file with the base's parser.
@@ -388,8 +390,11 @@ For the owner; nothing here is applied.
    and costs up to 30% on session open and on redaction of short results (the
    section above); `panic = "abort"` is out. Not clearly beneficial, so not
    applied. If distribution size starts to matter, `lto = "fat"` for the
-   release workflow is the first step, then `"s"` for the dependencies only
-   (-5.8%, the cheapest runtime cost of the "s" rows).
+   release workflow is the first step. `"s"` for the dependencies only (-5.8%)
+   is not recommended on this evidence: the CPU measurements above covered `"s"`
+   for everything only, and the slowest case, `SecretSet::redact`, runs partly
+   in the `uteke-privacy` regex stack, which a `package."*"` override would also
+   set to `"s"`; its cost was not measured and is probably not small.
 3. **The growth is accepted as three decisions plus first-party code**
    (Recommendation 1). Nothing is reverted.
 4. **Open, outside this repository:** the `uteke-privacy` request of

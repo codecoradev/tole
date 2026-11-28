@@ -20,7 +20,7 @@ Metrics (all five are budgeted per platform):
                   call, one durable JSONL commit. The mock answers at once,
                   so provider latency is excluded; its own (small, constant)
                   cost is included.
-  binary_size_mb  size of the binary passed to --bin, in MiB (#991). CI builds
+  binary_size_mib size of the binary passed to --bin, in MiB (#991). CI builds
                   with `strip = true`, so it is the stripped release binary;
                   an unstripped local build is about 1.4 times larger.
 """
@@ -326,13 +326,13 @@ def measure(binary: str) -> dict:
         finally:
             provider.close()
     version = subprocess.run([env.bin, "--version"], capture_output=True, text=True).stdout.strip()
-    binary_size_mb = Path(env.bin).stat().st_size / 1048576
+    binary_size_mib = Path(env.bin).stat().st_size / 1048576
     metrics = {
         "cold_start_ms": cold,
         "idle_rss_mb": idle,
         "active_rss_mb": sess["active_rss_mb"],
         "per_turn_ms": sess["per_turn_ms"],
-        "binary_size_mb": binary_size_mb,
+        "binary_size_mib": binary_size_mib,
     }
     return {
         "schema": SCHEMA,
@@ -341,7 +341,7 @@ def measure(binary: str) -> dict:
         "cpus": os.cpu_count(),
         "mem_total_mb": _mem_total_mb(),
         "binary": version,
-        "binary_size_mb": binary_size_mb,
+        "binary_size_mb": binary_size_mib,  # same value in MiB, kept for readers of older reports
         "commit": os.environ.get("GITHUB_SHA", ""),
         "rounds": {"short": ROUNDS_SHORT, "long": ROUNDS_LONG},
         "metrics": metrics,
@@ -393,13 +393,13 @@ def gate(report: dict, budget_text: str) -> tuple[list[budget.Verdict], str]:
     return verdicts, status
 
 
-UNITS = {"cold_start_ms": "ms", "idle_rss_mb": "MB", "active_rss_mb": "MB", "per_turn_ms": "ms", "binary_size_mb": "MB"}
+UNITS = {"cold_start_ms": "ms", "idle_rss_mb": "MB", "active_rss_mb": "MB", "per_turn_ms": "ms", "binary_size_mib": "MiB"}
 LABELS = {
     "cold_start_ms": "Cold start (`tole --version`)",
     "idle_rss_mb": "Idle RSS (`tole serve`)",
     "active_rss_mb": "Active-session RSS (peak)",
     "per_turn_ms": "Per-turn overhead",
-    "binary_size_mb": "Binary size (release, stripped)",
+    "binary_size_mib": "Binary size (release, stripped)",
 }
 
 
@@ -410,18 +410,19 @@ def render(report: dict) -> str:
         f"### Performance: {report['platform']}",
         "",
         f"{report['binary']}, {report['cpu']} ({report['cpus']} vCPU, {report['mem_total_mb']:.0f} MB RAM), "
-        f"binary {report['binary_size_mb']:.1f} MB. Mock provider, no network.",
+        f"binary {report['binary_size_mb']:.1f} MiB. Mock provider, no network.",
         "",
         "| Metric | Measured | Budget | Headroom |",
         "|---|---:|---:|---:|",
     ]
     for m in budget.METRICS:
         v = ver.get(m)
-        val = report["metrics"][m]
+        val = report["metrics"].get(m)  # a report from before a metric existed has no value for it
         cell = f"{v['ceiling']:g} {UNITS[m]}" if v else "none"
         head = f"{v['headroom_pct']:.0f}%" if v else "n/a"
         mark = "" if not v or v["ok"] else " **OVER**"
-        lines.append(f"| {LABELS[m]} | {val:.2f} {UNITS[m]} | {cell} | {head}{mark} |")
+        shown = "n/a" if val is None else f"{val:.2f} {UNITS[m]}"
+        lines.append(f"| {LABELS[m]} | {shown} | {cell} | {head}{mark} |")
     return "\n".join(lines) + "\n"
 
 

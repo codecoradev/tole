@@ -259,13 +259,16 @@ tole_core 2.1, serde_core 1.0, tole 0.9, tokio 0.5, serde_json 0.4, rustls 0.4.
 **Decision (2026-11-28, delegated by the owner on #991).** The size is now
 gated and the profile is unchanged.
 
-- Gate: `bench/budget.toml` has `binary_size_mb` per platform (see "Release
-  perf budget (#921)"): ceiling 25 MiB on x86_64 (baseline 23.49 MiB = 24,628,832
-  bytes at 9dc6caf, x1.06) and 21.5 MiB on aarch64 (an estimate, see the file).
-  That leaves 1.5 MiB: a step like the HTTP MCP client (3.2 MiB) fails the job,
-  the regex stack (1.5 MiB) is at the edge, a 1.25 MiB step passes alone and
-  trips it on top of a week of growth; ordinary first-party growth does not. The gate only moves down, so a ceiling is raised with the
-  `perf-budget-raise` label after reading what the new size buys.
+- Gate: `bench/budget.toml` has `binary_size_mib` per platform (see "Release
+  perf budget (#921)"): ceiling 26 MiB on x86_64 (baseline 23.49 MiB = 24,628,832
+  bytes at 9dc6caf, x1.11) and 22.5 MiB on aarch64 (an estimate, see the file).
+  That leaves 2.5 MiB, about 5 to 12 weeks of first-party growth at the November
+  rate (0.2 to 0.5 MiB a week): a step like the HTTP MCP client (3.2 MiB) fails
+  the job in one go, the regex stack (1.5 MiB) and the web tools (1.25 MiB) would
+  pass alone and trip it together. Ordinary growth will reach the ceiling too, so
+  it is re-baselined on purpose at each release by the maintainer who cuts it
+  (lowered to measured x1.11, or raised with the `perf-budget-raise` label after
+  reading what the growth bought); it is not raised by reflex.
 - Profile: `opt-level = 3`, thin LTO, `panic = "unwind"` stay. `opt-level =
   "s"` is -5.5 MB (-22.7%) but costs on the paths that are CPU-bound rather
   than provider-bound (release build, same machine, interleaved, three runs per
