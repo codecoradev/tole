@@ -7,4 +7,5 @@ mod test_dir;
 mod advisor;
 mod plugin_scan;
 mod router;
+mod skills_curator;
 mod skills_draft;

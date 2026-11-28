@@ -2,7 +2,7 @@
 //! (#1307): a fixed-seed xorshift picks one value per axis, so a run is the
 //! same on every machine and no clock or `rand` is involved.
 //!
-//! A generated line is: leading assignments, a wrapper, the program word and
+//! A generated line is: leading assignments, redirections, a wrapper, the program word and
 //! one argument form one simple command; a context puts it behind or between
 //! other commands (separators, braces, a subshell, `if`); up to two layers of
 //! `sh -c '...'` wrap it, each quoted with single quotes, double quotes or
@@ -24,6 +24,16 @@ const ASSIGNS: &[&str] = &[
     "X='a;c' ",
     "X=$(echo a) ",
     "X=1 Y=2 ",
+    "X=a}b ",
+    "X=a${IFS}b ",
+    "X+=1 ",
+    ">/dev/null ",
+    "2>&1 ",
+    ">&- ",
+    "3>&- ",
+    ">|/dev/null ",
+    "$NOPE ",
+    "! ",
 ];
 const WRAPPERS: &[&str] = &[
     "",
@@ -38,6 +48,14 @@ const WRAPPERS: &[&str] = &[
     "command ",
     "nice ",
     "timeout 5 ",
+    "env env ",
+    "env X=1 env ",
+    "nohup env ",
+    "coproc ",
+    "builtin command ",
+    "ionice -c3 ",
+    "time</dev/null ",
+    "env>/dev/null ",
 ];
 const PROGRAMS: &[&str] = &[
     "tole",
@@ -47,6 +65,15 @@ const PROGRAMS: &[&str] = &[
     "'tole'",
     "t\\ole",
     "tole-cli",
+    "tole>/dev/null",
+    "tole$NOPE",
+    "tole\"$NOPE\"",
+    "tol\\\ne",
+    "$'\\x74ole'",
+    "./tol?",
+    "./to[l]e",
+    "$PWD/tol*",
+    "$NOPE tole",
 ];
 /// `{}` is the simple command.
 const CONTEXTS: &[&str] = &[
@@ -68,6 +95,9 @@ const CONTEXTS: &[&str] = &[
     "echo a;{}",
     "cd . && {}",
     "echo \"{}\"",
+    "f() { {}; }; f",
+    "function f { {}; }; f",
+    "true && { {}; }",
 ];
 /// Not `env sh -c` and the like: a wrapper in front of a shell is a documented
 /// route listed in `KNOWN_RESIDUAL`, and mixing it in only repeats that gap.

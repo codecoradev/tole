@@ -24,7 +24,7 @@
 # Never add an entry: split the file or the crate. Cap: 500 lines per file,
 # 50,000 per crate src/. Format: `file <path> <lines>` or `crate <name> <lines>`.
 crate tole-cli 84674
-crate tole-core 64508
+crate tole-core 64261
 file crates/tole-cli/src/approvals.rs 1304
 file crates/tole-cli/src/config/apply.rs 1522
 file crates/tole-cli/src/config/apply_tests.rs 1872
@@ -134,7 +134,7 @@ file crates/tole-core/src/sandbox_tests.rs 934
 file crates/tole-core/src/secrets/mod.rs 1359
 file crates/tole-core/src/session/storage.rs 1729
 file crates/tole-core/src/skills/approval.rs 1289
-file crates/tole-core/src/skills/curator.rs 705
+file crates/tole-core/src/skills/curator.rs 701
 file crates/tole-core/src/skills/draft.rs 840
 file crates/tole-core/src/skills/index.rs 1605
 file crates/tole-core/src/skills/mod.rs 658

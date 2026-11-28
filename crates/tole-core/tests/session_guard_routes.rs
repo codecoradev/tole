@@ -48,11 +48,92 @@ const ROUTES: &[&str] = &[
     "env -i -S 'tole x'",
     "sudo env --split-string='tole x'",
     "env --s='tole x'",
+    // A brace group, a function: a lone `{` or `}` is not the program.
+    "{ X=a}b tole x; }",
+    "{ X=a${IFS}b tole x; }",
+    "{ env X=a}b tole x; }",
+    "{ env X{=1 tole x; }",
+    "function f { X=a}b tole x; }; f",
+    "{ { X=a}b tole x; }; }",
+    "{ $(echo tole) x; }",
+    // `env` anywhere in a chain.
+    "env env -S 'tole x'",
+    "env X=1 env -S 'tole x'",
+    "nohup env env -S 'tole x'",
+    "env sudo env -S 'tole x'",
+    "env nohup env -S 'tole x'",
+    "env -iS 'tole x'",
+    // Closing a descriptor is one word; `>|` is a redirection.
+    ">&- tole x",
+    "3>&- tole x",
+    "2>&- tole x",
+    "<&- tole x",
+    "3<&- tole x",
+    ">|f tole x",
+    ">| f tole x",
+    // A backslash-newline is no character.
+    // The program word glued to a redirection or a variable, or a variable
+    // that expands to nothing in front of it.
+    "tole>f x",
+    "tole</dev/null x",
+    "tole>&2",
+    "tole<<<x",
+    "tole$E x",
+    "tole$IFS x",
+    "tole\"$E\" x",
+    "tole$@ x",
+    "$E tole x",
+    "$@ tole x",
+    // A glob or an ANSI-C string in the program word.
+    "./tol? x",
+    "./to[l]e x",
+    "./tol* x",
+    "$PWD/tol? x",
+    // A variable word or a substitution in front of the program.
+    "$EMPTY$EMPTY tole x",
+    "\"$@\" tole x",
+    "$E>f tole x",
+    "env $(echo tole) x",
+    "time $(echo tole) x",
+    "if $(echo tole) x; then :; fi",
+    "! $(echo tole) x",
+    "timeout 5 $(echo tole) x",
+    // A redirection glued to a wrapper or a shell.
+    "time< f tole x",
+    "nohup>f tole x",
+    "env>f tole x",
+    "sh>f -c 'tole x'",
+    "bash<f -c 'tole x'",
+    // Other shells and runners.
+    "rbash -c 'tole x'",
+    "ksh93 -c 'tole x'",
+    "watch tole x",
+    "strace tole x",
+    "flock f tole x",
+    "ionice -c3 tole x",
+    "taskset 1 tole x",
+    "chrt 1 tole x",
+    "setpriv tole x",
+    "script -qc tole /dev/null",
     // A nested shell whose payload is unquoted, with escaped blanks.
     "sh -c echo\\ a\\;\\ tole\\ x",
     "sh -c \\(\\ tole\\ x\\ \\)",
     "sh -c true\\ \\&\\&\\ tole\\ x",
     "sh -c true\\ \\&\\&\\ X=a\\\\\\ b\\ tole\\ x",
+];
+
+/// Routes that need a shell to read them: as a command line there is no brace
+/// group, no continuation line, no ANSI-C string and no function to define.
+const TEXT_ONLY: &[&str] = &[
+    "'to'$E'le' x",
+    "\"$EMPTY\"tole x",
+    "true && { X=a}b tole x; }",
+    "f() { X=a}b tole x; }; f",
+    "tol\\\ne x",
+    "to\\\nle x",
+    "$'\\x74ole' x",
+    "$'\\164ole' x",
+    "$'t\\157le' x",
 ];
 
 /// Realistic commands next to the routes (`&>`, `2>&1`, `--show-output`, `!`,
@@ -78,6 +159,16 @@ const ALLOWED: &[&str] = &[
     "git commit -m 'fix tole bug'",
     "sh -c 'echo a; echo b'",
     "echo a\\ b",
+    "[ -f x ] && echo yes",
+    "[[ -f x ]] || echo no",
+    "rg \"foo|ba?\" src",
+    "git log --grep \"a|b*\"",
+    "./run.sh --all",
+    "{ echo a; echo b; }",
+    "f() { echo a; }; f",
+    "echo a >&- ",
+    "echo a >| out.txt",
+    "$CC -o x y.c",
 ];
 
 fn quote(t: &str) -> String {
@@ -108,7 +199,7 @@ fn check(name: &str, bad: Vec<String>) {
 #[test]
 fn every_route_is_refused_as_shell_text_at_depths_0_to_3() {
     let mut bad = Vec::new();
-    for r in ROUTES {
+    for r in ROUTES.iter().chain(TEXT_ONLY) {
         for d in 0..=3 {
             let t = nest(r, d);
             if !refused(&shell(&t)) {
@@ -156,4 +247,34 @@ fn an_unclosed_quote_or_escaped_blank_before_the_program_is_doubt_and_refused() 
     ] {
         assert!(refused(&shell(t)), "must refuse: {t:?}");
     }
+}
+
+/// The leading words are walked once, with a cap: no recursion, no rebuilt word
+/// list (the first version took 2.7 GB and overflowed a 2 MiB stack on 10k words).
+#[test]
+fn a_hundred_thousand_leading_words_are_refused_quickly_on_a_small_stack() {
+    for lead in [">f ", "X+=1 ", "{ ", "$E "] {
+        let text = format!("{}tole x", lead.repeat(100_000));
+        let started = std::time::Instant::now();
+        let (a, b) = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || (refused(&shell(&text)), refused(&line(&text))))
+            .unwrap()
+            .join()
+            .expect("no stack overflow");
+        assert!(a && b, "{lead:?}: refused as text {a}, as argv {b}");
+        assert!(started.elapsed().as_secs() < 20, "{lead:?} took too long");
+    }
+    // Nested shells and a glob of many stars stay linear too.
+    let text = nest(&format!("{}echo", ">f ".repeat(20_000)), 3);
+    let glob = format!("env {}x", "*a".repeat(5_000));
+    let started = std::time::Instant::now();
+    let _ = (refused(&shell(&text)), refused(&shell(&glob)));
+    assert!(
+        started.elapsed().as_secs() < 30,
+        "nested or glob input took too long"
+    );
+    // Inside the cap the program behind the words is still found.
+    let text = format!("{}tole x", ">f ".repeat(60));
+    assert!(refused(&shell(&text)) && refused(&line(&text)));
 }
