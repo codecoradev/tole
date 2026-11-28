@@ -432,7 +432,3 @@ pub fn report(findings: &[Finding]) -> String {
     }
     out
 }
-
-#[cfg(test)]
-#[path = "plugin_scan_tests.rs"]
-mod tests;

@@ -1287,6 +1287,31 @@ them. Two layers close the direct routes; neither is a boundary.
   bash 5.2 and 5.3, ksh93, mksh, zsh) and not every way a shell can run
   text. A human running `tole` from a terminal is not affected:
   the check lives in the two tools, not in the CLI.
+  Since #1307 the guard also reads the text a second time, only where the cut
+  above is naive, the way a shell does where the cut is wrong: a backslash keeps
+  the next character in its word, `{` and `}` are word characters, the `&` of
+  `>&`, `<&` and `&>` belongs to a redirection, and a command substitution that
+  opens a word is an unknown program. This only adds refusals (a command the
+  first reading refuses stays refused). Closed with it, as `sh -c` text, as a
+  command line and nested in `sh -c`: a leading `X+=v` or redirection (`>f`,
+  `2>&1`, `&>f`, `{fd}>f`), after which the program behind it is checked; a
+  leading array assignment (`X[0]=1 tole x`); a program that is a command
+  substitution (`$(echo tole) x`, a backtick); `!`, `coproc`, `builtin`,
+  `elif` and `until`, which are wrappers now; a quoted or escaped KEY behind a
+  wrapper cut open by a separator in the quotes (`env "X=a;c" tole x`); a word
+  cut at a brace (`X=a${IFS}b tole x`, `env X=a}b tole x`); `env -S` and
+  `--split-string` (and any `--s...` abbreviation); and a nested `sh -c` whose
+  payload is unquoted with escaped blanks (`sh -c echo\ a\;\ tole\ x`), which is
+  unescaped for the second pass, the words after `-c` also being checked
+  joined. What it refuses without running tole: `X[0]=1 cmd`, a command whose
+  program is a substitution (`$(git rev-parse --show-toplevel)/run.sh`), a
+  word in front of the program that quotes or an escaped blank leave open
+  (`>'a b' cmd`, `X+='a b' cmd`), any later word of `!`, `elif`, `until`,
+  `builtin` or `coproc` that is `tole` (like `if`, `time`, `env`), `env` with an
+  option containing `S` before its program, and a nested `sh -c "..."` text
+  whose payload starts with a substitution. The over-refusal of #1302 is
+  unchanged: `RUSTFLAGS="-D warnings" cargo test` is still refused, because
+  the second reading cannot allow what the first refuses.
 - **A marker for what still runs.** Every process those two tools start
   carries `TOLE_UNDER_SESSION=1` (a child agent also has
   `TOLE_AGENT_DEPTH >= 1`). The owner-only subcommands above refuse to
@@ -1309,14 +1334,12 @@ shell's `-c` text, and `env -i` also clears the marker, so the second layer
 does not see it either. It reaches the owner-only records; only the Write
 approval of `run_command` and the sandbox bound it. Other routes the guard
 does not follow, all present before #1287: `eval`, `echo x | sh`,
-`x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, and, found in the #1302
-review and still allowed: `X+=1 tole x`, `X[0]=1 tole x`, a leading redirection
-(`>/dev/null tole x`, `2>&1 tole x`), `! tole x`, `coproc tole x`,
-`builtin command tole x` (`builtin tole x` alone runs nothing: `builtin` only
-runs builtins), `env -S 'tole x'` (as an argv), `$(echo tole) x`, a quoted or escaped KEY
-behind a wrapper with a separator inside the quotes (`env "X=a;c" tole x`,
-`env 'X'='a;c' tole x`; a plain key is refused), and the `{` and `}` the
-cut also splits inside a word; an interpreter
+`x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, a program that runs one of
+its arguments and is not in the wrapper list (`watch`, `flock`, `ionice`,
+`taskset`, `strace`), a wrapper in front of a shell's `-c` (`env sh -c 'tole
+x'`, `sudo sh -c ...`: allowed as a command line; as shell text the quote cut
+usually leaves `tole` visible), and a command substitution as the program behind a wrapper or keyword (`env $(echo
+tole) x`; as the program itself it is refused since #1307); an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
 into the data dir is not seen. A session with `run_command` has the
@@ -1332,7 +1355,8 @@ binary never runs: the fake and `sudo` / `doas` shims sit first on a cleared
 `PATH`, and the test is skipped when a real `tole` is in a system directory.
 It guarantees, within its corpus: a line that a shell runs as `tole` and the
 guard allows is a failure unless it is listed in `KNOWN_RESIDUAL` (the routes
-above, as exact texts, plus one named class of generated lines), and the list
+above that a shell runs, as exact texts; a named class of generated lines is
+supported and none is open), and the list
 can only shrink: an entry the guard now refuses, or that no shell runs any
 more, fails the test and has to be deleted. The corpus is the hand-written
 tables of the earlier guard tests (#1287, #1298, #1302) and a fixed-seed
@@ -1343,11 +1367,11 @@ beyond the hand cases, `eval` strings built at run time, a wrapper in front of a
 nested shell, beyond the exact entries); what a shell does with an environment
 other than the test's; and a copy or a link of the binary, which the guard tests
 of #684 cover. `TOLE_GUARD_DIFF_REPORT=1` prints every disagreement
-as a worklist instead of failing. Found by it, not in the list above and still
-allowed: a nested shell whose payload is written unquoted with backslash-escaped
-blanks (`sh -c echo\ a\;\ tole\ x`, `sh -c \(\ tole\ x\ \)`); the guard cuts
-words at the escaped blank and a shell does not. The same text split as an argv
-is refused.
+as a worklist instead of failing. It found, and #1307 closed, a nested
+shell whose payload is written unquoted with backslash-escaped blanks (the
+generated class `sh -c \(\ tole\ x\ \)`); no class is open. Open and listed as
+exact entries: the wrapper, `eval`, pipe, variable, `xargs`, `find -exec` and
+`rg --pre` routes above.
 
 ### Delegation approvals (#714)
 

@@ -24,9 +24,10 @@ use std::process::Command;
 
 /// Wrappers and shell keywords that run another program: every later word is
 /// checked as a possible program.
-const WRAPPERS: [&str; 17] = [
+const WRAPPERS: [&str; 22] = [
     "env", "nohup", "exec", "command", "time", "nice", "timeout", "setsid", "stdbuf", "sudo",
-    "doas", "busybox", "then", "do", "else", "if", "while",
+    "doas", "busybox", "then", "do", "else", "if", "while", "elif", "until", "builtin", "coproc",
+    "!",
 ];
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 const ERR_TOLE: &str = "a session may not run the tole binary: owner-only records (cron jobs, \
@@ -88,10 +89,50 @@ fn is_tole(w: &str, cwd: &Path, exe: Option<&Path>) -> bool {
         || exe.is_some_and(|e| resolve(w, cwd).is_some_and(|r| r == e))
 }
 
+fn ident(k: &str) -> bool {
+    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn is_assignment(w: &str) -> bool {
-    w.split_once('=').is_some_and(|(k, _)| {
-        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+    w.split_once('=').is_some_and(|(k, _)| ident(k))
+}
+
+/// A word the cut may have split inside quotes or an escaped blank.
+fn open(w: &str) -> bool {
+    w.ends_with('\\') || ['\'', '"'].iter().any(|q| w.matches(*q).count() % 2 == 1)
+}
+
+/// `env`'s own options (`-S`, `--split-string`, abbreviated) up to its program.
+fn env_split(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(w) = it.next() {
+        if w == "-u" || w == "-C" {
+            it.next();
+        } else if w.starts_with("--s")
+            || (w.starts_with('-') && !w.starts_with("--") && w.contains('S'))
+        {
+            return true;
+        } else if !(w.starts_with('-') || is_assignment(w)) {
+            break;
+        }
+    }
+    false
+}
+
+/// A leading word that is not the program (#1307): `X+=1` or a redirection
+/// (`>f`, `2>&1`, `{fd}<f`, `&>f`). How many words it takes: a bare operator
+/// takes its target too.
+fn lead_len(w: &str) -> usize {
+    let t = w.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t
+        .strip_prefix('{')
+        .and_then(|r| r.split_once('}'))
+        .map_or(t, |p| p.1);
+    if t.starts_with(['<', '>']) || t.starts_with("&>") {
+        1 + t.chars().all(|c| "<>&|-".contains(c)) as usize
+    } else {
+        w.split_once("+=").is_some_and(|(k, _)| ident(k)) as usize
+    }
 }
 
 /// A word with a quote or backslash: an assignment value may then hold a blank
@@ -114,9 +155,29 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
     if is_tole(prog, cwd, exe) {
         return true;
     }
+    // Words before the program that the cut takes for it (#1307): the program
+    // behind them is checked too, and what cannot be followed is refused: a
+    // quoted one, an array assignment, a command substitution as the program.
+    let n = lead_len(&argv[i]);
+    let lead = &argv[i..(i + n).min(argv.len())];
+    if lead.iter().any(|w| open(w))
+        || argv[i].split_once('[').is_some_and(|(k, _)| ident(k))
+        || argv[i].starts_with("$(")
+        || argv[i].starts_with('`')
+        || (n > 0 && invokes_tole(argv.get(i + n..).unwrap_or_default(), cwd, exe, depth))
+    {
+        return true;
+    }
     let b = base(prog);
     if WRAPPERS.contains(&b.as_str()) {
+        // `env -S 'tole x'` splits its argument into words; a quote cut open by
+        // a separator inside it (`env "X=a;c" tole x`) leaves an open key.
+        let env = words[i..].iter().position(|w| base(w) == "env");
         return argv[i + 1..].iter().any(|w| is_assignment(w) && quoted(w))
+            || argv[i + 1..]
+                .iter()
+                .any(|w| is_assignment(&unquote(w)) && open(w))
+            || env.is_some_and(|e| env_split(&words[i + e + 1..]))
             || words[i + 1..]
                 .iter()
                 .any(|w| !is_assignment(w) && is_tole(w, cwd, exe));
@@ -125,8 +186,16 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
         let mut rest = argv[i + 1..].iter();
         while let Some(f) = rest.next() {
             if f.starts_with('-') && !f.starts_with("--") && f.contains('c') {
-                // The payload, and anything after it, is shell text.
-                return rest.any(|p| payload_invokes_tole(p, cwd, exe, depth + 1));
+                // The payload, and anything after it, is shell text; written
+                // unquoted it may hold escaped blanks and separators, and its
+                // words only mean something together (#1307).
+                let rest: Vec<&str> = rest.map(String::as_str).collect();
+                let text = |t: &str| {
+                    payload_invokes_tole(t, cwd, exe, depth + 1)
+                        || (t.contains('\\')
+                            && payload_invokes_tole(&unescape(t), cwd, exe, depth + 1))
+                };
+                return text(&rest.join(" ")) || rest.iter().any(|p| *p != "$(" && text(p));
             }
         }
     }
@@ -214,6 +283,7 @@ fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u3
             ps.iter()
                 .all(|p| inert(p) || naive(p).into_iter().all(filler))
         });
+    let quote_aware = parts.is_some();
     let segs = match parts {
         Some(parts) => parts
             .into_iter()
@@ -230,5 +300,56 @@ fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u3
         ];
         cuts.iter()
             .any(|w| !w.is_empty() && invokes_tole(w, cwd, exe, depth))
+    }) || (!quote_aware
+        && shell_words(payload)
+            .iter()
+            .any(|w| !w.is_empty() && invokes_tole(w, cwd, exe, depth)))
+}
+
+/// What a shell makes of an unquoted word: a backslash keeps the next character.
+fn unescape(w: &str) -> String {
+    let mut it = w.chars();
+    std::iter::from_fn(|| {
+        it.next()
+            .map(|c| if c == '\\' { it.next() } else { Some(c) })
     })
+    .flatten()
+    .collect()
+}
+
+/// A second reading of shell text, in addition to the cuts above and only when
+/// they were naive (#1307): where a cut splits a word the shell keeps whole, the
+/// program behind it was never seen. A backslash keeps the next character in
+/// its word (`a\ b`, `a\;b`), `{` and `}` are word characters, and the `&` of
+/// `>&`, `<&`, `&>` belongs to a redirection. A substitution that opens a word
+/// (`$(..)`, a backtick) becomes the word `$(`: an unknown program. Quotes are
+/// not followed, so this only ever adds refusals.
+fn shell_words(s: &str) -> Vec<Vec<String>> {
+    let (mut cmds, mut cmd, mut word) = (Vec::new(), Vec::new(), String::new());
+    let (mut esc, mut prev) = (false, ' ');
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        let amp = c == '&' && !matches!(prev, '<' | '>') && it.peek() != Some(&'>');
+        let sep = !esc && (matches!(c, ';' | '|' | '(' | ')' | '`' | '\n') || amp);
+        let at = word.trim_start_matches(['\'', '"']);
+        if (c == '`' || c == '(') && !esc && at == if c == '`' { "" } else { "$" } {
+            word = "$(".into();
+        }
+        if sep || (!esc && matches!(c, ' ' | '\t')) {
+            if !word.is_empty() {
+                cmd.push(std::mem::take(&mut word));
+            }
+            if sep {
+                cmds.push(std::mem::take(&mut cmd));
+            }
+        } else {
+            word.push(c);
+        }
+        (esc, prev) = (!esc && c == '\\', c);
+    }
+    if !word.is_empty() {
+        cmd.push(word);
+    }
+    cmds.push(cmd);
+    cmds
 }
