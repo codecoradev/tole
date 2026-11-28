@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod text;
-use text::{glob, novars, shell_words, takes, unquote_shell};
+use text::{glob, novars, numberlike, shell_words, takes, unquote_shell};
 
 /// Wrappers and shell keywords that run another program: every later word is
 /// checked as a possible program.
@@ -145,7 +145,8 @@ fn open(w: &str) -> bool {
 /// where the program is). An option that takes an argument (`takes`, also as a
 /// cluster end: `-iu X`) skips it.
 fn opts(args: &[String], wrapper: &str) -> (bool, usize) {
-    let (letters, mut lock) = takes(wrapper);
+    let (letters, pos) = takes(wrapper);
+    let mut once = pos != ' ';
     let (mut i, mut split) = (0, false);
     while let Some(raw) = args.get(i) {
         let skip = lead_len(raw); // a redirection, `X+=1`, a variable word
@@ -165,11 +166,15 @@ fn opts(args: &[String], wrapper: &str) -> (bool, usize) {
             // `-iu X` takes the next word; `-uX` has its argument attached.
             let at = w[1..].find(|c| letters.contains(c));
             i += usize::from(at.is_some_and(|k| k + 2 == w.len()));
-        } else if w.is_empty()
-            || !(is_assignment(&w) || w.starts_with(|c: char| c.is_ascii_digit()))
-                && !std::mem::take(&mut lock)
-        {
-            break;
+        } else {
+            // A word that is no option: the wrapper's first positional (a lock
+            // file, a mask), an assignment or a number is skipped, the rest is
+            // the program.
+            let first = std::mem::take(&mut once)
+                && (pos == 'f' || w.chars().all(|c| c.is_ascii_hexdigit()));
+            if w.is_empty() || !(first || is_assignment(&w) || numberlike(&w)) {
+                break;
+            }
         }
         i += 1;
     }
@@ -303,7 +308,7 @@ fn program_runs_tole(argv: &[String], words: &[String], i: usize, cx: &Cx, depth
             || argv[i + 1..]
                 .iter()
                 .any(|w| is_assignment(&unquote(w)) && open(w))
-            || (i..words.len()).any(|e| base(&words[e]) == "env" && opts(&argv[e + 1..], "env").0)
+            || (i..words.len()).any(|e| base(&stem(&argv[e])) == "env" && opts(&argv[e + 1..], "env").0)
             // What the chain runs is a substitution or a word the guard cannot
             // read: `env $(echo tole) x`, `nohup env ./tol? x`.
             || chain_unsure(argv, words, i)
@@ -337,7 +342,7 @@ fn named(list: &[&str], w: &str, own: &str) -> bool {
 fn chain_unsure(argv: &[String], words: &[String], mut wrap: usize) -> bool {
     loop {
         let from = wrap + 1;
-        let k = from + opts(&argv[from..], &base(&words[wrap])).1;
+        let k = from + opts(&argv[from..], &base(&stem(&argv[wrap]))).1;
         let Some(w) = argv.get(k) else { return false };
         if unsure(w) {
             return true;

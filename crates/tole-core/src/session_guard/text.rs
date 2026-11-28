@@ -157,19 +157,32 @@ pub(super) fn shell_words(s: &str, quotes: bool) -> Vec<Vec<String>> {
     cmds
 }
 
-/// The letters of a wrapper's options that take an argument, and whether a lock
-/// file comes first (`flock f cmd`).
-pub(super) fn takes(wrapper: &str) -> (&'static str, bool) {
+/// The letters of a wrapper's options that take an argument (per its man page),
+/// and the positional that comes first: `f` a lock file (`flock f cmd`), `h` a
+/// hex mask (`taskset ff cmd`).
+pub(super) fn takes(wrapper: &str) -> (&'static str, char) {
     match wrapper {
-        "env" => ("uCaP", false),
-        "timeout" => ("sk", false),
-        "stdbuf" => ("ioe", false),
-        "strace" => ("oepsuEP", false),
-        "flock" => ("wEc", true),
-        "taskset" | "nice" | "ionice" | "watch" => ("cnpPd", false),
-        "sudo" | "doas" => ("ghprtCUuDRTa", false),
-        "exec" => ("a", false),
-        "time" => ("fo", false),
-        _ => ("", false),
+        "env" => ("uCaP", ' '),
+        "timeout" => ("sk", ' '),
+        "stdbuf" => ("ioe", ' '),
+        "strace" => ("abeEIoOpPsSuUX", ' '),
+        "flock" => ("wEc", 'f'),
+        "taskset" => ("c", 'h'),
+        "nice" => ("n", ' '),
+        "ionice" => ("cnpPu", ' '),
+        "watch" => ("n", ' '),
+        "sudo" => ("CDghpRrTtUua", ' '),
+        "doas" => ("Cu", ' '),
+        "exec" => ("a", ' '),
+        "time" => ("fo", ' '),
+        _ => ("", ' '),
     }
+}
+
+/// A number, a duration or a mask (`5`, `.5`, `5s`, `0x1`, `1.lock`): a word that
+/// starts with a digit or a dot and is made of letters, digits and `.:,-`.
+pub(super) fn numberlike(w: &str) -> bool {
+    w.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".:,-".contains(c))
 }

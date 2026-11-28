@@ -1328,7 +1328,11 @@ them. Two layers close the direct routes; neither is a boundary.
   (`$'\x74ole' x`), also as the program of a wrapper chain, where the guard can
   size the wrapper's options and positional (`env`, `timeout`, `stdbuf`, `strace`,
   `flock`, `taskset`, `nice`, `ionice`, `watch`, `sudo`, `doas`, `exec`, `time`:
-  `timeout -s KILL 5 ./tol? x`, `flock f ./tol? x`, `sudo -g wheel $(echo tole) x`); the running binary under another name (a program word with `/proc/`, ending in
+  the argument-taking short options of each as its man page lists them, the lock
+  file of `flock`, the hex mask of `taskset`, and number-like words such as `.5`,
+  `5s`, `0x1`: `timeout -s KILL 5 ./tol? x`, `flock 1.lock ./tol? x`, `taskset ff
+  $(echo tole) x`, `sudo -g wheel $(echo tole) x`, `watch -d ./tol? x`; `watch`
+  sizes `-n` only); the running binary under another name (a program word with `/proc/`, ending in
   `/exe` or naming `PPID`: `/proc/$PPID/exe x`); a shell named by a glob or a
   variable (`/bin/d?sh -c 'tole x'`, `$S -c ...`, `${SHELL:-sh} -c ...`: any
   program or wrapper word with `$ * ? [` is scanned for a `-c` payload);
@@ -1392,7 +1396,8 @@ wrapper runs (`env FOO=$(echo tole) cmd` is fine; `env -i $(echo tole) x` and
 `env $(echo tole) x` are refused since #1307, and so are the wrapper options
 the guard sizes, but `timeout --signal KILL 5 $(echo tole) x` hides it behind
 an option outside its table, with a glob, an ANSI-C string or `${E:-tole}` in
-the same place); an interpreter
+the same place; so does `taskset -c 0 dd $(echo tole)`: a program named with hex
+letters only right after `taskset` is read as its mask); an interpreter
 (`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
 directly; the jail check compares paths, so a bind mount or a hard link
 into the data dir is not seen. A session with `run_command` has the
