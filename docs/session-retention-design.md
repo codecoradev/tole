@@ -2,12 +2,19 @@
 
 Status: **proposal for an owner decision** (issue #1020). Nothing here is
 implemented and nothing in this note is decided: section 8 lists what the owner
-has to decide. The note says what the code does today (with file references),
+has to decide, section 10 says what can be said about volume sizing today and
+section 11 recommends an order. The note says what the code does today (with file references),
 what retention can mean under the append-only rule, what each reading costs, and
 what a reader or a resume sees afterwards. Anything not checked in the code is
 marked **(not verified)**; section 9 lists them together.
 
-Code references are to `origin/develop` at 50c7bcc (2026-11-26).
+Code references are to `origin/develop` at 50c7bcc (2026-11-26), except where a
+sentence names a later change. Revision of 2026-11-28 (`origin/develop` at
+af83a4e): the readiness route that landed after the first version (#1318) is
+now stated in section 2, the container facts of #1325 are in section 10, and
+sections 10 and 11 are new. The file and line references of sections 2 to 7 were
+not re-read for this revision; a line number there can have moved, the symbol
+named next to it is what to search for.
 
 ## 1. The rule this has to respect
 
@@ -42,7 +49,11 @@ directory. The files are created through `openat` with mode `0o666` before the
 umask (`crates/tole-core/src/session/safe_dir.rs:164`), not `0600`; the global
 index is `0600` (`crates/tole-cli/src/session/index.rs:82`).
 
-**Growth.** Nothing removes or rotates a session file. A grep of `crates/` for
+**Growth.** Nothing removes or rotates a settled session file. (Three code paths
+unlink or replace a file, none of them retention: a failed `fork` removes its
+half-written output, `storage.rs:650`; a failed Claude Code import removes its
+half-written file, `ccimport.rs:308`; and `compact()` renames a new file over
+the live path, `storage.rs:1527`, see below.) A grep of `crates/` for
 "archive", "prune", "retention" has many hits (skill curator, approvals, cron,
 the webhook-delivery ledger `ledger/mod.rs`, `children/agents.rs`,
 `provider/replay.rs`, `integrations/git.rs`, desktop UI code) but none is
@@ -112,11 +123,22 @@ serve's index route is bounded and metadata only (it skips files over 16 MiB).
 **Failure when the disk is full.** A failed append (the code names ENOSPC)
 poisons that open handle: every later commit is refused until the session is
 re-opened (or `compact()` is run, see above), and the torn tail is discarded at
-the next open (`storage.rs:1010`). `tole serve` has no readiness route today (only
-`GET /health`, liveness, `serve.rs:6`); the "readiness issue" the issue text
-mentions is separate and is **not verified** here. `[delegation] min_free_disk_mb`
+the next open (`storage.rs:1010`). `tole serve` has a readiness route since
+#1318 (`GET /ready`, next to `GET /health`, which stays liveness;
+`crates/tole-cli/src/serve_support/ready.rs`, `docs/mobile-control.md` "`GET /ready`").
+Its `state` check creates and removes one empty file in the data directory, in
+the cron directory when `--cron` or a webhook destination is configured, and in
+`--sessions-dir` when that is given (the default container command gives it,
+`Dockerfile:76`; an override of the command that drops `--sessions-dir`, which
+`docs/container.md` tells operators to do for `--cron` or `--transport mcp`, loses
+the sessions probe); without `--sessions-dir` the sessions directories are not
+probed. So a **read-only volume** or one with no free inode turns the answer
+into `503 not ready`. The probe writes no byte (`writable` in `ready.rs`,
+`create_new` then `remove_file`), so whether it also fails on a volume that has
+inodes but no free data blocks depends on the filesystem and is **not verified**:
+do not rely on `/ready` as a disk-space alarm. `[delegation] min_free_disk_mb`
 guards child spawns on the data dir, workspace and worktree filesystems
-(`docs/threat-model.md:1139`); nothing guards the sessions directory itself.
+(`docs/threat-model.md:1141`); nothing guards the sessions directory itself.
 
 **Model commands and the sessions directory.** By default the barrier is the
 approval gate on `run_command` and `job_start`, plus a best-effort blocklist
@@ -372,13 +394,141 @@ feature, but none exists in the tree: no crate has a `sqlite` feature or uses
 from `Cargo.lock`, so that text is stale);
 deleting anything automatically or on a timer; a model-callable retention tool;
 retention of cron, approvals, outbox, delegation and job logs; remote archives
-(object storage); a readiness signal on `tole serve`.
+(object storage); a disk-space signal on `tole serve` (`/ready` is a write
+probe, see section 2).
 
 Not verified: whether `compact()` has any trigger (grep says none); whether
 `flate2`'s licence passes `deny.toml` (`cargo deny` not run); whether any
 reader opens a session by the id found in cron or delegation logs; the
 unread grep hits for "archive/prune/retention" (section 2); what
 `face_parity` would require of an archived-sessions listing; the server's
-behaviour on ENOSPC beyond the storage layer (the poison path is read, not run);
+behaviour on ENOSPC beyond the storage layer (the poison path is read, not run),
+and whether `GET /ready` fails on a volume with no free data blocks (its probe
+creates an empty file only);
 the size of real session stores. No command was run against a real session
 store for this note; everything above is from reading the source and the docs.
+
+## 10. Volume sizing: what can be said today
+
+There is **no measurement** of real session sizes or counts in this repository
+(section 7), so this section gives the facts the code fixes and a way to
+measure; it gives no "N GB per month" figure, because none can be backed.
+
+**Where the bytes go in the container recipe** (`Dockerfile`, `docs/container.md`
+"The image"; the default layout: `TOLE_CRON_DIR` can move the cron directory off
+`/data/codecora`, `cron/mod.rs:250-252`, and the statements about it then do not
+hold). One named volume, `tole-data`, mounted at `/data`, holds all of
+this, so one full volume stops all of it:
+
+| Path | What | Grows by | Bounded by |
+|---|---|---|---|
+| `/data/sessions` (`--sessions-dir`) | one `<id>.jsonl` and one `<id>.jsonl.lock` per session | every turn, append only | nothing (section 2) |
+| `/data/codecora/tole/images/<hash>.<ext>` | spilled inline and ACP images, shared by hash | a new image | nothing |
+| `/data/codecora/tole/images/serve/<session>/` | `tole serve` uploads | an upload | 64 MiB per session and 512 MiB in total by default (`serve_support/images.rs:28-34`; overridable by `TOLE_SERVE_IMAGE_SESSION_QUOTA` and `TOLE_SERVE_IMAGE_TOTAL_QUOTA`) |
+| `/data/home` (`HOME`) | the account home (for example a `~/.gitconfig`); not a retention target | by what runs in the container | nothing |
+| `/data/codecora` (rest) | user config, cron store, discussion logs, trust records, skills (`docs/container.md`, "The image"); the approvals log, webhook outbox and job logs are append-only too, where each one lives was not checked | cron runs, approvals, deliveries | nothing (outside this note) |
+
+The workspace is a second volume, `tole-workspace`; it holds the working
+folders and is the operator's own data, not a retention target here.
+
+**What drives the size of one session file.** Every tool result and every
+message is an entry, kept whole so that a replay is exact. What a single tool
+may return is bounded per tool, not per entry: `read_file` returns at most
+20,000 characters per call (`MAX_READ_CHARS`, `tools/read_file.rs:27`);
+`run_command` returns at most 4,000 characters of stdout and 2,000 of stderr
+(`run_command.rs:265-266`, `cap_output`); an MCP tool result is cut at 256 K
+characters (`MAX_RESULT_CHARS`, `mcp.rs:97`, used at `:751`, `:773`, `:812`). The
+32 MiB of `MAX_CAPTURE` (`subprocess.rs:21`) is a per-stream capture ceiling
+inside the process, not the size of an entry. Tool **inputs** are entries too (a
+file write or edit up to `MAX_EDIT_BYTES`, 1 MiB, `tools/file_tools.rs:33`), and
+so is the model's own output. Whether the turn layer trims anything further
+before a line is written was **not checked**.
+Context compaction appends a summary and saves tokens, not bytes (section 2).
+A long mission is the heavy case: each step adds to the same file.
+
+**How to measure, on the host or with `docker exec`** (read-only, none of these
+is a tole command and none was run for this note):
+
+```bash
+du -sh /data/sessions /data/codecora/tole/images       # total bytes
+ls -lS /data/sessions | head                            # the largest sessions
+find /data/sessions -name '*.jsonl' | wc -l             # how many
+find /data/sessions -name '*.jsonl' -mtime +90 | wc -l  # how many untouched for 90 days
+df -h /data                                             # free space on the volume
+```
+
+**Sizing rule that follows.** Take the measured growth per week of `/data` after
+a representative period, multiply by the weeks until you will next review it,
+and add headroom for the images (at least the 512 MiB serve quota when the
+desktop or mobile clients upload) and for the backup copy the recipe makes while
+the service is stopped (`docs/container.md`, "Persistence and upgrades": a
+`tar` of the volume needs room somewhere, not necessarily on the same volume).
+Watch free space from outside tole (the host's `df`, the orchestrator's volume
+metric): `GET /ready` fails on a read-only volume and, possibly, on a full one
+(section 2), but it is a write probe, not a space alarm. If the volume is shared
+with other state, size the whole of `/data`, not only `/data/sessions`.
+
+## 11. Recommendation
+
+A proposal; every step that touches a session file waits for decision 1 of
+section 8. The order is chosen so that each step is useful alone and the next one
+is only built if the data from the previous one calls for it.
+
+1. **Now, no code and no new rule: the measurement and the sizing text.** The
+   measure commands above, and a short "Disk growth" paragraph in
+   `docs/container.md` that points at section 10 (written in the change that
+   added this section). It decides nothing and moves no file. This is the only
+   step that needs no owner answer. The other half of option B, a written
+   procedure for moving whole files by hand, is **not** written down: it tells an
+   operator to move or remove session files, so it waits for decision 1.
+2. **First code: option A, measure and warn.** `tole sessions` and `tole doctor`
+   print file count, total bytes, oldest and largest (and the size of the image
+   directories), with a warning threshold that is off by default. Read-only, no
+   file format change, and it produces the real numbers section 7 says are
+   missing. It is the "smallest piece" the issue asks for.
+3. **Only if step 2 shows a problem: option C1, archive, and nothing more.**
+   `tole sessions archive --older-than DAYS --to DIR` moves **whole, settled**
+   session files (decision 7) out of the active directory; it is named
+   `archive`, not `prune`, because it never discards a log: the bytes survive in
+   the archive (the original is removed from the active directory, after the copy
+   is verified). Shape, each point
+   resting on section 2 to 5:
+   - an **owner command on the host**, never a model tool, and never run by a
+     timer or on a threshold (section 1);
+   - **dry run by default** (it lists what it would move and the bytes), the move
+     needs an explicit flag;
+   - **copy, verify, remove**: it takes the writer lock of the file (try-lock,
+     refuse with the holder's pid), copies byte for byte keeping the mtime,
+     compares the copy, and only then removes the original and its `.lock`
+     sidecar, in that order, so a crash leaves at least one whole copy
+     (section 4, section 7);
+   - **no compression** in the first piece (C2 needs a dependency or a runtime
+     `gzip`, and the licence gate of `AGENTS.md` section 6 for a new crate);
+   - **no index pointer** (C3): an archived session is invisible to `sessions`,
+     `--all` and `resume`, and the way back is moving the file back by hand
+     (section 4, first column). This is the cheapest reading and avoids
+     deciding the index schema; it costs that a person must remember where they
+     put the archive, which is acceptable for a first piece an owner runs by hand;
+   - **each file alone**: forks are self-contained (section 2), so archiving a
+     family together is not needed (decision 8);
+   - **images out of scope**: documented as an operator cleanup, as today. The
+     safe half later is `images/serve/<session id>/`, which is attributable by
+     directory name; the shared spill needs the reference scan of section 6.
+4. **Not recommended:** compaction as retention (it removes no entry,
+   section 2); rotation inside a live session (E, a format change for a problem
+   that lives in cold sessions); any in-place edit (F); a deleting command
+   (D stays the owner's own `rm`, after an export if wanted); a retention
+   tool callable by the model.
+
+**What needs the owner** (numbers are those of section 8): 1 (may a whole file
+be moved at all; steps 1 and 2 stand without it), 3 (where the archive lives and
+that the command is owner-only), 5 and 7 (selection by age, and settled
+sessions only), plus decision 4 (the index pointer): **is a first piece without one
+acceptable**, given that `resume` of an archived id then answers "no
+session" and `sessions --all` does not list it (section 4). Step 3 as written also settles
+two decisions by choosing the cheapest reading, for the owner to confirm: 6
+(images are out of the first piece) and 8 (each file alone). Decisions 2, 9 and
+10 can wait: the recommendation does not need them. Face parity
+(`AGENTS.md` section 6) still has to be checked for step 3: a CLI-only archive
+command is a row in `docs/faces.md` with its reason, or the same capability on
+the other faces; what `face_parity` would require was not checked.

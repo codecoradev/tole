@@ -727,7 +727,7 @@ The checks, each `true` when it does not apply (so even `checks` does not say wh
 
 - `state`: a file can be created and removed in the tole data directory, in the cron directory when
   `--cron` is given or a webhook destination is configured, and in `--sessions-dir` when it is
-  given (a read-only volume, a full disk, a path that is not a directory). A directory that does
+  given (a read-only volume, one with no free inode, or a path that is not a directory; a volume that still has inodes but no free blocks is not proven to fail the probe, which writes no byte). A directory that does
   not exist yet is probed at its nearest existing parent and is never created. Without
   `--sessions-dir` the sessions live in each session's workspace and are not probed.
 - `cron`: with `--cron`, this process's in-process ticker wrote its heartbeat (`ticker.json`, the file
