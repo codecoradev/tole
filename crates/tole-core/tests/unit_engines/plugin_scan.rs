@@ -1,5 +1,9 @@
-use super::*;
-use serde_json::json;
+//! Plugin manifest scanner (#1249: moved out of `src/`, only the public API).
+
+use serde_json::{json, Value};
+use tole_core::plugin_lock::ManifestTool;
+use tole_core::plugin_scan::*;
+use tole_core::secrets::SecretSet;
 
 fn tool(name: &str, desc: &str, schema: Value) -> ManifestTool {
     ManifestTool {

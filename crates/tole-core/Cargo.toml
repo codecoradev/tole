@@ -124,5 +124,13 @@ name = "session_guard_differential"
 required-features = ["shell-tools"]
 
 [[test]]
+name = "session_guard_routes"
+required-features = ["shell-tools"]
+
+[[test]]
+name = "session_guard_cost"
+required-features = ["shell-tools"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]

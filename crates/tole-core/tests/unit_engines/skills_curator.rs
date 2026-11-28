@@ -1,5 +1,9 @@
-use super::*;
+//! Skill curator (#1249: moved out of `src/`, only the public API).
 
+use std::path::{Path, PathBuf};
+use tole_core::skills::curator::*;
+
+const DAY: u64 = 86_400;
 const NOW: u64 = 100 * DAY;
 
 use crate::test_dir::TestDir;
@@ -392,11 +396,11 @@ fn the_run_tracker_collects_each_loaded_skill_once_and_clones_share() {
 fn the_ledger_exists_only_for_a_user_with_something_to_curate() {
     let data = tmp("curated");
     assert!(UsageLedger::curated_in(&data).is_none(), "a plain user");
-    std::fs::create_dir_all(data.join(crate::skill_draft::DRAFTS_DIR)).unwrap();
+    std::fs::create_dir_all(data.join(tole_core::skill_draft::DRAFTS_DIR)).unwrap();
     let l = UsageLedger::curated_in(&data).expect("a user with a draft");
     l.append(&rec(1, None, UsageKind::Success)).unwrap();
     assert!(data.join(USAGE_FILE).is_file());
-    std::fs::remove_dir_all(data.join(crate::skill_draft::DRAFTS_DIR)).unwrap();
+    std::fs::remove_dir_all(data.join(tole_core::skill_draft::DRAFTS_DIR)).unwrap();
     assert!(UsageLedger::curated_in(&data).is_none());
     CuratorState::default()
         .save(&data.join(STATE_FILE))

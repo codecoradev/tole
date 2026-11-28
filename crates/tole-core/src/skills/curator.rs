@@ -699,7 +699,3 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "curator_tests.rs"]
-mod tests;

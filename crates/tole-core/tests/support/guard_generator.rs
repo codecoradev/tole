@@ -2,10 +2,10 @@
 //! (#1307): a fixed-seed xorshift picks one value per axis, so a run is the
 //! same on every machine and no clock or `rand` is involved.
 //!
-//! A generated line is: leading assignments, a wrapper, the program word and
+//! A generated line is: leading assignments, redirections, a wrapper, the program word and
 //! one argument form one simple command; a context puts it behind or between
-//! other commands (separators, braces, a subshell, `if`); up to two layers of
-//! `sh -c '...'` wrap it, each quoted with single quotes, double quotes or
+//! other commands (separators, braces, a subshell, `if`); up to three layers of
+//! `[wrapper] sh -c '...'` wrap it, each quoted with single quotes, double quotes or
 //! backslashes. A line that starts with a shell is also emitted as a command
 //! line (split like `run_command`, run without an outer shell). `@FAKE@` is
 //! the directory of the fake `tole`.
@@ -24,6 +24,16 @@ const ASSIGNS: &[&str] = &[
     "X='a;c' ",
     "X=$(echo a) ",
     "X=1 Y=2 ",
+    "X=a}b ",
+    "X=a${IFS}b ",
+    "X+=1 ",
+    ">/dev/null ",
+    "2>&1 ",
+    ">&- ",
+    "3>&- ",
+    ">|/dev/null ",
+    "$NOPE ",
+    "! ",
 ];
 const WRAPPERS: &[&str] = &[
     "",
@@ -38,6 +48,27 @@ const WRAPPERS: &[&str] = &[
     "command ",
     "nice ",
     "timeout 5 ",
+    "env env ",
+    "env X=1 env ",
+    "nohup env ",
+    "coproc ",
+    "builtin command ",
+    "ionice -c3 ",
+    "timeout 5s ",
+    "timeout -s KILL 5 ",
+    "stdbuf -o L ",
+    "flock f ",
+    "taskset 0x1 ",
+    "taskset ff ",
+    "timeout .5 ",
+    "flock 1.lock ",
+    "watch -d ",
+    "strace -S calls ",
+    "sudo -g wheel ",
+    "time</dev/null ",
+    "env -u NOPE -C . ",
+    "env --unset NOPE ",
+    "env>/dev/null ",
 ];
 const PROGRAMS: &[&str] = &[
     "tole",
@@ -47,6 +78,20 @@ const PROGRAMS: &[&str] = &[
     "'tole'",
     "t\\ole",
     "tole-cli",
+    "tole>/dev/null",
+    "tole$NOPE",
+    "tole\"$NOPE\"",
+    "tol\\\ne",
+    "$'\\x74ole'",
+    "./tol?",
+    "./to[l]e",
+    "$PWD/tol*",
+    "$NOPE tole",
+    "./[]t]ole",
+    "./[[:lower:]]ole",
+    "to{l,x}e",
+    "${NOPE:-tole}",
+    "$(echo tole)",
 ];
 /// `{}` is the simple command.
 const CONTEXTS: &[&str] = &[
@@ -68,9 +113,27 @@ const CONTEXTS: &[&str] = &[
     "echo a;{}",
     "cd . && {}",
     "echo \"{}\"",
+    "f() { {}; }; f",
+    "function f { {}; }; f",
+    "true && { {}; }",
 ];
-/// Not `env sh -c` and the like: a wrapper in front of a shell is a documented
-/// route listed in `KNOWN_RESIDUAL`, and mixing it in only repeats that gap.
+/// What stands in front of a nested shell (a wrapper, with options) and which
+/// flags it gets: `env -i sh -lc`, `nice bash -xc`.
+const SHELL_WRAPPERS: &[&str] = &[
+    "",
+    "",
+    "env ",
+    "env -i ",
+    "env -C . ",
+    "sudo ",
+    "nohup ",
+    "exec ",
+    "exec -a x ",
+    "time ",
+    "nice ",
+    "timeout 5 ",
+];
+const SHELL_FLAGS: &[&str] = &["-c", "-c", "-lc", "-xc", "-e -c"];
 const SHELLS: &[&str] = &["sh", "bash"];
 
 #[derive(Clone, Copy)]
@@ -138,15 +201,22 @@ pub fn generate(count: usize) -> Vec<Input> {
             rng.pick(PROGRAMS)
         );
         let mut line = rng.pick(CONTEXTS).replace("{}", &cmd);
-        // Depth 0 for 3 in 10 lines, 1 for 4, 2 for 3.
+        // Depth 0 for 2 in 10 lines, 1 for 3, 2 for 4, 3 for 1.
         let depth = match rng.next() % 10 {
-            0..=2 => 0,
-            3..=6 => 1,
-            _ => 2,
+            0..=1 => 0,
+            2..=4 => 1,
+            5..=8 => 2,
+            _ => 3,
         };
         for _ in 0..depth {
             let how = *rng.pick(&[Quote::Single, Quote::Double, Quote::Backslash]);
-            line = format!("{} -c {}", rng.pick(SHELLS), quote(&line, how));
+            line = format!(
+                "{}{} {} {}",
+                rng.pick(SHELL_WRAPPERS),
+                rng.pick(SHELLS),
+                rng.pick(SHELL_FLAGS),
+                quote(&line, how)
+            );
         }
         if seen.insert(line.clone()) {
             if depth > 0 {

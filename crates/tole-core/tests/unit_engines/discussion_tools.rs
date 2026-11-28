@@ -1,12 +1,13 @@
-//! The tool allowance and the owner's approvals in the ledger (#1039).
+//! The tool allowance and the owner's approvals in the ledger (#1039; moved out
+//! of `src/` for #1249, only the public API).
 
-use super::log::{DiscussionLog, Event, Next, MAX_RECORD_BYTES};
-use super::{
+use crate::test_dir::TestDir;
+use tole_core::discussion::log::{DiscussionLog, Event, Next, MAX_RECORD_BYTES};
+use tole_core::discussion::{
     tool_name_ok, Contract, Gate, ToolVerdict, MAX_ALLOWED_TOOLS, MAX_QUESTION_CHARS,
     MAX_TOOL_NAME_CHARS,
 };
-use crate::secrets::SecretSet;
-use crate::test_dir::TestDir;
+use tole_core::secrets::SecretSet;
 
 fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -174,7 +175,10 @@ fn a_stopped_or_closed_discussion_grants_nothing() {
         .tool_approval("dap-2", SEARCH, ToolVerdict::Allow, 5)
         .unwrap_err();
     assert!(e.contains("closed"), "{e}");
-    assert_eq!(st.closed.unwrap().0, Gate::Escalate(super::Reason::Stopped));
+    assert_eq!(
+        st.closed.unwrap().0,
+        Gate::Escalate(tole_core::discussion::Reason::Stopped)
+    );
 }
 
 #[test]
