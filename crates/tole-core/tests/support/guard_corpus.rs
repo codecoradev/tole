@@ -72,14 +72,6 @@ const fn r(text: &'static str, needs: &'static [&'static str]) -> Residual {
     }
 }
 
-const fn rl(text: &'static str) -> Residual {
-    Residual {
-        line: true,
-        text,
-        needs: &[],
-    }
-}
-
 /// A family of generated lines that a shell runs as `tole` and the guard
 /// allows, for routes whose exact texts are too many to list. Same ratchet as
 /// an entry: the family must still have a live member, or it is deleted.
@@ -99,14 +91,8 @@ pub const RESIDUAL_CLASSES: &[ResidualClass] = &[];
 /// a change to the guard makes it refuse an entry, the test fails and says to
 /// delete the entry (#1307).
 pub const KNOWN_RESIDUAL: &[Residual] = &[
-    // Documented and not part of #1307: wrappers are not followed into a
-    // shell's `-c` text, and the guard does not follow eval, a pipe into a
-    // shell, a variable, xargs, find -exec or rg --pre.
-    rl("env -i sh -c '@FAKE@/tole x'"),
-    rl("env sh -c 'tole x'"),
-    rl("sudo sh -c 'tole x'"),
-    rl("nohup sh -c 'tole x'"),
-    rl("timeout 5 sh -c 'tole x'"),
+    // Documented and not part of #1307: the guard does not follow eval, a pipe
+    // into a shell, a variable, xargs, find -exec or rg --pre.
     r("eval 'tole x'", &[]),
     r("eval tole x", &[]),
     r("echo 'tole x' | sh", &[]),

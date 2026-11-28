@@ -104,6 +104,21 @@ const ROUTES: &[&str] = &[
     "env>f tole x",
     "sh>f -c 'tole x'",
     "bash<f -c 'tole x'",
+    // A wrapper in front of a shell's `-c`, with options and assignments between.
+    "env sh -c 'tole x'",
+    "env -i sh -c 'tole x'",
+    "env -C . sh -c 'tole x'",
+    "env FOO=1 sh -c 'tole x'",
+    "sudo sh -c 'tole x'",
+    "sudo -u root env sh -ic 'tole x'",
+    "nohup sh -c 'tole x'",
+    "timeout 5 sh -c 'tole x'",
+    "exec -a name sh -c 'tole x'",
+    "time bash -lc 'tole x'",
+    "nice -n 5 dash -xc 'tole x'",
+    "stdbuf -o0 sh -c 'echo a; tole x'",
+    "env env -i bash -c 'cd . && tole x'",
+    "env -i sh -c '/usr/bin/tole x'",
     // Other shells and runners.
     "rbash -c 'tole x'",
     "ksh93 -c 'tole x'",
@@ -265,6 +280,27 @@ fn a_hundred_thousand_leading_words_are_refused_quickly_on_a_small_stack() {
         assert!(a && b, "{lead:?}: refused as text {a}, as argv {b}");
         assert!(started.elapsed().as_secs() < 20, "{lead:?} took too long");
     }
+    // A long wrapper chain and many nested `-c` stay linear too.
+    let chain = format!("{}sh -c 'tole x'", "env ".repeat(20_000));
+    let layers = format!("{}echo a", "sh -c ".repeat(2_000));
+    let started = std::time::Instant::now();
+    let (a, b, c) = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            (
+                refused(&shell(&chain)),
+                refused(&line(&chain)),
+                refused(&line(&layers)),
+            )
+        })
+        .unwrap()
+        .join()
+        .expect("no stack overflow");
+    assert!(a && b && c, "chain {a} {b}, layers {c}");
+    assert!(
+        started.elapsed().as_secs() < 30,
+        "chain or layers took too long"
+    );
     // Nested shells and a glob of many stars stay linear too.
     let text = nest(&format!("{}echo", ">f ".repeat(20_000)), 3);
     let glob = format!("env {}x", "*a".repeat(5_000));

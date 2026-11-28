@@ -4,8 +4,8 @@
 //!
 //! A generated line is: leading assignments, redirections, a wrapper, the program word and
 //! one argument form one simple command; a context puts it behind or between
-//! other commands (separators, braces, a subshell, `if`); up to two layers of
-//! `sh -c '...'` wrap it, each quoted with single quotes, double quotes or
+//! other commands (separators, braces, a subshell, `if`); up to three layers of
+//! `[wrapper] sh -c '...'` wrap it, each quoted with single quotes, double quotes or
 //! backslashes. A line that starts with a shell is also emitted as a command
 //! line (split like `run_command`, run without an outer shell). `@FAKE@` is
 //! the directory of the fake `tole`.
@@ -99,8 +99,23 @@ const CONTEXTS: &[&str] = &[
     "function f { {}; }; f",
     "true && { {}; }",
 ];
-/// Not `env sh -c` and the like: a wrapper in front of a shell is a documented
-/// route listed in `KNOWN_RESIDUAL`, and mixing it in only repeats that gap.
+/// What stands in front of a nested shell (a wrapper, with options) and which
+/// flags it gets: `env -i sh -lc`, `nice bash -xc`.
+const SHELL_WRAPPERS: &[&str] = &[
+    "",
+    "",
+    "env ",
+    "env -i ",
+    "env -C . ",
+    "sudo ",
+    "nohup ",
+    "exec ",
+    "exec -a x ",
+    "time ",
+    "nice ",
+    "timeout 5 ",
+];
+const SHELL_FLAGS: &[&str] = &["-c", "-c", "-lc", "-xc", "-e -c"];
 const SHELLS: &[&str] = &["sh", "bash"];
 
 #[derive(Clone, Copy)]
@@ -168,15 +183,22 @@ pub fn generate(count: usize) -> Vec<Input> {
             rng.pick(PROGRAMS)
         );
         let mut line = rng.pick(CONTEXTS).replace("{}", &cmd);
-        // Depth 0 for 3 in 10 lines, 1 for 4, 2 for 3.
+        // Depth 0 for 2 in 10 lines, 1 for 3, 2 for 4, 3 for 1.
         let depth = match rng.next() % 10 {
-            0..=2 => 0,
-            3..=6 => 1,
-            _ => 2,
+            0..=1 => 0,
+            2..=4 => 1,
+            5..=8 => 2,
+            _ => 3,
         };
         for _ in 0..depth {
             let how = *rng.pick(&[Quote::Single, Quote::Double, Quote::Backslash]);
-            line = format!("{} -c {}", rng.pick(SHELLS), quote(&line, how));
+            line = format!(
+                "{}{} {} {}",
+                rng.pick(SHELL_WRAPPERS),
+                rng.pick(SHELLS),
+                rng.pick(SHELL_FLAGS),
+                quote(&line, how)
+            );
         }
         if seen.insert(line.clone()) {
             if depth > 0 {

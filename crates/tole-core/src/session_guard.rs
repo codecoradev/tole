@@ -236,8 +236,13 @@ fn program_runs_tole(
     if is_tole(prog, cwd, exe) || is_tole(&own, cwd, exe) {
         return true;
     }
-    let b = [base(prog), base(&own)]; // `time< f tole x`
-    if b.iter().any(|b| WRAPPERS.contains(&b.as_str())) {
+    // `time< f tole x`: a redirection or variable can be glued to the name.
+    let named = |list: &[&str], w: &str, own: &str| {
+        [base(w), base(own)]
+            .iter()
+            .any(|b| list.contains(&b.as_str()))
+    };
+    if named(&WRAPPERS, prog, &own) {
         // `env -S 'tole x'` splits its argument into words; a quote cut open by
         // a separator inside it (`env "X=a;c" tole x`) leaves an open key.
         return argv[i + 1..].iter().any(|w| is_assignment(w) && quoted(w))
@@ -259,29 +264,36 @@ fn program_runs_tole(
                     && (is_tole(&words[j], cwd, exe)
                         || is_tole(&stem(&argv[j]), cwd, exe)
                         || hidden(&argv[j]))
-            });
+            })
+            // The first shell behind the wrapper: `env -i sh -c 'tole x'`.
+            || (i + 1..words.len())
+                .find(|&j| named(&SHELLS, &words[j], &stem(&argv[j])))
+                .is_some_and(|j| shell_runs_tole(argv, j, cwd, exe, depth));
     }
-    if b.iter().any(|b| SHELLS.contains(&b.as_str())) {
-        let mut rest = argv[i + 1..].iter();
-        while let Some(f) = rest.next() {
-            if f.starts_with('-') && !f.starts_with("--") && f.contains('c') {
-                // The payload, and anything after it, is shell text. Words that come
-                // from shell text (depth > 0) are still quoted for the shell the
-                // text is handed to, and mean something only together (#1307).
-                let rest: Vec<&str> = rest.map(String::as_str).collect();
-                let text = |t: &str| {
-                    payload_invokes_tole(t, cwd, exe, depth + 1)
-                        || [false, true].iter().any(|&q| {
-                            let on = if q { depth > 0 } else { true };
-                            on && t.contains(if q {
-                                &['\\', '\'', '"'][..]
-                            } else {
-                                &['\\'][..]
-                            }) && payload_invokes_tole(&unquote_shell(t, q), cwd, exe, depth + 1)
-                        })
-                };
-                return text(&rest.join(" ")) || rest.iter().any(|p| *p != "$(" && text(p));
-            }
+    named(&SHELLS, prog, &own) && shell_runs_tole(argv, i, cwd, exe, depth)
+}
+
+/// Does the shell at `argv[at]` run tole from its `-c` payload (`-c`, `-lc`, `-xc`)?
+fn shell_runs_tole(argv: &[String], at: usize, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
+    let mut rest = argv[at + 1..].iter();
+    while let Some(f) = rest.next() {
+        if f.starts_with('-') && !f.starts_with("--") && f.contains('c') {
+            // The payload, and anything after it, is shell text. Words that come
+            // from shell text (depth > 0) are still quoted for the shell the
+            // text is handed to, and mean something only together (#1307).
+            let rest: Vec<&str> = rest.map(String::as_str).collect();
+            let text = |t: &str| {
+                payload_invokes_tole(t, cwd, exe, depth + 1)
+                    || [false, true].iter().any(|&q| {
+                        let on = if q { depth > 0 } else { true };
+                        on && t.contains(if q {
+                            &['\\', '\'', '"'][..]
+                        } else {
+                            &['\\'][..]
+                        }) && payload_invokes_tole(&unquote_shell(t, q), cwd, exe, depth + 1)
+                    })
+            };
+            return text(&rest.join(" ")) || rest.iter().any(|p| *p != "$(" && text(p));
         }
     }
     false
