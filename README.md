@@ -251,8 +251,12 @@ occurrence after downtime (default `skip`), `--paused` saves a job disabled,
 `tole serve --port --bind --transport mcp --cron --token-file --shutdown-grace`.
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
-`--sessions-dir`): append-only, crash-safe, replayable — kill the process
-mid-turn and resume exactly where it stopped.
+`--sessions-dir`): append-only, crash-safe, replayable. After a SIGKILL
+mid-turn the log still parses and `tole resume <id>` finishes the turn in the
+same session; a write that was in flight is not run again unless you allow it
+(its outcome is unknown). Pinned by the kill loops in
+[docs/crash-resume.md](docs/crash-resume.md), which also lists what a kill
+test cannot show (a power cut).
 
 Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
@@ -620,9 +624,9 @@ tole mission "ship the feature" --max-steps 48 --max-minutes 15 \
 Autonomous turn-chaining toward a goal (#199): the existing turn
 machinery looped until the model declares `MISSION_COMPLETE` (and
 `--verify` exits 0, when set) or a budget trips (`--max-steps`,
-`--max-minutes`, `--max-tokens`). Every chained turn is a normal durable turn — crash
-mid-mission resumes exactly where it stopped (`tole mission --resume
-<id>`, or plain `tole resume`), cancel works unchanged, Destructive
+`--max-minutes`, `--max-tokens`). Every chained turn is a normal durable turn — after a
+crash, `tole resume <id>` finishes the cut-off turn and `tole mission --resume
+<id>` continues the mission (it refuses a cut-off turn), cancel works unchanged, Destructive
 tools stay un-auto-allowable, and a durable summary lands on the
 session either way. Plans ride the `todo_write`/`todo_read` tools
 (#198); budget exhaustion settles resumably, never a dead session.

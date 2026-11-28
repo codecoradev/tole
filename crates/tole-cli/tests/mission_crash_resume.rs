@@ -25,7 +25,9 @@
 //!   approval and was killed there loses the queue row (it is in memory) and
 //!   has not run the effect; the session is parked, so `tole mission
 //!   --resume` continues it without the two steps and the effect still has
-//!   not run: nothing asks again unless the model does.
+//!   not run: nothing asks again unless the model does. A kill before the
+//!   denial is written (the row is queued first) leaves a cut-off turn
+//!   instead: the two steps again (#1018, an intermittent CI failure).
 //! - After the two steps the mission completes, the goal was sent once, the
 //!   `fact/mission` register says `complete` and the effect ran as often as
 //!   the contract says: once, plus once more when the replay was approved.
@@ -296,86 +298,176 @@ fn a_mission_killed_at_a_random_point_resumes_in_two_steps_and_completes() {
     eprintln!("mission loop: {cut_off} cut off mid-turn, {settled} already settled, {none} before the session existed");
 }
 
+/// `tole <args>` over a serve's directory (its `.tole/sessions`), the way the
+/// operator recovers a mission that `tole serve` was running.
+fn cli_over(serve_dir: &Path, base: &str, args: &[&str]) -> Command {
+    let mut cmd = common::hermetic_command(
+        env!("CARGO_BIN_EXE_tole"),
+        &home_of(serve_dir),
+        &[
+            ("TOLE_BASE_URL", base),
+            ("TOLE_MODEL", "mock-model"),
+            ("TOLE_API_KEY", "sk-test"),
+            ("TOLE_NO_UPDATE_CHECK", "1"),
+        ],
+    );
+    cmd.arg("-s")
+        .arg(serve_dir.join(".tole/sessions"))
+        .args(args)
+        .current_dir(serve_dir)
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Start a mission over serve and wait until its `run_command` is a pending
+/// row of the approvals queue: `(serve, mission id, tag)`.
+fn serve_mission_at_approval(base: &str, tag: &str, ctx: &str) -> (Serve, String) {
+    let serve = Serve::spawn(base);
+    let goal = json!({"goal": format!("RUN-EFFECT {tag}")}).to_string();
+    let (code, v) = serve.http("POST", "/missions", Some(&goal));
+    assert_eq!(code, 202, "{ctx}: {v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    common::wait_until(common::WAIT, "the approval to be queued", || {
+        let (code, v) = serve.http("GET", &format!("/approvals?session={id}"), None);
+        assert_eq!(code, 200, "{ctx}: {v}");
+        v["approvals"].as_array().unwrap().len() == 1
+    });
+    (serve, id)
+}
+
+/// The turn is parked after its denial (`parked_after_denial` in tole-core):
+/// the last entry of the log is the denial note.
+fn parked(items: &[Value]) -> bool {
+    crash_loop::last_entry(items).is_some_and(|e| e["payload"]["denial_note"] == json!(true))
+}
+
+/// What a killed serve mission leaves, and the recovery of each state. `tag`
+/// is the goal's marker, `ctx` names the round.
+///
+/// - Parked (the denial note is the last entry): `tole mission --resume`
+///   continues it directly.
+/// - Cut off before the note (the register still says `planning`, the window
+///   between the queued row and the denial's commit): the same refusal as any
+///   cut-off turn, so `tole resume` first, then the mission.
+///
+/// Either way the lost row does not run the effect, the log parses and the
+/// goal is in it once. Returns whether the log was parked at the kill.
+fn recover_serve_mission(base: &str, dir: &Path, file: &Path, tag: &str, ctx: &str) -> bool {
+    let effect = dir.join("effect.log");
+    let id = id_of(file);
+    let log = read_log(file, ctx);
+    assert_eq!(user_messages_with(&log.items, tag), 1, "{ctx}");
+    assert_eq!(effect_runs(&effect), 0, "{ctx}: nothing ran");
+    assert!(settles(&log.items, "run_command").is_empty(), "{ctx}");
+    let was_parked = parked(&log.items);
+    if !was_parked {
+        // Cut off: nothing but `Planning` and no denial note.
+        assert_eq!(last_pc(&log.items).as_deref(), Some("planning"), "{ctx}");
+        let before = entry_seqs(&log.items);
+        let refused = run(cli_over(dir, base, &["mission", "--resume", &id, "resume"]));
+        assert_eq!(refused.code, Some(1), "{ctx}: {}", refused.stderr);
+        assert!(
+            refused
+                .stderr
+                .contains("run_turn requires pc Idle or Final"),
+            "{ctx}: {}",
+            refused.stderr
+        );
+        assert_eq!(
+            entry_seqs(&read_log(file, ctx).items),
+            before,
+            "{ctx}: the refusal wrote entries"
+        );
+        // `tole resume` replans; the model asks again, nothing is allowed.
+        let second = run(cli_over(dir, base, &["resume", &id]));
+        assert_eq!(second.code, Some(2), "{ctx}: {}", second.stderr);
+        assert_eq!(effect_runs(&effect), 0, "{ctx}: resume without an allow");
+    }
+    let ended = run(cli_over(dir, base, &["mission", "--resume", &id, "resume"]));
+    assert_eq!(
+        ended.code,
+        Some(0),
+        "{ctx}: {}{}",
+        ended.stdout,
+        ended.stderr
+    );
+    assert!(
+        ended.stdout.contains("status: complete"),
+        "{ctx}: {}",
+        ended.stdout
+    );
+    assert_eq!(mission_status(file), "complete", "{ctx}");
+    assert_eq!(
+        effect_runs(&effect),
+        0,
+        "{ctx}: a resume does not run the lost approval"
+    );
+    let end = read_log(file, ctx);
+    assert!(!end.torn, "{ctx}: the file ends in a torn line");
+    assert_eq!(user_messages_with(&end.items, tag), 1, "{ctx}");
+    was_parked
+}
+
 /// A mission started over serve (`POST /missions`) stops at a `run_command`
-/// that waits in the approvals queue. Kill the serve there, at a random
-/// moment: the row is gone with the process, the effect has not run, the
-/// session log parses, and the CLI continues the mission.
+/// that waits in the approvals queue. Kill the serve at a random moment after
+/// the row is visible: the row is gone with the process, the effect has not
+/// run, the session log parses, and the mission is recovered (see
+/// [`recover_serve_mission`]). The kill may land before the denial is written,
+/// which leaves a cut-off turn instead of a parked one; the round takes the
+/// recovery its log needs and neither is skipped.
 #[test]
 fn a_serve_mission_killed_at_a_pending_approval_loses_the_row_not_the_session() {
     let (seed, rounds) = (seed(), rounds(2));
     eprintln!("mission approval loop: seed={seed} rounds={rounds}");
     let mut rng = Rng(seed);
     let base = mock::spawn(0);
+    let mut parked_rounds = 0;
     for round in 0..rounds {
         let tag = format!("a{seed}-{round}");
         let ctx = format!("round {round}, seed {seed}");
-        let mut serve = Serve::spawn(&base);
-        let (code, v) = serve.http(
-            "POST",
-            "/missions",
-            Some(&json!({"goal": format!("RUN-EFFECT {tag}")}).to_string()),
-        );
-        assert_eq!(code, 202, "{ctx}: {v}");
-        let id = v["id"].as_str().unwrap().to_string();
-        let rows = |s: &Serve| -> Vec<Value> {
-            let (code, v) = s.http("GET", &format!("/approvals?session={id}"), None);
-            assert_eq!(code, 200, "{ctx}: {v}");
-            v["approvals"].as_array().unwrap().clone()
-        };
-        common::wait_until(common::WAIT, "the approval to be queued", || {
-            rows(&serve).len() == 1
-        });
+        let (mut serve, id) = serve_mission_at_approval(&base, &tag, &ctx);
         std::thread::sleep(Duration::from_millis(rng.below(200)));
         serve.kill();
-
-        let effect = serve.dir.join("effect.log");
         let file = serve.session_file(&id);
-        let log = read_log(&file, &ctx);
-        assert_eq!(user_messages_with(&log.items, &tag), 1, "{ctx}");
-        assert_eq!(effect_runs(&effect), 0, "{ctx}: nothing ran");
-        assert!(settles(&log.items, "run_command").is_empty(), "{ctx}");
-        let second = Serve::spawn_in(&base, serve.dir.clone(), false);
-        assert!(
-            rows(&second).is_empty(),
-            "{ctx}: the row died with the process"
-        );
-        drop(second);
+        let rows_after = {
+            let second = Serve::spawn_in(&base, serve.dir.clone(), false);
+            let (_, v) = second.http("GET", &format!("/approvals?session={id}"), None);
+            v["approvals"].as_array().unwrap().len()
+        };
+        assert_eq!(rows_after, 0, "{ctx}: the row died with the process");
+        if recover_serve_mission(&base, &serve.dir, &file, &tag, &ctx) {
+            parked_rounds += 1;
+        }
+    }
+    eprintln!("mission approval loop: {parked_rounds} of {rounds} parked at the kill");
+}
 
-        let mut cmd = common::hermetic_command(
-            env!("CARGO_BIN_EXE_tole"),
-            &home_of(&serve.dir),
-            &[
-                ("TOLE_BASE_URL", &base),
-                ("TOLE_MODEL", "mock-model"),
-                ("TOLE_API_KEY", "sk-test"),
-                ("TOLE_NO_UPDATE_CHECK", "1"),
-            ],
-        );
-        cmd.arg("-s")
-            .arg(serve.dir.join(".tole/sessions"))
-            .args(["mission", "--resume", &id, "resume"])
-            .current_dir(&serve.dir)
-            .stdin(Stdio::null());
-        let ended = run(cmd);
-        assert_eq!(
-            ended.code,
-            Some(0),
-            "{ctx}: {}{}",
-            ended.stdout,
-            ended.stderr
-        );
-        assert!(
-            ended.stdout.contains("status: complete"),
-            "{ctx}: {}",
-            ended.stdout
-        );
-        assert_eq!(mission_status(&file), "complete", "{ctx}");
-        assert_eq!(
-            effect_runs(&effect),
-            0,
-            "{ctx}: a resume does not run the lost approval"
-        );
-        let end = read_log(&file, &ctx);
-        assert_eq!(user_messages_with(&end.items, &tag), 1, "{ctx}");
+/// The kill that lands before the denial is written, made certain: the serve
+/// is killed once the turn is parked, and the log is then cut back to what a
+/// kill earlier would have left (`cut` trailing lines gone: the mission
+/// summary and the denial note, and for 3 the `error` entry too). The log is
+/// append-only and written line by line, so a prefix of it is exactly what the
+/// kill leaves. `a_serve_mission_killed_at_a_pending_approval_...` meets this
+/// state only when the kill is slow to land (a busy CI machine, #1018).
+#[test]
+fn a_serve_mission_killed_before_its_denial_is_written_needs_two_steps() {
+    let base = mock::spawn(0);
+    for (round, cut) in [2usize, 3].into_iter().enumerate() {
+        let tag = format!("c{seed}-{round}", seed = seed());
+        let ctx = format!("cut {cut}, tag {tag}");
+        let (mut serve, id) = serve_mission_at_approval(&base, &tag, &ctx);
+        let file = serve.session_file(&id);
+        // The turn is parked once the mission summary is the file's last line.
+        common::wait_until(common::WAIT, "the turn to park", || {
+            std::fs::read_to_string(&file)
+                .is_ok_and(|t| t.lines().last().is_some_and(|l| l.contains("\"fact\"")))
+        });
+        serve.kill();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let keep = lines[..lines.len() - cut].join("\n") + "\n";
+        std::fs::write(&file, keep).unwrap();
+        let was_parked = recover_serve_mission(&base, &serve.dir, &file, &tag, &ctx);
+        assert!(!was_parked, "{ctx}: the cut log is not parked");
     }
 }
