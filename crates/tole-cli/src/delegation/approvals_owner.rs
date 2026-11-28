@@ -337,6 +337,18 @@ pub fn doctor_line(cfg: &crate::config::Config) -> String {
     }
 }
 
+/// The `tole doctor` lines of the approvals mode: the mode (#714) and, with
+/// delegation in use and `approvals` unset, the hint (#813) that says what the
+/// default `off` means and how to opt in.
+pub fn print_doctor(setup: &crate::delegate::Setup, cwd: Option<&std::path::Path>) {
+    println!("{}", doctor_line(&setup.cfg));
+    let log = setup.data_dir.as_deref().zip(cwd);
+    let log = log.and_then(|(d, c)| crate::delegate::log_path(d, c));
+    if let Some(h) = doctor_hint(&setup.cfg, log.as_deref()) {
+        println!("{h}");
+    }
+}
+
 /// The `tole doctor` hint for an unset `[delegation] approvals` (#813): it
 /// fires only when delegation is in use and the key is not set at all (an
 /// explicit `off` is a decision, not a gap). "In use" is the narrowest

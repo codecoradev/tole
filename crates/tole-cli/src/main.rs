@@ -2001,18 +2001,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             for l in tole_cli::machine_guard::doctor_lines(&host.delegation, cwd.as_deref(), now) {
                 println!("{l}");
             }
-            println!(
-                "{}",
-                tole_cli::approvals_owner::doctor_line(&host.delegation.cfg)
-            );
-            // Delegation in use with `approvals` unset (#813): say what the
-            // default `off` means and how to opt in.
-            let log = host.delegation.data_dir.as_deref().zip(cwd.as_deref());
-            let log = log.and_then(|(d, c)| tole_cli::delegate::log_path(d, c));
-            if let Some(h) =
-                tole_cli::approvals_owner::doctor_hint(&host.delegation.cfg, log.as_deref())
-            {
-                println!("{h}");
+            tole_cli::approvals_owner::print_doctor(&host.delegation, cwd.as_deref());
+            // The size of the session store (#1020): read-only, metadata only.
+            if let Some(l) = tole_cli::session::size::line(&sessions_dir) {
+                println!("{l}");
             }
             // The plugin lock (#599): each configured server's approval.
             #[cfg(feature = "mcp")]
