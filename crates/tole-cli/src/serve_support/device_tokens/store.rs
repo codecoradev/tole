@@ -3,18 +3,20 @@
 //! `serve-tokens.jsonl` is append-only and `serve-tokens.lock` is an advisory
 //! lock (the OS drops it with the process, so none goes stale). `add` and
 //! `revoke` take it blocking, read the file and append one whole line under
-//! it, so two writers cannot both add one name. The file is never rewritten,
-//! renamed or truncated, and it is never followed through a link.
+//! it, so two writers cannot both add one name. Nothing here rewrites, renames
+//! or truncates the file (append-only by convention, not enforced by the file
+//! system). The last component of the file and of the lock is opened with
+//! `O_NOFOLLOW` (unix); parent directories are followed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use super::{
     generate, validate_name, Line, Principal, Scope, Secret, Snapshot, StoreError, MAX_ACTIVE,
-    MAX_FILE_BYTES, MAX_USED_FILE_BYTES, TOUCH_EVERY_SECS,
+    MAX_FILE_BYTES, MAX_USED_FILE_BYTES, RETRY_AFTER_SECS, TOUCH_EVERY_SECS,
 };
 
 const FILE: &str = "serve-tokens.jsonl";
@@ -206,6 +208,7 @@ impl Store {
 
     /// Appends a revoke for the active token `name`.
     pub fn revoke(&self, name: &str, now: u64) -> Result<(), StoreError> {
+        validate_name(name).map_err(StoreError::BadName)?;
         self.locked(|snap| {
             snap.active(name)
                 .ok_or_else(|| StoreError::NotFound(name.to_string()))?;
@@ -258,10 +261,22 @@ fn last_byte(f: &mut File) -> std::io::Result<Option<u8>> {
     Ok(Some(b[0]))
 }
 
-/// What `Live` compares to see that the file changed: length, mtime and
-/// ctime. An append changes the length and a `chmod` changes the ctime, so a
-/// file made unsafe, or made safe again, is looked at again.
-type Stamp = Option<(u64, Option<SystemTime>, i64)>;
+/// What `Live` compares to see that the file changed: length, mtime, ctime,
+/// inode and device. An append changes the length, a `chmod` changes the
+/// ctime and a file put in place by a rename changes the inode, so a file
+/// made unsafe, made safe again or replaced is looked at again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct FileStamp {
+    pub(super) len: u64,
+    pub(super) mtime: Option<SystemTime>,
+    pub(super) ctime: i64,
+    pub(super) ino: u64,
+    pub(super) dev: u64,
+}
+
+type Stamp = Option<FileStamp>;
+
+pub(super) type Loader = Box<dyn Fn() -> Result<Snapshot, StoreError> + Send + Sync>;
 
 struct Cached {
     /// `None` until the first load.
@@ -269,50 +284,81 @@ struct Cached {
     /// Empty when the file is missing or unusable (fail closed).
     snap: Arc<Snapshot>,
     error: Option<String>,
+    /// Set when the last load failed with an error that may pass (I/O): the
+    /// load is tried again at this time even if the file did not change.
+    retry_at: Option<Instant>,
 }
 
 /// The view `tole serve` holds (part 2): a cached fold that is re-read when
 /// the file changes, so a revoke applies on the next request, and a coalesced
 /// last-use writer. A file that cannot be used means no device token is
-/// valid; the error is cached with the stamp, so unauthenticated requests do
-/// not re-read a corrupt file.
+/// valid. A failure that belongs to the file (corrupt, unsafe, too large) is
+/// cached with the stamp, so unauthenticated requests do not re-read it; an
+/// I/O error is retried after [`RETRY_AFTER_SECS`] or when the file changes.
+/// See the module doc for the cost model (mutex over file I/O, synchronous
+/// `touch`).
 pub struct Live {
     store: Store,
+    loader: Loader,
+    retry_after: Duration,
     cached: Mutex<Cached>,
     touched: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Live {
     pub fn new(store: Store) -> Live {
+        let s = store.clone();
+        Self::with_loader(
+            store,
+            Box::new(move || s.load()),
+            Duration::from_secs(RETRY_AFTER_SECS),
+        )
+    }
+
+    /// A view whose loads are made by `loader` (tests inject a failure).
+    pub(super) fn with_loader(store: Store, loader: Loader, retry_after: Duration) -> Live {
         Live {
             store,
+            loader,
+            retry_after,
             cached: Mutex::new(Cached {
                 stamp: None,
                 snap: Arc::new(Snapshot::default()),
                 error: None,
+                retry_at: None,
             }),
             touched: Mutex::new(Default::default()),
         }
     }
 
-    fn stamp(&self) -> Stamp {
+    pub(super) fn stamp(&self) -> Stamp {
         match std::fs::symlink_metadata(&self.store.file) {
             Ok(m) => {
-                #[cfg(unix)]
-                let ctime = {
-                    use std::os::unix::fs::MetadataExt;
-                    m.ctime()
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(m.ctime_nsec())
+                #[allow(unused_mut)]
+                let mut st = FileStamp {
+                    len: m.len(),
+                    mtime: m.modified().ok(),
+                    ..FileStamp::default()
                 };
-                #[cfg(not(unix))]
-                let ctime = 0;
-                Some((m.len(), m.modified().ok(), ctime))
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    st.ctime = m
+                        .ctime()
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(m.ctime_nsec());
+                    st.ino = m.ino();
+                    st.dev = m.dev();
+                }
+                Some(st)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            // Unreadable now: a stamp no file has, so it is retried only
+            // Unreadable now: a stamp no file has, so it is looked at again
             // when the state changes.
-            Err(_) => Some((u64::MAX - 1, None, 0)),
+            Err(_) => Some(FileStamp {
+                len: u64::MAX - 1,
+                ..FileStamp::default()
+            }),
         }
     }
 
@@ -320,16 +366,22 @@ impl Live {
         let mut c = self.cached.lock().unwrap_or_else(|p| p.into_inner());
         // Stat before reading: a write between the two is seen next time.
         let stamp = self.stamp();
-        if c.stamp != Some(stamp) {
-            match self.store.load() {
+        let retry = c.retry_at.is_some_and(|t| Instant::now() >= t);
+        if c.stamp != Some(stamp) || retry {
+            c.retry_at = None;
+            match (self.loader)() {
                 Ok(s) => (c.snap, c.error) = (Arc::new(s), None),
-                Err(e) => (c.snap, c.error) = (Arc::new(Snapshot::default()), Some(e.to_string())),
+                Err(e) => {
+                    if !e.is_deterministic() {
+                        c.retry_at = Some(Instant::now() + self.retry_after);
+                    }
+                    (c.snap, c.error) = (Arc::new(Snapshot::default()), Some(e.to_string()));
+                }
             }
             c.stamp = Some(stamp);
         }
         c.snap.clone()
     }
-
     /// Has the file been looked at yet? (Tests: a token of the wrong shape
     /// must not cause a read.)
     #[cfg(test)]

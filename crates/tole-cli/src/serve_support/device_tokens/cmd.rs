@@ -1,8 +1,11 @@
 //! `tole serve token add|list|revoke` (#1320, part 1).
 //!
-//! `add` prints the token on **stdout** and nothing else there, once; the
-//! sentence about it goes to stderr, so `T=$(tole serve token add phone
-//! --scope read-only)` captures just the secret. `add` and `revoke` write an
+//! `add` prints the token on **stdout** and nothing else there, once, before
+//! anything else is said (if that write fails the new token is revoked and
+//! the command fails); the sentence about it goes to stderr, last. So `T=$(tole
+//! serve token add phone --scope read-only)` captures just the secret. That
+//! keeps it out of the process list only for `add`: using `$T` later in a
+//! command line shows it to every local process. `add` and `revoke` write an
 //! owner decision and refuse under an agent session (#684). `list` shows
 //! names, scopes and times, never a token or a hash.
 
@@ -82,17 +85,30 @@ pub fn run(
     match action {
         TokenAction::Add { name, scope } => {
             let added = store.add(&name, scope, now).map_err(e)?;
-            writeln!(
-                err,
-                "tole: token '{}' ({}) created. It is shown only now; keep it.",
-                added.name,
-                scope.as_str()
-            )?;
+            // The secret goes out FIRST and must arrive: a token nobody saw
+            // is revoked at once, not left active and unknown.
+            let shown = writeln!(out, "{}", added.secret.expose()).and_then(|()| out.flush());
+            if let Err(io) = shown {
+                return Err(match store.revoke(&name, now) {
+                    Ok(()) => anyhow!(
+                        "could not print the token for {name:?} ({io}); it was revoked, try again"
+                    ),
+                    Err(re) => anyhow!(
+                        "could not print the token for {name:?} ({io}) and could not revoke it \
+                         ({re}): run `tole serve token revoke {name}`"
+                    ),
+                });
+            }
             writeln!(
                 err,
                 "tole: `tole serve` does not check device tokens yet (#1320, part 2)."
             )?;
-            writeln!(out, "{}", added.secret.expose())?;
+            writeln!(
+                err,
+                "tole: token {:?} ({}) created. It is shown only now; keep it.",
+                added.name,
+                scope.as_str()
+            )?;
         }
         TokenAction::List => {
             let snap = store.load().map_err(e)?;
@@ -111,7 +127,7 @@ pub fn run(
         }
         TokenAction::Revoke { name } => {
             store.revoke(&name, now).map_err(e)?;
-            writeln!(err, "tole: token '{name}' revoked")?;
+            writeln!(err, "tole: token {name:?} revoked")?;
         }
     }
     Ok(())

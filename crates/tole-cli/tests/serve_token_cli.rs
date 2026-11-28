@@ -82,7 +82,7 @@ fn add_list_revoke_on_the_real_binary() {
         &[],
     );
     assert!(!dup.status.success());
-    assert!(out(&dup).is_empty() && err(&dup).contains("'phone'"));
+    assert!(out(&dup).is_empty() && err(&dup).contains("\"phone\""));
     for bad in ["Phone", "a b", "-x", ""] {
         let o = tole(
             &base,
@@ -103,6 +103,27 @@ fn add_list_revoke_on_the_real_binary() {
     )
     .status
     .success());
+
+    // A name is never echoed raw: no escape sequence reaches the terminal.
+    let esc = tole(&base, &["serve", "token", "revoke", "\u{1b}[31mphone"], &[]);
+    assert!(
+        !esc.status.success() && !err(&esc).contains('\u{1b}'),
+        "{:?}",
+        err(&esc)
+    );
+    let esc = tole(
+        &base,
+        &[
+            "serve",
+            "token",
+            "add",
+            "\u{1b}]0;x\u{7}",
+            "--scope",
+            "full",
+        ],
+        &[],
+    );
+    assert!(!esc.status.success() && !err(&esc).contains('\u{1b}') && out(&esc).is_empty());
 
     let rev = tole(&base, &["serve", "token", "revoke", "phone"], &[]);
     assert!(rev.status.success() && out(&rev).is_empty());

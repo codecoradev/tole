@@ -563,19 +563,32 @@ tole serve token revoke <name>
 
 - The token is `tole_dt_` and 43 characters (256 bits from the OS random source). It is printed once
   and cannot be shown again: only its SHA-256 is stored, with the name, the scope, the time of
-  creation and a last-used time that part 2 fills in. The token goes to stdout alone (the sentence
-  about it to stderr), so `T=$(tole serve token add phone --scope read-only)` keeps it out of the
-  terminal history and the process list (it is never an argument).
+  creation and a last-used time that part 2 fills in. The token goes to stdout alone, before
+  anything else is said (if it cannot be written, for example to a closed pipe, the new token is
+  revoked at once and the command fails); the sentence about it goes to stderr, last. It is never
+  an argument, so `T=$(tole serve token add phone --scope read-only)` keeps it out of the process
+  list **for `add` only**: using `$T` later in a command line shows it to every local process.
 - The file is `serve-tokens.jsonl` in the tole data dir (`$CODECORA_HOME/tole`), mode 0600, in a
   directory that is not group or world writable; a wider file is refused, not repaired. It is
-  append-only like the session log: a revoke is a new line. A name is `[a-z0-9][a-z0-9._-]{0,63}`,
-  unique among active tokens, and at most 64 tokens are active.
-- A line that does not read back, a name added twice or a newer record version makes the store
-  unusable (every command fails with the line number and writes nothing; no device token is valid
-  until the owner repairs the file by hand). Nothing is guessed, because a skipped revoke line
-  would bring a revoked token back.
+  append-only by convention (no tole code rewrites it; the file system does not enforce it): a
+  revoke is a new line. The last component of the token file and of its lock is opened with
+  `O_NOFOLLOW` (unix only); parent directories are followed, as for the other tole stores. The
+  owner of the file is not compared with the effective uid, so the protection is the mode of the
+  file and directory, not who owns them. A name is `[a-z0-9][a-z0-9._-]{0,63}`, unique among
+  active tokens, and at most 64 tokens are active; errors show a name quoted and escaped.
+- A line that does not read back, a name added twice, a hash added twice (a revoked one included),
+  a revoke of a name that is not active, or a newer record version makes the store unusable (every
+  command fails with the line number and writes nothing; no device token is valid until the owner
+  repairs the file by hand). Nothing is guessed, because a skipped revoke line would bring a
+  revoked token back. For the same reason **restoring the file from a backup brings back every
+  token revoked since the backup was taken: rotate all tokens after a restore.**
 - `add` and `revoke` refuse under an agent session (#684): a token holder or a model never mints or
   revokes tokens. `list` shows no token and no hash.
+- For part 2 (the code that will enforce the scope): `Live::lookup` holds a mutex while it reloads
+  the file and `Live::touch` writes synchronously, so the serve middleware must call them from
+  `spawn_blocking` or an equivalent thread. Last-used lines are never compacted: after 3 MiB of
+  file they stop being recorded. A reload that fails with an I/O error is retried after 5 seconds
+  or when the file changes; a corrupt, unsafe or oversized file stays refused until it changes.
 
 ## Local socket and per-launch credential (#1043)
 

@@ -7,12 +7,23 @@
 //! path cannot afford PBKDF2), a name, a scope and times.
 //!
 //! The file is `<tole data dir>/serve-tokens.jsonl`, owner-only (0600, a data
-//! dir nobody else can write), append-only like every record of tole:
+//! dir that is not group or world writable) and append-only **by convention**
+//! (nothing in tole rewrites it; the file system does not enforce it):
 //! `add`, `revoke` and `used` are lines, and a revoke is a new line, never a
 //! deletion. The state is the fold of the lines. A line that does not read
-//! back, a name added twice, an unknown record version or a file over its
-//! cap makes the whole store unusable ([`StoreError::Corrupt`]): a skipped
-//! revoke line would bring a revoked token back, so nothing is guessed.
+//! back, a name added twice, a hash that was added before (a revoked one
+//! included), a revoke of a name that is not active, an unknown record
+//! version or a file over its cap makes the whole store unusable
+//! ([`StoreError::Corrupt`]): a skipped revoke line would bring a revoked
+//! token back, so nothing is guessed.
+//!
+//! What the file rules do and do not cover. The last component of the token
+//! file and of the lock file is opened with `O_NOFOLLOW` (unix only); the
+//! parent directories are followed, as the other tole stores do. The owner of
+//! the file is not compared with the effective uid (that needs `unsafe`), so
+//! the protection is the mode of the file and of the data dir, not who owns
+//! them. **Restoring the file from a backup brings back every token revoked
+//! since the backup was taken: rotate all tokens after a restore.**
 //!
 //! For the enforcement of part 2 the whole surface is [`Live`]:
 //! `live.lookup(presented)` is `Option<Principal>` (name and scope) and
@@ -20,6 +31,15 @@
 //! [`TOUCH_EVERY_SECS`] per name. A request costs one `stat` of the file
 //! (an append always changes its length, so a revoke is seen on the next
 //! request) and a comparison over every active hash with no early exit.
+//!
+//! For part 2, mind the cost model: `Live::lookup` holds a mutex while it
+//! reloads the file after a change, and `Live::touch` does synchronous file
+//! I/O under a try-lock. Call both from `spawn_blocking` (or an equivalent
+//! thread), not from an async task. `used` lines are never compacted: past
+//! [`MAX_USED_FILE_BYTES`] last-used stops being recorded (the file is not
+//! rewritten to make room). A load that fails with an I/O error is retried
+//! after [`RETRY_AFTER_SECS`] or when the file changes; a corrupt, unsafe or
+//! oversized file stays refused until the file changes.
 
 mod cmd;
 mod store;
@@ -52,6 +72,8 @@ pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_USED_FILE_BYTES: u64 = 3 * 1024 * 1024;
 /// Last use is written at most this often per token.
 pub const TOUCH_EVERY_SECS: u64 = 15 * 60;
+/// `Live` retries a load that failed with an I/O error after this long.
+pub const RETRY_AFTER_SECS: u64 = 5;
 const VERSION: u8 = 1;
 const HASH_PREFIX: &str = "sha256:";
 
@@ -127,8 +149,8 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::BadName(why) => write!(f, "invalid token name: {why}"),
-            StoreError::Duplicate(n) => write!(f, "an active token named '{n}' exists"),
-            StoreError::NotFound(n) => write!(f, "no active token named '{n}'"),
+            StoreError::Duplicate(n) => write!(f, "an active token named {n:?} exists"),
+            StoreError::NotFound(n) => write!(f, "no active token named {n:?}"),
             StoreError::TooMany => {
                 write!(f, "at most {MAX_ACTIVE} active tokens; revoke one first")
             }
@@ -152,6 +174,14 @@ impl std::fmt::Display for StoreError {
 }
 
 impl std::error::Error for StoreError {}
+
+impl StoreError {
+    /// Is the failure a property of the file (it stays until the file
+    /// changes) and not of the moment (an I/O error may pass)?
+    pub fn is_deterministic(&self) -> bool {
+        !matches!(self, StoreError::Io(_) | StoreError::Random)
+    }
+}
 
 impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
@@ -334,9 +364,10 @@ impl Snapshot {
         self.entries.iter().filter(|e| e.active()).count()
     }
 
-    /// Reads the file's bytes. Any line that does not read back is an error;
-    /// a revoke or a use of a name that is not active is ignored (it can only
-    /// take away, never grant).
+    /// Reads the file's bytes. Any line that does not read back is an error,
+    /// and so is a revoke of a name that is not active. A use of a name that
+    /// is not active (or was revoked) is ignored: it changes nothing but the
+    /// last-used time of an active token.
     pub fn parse(bytes: &[u8]) -> Result<Snapshot, StoreError> {
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(StoreError::TooLarge);
@@ -369,7 +400,9 @@ impl Snapshot {
                     if snap.active(&name).is_some() {
                         return Err(bad("name added twice without a revoke"));
                     }
-                    if snap.entries.iter().any(|e| e.active() && e.hash == hash) {
+                    // Revoked entries count: a hash that was ever added is not
+                    // added again, so a revoked token cannot be re-added.
+                    if snap.entries.iter().any(|e| e.hash == hash) {
                         return Err(bad("hash added twice"));
                     }
                     if snap.active_count() >= MAX_ACTIVE {
@@ -385,13 +418,12 @@ impl Snapshot {
                     });
                 }
                 Line::Revoke { name, at, .. } => {
-                    if let Some(e) = snap
+                    let e = snap
                         .entries
                         .iter_mut()
                         .find(|e| e.active() && e.name == name)
-                    {
-                        e.revoked_at = Some(at);
-                    }
+                        .ok_or_else(|| bad("revoke of a name that is not active"))?;
+                    e.revoked_at = Some(at);
                 }
                 Line::Used { name, at, .. } => {
                     if let Some(e) = snap
