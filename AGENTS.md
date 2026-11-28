@@ -40,7 +40,8 @@ continuity, infra facts.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
   missions, Tier 3 baselines).
 - `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
-  branch before a PR; `arch-check.sh`: crate kinds and the crate dependency
+  branch before a PR, `--agent DIR` for the agent-as-reviewer flow with
+  `cora-agent-review.py`; `arch-check.sh`: crate kinds and the crate dependency
   matrix, #1249).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
@@ -151,9 +152,31 @@ The script splits a large diff into chunks of at most 600 changed lines
 (`--max-lines`), so each Cora call stays small; exit 0 means no findings, 2
 means findings, 1 means Cora errored or ran without an LLM (not a pass). State
 the result in the PR **Testing** section (for example "scripts/review-local.sh:
-no findings" or the findings and how each was handled). Without an LLM key, use
-`cora mcp` (`review_prepare` / `review_finalize`) so you are the reviewer. This
-only moves feedback earlier: the CI Cora Review job stays the merge gate.
+no findings" or the findings and how each was handled). This only moves
+feedback earlier: the CI Cora Review job stays the merge gate.
+
+**Cora as the agent's reviewer (`cora mcp`) — before the PR exists (agents:
+mandatory).** An agent session has no LLM key, so `scripts/review-local.sh` on
+its own runs only the deterministic checks and is not a pass. Run the
+agent-as-reviewer flow on the finished branch **before you push and open the
+PR**:
+
+```bash
+scripts/review-local.sh --agent /tmp/review-<branch>      # chunks, then cora.review_prepare per chunk
+# a fresh reviewer answers each chunk-N.prompt.md into chunk-N.findings.json
+scripts/cora-agent-review.py finalize /tmp/review-<branch>   # cora.review_finalize: verdict; exit 0 / 2 / 1
+```
+
+The reviewer is a different agent from the author (for example a fresh
+read-only subagent given only the prompt files and the checkout), never the
+agent that wrote the code. Fix the real findings, re-run on the fixed branch
+until `finalize` reports none (or each remaining one is answered in the PR),
+then open the PR and state in its **Testing** section the chunks, the verdict
+and how each finding was handled. A missing findings file or a failed call is
+not a pass. This is in addition to the independent read-only reviews that the
+approval, egress, auth, sandbox and guard paths need (section 2) and to the CI
+Cora Review, which stays the merge gate. Run the helper inside the checkout or
+worktree that holds the branch, so cora's index matches the code.
 
 ## 4. Tooling — cora & team memory first
 
@@ -172,7 +195,9 @@ of reinventing or brute-forcing:
   and path questions without reading whole files.
 - `cora dead-code` — after removals; `cora debt` — trend checks.
 - `cora review --staged` before every commit and `scripts/review-local.sh`
-  before every PR (mandatory, see §3); `cora scan` after significant or
+  (`--agent DIR` + `scripts/cora-agent-review.py finalize DIR` when there is no
+  LLM key: Cora as the agent's reviewer through `cora mcp`) before every PR
+  (mandatory, see §3); `cora scan` after significant or
   security-adjacent changes.
 - Run the code-intelligence commands (`cora callers` / `cora impact` /
   `cora affected`) before: moving, renaming or removing a public item
