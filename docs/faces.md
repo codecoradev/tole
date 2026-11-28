@@ -20,7 +20,7 @@ a documented row below or a bug.
 
 | Difference | Why it is allowed |
 |---|---|
-| **Identity and authentication** | The CLI runs as the owner at a terminal. `serve` and `mcp-http` authenticate a bearer token. `acp` and `mcp` trust the parent process that spawned them. Cron runs as the owner without anyone present. |
+| **Identity and authentication** | The CLI runs as the owner at a terminal. `serve` and `mcp-http` authenticate a bearer token; `serve` also takes per-device tokens with a `read-only` or `full` scope (#1320), `mcp-http` does not (its tools cannot be classified as reads or writes). `acp` and `mcp` trust the parent process that spawned them. Cron runs as the owner without anyone present. |
 | **Input and output format** | A terminal line, a JSON route, an ACP message, an MCP tool call, a scheduled prompt and its delivered summary. The turn runner underneath is the same (#944). |
 | **Approval delivery channel** | The interactive prompt (CLI, ACP editor), the approvals queue answered over a route (`serve`), a pre-authorized allowlist (`tole mcp`, cron), or a delegated approver for a child agent. The gate itself, `gate::authorize`, is one function on every face. |
 
@@ -140,6 +140,7 @@ design, section 0) or a design rule, not a gap:
 | Change the allow list | the owner's config and `--allow` | An approval answers one call; the standing allow list is configuration. |
 | Create or edit a cron job | `tole cron create`, `tole cron edit` | A job carries a prompt, an allow list and, for a script job, a command run with the owner's authority. Stays local-only unless the owner decides otherwise (#1042). |
 | Choose a folder with the operating system's dialog | the desktop process | It is a window on the client's machine; the server only checks that a folder is inside its workspace. |
+| Create, list or revoke a device token (#1320) | `tole serve token add\|list\|revoke` at a terminal | Minting or revoking a credential is the owner's decision; a token holder, a model or a desktop must not widen its own scope or mint another. `add` and `revoke` refuse under an agent session (#684). The token store is `tole serve`'s own state, so no other face has a copy of it. |
 | Read the workspace folder from the client (a file panel) | the desktop process, on the same machine as the server | Serve has no file route on purpose. A client that reads the folder itself does not go through the file tools' jail or the approval gate for writes, so it is display only and never writes; mobile and a remote desktop cannot do it. |
 
 ## Adding or changing a face capability

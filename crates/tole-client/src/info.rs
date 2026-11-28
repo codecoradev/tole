@@ -18,6 +18,11 @@ pub struct Info {
     pub protocol_version: u32,
     /// Sorted, stable feature names (`entries`, `events.sse`, `missions`, ...).
     pub features: Vec<String>,
+    /// What the token this client sent may do: `full` or `read-only` (an open
+    /// vocabulary: treat an unknown word as `read-only`). `None` from a server
+    /// that does not report it, which has no read-only tokens either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl Info {

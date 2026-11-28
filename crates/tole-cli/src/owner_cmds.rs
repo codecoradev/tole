@@ -176,3 +176,15 @@ pub(crate) fn discuss_command(
     print!("{out}");
     Ok(())
 }
+
+/// `tole audit`: the delegation audit of a goal, or of the whole tree.
+pub(crate) fn audit_command(root: &Path, goal: Option<&str>, json: bool) -> Result<()> {
+    let data = tole_core::paths::tole_data_dir()
+        .ok_or_else(|| anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)"))?;
+    let log = tole_cli::delegate::log_path(&data, root)
+        .ok_or_else(|| anyhow!("cannot canonicalize the workspace {}", root.display()))?;
+    let out = tole_cli::audit::audit(&log, goal, json, &tole_core::secrets::SecretSet::from_env())
+        .map_err(anyhow::Error::msg)?;
+    print!("{out}");
+    Ok(())
+}

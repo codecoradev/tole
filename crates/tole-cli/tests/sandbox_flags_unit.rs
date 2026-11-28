@@ -1,9 +1,14 @@
-use super::*;
+//! `tole_cli::sandbox_flags` (#601): what the sandbox flags and the config make of a run. Moved
+//! from the unit tests of `src/sandbox_flags.rs` (#1320) with the test names unchanged.
+
 use std::path::Path;
-use tole_core::sandbox::Network;
+use tole_cli::config::SandboxConfig;
+use tole_cli::sandbox_flags::*;
+use tole_core::sandbox::flags::Override;
+use tole_core::sandbox::{Mode, Network};
 
 fn cfg(src: &str) -> SandboxConfig {
-    crate::config::parse(src, Path::new("config.toml"))
+    tole_cli::config::parse(src, Path::new("config.toml"))
         .unwrap()
         .sandbox
         .unwrap_or_default()
@@ -170,13 +175,13 @@ fn sandbox_cannot_name_an_unknown_profile_or_turn_the_sandbox_on() {
 
 #[test]
 fn a_project_config_cannot_define_the_profile_a_flag_selects() {
-    let project = crate::config::parse(
+    let project = tole_cli::config::parse(
         "[sandbox.profiles.loose]\nworkspace = \"write\"\nnetwork = \"host\"\n",
         Path::new("p.toml"),
     )
     .unwrap();
-    let user = crate::config::parse(USER, Path::new("u.toml")).unwrap();
-    let layered = crate::config::layered(&project, &user);
+    let user = tole_cli::config::parse(USER, Path::new("u.toml")).unwrap();
+    let layered = tole_cli::config::layered(&project, &user);
     let s = layered.sandbox.unwrap_or_default();
     let p = s.policy().ok();
     let e = apply(&prof("loose"), p.as_ref(), Some(&s), &ctx()).unwrap_err();

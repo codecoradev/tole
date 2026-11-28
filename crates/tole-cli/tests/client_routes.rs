@@ -26,56 +26,8 @@ use tole_client::Route;
 
 mod common;
 mod serve_harness;
+use serve_harness::routes::SERVE_ROUTES;
 use serve_harness::{spawn_mock, Serve};
-
-/// Every route `tole serve` registers: `(method, template)`. `{id}` is a
-/// session, approval, discussion, cron job or mission id, `{hash}` an image's
-/// hash, `{name}` a webhook route name.
-const SERVE_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/health"),
-    ("GET", "/info"),
-    ("GET", "/ready"),
-    ("GET", "/models"),
-    ("GET", "/sessions"),
-    ("GET", "/sessions/index"),
-    ("POST", "/sessions"),
-    ("GET", "/sessions/{id}"),
-    ("GET", "/sessions/{id}/status"),
-    ("GET", "/sessions/{id}/entries"),
-    ("GET", "/sessions/{id}/events"),
-    ("POST", "/sessions/{id}/prompt"),
-    ("POST", "/sessions/{id}/cancel"),
-    ("POST", "/sessions/{id}/interrupt"),
-    ("POST", "/sessions/{id}/detach"),
-    ("POST", "/sessions/{id}/fork"),
-    ("GET", "/sessions/{id}/tree"),
-    ("POST", "/sessions/{id}/compact"),
-    ("POST", "/sessions/{id}/name"),
-    ("POST", "/sessions/{id}/model"),
-    ("POST", "/sessions/{id}/effort"),
-    ("POST", "/sessions/{id}/images"),
-    ("GET", "/sessions/{id}/images/{hash}"),
-    ("GET", "/approvals"),
-    ("POST", "/approvals/{id}/decision"),
-    ("POST", "/missions"),
-    ("GET", "/missions/{id}"),
-    ("POST", "/missions/{id}/cancel"),
-    ("GET", "/discussions"),
-    ("GET", "/discussions/{id}"),
-    ("GET", "/discussions/{id}/events"),
-    ("POST", "/discussions/estimate"),
-    ("POST", "/discussions"),
-    ("POST", "/discussions/{id}/resume"),
-    ("POST", "/discussions/{id}/stop"),
-    ("GET", "/profiles"),
-    ("GET", "/skills"),
-    ("GET", "/tools"),
-    ("GET", "/cron/jobs"),
-    ("POST", "/cron/jobs/{id}/pause"),
-    ("POST", "/cron/jobs/{id}/resume"),
-    ("GET", "/cron/runs"),
-    ("POST", "/hooks/{name}"),
-];
 
 /// Routes of serve the client has no method for, on purpose, each with why.
 const NOT_IN_CLIENT: &[(&str, &str, &str)] = &[

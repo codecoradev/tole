@@ -108,8 +108,8 @@ lists both).
 - **Health.** `HEALTHCHECK` runs `healthcheck.sh` (bash `/dev/tcp`, no curl in
   the image): `GET /ready` on the container's loopback must answer `200`: the
   state directories (`/data/codecora`, `/data/sessions`) take a write, and with
-  `--cron` the ticker beats. It answers `503` when one does not (a read-only or full
-  volume shows up here) and while serve drains after SIGTERM. `GET /health` is the
+  `--cron` the ticker beats. It answers `503` when one does not (a read-only volume or one with no free inode shows up here; a
+  volume that still has inodes but no free blocks is not proven to fail the probe) and while serve drains after SIGTERM. `GET /health` is the
   liveness answer (the process is up) for a probe that must not fail on a full disk;
   a Kubernetes readiness probe uses `/ready`, a liveness probe `/health`. Neither
   takes a token (mobile-control.md, "`GET /ready`"). `/info` (token needed) is for you to probe the
@@ -141,6 +141,18 @@ version step first. Do not run two servers on the same
 `409`). To back up, copy the volume while the service is stopped:
 `docker run --rm -v tole_tole-data:/data -v "$PWD":/b debian:bookworm-slim tar czf /b/tole-data.tgz -C /data .`
 (the volume name is prefixed with the compose project name).
+
+**Disk growth.** Nothing in tole removes or rotates a settled session file or a
+spilled image: the ledgers and `/data/codecora/tole/images` only grow, and they share the
+`tole-data` volume with the config and the cron store, so a full volume stops all
+of it. `GET /ready` fails on a read-only volume (its `state` check creates and
+removes an empty file in `/data/sessions` and in the tole data directory under `/data/codecora`), but it is a
+write probe and not a space alarm: watch free space from the host (`df -h`, the
+orchestrator's volume metric). To see what is using it:
+`du -sh /data/sessions /data/codecora/tole/images` and `ls -lS /data/sessions | head`
+inside the container. Retention is a proposal awaiting an owner decision, see
+[session-retention-design.md](session-retention-design.md) (#1020), which also
+says what can be said about sizing the volume.
 
 ## TLS and the live event stream
 
@@ -207,9 +219,10 @@ Read [threat-model.md](threat-model.md) ("Remote approver trust boundary
 serve in a container (#1044)") and [desktop-design.md](desktop-design.md) 3.2 and 3.3 first. In short:
 
 - **The serve token is approval authority.** Whoever holds it can read every
-  transcript, start turns and approve Writes on the box. There are no scopes, no
-  per-device tokens and no revocation short of changing the secret and
-  restarting. Treat it like an SSH key: `openssl rand -hex 32`, a file, not in a
+  transcript, start turns and approve Writes on the box. The shared token has no
+  scope and no revocation short of changing the secret and restarting; a
+  per-device token (#1320, `tole serve token add`, `read-only` or `full`) is
+  revoked alone with no restart. Treat it like an SSH key: `openssl rand -hex 32`, a file, not in a
   chat or a shell history, rotate on any doubt.
 - **Public exposure invites a lock-out.** The failed-auth limiter (10 a minute)
   counts per source address, and behind the proxy that address is the proxy's:
@@ -310,8 +323,8 @@ container; the container only bounds where it lands):
   provider key), and send anything out over the open network.
 - It does not give a shell on the VPS or access outside the container's
   volumes, **unless** a command escapes the container (shared kernel, see above).
-- There are no scopes, no per-device tokens and no revocation list. Per-device
-  tokens (#1320) are separate work and this page does not depend on them.
+- The shared token has no scope and no revocation list; per-device tokens (#1320)
+  have both, and this page does not depend on them.
 
 **Rotate** (also after a laptop is lost, a screen was shared, or on any doubt;
 tested on the compose stack, old token `401` and new token `200` afterwards):
@@ -511,5 +524,6 @@ image.
   instruction" property for that; it is not built.
 - **Real-IP handling.** A trusted-proxy setting so tole's failed-auth limiter
   counts the client and not the proxy (a src change).
-- **Per-device tokens** (#1320) are being built separately; when they land, the
-  rotation and leak sections change.
+- **Per-device tokens** (#1320) are in; the rotation and leak sections above still
+  describe the shared token, and a lost device's token is revoked with
+  `tole serve token revoke <name>` (no restart).

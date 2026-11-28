@@ -15,7 +15,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Workspace files | `--workspace` dir (default cwd) | Readable AND writable by the model via tools |
 | Host env of child processes | inherited by spawned commands | See ENV-1 |
 | Subprocess execution authority | run_command / job_start / git / gh | The model chooses argv within argv-split + jail rules |
-| Device tokens (#1320, part 1) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential; an interpreter that edits it is not stopped (defense in depth only, see #601). **`tole serve` does not check these tokens yet** (part 2), so they grant and restrict nothing today |
+| Device tokens (#1320) | `<tole data dir>/serve-tokens.jsonl` | The file holds only SHA-256 hashes of 256-bit random tokens, names, scopes and times; a token is printed once and never stored. 0600 in a data dir that is not group or world writable, the last component opened `O_NOFOLLOW` (unix; parent directories are followed; the owner is not compared with the euid), append-only by convention (a revoke is a line, nothing enforces it), and an unreadable line, a repeated hash or a revoke of a name that is not active makes the whole store unusable so a damaged revoke cannot revive a token. Restoring the file from a backup brings back every token revoked since: rotate all tokens after a restore. Writing the file is minting a credential, so `add` and `revoke` refuse under an agent session (#684, defense in depth, not a boundary: an interpreter that edits the file is not stopped, see #601). **Enforcement (the REST face of `tole serve`):** the shared token and Basic stay `full`; a device token is looked up by the SHA-256 of what was sent, compared over every active hash with no early exit, on every route but `/health` and an uncredentialed `/ready`. A `read-only` token passes only `GET` on an explicit list of read routes and gets `403` on everything else before the route runs (every `POST`, any other method, any path not listed, so a route added later is refused until it is listed), the answer to an approval included, so it cannot approve a Write or change a session, mission, discussion or cron job; a test walks the whole route table. A wrong, unknown and revoked token get one `401` (the bytes of a wrong shared token) and count towards the per-IP failure limit; a revoke is seen on the next request. `GET /info` reports the scope. A file that cannot be read refuses every device token, never a guess. No token value is logged, returned or sent in a webhook. `--transport mcp` takes no device token (its tools cannot be classified as reads or writes). `POST /hooks/{name}` is signed by its sender and never reads the token. Revoking a token also ends the event streams it opened (checked every 150 ms), and a read-only token cannot take the last 2 of the 8 stream slots. A file damaged after start-up is said on stderr once per change of state. Residual: the failed-auth limiter is per peer IP, so behind a proxy a revoked device that keeps retrying locks out everyone sharing the proxy address; an agent session that can write the data dir could append an `add` line (#601). A `read-only` token reads every transcript and the approvals list (a pending approval shows the tool and its summary), so it is for a device you trust to look, not for one you do not; its scope is not bound to a session; the last-used time is written at most once per 15 minutes per token and is information, not authority |
 
 ## Trust boundaries
 
@@ -523,11 +523,13 @@ restart), decisions are one-shot per (session, effect) with expiry to
 denied (a stolen device cannot bank future approvals), every decision
 is audited on the session, and there is no push endpoint in tole — the
 phone pulls, so the attack surface tole exposes is exactly the
-authenticated REST face. Scoped device tokens (per-device, revocable,
-read-only vs approver roles) are #1320: part 1 (the token store) exists but nothing creates a token yet and
-`tole serve` does not check them, so until part 2 enforces the scope the deployment guidance is
-unchanged: a dedicated OS user + minimal `--allow`/`--trust` on the serve
-process.
+authenticated REST face. Scoped device tokens (#1320: per-device,
+revocable with no restart, `read-only` or `full`; `tole serve token
+add|list|revoke`, see "Device tokens" in `docs/mobile-control.md`) let a
+phone watch a task with a `read-only` token that cannot answer an
+approval. The deployment guidance is unchanged for the shared token and
+for a `full` device token: a dedicated OS user + minimal
+`--allow`/`--trust` on the serve process.
 
 ### Remote MCP servers (#530)
 
@@ -1308,7 +1310,10 @@ them. Two layers close the direct routes; neither is a boundary.
   (`$(echo tole) x`, a backtick); `!`, `coproc`, `builtin`, `elif` and `until`
   (wrappers now), and `setpriv`, `chrt`, `ionice`, `taskset`, `script`,
   `strace`, `flock`, `watch`; `rbash`, `ash`, `csh`, `tcsh`, `mksh`, `ksh93`
-  and `yash` as shells; a quoted or escaped KEY behind a wrapper cut open by a
+  and `yash` as shells; a wrapper in front of a shell's `-c`
+  (`env -i sh -c 'tole x'`, `sudo -u root bash -lc ...`, `exec -a x dash -xc ...`,
+  also several quote layers deep): the first shell after a wrapper chain is
+  followed; a quoted or escaped KEY behind a wrapper cut open by a
   separator in the quotes (`env "X=a;c" tole x`); a word cut at a brace
   (`X=a${IFS}b tole x`, `env X=a}b tole x`), also inside a brace group or a
   function body (`{ X=a}b tole x; }`); `env -S`, `--split-string` and any
@@ -1349,10 +1354,11 @@ them. Two layers close the direct routes; neither is a boundary.
 
 Residual, deliberately: a renamed or copied tole binary started with a
 cleared environment (`env -i`, a wrapper that drops variables) is
-indistinguishable from a program the owner runs. The highest-impact case
-is `env -i sh -c '/usr/local/bin/tole ...'`: it is allowed, because the
-wrappers (`env`, `nohup`, `sudo`, `timeout`, ...) are not followed into a
-shell's `-c` text, and `env -i` also clears the marker, so the second layer
+indistinguishable from a program the owner runs. `env -i sh -c
+'/usr/local/bin/tole ...'` was the highest-impact case: since #1307 the first
+shell behind a wrapper chain is followed into its `-c` payload and the command
+is refused by name; a copy of the binary under another name that no word
+check can see is not, and `env -i` also clears the marker, so the second layer
 does not see it either. It reaches the owner-only records; only the Write
 approval of `run_command` and the sandbox bound it. Other routes the guard
 does not follow, all present before #1287: `eval`, `echo x | sh`,
@@ -1363,10 +1369,7 @@ string (`watch 'tole x'`, `script -c 'tole x'`, `flock f -c 'tole x'`, `perl
 text fed to a shell some other way (`sh <<< 'tole x'`, `bash <(echo tole x)`,
 `. <(...)`, `source /dev/stdin <<< ...`, `trap 'tole x' EXIT`), zsh's `noglob`,
 `nocorrect`, `=tole` and `repeat` (zsh is in the shell list but was not
-checked), a wrapper in front of a shell's `-c` (`env sh -c 'tole x'`, `sudo sh
--c ...`: allowed as a command line; as shell text the quote cut often leaves
-`tole` visible, but not several quote layers deep, e.g. `exec dash -c "dash -c
-\"...\""`), and a command substitution that is not the first word a
+checked), and a command substitution that is not the first word a
 wrapper runs (`env FOO=$(echo tole) cmd` is fine; `env -i $(echo tole) x` and
 `env $(echo tole) x` are refused since #1307, but `nohup env -i FOO=1
 $(echo tole)` hides it behind one more option the guard cannot size); an interpreter
@@ -1390,11 +1393,10 @@ supported and none is open in the corpus), and the list
 can only shrink: an entry the guard now refuses, or that no shell runs any
 more, fails the test and has to be deleted. The corpus is the hand-written
 tables of the earlier guard tests (#1287, #1298, #1302) and a fixed-seed
-generator (assignments, wrappers, separators, quotes, nested `sh -c` to depth 2,
-seven spellings of the program word). It does not cover: zsh, ksh, fish or
+generator (assignments, wrappers, separators, quotes, nested `[wrapper] sh -c` to
+depth 3 with flags such as `-lc` and `-xc`, many spellings of the program word). It does not cover: zsh, ksh, fish or
 busybox; inputs outside that grammar (here-documents, aliases and functions
-beyond the hand cases, `eval` strings built at run time, a wrapper in front of a
-nested shell, beyond the exact entries); what a shell does with an environment
+beyond the hand cases, `eval` strings built at run time, beyond the exact entries); what a shell does with an environment
 other than the test's; and a copy or a link of the binary, which the guard tests
 of #684 cover. `TOLE_GUARD_DIFF_REPORT=1` prints every disagreement
 as a worklist instead of failing. It found, and #1307 closed, a nested
@@ -1402,8 +1404,9 @@ shell whose payload is written unquoted with backslash-escaped blanks (the
 generated class `sh -c \(\ tole\ x\ \)`); no class is open in its corpus
 (brace groups and functions, `env env`, `>&-`, `>|`, a glued `tole>f`, a
 backslash-newline and `$'\x74ole'` are generator axes since the review of
-#1330). Open and listed as exact entries: the wrapper, `eval`, pipe, variable,
-`xargs`, `find -exec` and `rg --pre` routes above.
+#1330), and so is a wrapper in front of each nested shell. Open and listed as
+exact entries: the `eval`, pipe, variable, `xargs`, `find -exec` and `rg --pre`
+routes above.
 
 ### Delegation approvals (#714)
 

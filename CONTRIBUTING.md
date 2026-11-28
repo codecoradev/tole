@@ -239,8 +239,21 @@ Get them earlier, on your own machine:
 2. Fix real findings; for a false positive, extend the rule in `.cora.yaml`
    instead of sprinkling inline ignores.
 3. State the result in the PR **Testing** section. Agent-written PRs must do
-   this; without an LLM key, review through `cora mcp` (`review_prepare` /
-   `review_finalize`).
+   this, **before the PR is opened**. Without an LLM key (an agent session),
+   use Cora as the agent's reviewer through `cora mcp`:
+   `scripts/review-local.sh --agent DIR` writes the chunks and calls
+   `cora.review_prepare` for each; a reviewer who did not write the code (a
+   fresh read-only subagent, or a person) answers each `DIR/chunk-N.prompt.md`
+   with a JSON array in `DIR/chunk-N.findings.json`; `scripts/cora-agent-review.py
+   finalize DIR` calls `cora.review_finalize` with the same diff, validates the
+   findings, applies the `.cora.yaml` rules and prints the verdict (exit `0` none,
+   `2` findings, `1` incomplete: not a pass). Run both inside the checkout or
+   worktree of the branch. It is advisory like `review-local.sh`: the CI Cora
+   Review stays the merge gate, and the independent read-only reviews that the
+   approval, egress, auth, sandbox and guard paths need (AGENTS.md section 2)
+   still apply. The deterministic `index-unused-import` findings that `prepare` lists
+   for a diff fragment are often false positives (the import is used elsewhere in the
+   file): the reviewer checks the file before reporting one.
 4. For a refactor, run `cora callers <symbol>`, `cora impact <symbol>` and
    `cora affected <files>` first when you move, rename or remove a public item,
    change a ledger, session, lock or config format, or touch the sandbox,

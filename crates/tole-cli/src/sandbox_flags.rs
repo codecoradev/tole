@@ -155,7 +155,3 @@ pub fn apply(
         },
     }))
 }
-
-#[cfg(test)]
-#[path = "sandbox_flags_tests.rs"]
-mod tests;

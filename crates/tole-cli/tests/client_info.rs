@@ -43,14 +43,16 @@ fn info_describes_the_server_it_meets() {
         assert!(info.has(name), "{name}: {:?}", info.features);
     }
     assert!(!info.has("no.such.feature"));
-    // Nothing but the three keys: no path, user name or setting.
+    // The shared token is `full` (#1320).
+    assert_eq!(info.scope.as_deref(), Some("full"));
+    // Nothing but the four keys: no path, user name, token name or setting.
     let keys: Vec<&str> = raw
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(keys, ["features", "protocolVersion", "version"]);
+    assert_eq!(keys, ["features", "protocolVersion", "scope", "version"]);
 
     // Behind the token: a wrong one is a 401, no answer without one.
     assert!(matches!(

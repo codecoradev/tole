@@ -26,5 +26,6 @@
     "tree"
   ],
   "protocolVersion": 1,
+  "scope": "full",
   "version": "<VERSION>"
 }

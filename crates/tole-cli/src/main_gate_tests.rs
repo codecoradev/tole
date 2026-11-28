@@ -60,6 +60,17 @@ fn only_cron_run_and_tick_load_the_user_config_among_the_skip_list() {
     assert_eq!(policy(&["cron", "tick"]), GatePolicy::Skip);
 }
 
+/// #1320: `tole serve token ...` only edits the token file, so it skips the
+/// project config; the server itself is still a protocol face that never asks.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn serve_token_skips_the_gate_and_the_server_does_not() {
+    assert_eq!(policy(&["serve", "token", "list"]), GatePolicy::Skip);
+    assert_eq!(policy(&["serve", "token", "revoke", "x"]), GatePolicy::Skip);
+    assert_eq!(policy(&["serve"]), GatePolicy::NoPrompt);
+    assert_eq!(policy(&["serve", "--port", "1"]), GatePolicy::NoPrompt);
+}
+
 #[test]
 fn only_interactive_cli_commands_may_prompt() {
     assert_eq!(policy(&["run", "hi"]), GatePolicy::MayPrompt);
