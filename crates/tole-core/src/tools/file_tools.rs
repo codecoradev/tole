@@ -40,24 +40,52 @@ pub fn content_hash(content: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// The refusal text of a jail check (#1285), shared with `read_file`: an
-/// absolute path is told to be relative; `..` and a target that resolves
+/// The path to check as a workspace-relative one (#1285). A relative `path`
+/// is returned as given. An absolute one only when it lies under `root` (as
+/// given or canonical, compared as text, so no file is touched and nothing
+/// outside the workspace can be probed); what remains after the root is then
+/// held to the same rules as any relative path (no `..`, symlinks resolved).
+/// `None`: not inside the workspace, or the workspace root itself.
+pub fn within_workspace(root: &Path, path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Some(p.to_path_buf());
+    }
+    let canon = root.canonicalize().ok();
+    let rest = [Some(root), canon.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|base| {
+            p.strip_prefix(base)
+                .ok()
+                .filter(|r| r.components().next().is_some())
+        });
+    rest.map(Path::to_path_buf)
+}
+
+/// The refusal text of a jail check, shared with `read_file` and `write_file`
+/// (#1285): a path that names no place inside the workspace says where the
+/// workspace is and how to write the path; `..` and a target that resolves
 /// outside `root` stay "escapes the jail". Both name the workspace.
-pub(super) fn refusal(tool: &str, root: &Path, rel: &str) -> String {
+pub fn refusal(tool: &str, root: &Path, rel: &str) -> String {
     let w = root.display();
-    match Path::new(rel).components().next() {
-        Some(Component::RootDir | Component::Prefix(_)) => {
-            format!("{tool}: path must be relative to the workspace ({w}), not absolute: {rel}")
-        }
-        _ => format!("{tool}: path escapes the jail: {rel} (use a path inside the workspace {w}; --workspace <dir> widens it)"),
+    let p = Path::new(rel);
+    let rooted = matches!(
+        p.components().next(),
+        Some(Component::RootDir | Component::Prefix(_))
+    );
+    if rooted && (!p.is_absolute() || within_workspace(root, rel).is_none()) {
+        format!("{tool}: path is not inside the workspace ({w}): {rel} (use a path relative to {w}, or an absolute path under it; --workspace <dir> widens it)")
+    } else {
+        format!("{tool}: path escapes the jail: {rel} (use a path inside the workspace {w}; --workspace <dir> widens it)")
     }
 }
 
 /// Resolve `rel` inside the jail. Shared shape with `WriteFileTool` /
-/// `ReadFileTool`: `rel` must be relative, no `..`, and the resolved
-/// target (through symlinks) must stay inside `root`.
+/// `ReadFileTool`: `rel` is relative, or absolute under `root`; no `..`, and
+/// the resolved target (through symlinks) must stay inside `root`.
 fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
-    let rel_path = Path::new(rel);
+    let rel_path = within_workspace(root, rel).ok_or_else(|| refusal(tool, root, rel))?;
     // Component-based validation (uniform with WriteFileTool; CodeCora
     // scan #6/#12): on Windows, drive-prefixed and rooted relatives are
     // NOT `is_absolute()` yet `Path::join` lets both escape the base, and
@@ -69,7 +97,7 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
     if !all_normal {
         return Err(refusal(tool, root, rel));
     }
-    let target = root.join(rel_path);
+    let target = root.join(&rel_path);
     if !target.exists() {
         return Err(format!("{tool}: not found in jail: {rel}"));
     }
@@ -83,6 +111,11 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
         return Err(refusal(tool, root, rel));
     }
     Ok(canon_target)
+}
+
+/// [`jailed`] for `read_file`, which shares the jail.
+pub(super) fn resolve_in_jail(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
+    jailed(root, rel, tool)
 }
 
 /// The `path` input resolved like [`jailed`], relative to the canonical root
@@ -257,7 +290,7 @@ impl Tool for EditFileTool {
         Some(json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" },
+                "path": { "type": "string", "description": "Workspace-relative file path (no ..; absolute only inside the workspace)" },
                 "old_hash": { "type": "string", "description": "Content hash (16-hex) returned by read_file when you read this file. Refused if the file changed since." },
                 "old_text": { "type": "string", "description": "Exact text to replace. Must match exactly once in the file." },
                 "new_text": { "type": "string", "description": "Replacement text. Empty string deletes the matched text." }
@@ -433,7 +466,7 @@ impl Tool for DeleteFileTool {
         Some(json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths). Files only." }
+                "path": { "type": "string", "description": "Workspace-relative file path (no ..; absolute only inside the workspace). Files only." }
             },
             "required": ["path"]
         }))

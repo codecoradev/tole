@@ -143,6 +143,8 @@ pub use provider::mock;
 pub use provider::openai;
 #[doc(inline)]
 pub use provider::replay;
+#[cfg(feature = "shell-tools")]
+pub mod program_path;
 pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;

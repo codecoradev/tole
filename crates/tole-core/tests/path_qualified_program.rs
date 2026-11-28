@@ -1,9 +1,13 @@
-//! #1286: a program written as a path is still refused (bare names resolve
-//! through PATH, the audited surface), but the refusal says that and names
-//! the bare name; the destructive text is kept for a teardown program or a
-//! recursive `rm` behind the path, however it is wrapped.
+//! #1286: `check_destructive_argv` (the cron argv rule) still refuses a program
+//! written as a path (bare names resolve through PATH, the audited surface),
+//! but the refusal says that and names the bare name; the destructive text is
+//! kept for a teardown program or a recursive `rm` behind the path, however
+//! it is wrapped. `run_command` and `job_start` let a path through as the
+//! program, under `check_command_argv`: `path_qualified_run.rs`.
 #![cfg(feature = "shell-tools")]
 
+#[path = "support/which.rs"]
+mod which;
 use serde_json::json;
 use tole_core::run_command::RunCommandTool;
 use tole_core::subprocess::check_destructive_argv;
@@ -115,16 +119,20 @@ fn every_path_qualified_program_is_still_refused() {
 }
 
 #[test]
-fn run_command_gives_the_same_reasons() {
+fn run_command_keeps_the_destructive_text_and_the_payload_rule() {
     let t = RunCommandTool::new(std::env::temp_dir());
     let run = |c: &str| t.execute(json!({ "command": c })).unwrap_err();
-    let err = run("./target/release/mytool list");
+    if let Some(rm) = which::find_exe("rm") {
+        assert!(run(&format!("{} -rf /", rm.display())).contains(DESTRUCTIVE));
+    }
+    assert!(run("bash -c '/bin/rm -rf /'").contains(DESTRUCTIVE));
+    // A program in a shell text is still the shell's to resolve (#1286 only
+    // lets a path through as the program; see `path_qualified_run.rs`).
+    let err = run("bash -c './target/release/mytool list'");
     assert!(
         err.contains("written as a path") && err.contains("`mytool`"),
         "{err}"
     );
-    assert!(run("/bin/rm -rf /").contains(DESTRUCTIVE));
-    assert!(run("bash -c '/bin/rm -rf /'").contains(DESTRUCTIVE));
 }
 
 /// A session reads one consistent story about the tole binary: the path
