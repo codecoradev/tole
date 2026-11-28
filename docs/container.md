@@ -348,11 +348,12 @@ write probe and not a space alarm: watch free space from the host (`df -h`, the
 orchestrator's volume metric). To see what is using it:
 `du -sh /data/sessions /data/codecora/tole/images` and `ls -lS /data/sessions | head`
 inside the container. Retention is decided in part and built in part: a whole
-settled session file may be moved by an owner command, nothing deletes one, and
-only a read-only size report exists so far (`tole sessions` and `tole doctor` print
-the number of session files, their bytes, the largest and the oldest); the archive
-command is not built. See [session-retention-design.md](session-retention-design.md)
-section 12 (#1020), which also says what can be said about sizing the volume.
+settled session file will be movable by an owner command once one is built, and no
+tole command deletes one; the archive command is not built. Once the size report
+of #1020 is built (it merges separately), `tole sessions` and `tole doctor` print
+the number of session files, their bytes, the largest and the oldest. See
+[session-retention-design.md](session-retention-design.md), section 10 (sizing the
+volume) and section 12 (the decisions, #1020).
 
 ## TLS and the live event stream
 

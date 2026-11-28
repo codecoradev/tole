@@ -1,10 +1,10 @@
 # Session store retention — design note
 
 Status: **decided for the first pieces** (issue #1020; the owner delegated the
-choice: "choose the best option and record it"). Section 12 records the
+choice: "choose the best option and record it"). Section 12 (new) records the
 decisions of section 8 and what is built and what is not: a size report is step
-2 and is built in a separate change under #1020; the archive command of step 3 is **not built** and stays open in
-#1020. Sections 1 to 11 are the analysis the decisions rest on and were written
+2 and is built in a separate change under #1020; the archive command of step 3
+is **not built** and stays open in #1020. Sections 1 to 11 are the analysis the decisions rest on and were written
 before them, so their wording of "proposal" and "for the owner" is the state at
 that time; section 12 wins where they differ. The note says what the code does
 today (with file references), what retention can mean under the append-only
@@ -475,7 +475,8 @@ with other state, size the whole of `/data`, not only `/data/sessions`.
 
 ## 11. Recommendation
 
-The recommendation as written before section 12 (which adopts it); every step that touches a session file waits for decision 1 of
+The recommendation as written before section 12 (which adopts it with the
+changes listed in section 12); every step that touches a session file waits for decision 1 of
 section 8. The order is chosen so that each step is useful alone and the next one
 is only built if the data from the previous one calls for it.
 
@@ -488,7 +489,8 @@ is only built if the data from the previous one calls for it.
    operator to move or remove session files, so it waits for decision 1.
 2. **First code: option A, measure and warn.** `tole sessions` and `tole doctor`
    print file count, total bytes, oldest and largest (and the size of the image
-   directories), with a warning threshold that is off by default. Read-only, no
+   directories), with a warning threshold that is off by default (section 12:
+   no threshold and no image directories in the first version). Read-only, no
    file format change, and it produces the real numbers section 7 says are
    missing. It is the "smallest piece" the issue asks for.
 3. **Only if step 2 shows a problem: option C1, archive, and nothing more.**
@@ -542,18 +544,18 @@ the other faces; what `face_parity` would require was not checked.
 
 The owner delegated the choice of the open decisions of section 8 on #1020
 ("choose the best option and record it"). Each answer below is the conservative
-reading, chosen so that the append-only rule of `AGENTS.md` §6 keeps its full
-meaning and so that nothing here has to be undone. They bind the code that is
+reading, chosen to keep entries immutable; the `AGENTS.md` §6 sentence that
+permits moving a whole file is added when step 3 is built. They bind the code that is
 built under #1020; a later change of one needs an owner decision recorded here.
 
 | # | Decision | Answer |
 |---|---|---|
-| 1 | May a whole session file be moved at all? | **Yes, and only that.** A *settled* session file (decision 7) may be moved byte for byte to another location by an owner command that holds the file's writer lock. No entry is ever edited, dropped or rewritten, a file is never compressed in place, and tole gets **no command that deletes** a session file: removing one stays the owner's own `rm` (option D). `AGENTS.md` §6 is read as "entries are never changed or removed; a whole file may be moved, intact, by the owner". The sentence is added to `AGENTS.md` §6 in the change that builds step 3, not before, because until then nothing moves a file. |
+| 1 | May a whole session file be moved at all? | **Yes, and only that.** A *settled* session file (decision 7) may be moved byte for byte to another location by an owner command that holds the file's writer lock. No entry is ever edited, dropped or rewritten, a file is never compressed in place, and tole gets **no command that deletes** a session file: removing one stays the owner's own `rm` (option D). The removal of the source after a verified copy is part of the move, not a deletion command. `AGENTS.md` §6 is read as "entries are never changed or removed; a whole file may be moved, intact, by the owner". The sentence is added to `AGENTS.md` §6 in the change that builds step 3, not before, because until then nothing moves a file. |
 | 2 | Plain move or compressed? | **Plain move (C1).** No compression, no new dependency, no licence question. A compressed archive (C2) can be added later behind its own decision. |
-| 3 | Where does an archive live? Owner command only? | **An owner-chosen directory, given explicitly (`--to DIR`, no default), outside the sessions directory.** The directory is created with owner-only permissions when it does not exist. The command is an **owner command on the host and never a model tool**, never run on a timer or on a threshold, and dry-run by default (it lists what it would move and the bytes; a flag does the move). An archive inside the sessions directory is not offered: the sandbox bind (section 2) protects it only in one opt-in configuration. |
+| 3 | Where does an archive live? Owner command only? | **An owner-chosen directory, given explicitly (`--to DIR`, no default), outside the sessions directory.** The directory is created with owner-only permissions when it does not exist. The command is an **owner command on the host and never a model tool**, never run on a timer or on a threshold, and dry-run by default (it lists what it would move and the bytes; a flag does the move). An owner command is not a `Tool`, so the `Approver` rule of `AGENTS.md` §6 does not apply to it: the dry-run default plus the explicit flag is its confirmation, and the session guard (#684) keeps a model from running the tole binary. An archive inside the sessions directory is not offered: the sandbox bind (section 2) protects it only in one opt-in configuration. |
 | 4 | Index pointer line (C3)? | **None in the first piece.** An archived session is invisible to `tole sessions`, `--all` and `resume` (section 4, first column); the way back is moving the file back by hand. This decides no index schema and keeps the index append-only as it is. The cost, a person must remember where they put the archive, is accepted for a command an owner runs by hand. A pointer line and a `resume` that says "archived, restore with ..." is a later, separate decision. |
 | 5 | Selection | **By age only: `--older-than DAYS`, by the file's last write time** (the mtime, which approximates last activity and is what `tole sessions` shows). No selection by size or by an id list in the first piece. |
-| 6 | Images | **Out of the first piece.** They stay an operator cleanup as documented (`docs/threat-model.md`, `docs/mobile-control.md`). The reference scan of section 6 is the precondition for ever moving a shared image. |
+| 6 | Images | **Out of the first piece.** They stay an operator cleanup as documented (`docs/threat-model.md`, the image section: the spill dir "is not pruned ... an operator cleanup"; `docs/mobile-control.md`, "Known limitation": uploads no prompt references are not garbage-collected). The reference scan of section 6 is the precondition for ever moving a shared image. |
 | 7 | Which states are eligible? | **Settled sessions only: the replayed state is `Idle` or `Final`, the writer lock is free, and the file replays without error.** A session in `Planning`, `ToolCall`, `AwaitingApproval`, `Executing` or `Settling`, one that is locked, and one that does not replay are skipped and listed with the reason; the owner resumes or inspects it first. |
 | 8 | Family together or each file alone? | **Each file alone.** Forks are self-contained (section 2), so a fork whose source was moved is a root in `--tree` and nothing else changes. |
 | 9 | Tighten the file mode (`0o666` before the umask) to `0600`? | **Independent of retention and not decided here.** It changes the permissions of new files on every face; it gets its own issue when someone wants it. |
@@ -563,14 +565,20 @@ built under #1020; a later change of one needs an owner decision recorded here.
 
 **What is built under these decisions.** Step 2 of section 11 only, in a
 separate change: `tole sessions` and `tole doctor` print the number of session
-files, their total bytes, the largest and the oldest (by last write), read from
-the directory metadata alone: no file is opened, replayed, moved or changed. It
+files, their total bytes, the largest and the oldest (by last write). The
+report reads directory metadata alone: it opens, replays, moves and changes no
+file (`tole sessions` itself still replays every file for its table). It
 has no warning threshold: a threshold needs a config key on the usual
 flag, environment and config layers, and the numbers it would act on do not
 exist yet. The image directories are not in the report (decision 6): use
-`du` as section 10 says. The report is a CLI-host command output, not a tool and
-not a session capability, so it adds no row to `docs/faces.md` (the face parity
-test compares tools and prompts).
+`du` as section 10 says. The size-report change (branch
+`feat/sessions-size-report`) adds no row to `docs/faces.md`: the face parity test
+compares tools and prompts and passes. That is a gap against `AGENTS.md` §6, which
+asks for a row in the hand-kept "Capabilities the test cannot see" table for a
+capability on one face (the report exists on the CLI only; `tole serve` lists
+sessions through `GET /sessions/index` and has no size report). The row (CLI only,
+policy: an owner report on the host) is to be added to that change; the archive
+command gets its row in the same way.
 
 **What is not built.** The archive command (step 3). It waits for the data of
 step 2 to show a problem, as section 11 says. When it is built it follows
