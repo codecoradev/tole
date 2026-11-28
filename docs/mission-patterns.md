@@ -17,7 +17,9 @@ code.
 
 A mission asks for a Write the way `tole run` does: the allow list first, then
 a `[y/N]` prompt on stdout with the answer read from stdin
-(`InteractiveApprover::stdio`, `crates/tole-cli/src/approver.rs`). Two ways it
+(`InteractiveApprover::stdio` in `crates/tole-cli/src/approver.rs`; the prompt
+and the read are `ask` in `crates/tole-cli/src/stdio_prompt.rs`, which denies on
+end of file, on a read error and on any answer but `y` or `yes`). Two ways it
 goes wrong headless:
 
 - **stdin stays open and nobody types**: the mission waits at the prompt. It
@@ -171,7 +173,7 @@ How a mission ended is its `status` (printed at the end, and in the
 |---|---|---|
 | `complete` | marker declared and, with `--verify`, the gate passed | review the diff |
 | `exhausted_steps`, `exhausted_tokens`, `exhausted_time` | `--max-steps`, `--max-tokens` or `--max-minutes` reached | resume with a larger `--max-steps` or `--max-tokens`; `--max-minutes` restarts per invocation anyway |
-| `exhausted_turn_cap` | three turns used the per-turn step cap (32 steps) without finishing | look at the transcript, then resume |
+| `exhausted_turn_cap` | three turns in a row used the per-turn step cap (32 steps) without finishing | look at the transcript, then resume |
 | `verify_failed` | the gate failed three times | read the last failure, fix the gate or the goal |
 | `verify_refused` | the owner's sandbox could not run the gate | fix the sandbox setting |
 | `stopped` | a turn settled for a reason the mission does not continue from: a denied approval, the loop guard, a provider failure, an unknown tool, a blocked stop gate, a cancel, or the 120-poll budget | read the `mission: turn settled:` line on stderr |
@@ -179,7 +181,9 @@ How a mission ended is its `status` (printed at the end, and in the
 
 A turn that hits the per-turn step cap does not end the mission: it gets a
 "produce the deliverable now" nudge and the mission goes on; only the third such
-turn ends it as `exhausted_turn_cap`, and that count restarts on `--resume`.
+turn in a row ends it as `exhausted_turn_cap`. A turn that ends in a final
+answer resets that count (`cap_trips = 0` in `mission.rs`); the count also
+starts again on `--resume`.
 Every status reached inside the loop (`error` included) writes a summary to the
 session; a failure before the loop (provider config, creating or opening the
 session) returns an error and writes none. A stopped or exhausted mission can
@@ -221,6 +225,14 @@ transcript. tole compacts between turns once a prompt reaches `--compact-at`
 reports no window never compacts on its own: set `TOLE_CONTEXT_WINDOW`
 (README, `TOLE_CONTEXT_WINDOW`). Compaction follows the context window, not the
 budget; nothing compacts because a ceiling is near.
+
+## See also
+
+- [approving-delegated-work.md](approving-delegated-work.md): a child that
+  `delegate` starts is a headless run too, and can ask the owner instead of
+  being denied when `[delegation] approvals` is on.
+- [crash-resume.md](crash-resume.md): what a kill leaves in a mission session
+  and what recovers it (`tole resume <id>` first, then `tole mission --resume`).
 
 ## What is not here
 
