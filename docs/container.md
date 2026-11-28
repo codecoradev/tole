@@ -108,8 +108,8 @@ lists both).
 - **Health.** `HEALTHCHECK` runs `healthcheck.sh` (bash `/dev/tcp`, no curl in
   the image): `GET /ready` on the container's loopback must answer `200`: the
   state directories (`/data/codecora`, `/data/sessions`) take a write, and with
-  `--cron` the ticker beats. It answers `503` when one does not (a read-only or full
-  volume shows up here) and while serve drains after SIGTERM. `GET /health` is the
+  `--cron` the ticker beats. It answers `503` when one does not (a read-only volume or one with no free inode shows up here; a
+  volume that still has inodes but no free blocks is not proven to fail the probe) and while serve drains after SIGTERM. `GET /health` is the
   liveness answer (the process is up) for a probe that must not fail on a full disk;
   a Kubernetes readiness probe uses `/ready`, a liveness probe `/health`. Neither
   takes a token (mobile-control.md, "`GET /ready`"). `/info` (token needed) is for you to probe the
@@ -142,8 +142,8 @@ version step first. Do not run two servers on the same
 `docker run --rm -v tole_tole-data:/data -v "$PWD":/b debian:bookworm-slim tar czf /b/tole-data.tgz -C /data .`
 (the volume name is prefixed with the compose project name).
 
-**Disk growth.** Nothing in tole removes or rotates a session file or a spilled
-image: the ledgers and `/data/codecora/tole/images` only grow, and they share the
+**Disk growth.** Nothing in tole removes or rotates a settled session file or a
+spilled image: the ledgers and `/data/codecora/tole/images` only grow, and they share the
 `tole-data` volume with the config and the cron store, so a full volume stops all
 of it. `GET /ready` fails on a read-only volume (its `state` check creates and
 removes an empty file in `/data/sessions` and in the tole data directory under `/data/codecora`), but it is a
