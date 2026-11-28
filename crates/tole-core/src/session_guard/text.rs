@@ -1,16 +1,37 @@
 //! Text readings of the session guard (#1307): shell words, quotes, globs. Each
 //! only ever adds refusals to what `session_guard.rs` reads.
 
+/// Where the `[..]` class that starts after its `[` ends: `[]x]`, `[!x]`,
+/// `[[:alpha:]]` (the index of the closing `]`).
+fn class_end(q: &[char]) -> Option<usize> {
+    let mut i = usize::from(matches!(q.first(), Some('!' | '^')));
+    i += usize::from(q.get(i) == Some(&']'));
+    while i < q.len() {
+        match q[i] {
+            ']' => return Some(i),
+            '[' if q.get(i + 1) == Some(&':') => {
+                i = (i + 2..q.len().saturating_sub(1))
+                    .find(|&k| q[k] == ':' && q[k + 1] == ']')
+                    .map_or(i + 1, |k| k + 2);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Does the glob `p` match `s`? (`*`, `?`, `[..]`). A class is read as any one
-/// character: more refusals, never fewer. Linear in `p`: no backtracking.
+/// character: more refusals, never fewer. Linear in `p`, and a pattern too long
+/// to read is taken to match.
 pub(super) fn glob(p: &[char], s: &[char]) -> bool {
+    if p.len() > 256 {
+        return true;
+    }
     let (mut toks, mut i) = (Vec::new(), 0);
     while i < p.len() {
-        let class = (p[i] == '[')
-            .then(|| p[i..].iter().position(|&c| c == ']'))
-            .flatten();
-        toks.push(if let Some(e) = class {
-            i += e;
+        let end = (p[i] == '[').then(|| class_end(&p[i + 1..])).flatten();
+        toks.push(if let Some(e) = end {
+            i += e + 1;
             '?'
         } else {
             p[i]
@@ -83,12 +104,17 @@ pub(super) fn unquote_shell(t: &str, quotes: bool) -> String {
 /// second, so this only ever adds refusals.
 pub(super) fn shell_words(s: &str, quotes: bool) -> Vec<Vec<String>> {
     let (mut cmds, mut cmd, mut word) = (Vec::new(), Vec::new(), String::new());
+    // `word` without its leading quotes and backslashes, kept as it grows.
+    let mut bare = String::new();
     let (mut esc, mut prev, mut q, mut ansi) = (false, ' ', None, false);
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if let Some(k) = q {
             // Inside quotes everything is part of the word (`"` and `$'` take escapes).
             word.push(c);
+            if !bare.is_empty() || !matches!(c, '\'' | '"' | '\\') {
+                bare.push(c);
+            }
             q = (c != k || esc).then_some(k);
             (esc, prev) = ((k == '"' || ansi) && !esc && c == '\\', c);
             continue;
@@ -96,21 +122,27 @@ pub(super) fn shell_words(s: &str, quotes: bool) -> Vec<Vec<String>> {
         let amp = c == '&' && !matches!(prev, '<' | '>') && it.peek() != Some(&'>');
         let pipe = c == '|' && prev != '>';
         let sep = !esc && (matches!(c, ';' | '(' | ')' | '`' | '\n') || pipe || amp);
-        let at = word.trim_start_matches(['\'', '"', '\\']);
-        if (c == '`' || c == '(') && !esc && at == if c == '`' { "" } else { "$" } {
-            word = "$(".into();
+        if (c == '`' || c == '(') && !esc && bare == if c == '`' { "" } else { "$" } {
+            (word, bare) = ("$(".into(), "$(".into());
         }
         if sep || (!esc && matches!(c, ' ' | '\t')) {
             if !word.is_empty() {
                 cmd.push(std::mem::take(&mut word));
             }
+            bare.clear();
             if sep {
                 cmds.push(std::mem::take(&mut cmd));
             }
         } else if esc && c == '\n' {
             word.pop(); // a backslash-newline is no character
+            if !bare.is_empty() {
+                bare.pop();
+            }
         } else {
             word.push(c);
+            if !bare.is_empty() || !matches!(c, '\'' | '"' | '\\') {
+                bare.push(c);
+            }
             if quotes && !esc && matches!(c, '\'' | '"') {
                 ansi = c == '\'' && word.ends_with("$'");
                 q = Some(c);

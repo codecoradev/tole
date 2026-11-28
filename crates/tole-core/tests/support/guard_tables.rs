@@ -45,6 +45,13 @@ pub const KNOWN_BAD: &[&str] = &[
     "$'\\164ole' x",
     "ionice -c3 tole x",
     "flock f tole x",
+    "env --unset NOPE -S 'tole x'",
+    "env -iu NOPE -S 'tole x'",
+    "env -C . -S 'tole x'",
+    "./[]t]ole x",
+    "./[[:lower:]]ole x",
+    "to{l,x}e y",
+    "${NOPE:-tole} y",
     "time</dev/null tole x",
     "env>/dev/null tole x",
     "X+=1 Y=2 tole x",
@@ -335,6 +342,9 @@ pub const KNOWN_GOOD: &[&str] = &[
     "if ! false; then echo ok; fi",
     "until true; do echo a; done",
     "true && echo ${HOME}",
+    "time ls *",
+    "for d in a b; do ls *; done",
+    "env FOO=1 echo *",
 ];
 
 /// Runs no `tole`; the guard refuses it today although it is harmless (the

@@ -19,6 +19,8 @@
 //! here. Only a sandbox that cannot write the data dir closes that (#601).
 
 use crate::child_env::UNDER_SESSION;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,6 +43,25 @@ const ERR_TOLE: &str = "a session may not run the tole binary: owner-only record
      (issue #684)";
 const ERR_MARKER: &str = "a session may not touch the TOLE_UNDER_SESSION marker (issue #684)";
 
+/// One check: where program words resolve, the work left (refuse when it is
+/// gone: a nested text is read many ways, and the cost must stay linear), and
+/// what is already known, so no text is read twice.
+struct Cx<'a> {
+    cwd: &'a Path,
+    exe: Option<&'a Path>,
+    fuel: Cell<i64>,
+    texts: RefCell<HashMap<(u32, String), bool>>,
+    words: RefCell<HashMap<String, bool>>,
+}
+
+impl Cx<'_> {
+    /// Pay `n` units of work; false when none is left.
+    fn pay(&self, n: usize) -> bool {
+        self.fuel.set(self.fuel.get() - n as i64);
+        self.fuel.get() >= 0
+    }
+}
+
 /// Mark a process a session's command tool is about to start.
 pub fn mark(cmd: &mut Command) -> &mut Command {
     cmd.env(UNDER_SESSION, "1")
@@ -55,7 +76,15 @@ pub fn check_session_argv(argv: &[String], cwd: &Path) -> Result<(), String> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok());
-    if invokes_tole(argv, cwd, exe.as_deref(), 0) {
+    let size: usize = argv.iter().map(String::len).sum();
+    let cx = Cx {
+        cwd,
+        exe: exe.as_deref(),
+        fuel: Cell::new(100 * size as i64 + 200_000),
+        texts: RefCell::default(),
+        words: RefCell::default(),
+    };
+    if invokes_tole(argv, &cx, 0) {
         return Err(ERR_TOLE.into());
     }
     Ok(())
@@ -87,12 +116,15 @@ fn resolve(w: &str, cwd: &Path) -> Option<PathBuf> {
     p.canonicalize().ok()
 }
 
-fn is_tole(w: &str, cwd: &Path, exe: Option<&Path>) -> bool {
+fn is_tole(w: &str, cx: &Cx) -> bool {
     if w.is_empty() || w.starts_with('-') {
         return false;
     }
     matches!(base(w).as_str(), "tole" | "tole-cli")
-        || exe.is_some_and(|e| resolve(w, cwd).is_some_and(|r| r == e))
+        || *cx.words.borrow_mut().entry(w.into()).or_insert_with(|| {
+            cx.exe
+                .is_some_and(|e| resolve(w, cx.cwd).is_some_and(|r| r == e))
+        })
 }
 
 fn ident(k: &str) -> bool {
@@ -108,21 +140,38 @@ fn open(w: &str) -> bool {
     w.ends_with('\\') || ['\'', '"'].iter().any(|q| w.matches(*q).count() % 2 == 1)
 }
 
-/// `env`'s own options (`-S`, `--split-string`, abbreviated) up to its program.
-fn env_split(args: &[String]) -> bool {
-    let mut it = args.iter();
-    while let Some(w) = it.next() {
-        if w == "-u" || w == "-C" {
-            it.next();
-        } else if w.starts_with("--s")
-            || (w.starts_with('-') && !w.starts_with("--") && w.contains('S'))
+/// Walks the options, assignments, redirections and numbers a wrapper takes up to its
+/// program: (an `env -S` / `--split-string` was seen, where the program is).
+/// An option that takes an argument (`-u`, `-C`, `-a`, `-P`, `--unset`,
+/// `--chdir`, `--argv0`, also as a cluster end: `-iu X`) skips it.
+fn opts(args: &[String]) -> (bool, usize) {
+    let (mut i, mut split) = (0, false);
+    while let Some(raw) = args.get(i) {
+        let skip = lead_len(raw); // a redirection, `X+=1`, a variable word
+        if skip > 0 {
+            i += skip;
+            continue;
+        }
+        let w = unquote(raw);
+        if let Some(long) = w.strip_prefix("--") {
+            split |= long.starts_with('s');
+            let takes = ["unset", "chdir", "argv0"]
+                .iter()
+                .any(|o| o.starts_with(long));
+            i += usize::from(takes && !long.is_empty() && !long.contains('='));
+        } else if w.starts_with('-') && w.len() > 1 {
+            split |= w.contains('S');
+            // `-iu X` takes the next word; `-uX` has its argument attached.
+            let at = w.find(['u', 'C', 'a', 'P']);
+            i += usize::from(at.is_some_and(|k| k + 1 == w.len()));
+        } else if w.is_empty()
+            || !(is_assignment(&w) || w.chars().all(|c| c.is_ascii_digit() || c == '.'))
         {
-            return true;
-        } else if !(w.starts_with('-') || is_assignment(w)) {
             break;
         }
+        i += 1;
     }
-    false
+    (split, i)
 }
 
 /// The program word up to what a shell reads as something else glued to it:
@@ -137,7 +186,8 @@ fn stem(w: &str) -> String {
 /// variable word, which may expand to nothing. 0: the word is the program.
 fn lead_len(w: &str) -> usize {
     let head = w.split(['<', '>']).next().unwrap_or("");
-    let var = head.contains('$') && novars(head).chars().all(|c| matches!(c, '"' | '\''));
+    let var =
+        head.contains('$') && !built(head) && novars(head).chars().all(|c| matches!(c, '"' | '\''));
     if matches!(w, "{" | "}") || var {
         return 1;
     }
@@ -157,20 +207,29 @@ fn lead_len(w: &str) -> usize {
     }
 }
 
+/// `${E:-tole}` and `to{l,x}e`: the shell builds the word.
+fn built(w: &str) -> bool {
+    w.split("${").skip(1).any(|r| {
+        let r = r.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        !r.starts_with('}')
+    }) || (w.contains('{') && (w.contains(',') || w.contains("..")))
+}
+
 /// A word the guard cannot read (#1307): a glob that can expand to the tole
-/// binary (`./tol?`, `$PWD/to[l]e`), or an ANSI-C string with an escape
-/// (`$'\x74ole'`). A word with an open quote is a piece of a cut that fell
-/// inside quotes and is left to the cuts.
+/// binary (`./tol?`, `$PWD/to[l]e`), a built word, an ANSI-C string with an
+/// escape (`$'\x74ole'`). A word with an open quote is a piece of a cut that
+/// fell inside quotes and is left to the cuts.
 fn hidden(w: &str) -> bool {
     let name: Vec<char> = unquote(w.rsplit('/').next().unwrap_or(""))
         .chars()
         .collect();
-    !open(w)
-        && (w.contains("$'") && w.contains('\\')
-            || w.contains(['*', '?', '['])
-                && ["tole", "tole-cli", "tole.exe", "tole-cli.exe"]
-                    .iter()
-                    .any(|t| glob(&name, &t.chars().collect::<Vec<_>>())))
+    let glob_tole = w.contains(['*', '?', '['])
+        && ["tole", "tole-cli", "tole.exe", "tole-cli.exe"]
+            .iter()
+            .any(|t| glob(&name, &t.chars().collect::<Vec<_>>()));
+    // The running binary under another name: `/proc/$PPID/exe`.
+    let own = w.contains("/proc/") || w.ends_with("/exe") || w.contains("PPID");
+    !open(w) && (w.contains("$'") && w.contains('\\') || glob_tole || built(w) || own)
 }
 
 /// A program word the guard cannot read: a command substitution, or `hidden`.
@@ -191,9 +250,12 @@ fn quoted(w: &str) -> bool {
 /// doubt, and refused.
 const MAX_LEAD: usize = 64;
 
-fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
+fn invokes_tole(argv: &[String], cx: &Cx, depth: u32) -> bool {
     if depth > 4 {
         return true; // nested beyond any honest use: refuse, do not guess
+    }
+    if !cx.pay(argv.len() + 1) {
+        return true;
     }
     let words: Vec<String> = argv.iter().map(|w| unquote(w)).collect();
     let (mut i, mut lead) = (0, 0);
@@ -211,12 +273,15 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
         // The word the cut takes for the program, then, past the words that are
         // none (#1307), the program behind them.
         let n = lead_len(&argv[i]);
-        if program_runs_tole(argv, &words, i, cwd, exe, depth) || (n == 0 && unsure(&argv[i])) {
+        if program_runs_tole(argv, &words, i, cx, depth) || (n == 0 && unsure(&argv[i])) {
             return true;
         }
         lead += 1;
+        // A quote at the end closes what an earlier word opened: the quote-aware
+        // reading of the text has the word whole (`>'a b' tole x` has it open).
         let skipped = &argv[i..(i + n).min(argv.len())];
-        if n == 0 || lead > MAX_LEAD || skipped.iter().any(|w| open(w)) {
+        if n == 0 || lead > MAX_LEAD || skipped.iter().any(|w| open(w) && !w.ends_with(['\'', '"']))
+        {
             return n > 0;
         }
         i = (i + n).min(argv.len());
@@ -224,24 +289,11 @@ fn invokes_tole(argv: &[String], cwd: &Path, exe: Option<&Path>, depth: u32) -> 
 }
 
 /// Is `argv[i]`, taken as the program, tole or a wrapper or shell that runs it?
-fn program_runs_tole(
-    argv: &[String],
-    words: &[String],
-    i: usize,
-    cwd: &Path,
-    exe: Option<&Path>,
-    depth: u32,
-) -> bool {
+fn program_runs_tole(argv: &[String], words: &[String], i: usize, cx: &Cx, depth: u32) -> bool {
     let (prog, own) = (&words[i], stem(&argv[i]));
-    if is_tole(prog, cwd, exe) || is_tole(&own, cwd, exe) {
+    if is_tole(prog, cx) || is_tole(&own, cx) {
         return true;
     }
-    // `time< f tole x`: a redirection or variable can be glued to the name.
-    let named = |list: &[&str], w: &str, own: &str| {
-        [base(w), base(own)]
-            .iter()
-            .any(|b| list.contains(&b.as_str()))
-    };
     if named(&WRAPPERS, prog, &own) {
         // `env -S 'tole x'` splits its argument into words; a quote cut open by
         // a separator inside it (`env "X=a;c" tole x`) leaves an open key.
@@ -249,32 +301,53 @@ fn program_runs_tole(
             || argv[i + 1..]
                 .iter()
                 .any(|w| is_assignment(&unquote(w)) && open(w))
-            || (i..words.len()).any(|e| base(&words[e]) == "env" && env_split(&words[e + 1..]))
-            // The program a wrapper runs is a substitution: `env $(echo tole) x`.
-            || argv[i + 1..]
-                .iter()
-                .find(|w| {
-                    !(w.starts_with('-')
-                        || is_assignment(&unquote(w))
-                        || w.chars().all(|c| c.is_ascii_digit() || c == '.'))
-                })
-                .is_some_and(|w| w.starts_with("$(") || w.starts_with('`'))
+            || (i..words.len()).any(|e| base(&words[e]) == "env" && opts(&argv[e + 1..]).0)
+            // What the chain runs is a substitution or a word the guard cannot
+            // read: `env $(echo tole) x`, `nohup env ./tol? x`.
+            || chain_unsure(argv, words, i + 1)
             || (i + 1..words.len()).any(|j| {
                 !is_assignment(&words[j])
-                    && (is_tole(&words[j], cwd, exe)
-                        || is_tole(&stem(&argv[j]), cwd, exe)
-                        || hidden(&argv[j]))
+                    && (is_tole(&words[j], cx) || is_tole(&stem(&argv[j]), cx))
             })
             // The first shell behind the wrapper: `env -i sh -c 'tole x'`.
             || (i + 1..words.len())
-                .find(|&j| named(&SHELLS, &words[j], &stem(&argv[j])))
-                .is_some_and(|j| shell_runs_tole(argv, j, cwd, exe, depth));
+                .find(|&j| named(&SHELLS, &words[j], &stem(&argv[j])) || vague(&argv[j]))
+                .is_some_and(|j| shell_runs_tole(argv, j, cx, depth));
     }
-    named(&SHELLS, prog, &own) && shell_runs_tole(argv, i, cwd, exe, depth)
+    // A shell named by a glob or a variable: `/bin/d?sh -c 'tole x'`, `$S -c ...`.
+    (named(&SHELLS, prog, &own) || vague(&argv[i])) && shell_runs_tole(argv, i, cx, depth)
+}
+
+/// A word the shell expands to something else: it may name a shell.
+fn vague(w: &str) -> bool {
+    w.contains(['$', '*', '?', '['])
+}
+
+/// Is the word (or its stem: `time< f tole x`) one of `list`?
+fn named(list: &[&str], w: &str, own: &str) -> bool {
+    [base(w), base(own)]
+        .iter()
+        .any(|b| list.contains(&b.as_str()))
+}
+
+/// The program a wrapper chain (from `argv[at]`) runs is a substitution or
+/// hidden: only the program word of each wrapper, not its arguments.
+fn chain_unsure(argv: &[String], words: &[String], mut at: usize) -> bool {
+    while let Some(w) = argv.get(at + opts(&argv[at..]).1) {
+        if unsure(w) {
+            return true;
+        }
+        at += opts(&argv[at..]).1;
+        if !named(&WRAPPERS, &words[at], &stem(w)) {
+            return false;
+        }
+        at += 1;
+    }
+    false
 }
 
 /// Does the shell at `argv[at]` run tole from its `-c` payload (`-c`, `-lc`, `-xc`)?
-fn shell_runs_tole(argv: &[String], at: usize, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
+fn shell_runs_tole(argv: &[String], at: usize, cx: &Cx, depth: u32) -> bool {
     let mut rest = argv[at + 1..].iter();
     while let Some(f) = rest.next() {
         if f.starts_with('-') && !f.starts_with("--") && f.contains('c') {
@@ -283,17 +356,13 @@ fn shell_runs_tole(argv: &[String], at: usize, cwd: &Path, exe: Option<&Path>, d
             // text is handed to, and mean something only together (#1307).
             let rest: Vec<&str> = rest.map(String::as_str).collect();
             let text = |t: &str| {
-                payload_invokes_tole(t, cwd, exe, depth + 1)
-                    || [false, true].iter().any(|&q| {
-                        let on = if q { depth > 0 } else { true };
-                        on && t.contains(if q {
-                            &['\\', '\'', '"'][..]
-                        } else {
-                            &['\\'][..]
-                        }) && payload_invokes_tole(&unquote_shell(t, q), cwd, exe, depth + 1)
-                    })
+                let read = |t: &str| payload_invokes_tole(t, cx, depth + 1);
+                read(t)
+                    || (t.contains('\\') && read(&unquote_shell(t, false)))
+                    || (depth > 0 && t.contains(['\\', '\'', '"']) && read(&unquote_shell(t, true)))
             };
-            return text(&rest.join(" ")) || rest.iter().any(|p| *p != "$(" && text(p));
+            return text(&rest.join(" "))
+                || (rest.len() > 1 && rest.iter().any(|p| *p != "$(" && text(p)));
         }
     }
     false
@@ -371,7 +440,18 @@ fn split_quoted(s: &str) -> Option<Vec<&str>> {
 /// is an [`INERT`] program or a [`FILLER`] (seen through the naive cut).
 /// Anything else, and any doubt, splits the whole text naively, as does
 /// deeper text (blank-cut words, quotes still on), so nesting cannot loosen it.
-fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u32) -> bool {
+fn payload_invokes_tole(payload: &str, cx: &Cx, depth: u32) -> bool {
+    let key = (depth, payload.to_string());
+    if let Some(&known) = cx.texts.borrow().get(&key) {
+        return known;
+    }
+    // Refuse what costs too much to read (and do not remember it).
+    let verdict = !cx.pay(payload.len() + 1) || read_payload(payload, cx, depth);
+    cx.texts.borrow_mut().insert(key, verdict);
+    verdict
+}
+
+fn read_payload(payload: &str, cx: &Cx, depth: u32) -> bool {
     let filler = |q: &str| blank_words(q).next().is_none_or(|f| FILLER.contains(&f));
     let parts = (depth == 1)
         .then(|| split_quoted(payload))
@@ -395,12 +475,14 @@ fn payload_invokes_tole(payload: &str, cwd: &Path, exe: Option<&Path>, depth: u3
             blank_words(seg).map(String::from).collect::<Vec<_>>(),
             seg.split_whitespace().map(String::from).collect(),
         ];
-        cuts.iter()
-            .any(|w| !w.is_empty() && invokes_tole(w, cwd, exe, depth))
+        let skip = usize::from(cuts[0] == cuts[1]); // the same words: once
+        cuts[..2 - skip]
+            .iter()
+            .any(|w| !w.is_empty() && invokes_tole(w, cx, depth))
     }) || (!quote_aware
         && [false, true].iter().any(|&q| {
             shell_words(payload, q)
                 .iter()
-                .any(|w| !w.is_empty() && invokes_tole(w, cwd, exe, depth))
+                .any(|w| !w.is_empty() && invokes_tole(w, cx, depth))
         }))
 }

@@ -1317,23 +1317,35 @@ them. Two layers close the direct routes; neither is a boundary.
   separator in the quotes (`env "X=a;c" tole x`); a word cut at a brace
   (`X=a${IFS}b tole x`, `env X=a}b tole x`), also inside a brace group or a
   function body (`{ X=a}b tole x; }`); `env -S`, `--split-string` and any
-  `--s...` abbreviation, behind any `env` of a chain; a program word glued to a
+  `--s...` abbreviation, behind any `env` of a chain and behind `env` options that
+  take an argument (`-u`, `-C`, `-a`, `-P`, `--unset`, `--chdir`, `--argv0`, also
+  as a cluster end: `env -iu FOO -S 'tole x'`); a program word glued to a
   redirection or a variable (`tole>f x`, `tole$E x`, `tole"$E" x`, `'to'$E'le' x`, `time< f tole x`) and a variable word in
   front of the program (`$E tole x`, `"$@" tole x`); a program
-  that is a glob matching `tole` or `tole-cli` (`./tol? x`, `$PWD/to[l]e x`) or
-  an ANSI-C string with an escape (`$'\x74ole' x`), also behind a wrapper;
+  that is a glob matching `tole` or `tole-cli` (`./tol? x`, `$PWD/to[l]e x`,
+  `./[]t]ole x`, `./[[:lower:]]ole x`), brace expansion or a default value
+  (`to{l,x}e y`, `${E:-tole} y`) or an ANSI-C string with an escape
+  (`$'\x74ole' x`), also as the program of a wrapper chain; the running binary under another name (a program word with `/proc/`, ending in
+  `/exe` or naming `PPID`: `/proc/$PPID/exe x`); a shell named by a glob or a
+  variable (`/bin/d?sh -c 'tole x'`, `$S -c ...`, `${SHELL:-sh} -c ...`: any
+  program or wrapper word with `$ * ? [` is scanned for a `-c` payload);
   `tol\<newline>e x`; and a nested `sh -c` whose payload is unquoted with
   escaped blanks (`sh -c echo\ a\;\ tole\ x`). What it refuses without
   running tole: `X[0]=1 cmd`; a command whose program is a substitution
   (`$(git rev-parse --show-toplevel)/run.sh`, `` `which python3` -V ``,
   `time $(cmd)`); a
-  glob program that can match `tole`; a word before the program that quotes
+  program word that is a glob matching `tole`, has a brace list or `${..}` with
+  an operator, or is an ANSI-C string with an escape, at the program position
+  only (`ls *`, `time ls *`, `cp * y`, `sudo rm -rf ./build/*` and
+  `echo $'a\nb'` are allowed), and a glob longer than 256 characters; a word before the program that quotes
   or an escaped blank leave open (`>'a b' cmd`, `X+='a b' cmd`); more than 64
   leading words; any later word of `!`, `elif`, `until`, `builtin`, `coproc`,
   `time`, `env` and the other wrappers that is `tole` or `tole-cli`, with or
   without something glued to it (`! grep tole f`, `time cargo build -p
   tole-cli`, `sudo grep 'tole$' f`); `env` with an option containing `S`
-  before its program (`env --split-string="a b" make`, `env -iS ...`); and a
+  before its program (`env --split-string="a b" make`, `env -iS ...`); a text
+  that costs too much to read (the work is capped at a small multiple of its
+  size, and each nested text is read once); and a
   nested `sh -c '$(date)'` text whose payload starts with a substitution (`sh
   -c 'echo $(date)'` is allowed). The over-refusal of #1302 is unchanged:
   `RUSTFLAGS="-D warnings" cargo test` is still refused, because the second
@@ -1364,12 +1376,14 @@ approval of `run_command` and the sandbox bound it. Other routes the guard
 does not follow, all present before #1287: `eval`, `echo x | sh`,
 `x=tole; $x`, `xargs`, `find -exec`, `rg --pre`, a program that runs one of
 its arguments and is not in the wrapper list, or that takes the command as one
-string (`watch 'tole x'`, `script -c 'tole x'`, `flock f -c 'tole x'`, `perl
+string (`watch 'tole x'`, `script -c 'tole x'`, `flock f -c 'tole x'`: allowed
+as an argv, refused as `sh -c` text where the quotes leave `tole` a word; `perl
 -e`, `python -c`, `awk`, `sed '1e ...'`, `git -c alias.t='!tole x'`), a command
 text fed to a shell some other way (`sh <<< 'tole x'`, `bash <(echo tole x)`,
 `. <(...)`, `source /dev/stdin <<< ...`, `trap 'tole x' EXIT`), zsh's `noglob`,
 `nocorrect`, `=tole` and `repeat` (zsh is in the shell list but was not
-checked), and a command substitution that is not the first word a
+checked), a name bound on an earlier line (`alias t=tole`, `hash -p`, `set --`, `for t in tole; do $t`,
+`read t`, extglob), a copied or linked binary under another name, and a command substitution that is not the first word a
 wrapper runs (`env FOO=$(echo tole) cmd` is fine; `env -i $(echo tole) x` and
 `env $(echo tole) x` are refused since #1307, but `nohup env -i FOO=1
 $(echo tole)` hides it behind one more option the guard cannot size); an interpreter
@@ -1401,7 +1415,8 @@ other than the test's; and a copy or a link of the binary, which the guard tests
 of #684 cover. `TOLE_GUARD_DIFF_REPORT=1` prints every disagreement
 as a worklist instead of failing. It found, and #1307 closed, a nested
 shell whose payload is written unquoted with backslash-escaped blanks (the
-generated class `sh -c \(\ tole\ x\ \)`); no class is open in its corpus
+generated class `sh -c \(\ tole\ x\ \)`); no class of its generator is open (a
+sample of the grammar, not a proof: see the open routes above)
 (brace groups and functions, `env env`, `>&-`, `>|`, a glued `tole>f`, a
 backslash-newline and `$'\x74ole'` are generator axes since the review of
 #1330), and so is a wrapper in front of each nested shell. Open and listed as

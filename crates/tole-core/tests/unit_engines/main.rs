@@ -5,6 +5,7 @@
 mod test_dir;
 
 mod advisor;
+mod discussion_tools;
 mod plugin_scan;
 mod router;
 mod skills_curator;

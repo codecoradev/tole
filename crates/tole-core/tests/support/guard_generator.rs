@@ -55,6 +55,8 @@ const WRAPPERS: &[&str] = &[
     "builtin command ",
     "ionice -c3 ",
     "time</dev/null ",
+    "env -u NOPE -C . ",
+    "env --unset NOPE ",
     "env>/dev/null ",
 ];
 const PROGRAMS: &[&str] = &[
@@ -74,6 +76,10 @@ const PROGRAMS: &[&str] = &[
     "./to[l]e",
     "$PWD/tol*",
     "$NOPE tole",
+    "./[]t]ole",
+    "./[[:lower:]]ole",
+    "to{l,x}e",
+    "${NOPE:-tole}",
 ];
 /// `{}` is the simple command.
 const CONTEXTS: &[&str] = &[

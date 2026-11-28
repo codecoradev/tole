@@ -4,8 +4,8 @@
 //! each must be refused as `sh -c` text, as a split command line, and nested in
 //! `sh -c` at depths 1 to 3. `ALLOWED` is what must stay allowed next to them
 //! (as `sh -c` text: nested in quotes the guard cuts naively and refuses more).
-//! Not here (documented, not part of #1307): a wrapper in front of a shell's
-//! `-c`, `eval`, a pipe into a shell, `x=tole; $x`, `xargs`, `find -exec`.
+//! Not here (open, listed in `docs/threat-model.md`): `eval`, a pipe or a
+//! here-string into a shell, `x=tole; $x`, `xargs`, `find -exec`, `rg --pre`.
 
 use std::path::Path;
 use tole_core::run_command::RunCommandTool;
@@ -63,6 +63,14 @@ const ROUTES: &[&str] = &[
     "env sudo env -S 'tole x'",
     "env nohup env -S 'tole x'",
     "env -iS 'tole x'",
+    // `env -S` behind an option that takes an argument.
+    "env --unset FOO -S 'tole x'",
+    "env --chdir /tmp -S 'tole x'",
+    "env -iu FOO -S 'tole x'",
+    "env -C dir -S 'tole x'",
+    "env -a x -S 'tole x'",
+    "env -u A -u B -S 'tole x'",
+    "env -uFOO -S 'tole x'",
     // Closing a descriptor is one word; `>|` is a redirection.
     ">&- tole x",
     "3>&- tole x",
@@ -71,7 +79,6 @@ const ROUTES: &[&str] = &[
     "3<&- tole x",
     ">|f tole x",
     ">| f tole x",
-    // A backslash-newline is no character.
     // The program word glued to a redirection or a variable, or a variable
     // that expands to nothing in front of it.
     "tole>f x",
@@ -140,6 +147,24 @@ const ROUTES: &[&str] = &[
 /// Routes that need a shell to read them: as a command line there is no brace
 /// group, no continuation line, no ANSI-C string and no function to define.
 const TEXT_ONLY: &[&str] = &[
+    // The running binary under another name, and a shell named by a glob or a variable.
+    "/proc/$PPID/exe x",
+    "/proc/${PPID}/exe x",
+    "exec /proc/$PPID/exe x",
+    "env -i /proc/$PPID/exe x",
+    "/bin/d?sh -c 'tole x'",
+    "$0 -c 'tole x'",
+    "S=sh; $S -c 'tole x'",
+    "${SHELL:-sh} -c 'tole x'",
+    "env $S -c 'tole x'",
+    // A glob class, brace expansion, a default value: the shell builds the word.
+    "./[]t]ole x",
+    "./[[:lower:]]ole x",
+    "./[!x]ole x",
+    "to{l,x}e y",
+    "${E:-tole} y",
+    "${E-tole} y",
+    "{tole,x} y",
     "'to'$E'le' x",
     "\"$EMPTY\"tole x",
     "true && { X=a}b tole x; }",
@@ -184,6 +209,28 @@ const ALLOWED: &[&str] = &[
     "echo a >&- ",
     "echo a >| out.txt",
     "$CC -o x y.c",
+    // A glob or an ANSI-C string that is an argument, not the program.
+    // A redirection that ends a quoted nested payload.
+    "sh -c \"nohup sh -c 'make > log 2>&1' &\"",
+    "sh -c 'make 2>&1'",
+    "sh -c \"echo a >f\"",
+    "time ls *",
+    "timeout 30 grep -rn foo *",
+    "env ls t*",
+    "time printf $'a\\tb\\n'",
+    "command ls *",
+    "exec ls *",
+    "! ls *",
+    "$CC -c foo.c",
+    "for d in a b; do ls *; done",
+    "if true; then cp * y; fi",
+    "env FOO=1 cargo test *",
+    "sudo rm -rf ./build/*",
+    "time echo $'a\\nb'",
+    "${HOME}/bin/tool x",
+    "echo ${HOME} ${X:-y}",
+    "env X=1 rg -S foo src",
+    "env -u FOO rg -S foo src",
 ];
 
 fn quote(t: &str) -> String {
@@ -304,8 +351,13 @@ fn a_hundred_thousand_leading_words_are_refused_quickly_on_a_small_stack() {
     // Nested shells and a glob of many stars stay linear too.
     let text = nest(&format!("{}echo", ">f ".repeat(20_000)), 3);
     let glob = format!("env {}x", "*a".repeat(5_000));
+    let classes = format!("env ./{}x", "[".repeat(80_000));
     let started = std::time::Instant::now();
-    let _ = (refused(&shell(&text)), refused(&shell(&glob)));
+    let _ = (
+        refused(&shell(&text)),
+        refused(&shell(&glob)),
+        refused(&shell(&classes)),
+    );
     assert!(
         started.elapsed().as_secs() < 30,
         "nested or glob input took too long"
@@ -313,4 +365,92 @@ fn a_hundred_thousand_leading_words_are_refused_quickly_on_a_small_stack() {
     // Inside the cap the program behind the words is still found.
     let text = format!("{}tole x", ">f ".repeat(60));
     assert!(refused(&shell(&text)) && refused(&line(&text)));
+}
+
+fn quote_double(t: &str) -> String {
+    let esc: String = t
+        .chars()
+        .flat_map(|c| {
+            ['\\', '"', '$', '`']
+                .contains(&c)
+                .then_some('\\')
+                .into_iter()
+                .chain([c])
+        })
+        .collect();
+    format!("\"{esc}\"")
+}
+
+fn quote_backslash(t: &str) -> String {
+    t.chars()
+        .flat_map(|c| {
+            (!c.is_ascii_alphanumeric() && !"_-./=,:@".contains(c))
+                .then_some('\\')
+                .into_iter()
+                .chain([c])
+        })
+        .collect()
+}
+
+/// Nested `sh -c` layers must not multiply the work: each payload was read
+/// twice and each reading three ways, so the cost was exponential in the depth
+/// (4 s for 3 commands in 3 levels). Every quote style, 3 to 10 commands, 3 to 6
+/// layers, a bound per call.
+#[test]
+fn nested_shell_layers_cost_a_bounded_time() {
+    type Style = fn(&str) -> String;
+    let styles: [(&str, Style); 3] = [
+        ("single", quote),
+        ("double", quote_double),
+        ("backslash", quote_backslash),
+    ];
+    for (name, q) in styles {
+        for commands in [3, 6, 10] {
+            for layers in 3..=6 {
+                let mut text = vec!["echo a b"; commands].join("; ");
+                for _ in 0..layers {
+                    text = format!("sh -c {}", q(&text));
+                }
+                let started = std::time::Instant::now();
+                let _ = (refused(&shell(&text)), refused(&line(&text)));
+                let took = started.elapsed();
+                assert!(
+                    took.as_millis() < 1500,
+                    "{name}, {commands} commands, {layers} layers: {took:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Runs of quotes and backslashes, and many inline shells: each text is read in
+/// time linear in its size (a word was trimmed again for every character: 50 KB
+/// of backslashes took a minute).
+#[test]
+fn long_runs_of_quotes_backslashes_and_inline_shells_cost_linear_time() {
+    let texts = [
+        format!("sh -c {}x", "\\".repeat(50_000)),
+        format!("sh -c {} tole", "'\"".repeat(50_000)),
+        format!("sh -c {}", "\\'".repeat(50_000)),
+        format!("sh -c {}", "\"'".repeat(50_000)),
+        format!("{}echo", "sh -c 'echo a'; ".repeat(20_000)),
+        format!("{}echo", "sh -c 'echo a' & ".repeat(20_000)),
+    ];
+    for t in texts {
+        let started = std::time::Instant::now();
+        let long = t.clone();
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let _ = refused(&shell(&long));
+                if let Ok(argv) = RunCommandTool::split_argv(&long) {
+                    let _ = refused(&argv);
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("no stack overflow");
+        let took = started.elapsed();
+        assert!(took.as_secs() < 8, "{} bytes took {took:?}", t.len());
+    }
 }

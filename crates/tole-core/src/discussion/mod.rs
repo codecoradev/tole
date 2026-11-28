@@ -999,6 +999,3 @@ pub fn checker_request(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod tools_tests;
